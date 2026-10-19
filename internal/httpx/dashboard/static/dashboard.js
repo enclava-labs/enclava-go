@@ -1,7 +1,5 @@
 (function () {
-  var STORAGE_KEY = 'enclava-dashboard-api-key';
   var THEME_KEY = 'enclava-theme';
-  var AUTH_MODE = (document.body && document.body.dataset.dashboardAuthMode) || 'api_key';
 
   // ── Theme management ──────────────────────────────────────────────
 
@@ -100,52 +98,28 @@
     return svg;
   }
 
-  // ── API key management ────────────────────────────────────────────
+  // ── Session authentication ────────────────────────────────────────
 
-  // Session mode: the server stores the per-session CSRF token and ships it
-  // in a script-readable cookie; mutations echo it back in X-CSRF-Token.
+  // The server stores the per-session CSRF token and ships it in a
+  // script-readable cookie; mutations echo it back in X-CSRF-Token. No
+  // service key is kept in this browser — dashboard auth is the session
+  // cookie alone.
   function sessionCSRFToken() {
     var match = document.cookie.match(/(?:^|;\s*)enclava_csrf=([^;]*)/);
     return match ? decodeURIComponent(match[1]) : '';
   }
 
-  function getSavedAPIKey() {
-    return localStorage.getItem(STORAGE_KEY) || '';
-  }
-
-  function setSavedAPIKey(rawKey) {
-    var key = (rawKey || '').trim();
-    if (!key) {
-      localStorage.removeItem(STORAGE_KEY);
-      return;
-    }
-    localStorage.setItem(STORAGE_KEY, key);
-  }
-
-  function formatMaskedKey(key) {
-    if (!key) return 'Not set';
-    if (key.length <= 12) return key;
-    return key.slice(0, 8) + '...' + key.slice(-4);
-  }
-
-  function setAuthState(hasKey) {
-    var loginPanel = document.getElementById('api-key-login-panel');
-    var shell = document.getElementById('dashboard-shell');
-    var active = document.getElementById('active-api-key');
-
-    if (!shell) return;
-
-    if (AUTH_MODE === 'session') {
-      if (loginPanel) loginPanel.classList.add('hidden');
-      shell.classList.remove('hidden');
-      if (active) active.textContent = 'Session';
-      return;
-    }
-
-    if (!loginPanel || !active) return;
-    loginPanel.classList.toggle('hidden', hasKey);
-    shell.classList.toggle('hidden', !hasKey);
-    active.textContent = hasKey ? formatMaskedKey(getSavedAPIKey()) : 'Not set';
+  // fetch wrapper for dashboard JSON APIs: session cookie plus CSRF.
+  function apiFetch(path, options) {
+    options = options || {};
+    options.headers = options.headers || {};
+    var csrf = sessionCSRFToken();
+    if (csrf) options.headers['X-CSRF-Token'] = csrf;
+    return fetch(path, options).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (body) {
+        return { status: res.status, ok: res.ok, body: body };
+      });
+    });
   }
 
   // ── Dashboard messages ────────────────────────────────────────────
@@ -257,26 +231,12 @@
 
   function onBeforeDashboardRequest(event) {
     var path = getEventPath(event);
-    if (!path.startsWith('/dashboard/partials/')) return;
-    if (AUTH_MODE === 'session') {
-      var csrf = sessionCSRFToken();
-      if (csrf) {
-        event.detail.headers = event.detail.headers || {};
-        event.detail.headers['X-CSRF-Token'] = csrf;
-      }
-      return;
+    if (!path.startsWith('/dashboard/')) return;
+    var csrf = sessionCSRFToken();
+    if (csrf) {
+      event.detail.headers = event.detail.headers || {};
+      event.detail.headers['X-CSRF-Token'] = csrf;
     }
-
-    var key = getSavedAPIKey();
-    if (!key) {
-      event.preventDefault();
-      showToast('Set an API key first to use the dashboard.', 'warning');
-      return;
-    }
-
-    event.detail.headers = event.detail.headers || {};
-    event.detail.headers.Authorization = 'Bearer ' + key;
-    event.detail.headers['X-API-Key'] = key;
   }
 
   function onDashboardError(event) {
@@ -285,16 +245,12 @@
 
     var status = event.detail.xhr && event.detail.xhr.status;
     if (status === 401) {
-      if (AUTH_MODE === 'session') {
-        showToast('Dashboard session expired. Redirecting to login...', 'error');
-        window.location.href = '/dashboard/login';
-        return;
-      }
-      showToast('API key is missing or invalid.', 'error');
+      showToast('Dashboard session expired. Redirecting to login...', 'error');
+      window.location.href = '/dashboard/login';
       return;
     }
     if (status === 403) {
-      showToast('API key lacks access to dashboard scopes.', 'error');
+      showToast('Your account lacks access to this dashboard action.', 'error');
       return;
     }
     if (status >= 500) {
@@ -354,37 +310,10 @@
 
   document.addEventListener('DOMContentLoaded', function () {
     initTheme();
-
-    var keyForm = document.getElementById('api-key-form');
-    var keyInput = document.getElementById('api-key-input');
-    var clearButton = document.getElementById('clear-api-key');
-
-    setAuthState(AUTH_MODE === 'session' || !!getSavedAPIKey());
     refreshServiceStatus();
     initializeEndpointCopy();
     initExtractPage();
-
-    if (AUTH_MODE === 'session') return;
-
-    if (keyForm) {
-      keyForm.addEventListener('submit', function (event) {
-        event.preventDefault();
-        var raw = keyInput ? keyInput.value : '';
-        if (!raw.trim()) {
-          showToast('Please paste an API key before saving.', 'warning');
-          return;
-        }
-        setSavedAPIKey(raw);
-        window.location.reload();
-      });
-    }
-
-    if (clearButton) {
-      clearButton.addEventListener('click', function () {
-        setSavedAPIKey('');
-        window.location.reload();
-      });
-    }
+    initIdentityPage();
   });
 
   // ── Extract page ──────────────────────────────────────────────────
@@ -392,15 +321,8 @@
   function extractFetch(path, options) {
     options = options || {};
     options.headers = options.headers || {};
-    if (AUTH_MODE === 'session') {
-      options.headers['X-CSRF-Token'] = sessionCSRFToken();
-    } else {
-      var key = getSavedAPIKey();
-      if (key) {
-        options.headers['Authorization'] = 'Bearer ' + key;
-        options.headers['X-API-Key'] = key;
-      }
-    }
+    var csrf = sessionCSRFToken();
+    if (csrf) options.headers['X-CSRF-Token'] = csrf;
     return fetch('/dashboard/partials/extract' + path, options);
   }
 
@@ -1268,4 +1190,336 @@
       return isoStr;
     }
   }
+  // ── Identity page ─────────────────────────────────────────────────
+
+  // Renders and wires /dashboard/identity against the session+CSRF
+  // /api/v1/identities endpoints. All values go through textContent so
+  // account/provider labels are never interpreted as markup.
+  function identityMessage(message, tone) {
+    var mount = document.getElementById('identity-message');
+    if (!mount) return;
+    mount.textContent = message || '';
+    mount.className = 'min-h-[1.5rem] text-sm ' + (tone === 'error' ? 'text-destructive' : 'text-green-600 dark:text-green-400');
+  }
+
+  function parseScopes(raw) {
+    return (raw || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+  }
+
+  function clearChildren(el) {
+    while (el.firstChild) el.removeChild(el.firstChild);
+  }
+
+  function tableWithRows(headers, rows) {
+    var wrap = document.createElement('div');
+    wrap.className = 'rounded-md border overflow-hidden overflow-x-auto';
+    var table = document.createElement('table');
+    table.className = 'w-full caption-bottom text-sm';
+    var thead = document.createElement('thead');
+    thead.className = '[&_tr]:border-b bg-muted/50';
+    var hrow = document.createElement('tr');
+    headers.forEach(function (h) {
+      var th = document.createElement('th');
+      th.className = 'h-10 px-4 text-left align-middle font-medium text-muted-foreground';
+      th.textContent = h;
+      hrow.appendChild(th);
+    });
+    thead.appendChild(hrow);
+    var tbody = document.createElement('tbody');
+    rows.forEach(function (cells) {
+      var tr = document.createElement('tr');
+      tr.className = 'border-b transition-colors';
+      cells.forEach(function (cell) {
+        var td = document.createElement('td');
+        td.className = 'p-3 align-middle';
+        if (typeof cell === 'string') td.textContent = cell; else td.appendChild(cell);
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(thead);
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  function smallButton(label, onClick) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = label;
+    btn.className = 'inline-flex items-center justify-center rounded-md text-xs font-medium h-8 px-3 border border-input bg-background hover:bg-accent transition-colors';
+    btn.addEventListener('click', onClick);
+    return btn;
+  }
+
+  function refreshIdentityUsers() {
+    apiFetch('/api/v1/identities/users').then(function (res) {
+      if (res.ok) renderIdentityUsers(res.body.users || []);
+    });
+  }
+
+  function loadIdentityMe() {
+    apiFetch('/api/v1/identities/me').then(function (res) {
+      if (!res.ok) {
+        identityMessage(res.status === 403 ? 'This session has no linked user account.' : 'Could not load your account.', 'error');
+        return;
+      }
+      var me = res.body;
+      var set = function (id, v) { var el = document.getElementById(id); if (el) el.textContent = v; };
+      set('identity-email', me.email || '');
+      set('identity-display-name', me.display_name || '—');
+      set('identity-status', me.status || '');
+      var roles = (me.roles || []).map(function (r) { return r.name; });
+      set('identity-roles', roles.length ? roles.join(', ') : 'No roles');
+    });
+  }
+
+  function loadIdentitySessions() {
+    var mount = document.getElementById('identity-sessions');
+    if (!mount) return;
+    apiFetch('/api/v1/identities/me/sessions').then(function (res) {
+      clearChildren(mount);
+      if (!res.ok) {
+        mount.textContent = 'Could not load sessions.';
+        return;
+      }
+      var sessions = res.body.sessions || [];
+      if (!sessions.length) {
+        mount.textContent = 'No sessions.';
+        return;
+      }
+      mount.appendChild(tableWithRows(['Created', 'Expires', 'State', ''], sessions.map(function (s) {
+        var state = s.revoked_at ? 'Revoked (' + (s.revoke_reason || 'revoked') + ')' : (s.current ? 'Current session' : 'Active');
+        var action = document.createElement('span');
+        if (!s.revoked_at && !s.current) {
+          action.appendChild(smallButton('Revoke', function () {
+            apiFetch('/api/v1/identities/me/sessions/' + encodeURIComponent(s.id), { method: 'DELETE' }).then(function (r) {
+              identityMessage(r.ok ? 'Session revoked.' : 'Could not revoke the session.', r.ok ? 'success' : 'error');
+              loadIdentitySessions();
+            });
+          }));
+        }
+        return [formatTime(s.created_at), formatTime(s.expires_at), state, action];
+      })));
+    });
+  }
+
+  function loadIdentityLinks() {
+    var mount = document.getElementById('identity-links');
+    if (!mount) return;
+    apiFetch('/api/v1/identities/me/identities').then(function (res) {
+      clearChildren(mount);
+      if (!res.ok) {
+        mount.textContent = 'Could not load linked identities.';
+        return;
+      }
+      var links = res.body.identities || [];
+      if (!links.length) {
+        mount.textContent = 'No external sign-ins are linked to this account.';
+        return;
+      }
+      mount.appendChild(tableWithRows(['Issuer', 'Subject', 'Linked'], links.map(function (l) {
+        return [l.issuer || '', l.subject || '', formatTime(l.linked_at)];
+      })));
+    });
+  }
+
+  function renderIdentityUsers(users) {
+    var mount = document.getElementById('identity-users');
+    if (!mount) return;
+    clearChildren(mount);
+    if (!users.length) {
+      mount.textContent = 'No users.';
+      return;
+    }
+    mount.appendChild(tableWithRows(['Email', 'Status', 'Roles', 'Actions'], users.map(function (u) {
+      var roleNames = (u.roles || []).map(function (r) { return r.name; }).join(', ');
+      var actions = document.createElement('span');
+      actions.className = 'inline-flex gap-2';
+      var next = u.status === 'disabled' ? 'active' : 'disabled';
+      actions.appendChild(smallButton(next === 'active' ? 'Enable' : 'Disable', function () {
+        apiFetch('/api/v1/identities/users/' + encodeURIComponent(u.id), {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: next }),
+        }).then(function (r) {
+          identityMessage(r.ok ? 'User ' + next + '.' : 'Could not update the user.', r.ok ? 'success' : 'error');
+          refreshIdentityUsers();
+        });
+      }));
+      (identityRoles || []).forEach(function (role) {
+        var held = (u.roles || []).some(function (r) { return r.id === role.id; });
+        actions.appendChild(smallButton((held ? '− ' : '+ ') + (role.name || role.id), function () {
+          apiFetch('/api/v1/identities/users/' + encodeURIComponent(u.id) + '/roles/' + encodeURIComponent(role.id), {
+            method: held ? 'DELETE' : 'POST',
+          }).then(function (r) {
+            identityMessage(r.ok ? 'Role assignment updated.' : 'Could not update the role assignment.', r.ok ? 'success' : 'error');
+            refreshIdentityUsers();
+          });
+        }));
+      });
+      return [u.email || '', u.status || '', roleNames || '—', actions];
+    })));
+  }
+
+  var identityRoles = null;
+
+  function loadIdentityRoles() {
+    var list = document.getElementById('identity-role-list');
+    apiFetch('/api/v1/identities/roles').then(function (res) {
+      if (!res.ok) return;
+      identityRoles = res.body.roles || [];
+      if (list) {
+        clearChildren(list);
+        if (!identityRoles.length) {
+          list.textContent = 'No roles.';
+        } else {
+          list.appendChild(tableWithRows(['Name', 'Scopes'], identityRoles.map(function (r) {
+            return [r.name || '', (r.scopes || []).join(', ')];
+          })));
+        }
+      }
+      var select = document.getElementById('identity-new-user-role');
+      if (select) {
+        identityRoles.forEach(function (r) {
+          var opt = document.createElement('option');
+          opt.value = r.id;
+          opt.textContent = r.name;
+          select.appendChild(opt);
+        });
+      }
+      refreshIdentityUsers();
+    });
+  }
+
+  function loadIdentityServiceAccounts() {
+    var mount = document.getElementById('identity-service-accounts');
+    if (!mount) return;
+    apiFetch('/api/v1/identities/service-accounts').then(function (res) {
+      clearChildren(mount);
+      if (!res.ok) {
+        mount.textContent = 'Could not load service accounts.';
+        return;
+      }
+      var accounts = res.body.service_accounts || [];
+      if (!accounts.length) {
+        mount.textContent = 'No service accounts.';
+        return;
+      }
+      mount.appendChild(tableWithRows(['Name', 'Status', 'Scopes', ''], accounts.map(function (sa) {
+        var action = document.createElement('span');
+        var next = sa.status === 'disabled' ? 'active' : 'disabled';
+        action.appendChild(smallButton(next === 'active' ? 'Enable' : 'Disable', function () {
+          apiFetch('/api/v1/identities/service-accounts/' + encodeURIComponent(sa.id), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: next }),
+          }).then(function (r) {
+            identityMessage(r.ok ? 'Service account ' + next + '.' : 'Could not update the service account.', r.ok ? 'success' : 'error');
+            loadIdentityServiceAccounts();
+          });
+        }));
+        return [sa.name || '', sa.status || '', (sa.scopes || []).join(', '), action];
+      })));
+    });
+  }
+
+  function initIdentityPage() {
+    if (!document.getElementById('identity-sessions')) return;
+
+    loadIdentityMe();
+    loadIdentitySessions();
+    loadIdentityLinks();
+
+    // Administration is real server-side authorization: non-admin sessions
+    // get a truthful 403 and the section stays hidden.
+    apiFetch('/api/v1/identities/users').then(function (res) {
+      if (res.status === 403) return;
+      if (!res.ok) {
+        identityMessage('Could not load user administration.', 'error');
+        return;
+      }
+      var admin = document.getElementById('identity-admin');
+      if (admin) admin.classList.remove('hidden');
+      renderIdentityUsers(res.body.users || []);
+      loadIdentityRoles();
+      loadIdentityServiceAccounts();
+    });
+
+    var passwordForm = document.getElementById('identity-password-form');
+    if (passwordForm) {
+      passwordForm.addEventListener('submit', function (event) {
+        event.preventDefault();
+        apiFetch('/api/v1/identities/me/password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            current_password: document.getElementById('identity-current-password').value,
+            password: document.getElementById('identity-new-password').value,
+          }),
+        }).then(function (r) {
+          identityMessage(r.ok ? 'Password updated.' : 'Password change failed — check the current password.', r.ok ? 'success' : 'error');
+          if (r.ok) passwordForm.reset();
+        });
+      });
+    }
+
+    var userForm = document.getElementById('identity-create-user-form');
+    if (userForm) {
+      userForm.addEventListener('submit', function (event) {
+        event.preventDefault();
+        var roleID = document.getElementById('identity-new-user-role').value;
+        apiFetch('/api/v1/identities/users', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: document.getElementById('identity-new-user-email').value,
+            display_name: document.getElementById('identity-new-user-name').value,
+            password: document.getElementById('identity-new-user-password').value,
+            role_ids: roleID ? [roleID] : undefined,
+          }),
+        }).then(function (r) {
+          identityMessage(r.ok ? 'User created.' : 'Could not create the user.', r.ok ? 'success' : 'error');
+          if (r.ok) { userForm.reset(); refreshIdentityUsers(); }
+        });
+      });
+    }
+
+    var roleForm = document.getElementById('identity-create-role-form');
+    if (roleForm) {
+      roleForm.addEventListener('submit', function (event) {
+        event.preventDefault();
+        apiFetch('/api/v1/identities/roles', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: document.getElementById('identity-new-role-name').value,
+            scopes: parseScopes(document.getElementById('identity-new-role-scopes').value),
+          }),
+        }).then(function (r) {
+          identityMessage(r.ok ? 'Role created.' : 'Could not create the role.', r.ok ? 'success' : 'error');
+          if (r.ok) { roleForm.reset(); loadIdentityRoles(); }
+        });
+      });
+    }
+
+    var svcForm = document.getElementById('identity-create-svcacct-form');
+    if (svcForm) {
+      svcForm.addEventListener('submit', function (event) {
+        event.preventDefault();
+        apiFetch('/api/v1/identities/service-accounts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: document.getElementById('identity-new-svcacct-name').value,
+            scopes: parseScopes(document.getElementById('identity-new-svcacct-scopes').value),
+          }),
+        }).then(function (r) {
+          identityMessage(r.ok ? 'Service account created.' : 'Could not create the service account.', r.ok ? 'success' : 'error');
+          if (r.ok) { svcForm.reset(); loadIdentityServiceAccounts(); }
+        });
+      });
+    }
+  }
+
 })();

@@ -1,0 +1,163 @@
+{{define "page-identity"}}
+{{template "layout-head" .}}
+{{template "layout-nav" .}}
+
+  <main class="pt-16 min-h-screen">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 py-8 space-y-6">
+      <div class="flex flex-col gap-2">
+        <div class="eyebrow">Account</div>
+        <h1 class="text-3xl font-display font-bold">Identity &amp; access</h1>
+        <p class="text-muted-foreground mt-1">Your account, sessions and linked sign-ins. Administrators can also manage users, roles and service accounts.</p>
+      </div>
+
+      <div id="identity-message" class="min-h-[1.5rem] text-sm" role="status" aria-live="polite"></div>
+
+      {{/* ── Your account ─────────────────────────────────────────── */}}
+      <section class="rounded-lg border bg-card text-card-foreground shadow-sm p-6" aria-labelledby="identity-account-heading">
+        <h2 id="identity-account-heading" class="text-lg font-display font-semibold">Your account</h2>
+        <dl class="mt-3 grid grid-cols-1 gap-2 text-sm sm:grid-cols-2">
+          <div><dt class="text-muted-foreground">Email</dt><dd id="identity-email" class="font-medium">…</dd></div>
+          <div><dt class="text-muted-foreground">Name</dt><dd id="identity-display-name" class="font-medium">…</dd></div>
+          <div><dt class="text-muted-foreground">Status</dt><dd id="identity-status" class="font-medium">…</dd></div>
+          <div><dt class="text-muted-foreground">Roles</dt><dd id="identity-roles" class="font-medium">…</dd></div>
+        </dl>
+
+        <form id="identity-password-form" class="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2" autocomplete="off">
+          <h3 class="sm:col-span-2 text-sm font-semibold">Change password</h3>
+          <div class="space-y-2">
+            <label for="identity-current-password" class="text-sm font-medium leading-none">Current password</label>
+            <input id="identity-current-password" name="current_password" type="password" required
+              class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+          </div>
+          <div class="space-y-2">
+            <label for="identity-new-password" class="text-sm font-medium leading-none">New password</label>
+            <input id="identity-new-password" name="password" type="password" required
+              class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+          </div>
+          <div class="sm:col-span-2 flex justify-end">
+            <button type="submit" class="inline-flex items-center justify-center rounded-md text-sm font-medium bg-primary text-primary-foreground hover:bg-primary/90 h-10 px-4">Update password</button>
+          </div>
+        </form>
+      </section>
+
+      {{/* ── Sessions ─────────────────────────────────────────────── */}}
+      <section class="rounded-lg border bg-card text-card-foreground shadow-sm p-6" aria-labelledby="identity-sessions-heading">
+        <h2 id="identity-sessions-heading" class="text-lg font-display font-semibold">Sessions</h2>
+        <p class="text-sm text-muted-foreground mt-1">Revoking a session ends that sign-in immediately, server-side.</p>
+        <div id="identity-sessions" class="mt-3">
+          <div class="flex items-center gap-2 text-sm text-muted-foreground py-2">
+            <div class="spinner border-current"></div>
+            Loading sessions...
+          </div>
+        </div>
+      </section>
+
+      {{/* ── Linked sign-ins ──────────────────────────────────────── */}}
+      <section class="rounded-lg border bg-card text-card-foreground shadow-sm p-6" aria-labelledby="identity-links-heading">
+        <h2 id="identity-links-heading" class="text-lg font-display font-semibold">Linked sign-ins</h2>
+        <p class="text-sm text-muted-foreground mt-1">External identity providers bound to this account.</p>
+        <div id="identity-links" class="mt-3">
+          <div class="flex items-center gap-2 text-sm text-muted-foreground py-2">
+            <div class="spinner border-current"></div>
+            Loading linked identities...
+          </div>
+        </div>
+        {{if .Providers}}
+        <div class="mt-4 space-y-2">
+          {{range .Providers}}
+          <a href="/auth/oidc/{{.ID}}/start?return_to=/dashboard/identity"
+             class="inline-flex items-center justify-center rounded-md text-sm font-medium border border-input bg-background hover:bg-accent hover:text-accent-foreground h-10 px-4">
+            Link {{.Name}}
+          </a>
+          {{end}}
+        </div>
+        {{else}}
+        <p class="mt-3 text-sm text-muted-foreground">No external identity providers are configured.</p>
+        {{end}}
+      </section>
+
+      {{/* ── Administration (requires platform.admin; hidden otherwise) ── */}}
+      <section id="identity-admin" class="hidden space-y-6" aria-labelledby="identity-admin-heading">
+        <h2 id="identity-admin-heading" class="text-lg font-display font-semibold">Administration</h2>
+
+        <div class="rounded-lg border bg-card text-card-foreground shadow-sm p-6" aria-labelledby="identity-users-heading">
+          <h3 id="identity-users-heading" class="text-base font-display font-semibold">Users</h3>
+          <div id="identity-users" class="mt-3"></div>
+          <form id="identity-create-user-form" class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2" autocomplete="off">
+            <h4 class="sm:col-span-2 text-sm font-semibold">Create user</h4>
+            <div class="space-y-2">
+              <label for="identity-new-user-email" class="text-sm font-medium leading-none">Email</label>
+              <input id="identity-new-user-email" name="email" type="email" required
+                class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            </div>
+            <div class="space-y-2">
+              <label for="identity-new-user-name" class="text-sm font-medium leading-none">Display name</label>
+              <input id="identity-new-user-name" name="display_name" type="text"
+                class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            </div>
+            <div class="space-y-2">
+              <label for="identity-new-user-password" class="text-sm font-medium leading-none">Password</label>
+              <input id="identity-new-user-password" name="password" type="password" required
+                class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            </div>
+            <div class="space-y-2">
+              <label for="identity-new-user-role" class="text-sm font-medium leading-none">Initial role (optional)</label>
+              <select id="identity-new-user-role" name="role_id"
+                class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                <option value="">None</option>
+              </select>
+            </div>
+            <div class="sm:col-span-2 flex justify-end">
+              <button type="submit" class="inline-flex items-center justify-center rounded-md text-sm font-medium bg-primary text-primary-foreground hover:bg-primary/90 h-10 px-4">Create user</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="rounded-lg border bg-card text-card-foreground shadow-sm p-6" aria-labelledby="identity-roles-heading">
+          <h3 id="identity-roles-heading" class="text-base font-display font-semibold">Roles</h3>
+          <div id="identity-role-list" class="mt-3"></div>
+          <form id="identity-create-role-form" class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2" autocomplete="off">
+            <h4 class="sm:col-span-2 text-sm font-semibold">Create role</h4>
+            <div class="space-y-2">
+              <label for="identity-new-role-name" class="text-sm font-medium leading-none">Name</label>
+              <input id="identity-new-role-name" name="name" type="text" required
+                class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            </div>
+            <div class="space-y-2">
+              <label for="identity-new-role-scopes" class="text-sm font-medium leading-none">Scopes (comma-separated)</label>
+              <input id="identity-new-role-scopes" name="scopes" type="text"
+                class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            </div>
+            <div class="sm:col-span-2 flex justify-end">
+              <button type="submit" class="inline-flex items-center justify-center rounded-md text-sm font-medium bg-primary text-primary-foreground hover:bg-primary/90 h-10 px-4">Create role</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="rounded-lg border bg-card text-card-foreground shadow-sm p-6" aria-labelledby="identity-svcacct-heading">
+          <h3 id="identity-svcacct-heading" class="text-base font-display font-semibold">Service accounts</h3>
+          <p class="text-sm text-muted-foreground mt-1">Service accounts group long-lived API keys — manage the keys on the <a href="/dashboard/keys" class="text-primary hover:underline">API Keys</a> page.</p>
+          <div id="identity-service-accounts" class="mt-3"></div>
+          <form id="identity-create-svcacct-form" class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2" autocomplete="off">
+            <h4 class="sm:col-span-2 text-sm font-semibold">Create service account</h4>
+            <div class="space-y-2">
+              <label for="identity-new-svcacct-name" class="text-sm font-medium leading-none">Name</label>
+              <input id="identity-new-svcacct-name" name="name" type="text" required
+                class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            </div>
+            <div class="space-y-2">
+              <label for="identity-new-svcacct-scopes" class="text-sm font-medium leading-none">Scopes (comma-separated)</label>
+              <input id="identity-new-svcacct-scopes" name="scopes" type="text"
+                class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            </div>
+            <div class="sm:col-span-2 flex justify-end">
+              <button type="submit" class="inline-flex items-center justify-center rounded-md text-sm font-medium bg-primary text-primary-foreground hover:bg-primary/90 h-10 px-4">Create service account</button>
+            </div>
+          </form>
+        </div>
+      </section>
+    </div>
+  </main>
+
+{{template "layout-toast" .}}
+{{end}}

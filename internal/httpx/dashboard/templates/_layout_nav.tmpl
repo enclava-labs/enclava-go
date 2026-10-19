@@ -19,6 +19,7 @@
             </div>
           </details>
           <a href="/dashboard/analytics" class="dashboard-nav-link{{if eq .ActivePage "analytics"}} active{{end}}">Analytics</a>
+          <a href="/dashboard/identity" class="dashboard-nav-link{{if eq .ActivePage "identity"}} active{{end}}">Identity</a>
           <details class="dashboard-menu">
             <summary class="dashboard-nav-link{{if eq .ActivePage "providers"}} active{{end}}{{if eq .ActivePage "pricing"}} active{{end}}{{if eq .ActivePage "billing-audit"}} active{{end}}{{if eq .ActivePage "prompt-templates"}} active{{end}}" title="Operations menu">
               Operations
@@ -50,6 +51,7 @@
             <a href="/dashboard/pricing" class="dashboard-menu-item{{if eq .ActivePage "pricing"}} active{{end}}">Pricing</a>
             <a href="/dashboard/billing-audit" class="dashboard-menu-item{{if eq .ActivePage "billing-audit"}} active{{end}}">Billing Audit</a>
             <a href="/dashboard/prompt-templates" class="dashboard-menu-item{{if eq .ActivePage "prompt-templates"}} active{{end}}">Prompt Templates</a>
+            <a href="/dashboard/identity" class="dashboard-menu-item{{if eq .ActivePage "identity"}} active{{end}}">Identity</a>
           </div>
         </details>
       </div>
@@ -62,7 +64,6 @@
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/>
             </svg>
           </button>
-          {{if eq .AuthMode "session"}}
           <details class="dashboard-menu dashboard-account-menu">
             <summary class="dashboard-icon-button" title="User menu" aria-label="User menu">
               <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -70,7 +71,8 @@
               </svg>
             </summary>
             <div class="dashboard-menu-panel dashboard-menu-panel-right dashboard-account-panel">
-              <div class="dashboard-menu-header">Account</div>
+              <div class="dashboard-menu-header">{{if .UserEmail}}{{.UserEmail}}{{else}}Account{{end}}</div>
+              <a href="/dashboard/identity" class="dashboard-menu-item" title="Identity and access">Identity</a>
               <form method="post" action="/dashboard/logout">
                 <button type="submit" class="dashboard-menu-item dashboard-menu-danger" title="Sign out">
                   Logout
@@ -78,18 +80,6 @@
               </form>
             </div>
           </details>
-          {{else}}
-          <details class="dashboard-menu dashboard-account-menu">
-            <summary class="dashboard-icon-button" title="User menu" aria-label="User menu">
-              <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
-              </svg>
-            </summary>
-            <div class="dashboard-menu-panel dashboard-menu-panel-right dashboard-account-panel">
-              <div class="dashboard-menu-header">API Key Mode</div>
-            </div>
-          </details>
-          {{end}}
       </div>
     </div>
   </nav>
