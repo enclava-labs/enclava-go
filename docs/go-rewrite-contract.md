@@ -87,18 +87,15 @@ cost calculation from effective pricing snapshots.
 
 ## OpenAI-Compatible API
 
-All OpenAI-compatible public endpoints are available under both `/api/v1` and
-`/v1`. Usage records are stored with the canonical `/api/v1/...` endpoint, and
-API-key endpoint allowlists treat equivalent `/api/v1/...` and `/v1/...` paths
-as the same route.
-
-The core model, chat completion, embedding, and Responses endpoints have typed
-handlers for local budget/model/usage behavior. Other OpenAI API families are
-proxied through the configured OpenAI-compatible upstream when the API key has
-the `openai.proxy` scope. This passthrough preserves request methods, query
-strings, JSON or multipart bodies, selected OpenAI beta/project/tracing headers
-such as `OpenAI-*`, `Idempotency-Key`, and `X-Client-Request-Id`, upstream
-status codes, response headers, binary bodies, and SSE streams.
+The public OpenAI-compatible surface is mounted only under `/v1` and covers
+the selected core: `GET /v1/models`, `GET /v1/models/{model_id}`,
+`POST /v1/chat/completions` (unary + SSE stream) and `POST /v1/embeddings`.
+Every dispatch runs through the shared inference executor — policy, approved
+model-alias resolution, reservation and usage settlement — and model listings
+expose only tenant-approved aliases, never upstream ids or other tenants'
+endpoints. Unsupported products, unselected `/v1` paths and the legacy
+`/api/v1` inference aliases return explicit errors; there is no catch-all
+upstream passthrough.
 
 ### `GET /api/v1/models`
 
@@ -390,11 +387,11 @@ The launch contract suite includes:
 - `go test ./...`
 - `QDRANT_INTEGRATION_URL=http://127.0.0.1:6333 go test ./...`
 - `npx playwright test`
-- `OPENAI_CONTRACT_BASE_URL=<server>/api/v1 OPENAI_CONTRACT_API_KEY=<key> go test ./tests/contract`
+- `OPENAI_CONTRACT_BASE_URL=<server>/v1 OPENAI_CONTRACT_API_KEY=<key> OPENAI_CONTRACT_CHAT_MODEL=<alias> OPENAI_CONTRACT_EMBEDDING_MODEL=<alias> go test ./tests/contract`
 
 The SDK contract uses the official OpenAI Go client with a custom base URL and
-exercises model listing, chat completions, embeddings, and Responses API
-creation.
+exercises model listing, unary and streaming chat completions, embeddings and
+denial of unselected products.
 
 ## Health And Operations
 

@@ -45,7 +45,7 @@ func newIdentityFixture(t *testing.T) *identityFixture {
 	authSvc := auth.NewService(repo, "")
 	sessionAuth := NewSessionAuth(authSvc, auth.NewOIDCService(repo, nil), time.Hour, dashboardTemplates, "bootstrap")
 	app := NewApp(authSvc, nil, "", nil, repo, nil, nil, nil, nil, nil, nil, nil, nil, nil,
-		"sha256", "", "enc_", nil, sessionAuth, 1, false)
+		"sha256", "", "enc_", nil, sessionAuth, 1, false, nil)
 	return &identityFixture{app: app, repo: repo, db: db, tenant: tenant, adminKey: key}
 }
 

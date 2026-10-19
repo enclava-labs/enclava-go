@@ -213,6 +213,7 @@ func main() {
 		sessionAuth,
 		cfg.MaxUploadSizeMB,
 		cfg.TrustProxyHeaders,
+		inferenceSvc,
 	)
 
 	// The extract module mounts its API routes on the app's mux — every
