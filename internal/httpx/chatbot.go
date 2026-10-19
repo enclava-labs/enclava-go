@@ -331,20 +331,22 @@ func chatbotContentToString(v any) string {
 
 func chatbotAccess(principal auth.Principal) chatbot.Access {
 	return chatbot.Access{
-		APIKeyID:        principal.APIKeyID,
-		IsAdmin:         auth.HasScope(principal, "platform.admin"),
-		AllowedModels:   principal.AllowedModels,
-		AllowedChatbots: principal.AllowedChatbots,
-		AllowedAgents:   principal.AllowedAgents,
+		APIKeyID:           principal.APIKeyID,
+		IsAdmin:            auth.HasScope(principal, "platform.admin"),
+		AllowedModels:      principal.AllowedModels,
+		AllowedChatbots:    principal.AllowedChatbots,
+		AllowedAgents:      principal.AllowedAgents,
+		AllowedModelsAll:   principal.AllowedModelsAll,
+		AllowedChatbotsAll: principal.AllowedChatbotsAll,
+		AllowedAgentsAll:   principal.AllowedAgentsAll,
 	}
 }
 
+// chatbotAllowlistOpen reports whether the chatbot allowlist grants
+// unrestricted access — an explicit all-mode grant or a legacy "*" list item,
+// never merely an empty map.
 func chatbotAllowlistOpen(principal auth.Principal) bool {
-	if len(principal.AllowedChatbots) == 0 {
-		return true
-	}
-	_, ok := principal.AllowedChatbots["*"]
-	return ok
+	return auth.ChatbotAllowed(principal)
 }
 
 func chatbotVisible(principal auth.Principal, bot sqlite.ChatbotInstance) bool {

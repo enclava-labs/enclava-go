@@ -711,7 +711,7 @@ func invalidInput(err error) error {
 }
 
 func modelAllowed(access Access, model string) bool {
-	if len(access.AllowedModels) == 0 {
+	if access.AllowedModelsAll {
 		return true
 	}
 	if _, ok := access.AllowedModels["*"]; ok {
@@ -722,7 +722,7 @@ func modelAllowed(access Access, model string) bool {
 }
 
 func chatbotAllowed(access Access, bot sqlite.ChatbotInstance) bool {
-	if len(access.AllowedChatbots) == 0 && len(access.AllowedAgents) == 0 {
+	if access.AllowedChatbotsAll || access.AllowedAgentsAll {
 		return true
 	}
 	if _, ok := access.AllowedChatbots["*"]; ok {

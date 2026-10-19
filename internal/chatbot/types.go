@@ -15,11 +15,14 @@ var (
 )
 
 type Access struct {
-	APIKeyID        int64
-	IsAdmin         bool
-	AllowedModels   map[string]struct{}
-	AllowedChatbots map[string]struct{}
-	AllowedAgents   map[string]struct{}
+	APIKeyID           int64
+	IsAdmin            bool
+	AllowedModels      map[string]struct{}
+	AllowedChatbots    map[string]struct{}
+	AllowedAgents      map[string]struct{}
+	AllowedModelsAll   bool
+	AllowedChatbotsAll bool
+	AllowedAgentsAll   bool
 }
 
 type CreateChatbotInput struct {

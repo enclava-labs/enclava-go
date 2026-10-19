@@ -116,24 +116,36 @@ func (s *Service) Authenticate(ctx context.Context, plaintext string) (Principal
 			return Principal{}, errors.New("API key is expired")
 		}
 
+		models, modelsAll := allowlistSet(candidate.AllowedModels)
+		templates, templatesAll := allowlistSet(candidate.AllowedExtractTemplates)
+		chatbots, chatbotsAll := allowlistSet(candidate.AllowedChatbots)
+		agents, agentsAll := allowlistSet(candidate.AllowedAgents)
+		endpoints, endpointsAll := allowlistSet(candidate.AllowedEndpoints)
+		ips, ipsAll := allowlistSet(candidate.AllowedIPs)
 		principal := Principal{
-			APIKeyID:                candidate.ID,
-			Name:                    candidate.Name,
-			Scopes:                  listToSet(candidate.Scopes),
-			AllowedModels:           listToSet(candidate.AllowedModels),
-			AllowedExtractTemplates: listToSet(candidate.AllowedExtractTemplates),
-			AllowedChatbots:         listToSet(candidate.AllowedChatbots),
-			AllowedAgents:           listToSet(candidate.AllowedAgents),
-			AllowedEndpoints:        listToSet(candidate.AllowedEndpoints),
-			AllowedIPs:              listToSet(candidate.AllowedIPs),
-			RateLimitPerMinute:      candidate.RateLimitPerMinute,
-			RateLimitPerHour:        candidate.RateLimitPerHour,
-			RateLimitPerDay:         candidate.RateLimitPerDay,
-			IsUnlimited:             candidate.IsUnlimited,
-			BudgetLimitTokens:       candidate.BudgetLimitTokens,
-			BudgetLimitCents:        candidate.BudgetLimitCents,
-			BudgetPeriod:            candidate.BudgetPeriod,
-			RawAPIKeyPrefix:         candidate.KeyPrefix,
+			APIKeyID:                   candidate.ID,
+			Name:                       candidate.Name,
+			Scopes:                     listToSet(candidate.Scopes),
+			AllowedModels:              models,
+			AllowedModelsAll:           modelsAll,
+			AllowedExtractTemplates:    templates,
+			AllowedExtractTemplatesAll: templatesAll,
+			AllowedChatbots:            chatbots,
+			AllowedChatbotsAll:         chatbotsAll,
+			AllowedAgents:              agents,
+			AllowedAgentsAll:           agentsAll,
+			AllowedEndpoints:           endpoints,
+			AllowedEndpointsAll:        endpointsAll,
+			AllowedIPs:                 ips,
+			AllowedIPsAll:              ipsAll,
+			RateLimitPerMinute:         candidate.RateLimitPerMinute,
+			RateLimitPerHour:           candidate.RateLimitPerHour,
+			RateLimitPerDay:            candidate.RateLimitPerDay,
+			IsUnlimited:                candidate.IsUnlimited,
+			BudgetLimitTokens:          candidate.BudgetLimitTokens,
+			BudgetLimitCents:           candidate.BudgetLimitCents,
+			BudgetPeriod:               candidate.BudgetPeriod,
+			RawAPIKeyPrefix:            candidate.KeyPrefix,
 		}
 		_ = s.repo.TouchUsage(ctx, candidate.ID)
 		return principal, nil
