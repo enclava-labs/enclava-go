@@ -189,8 +189,8 @@ func TestCrossTenantConnectionDeny(t *testing.T) {
 	f := newConnectorFixture(t)
 	ctx := context.Background()
 	src, err := f.svc.CreateSource(ctx, f.principal, CreateSourceInput{
-		Type:  SourceTypeGitHub,
-		Name:  "Tenant A",
+		Type:   SourceTypeGitHub,
+		Name:   "Tenant A",
 		Config: map[string]any{"documents": []any{map[string]any{"content": "x"}}},
 	})
 	if err != nil {

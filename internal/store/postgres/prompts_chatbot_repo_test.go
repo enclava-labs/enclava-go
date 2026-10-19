@@ -22,11 +22,11 @@ func TestPromptsChatbotReposTenantScoped(t *testing.T) {
 	chatRepo := postgres.NewChatbotRepo(db)
 
 	tmpl := prompts.Template{
-		TenantID:  tenantA,
-		ID:        "tmpl_pc",
-		Name:      "PC Template",
+		TenantID:   tenantA,
+		ID:         "tmpl_pc",
+		Name:       "PC Template",
 		UserPrompt: "{{.user_input}}",
-		IsActive:  true,
+		IsActive:   true,
 	}
 	if err := promptRepo.Create(ctx, tmpl); err != nil {
 		t.Fatalf("create template: %v", err)
@@ -43,13 +43,13 @@ func TestPromptsChatbotReposTenantScoped(t *testing.T) {
 	}
 
 	bot := chatbot.Instance{
-		TenantID:   tenantA,
-		ID:         "bot_pc",
-		ExternalID: "pc_ext",
-		Name:       "PC Bot",
-		Model:      "m",
+		TenantID:         tenantA,
+		ID:               "bot_pc",
+		ExternalID:       "pc_ext",
+		Name:             "PC Bot",
+		Model:            "m",
 		PromptTemplateID: tmpl.ID,
-		IsEnabled:  true,
+		IsEnabled:        true,
 	}
 	if err := chatRepo.Create(ctx, bot); err != nil {
 		t.Fatalf("create chatbot: %v", err)

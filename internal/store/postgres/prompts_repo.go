@@ -165,4 +165,3 @@ func (r *PromptsRepo) Delete(ctx context.Context, tenantID, id string) error {
 	}
 	return nil
 }
-

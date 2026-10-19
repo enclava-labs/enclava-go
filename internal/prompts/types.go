@@ -20,7 +20,6 @@ type Template struct {
 	UpdatedAt       time.Time      `json:"updated_at"`
 }
 
-
 type CreateTemplateInput struct {
 	ID              string         `json:"id,omitempty"`
 	Name            string         `json:"name"`

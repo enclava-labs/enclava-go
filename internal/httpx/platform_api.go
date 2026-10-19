@@ -19,4 +19,3 @@ func (a *App) ProviderSnapshot() any {
 	}
 	return a.prober.Snapshot()
 }
-

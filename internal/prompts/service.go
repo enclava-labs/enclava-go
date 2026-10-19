@@ -30,8 +30,8 @@ type VisibleTemplateIDs interface {
 }
 
 type Service struct {
-	repo      Repository
-	chatbots  VisibleTemplateIDs
+	repo     Repository
+	chatbots VisibleTemplateIDs
 }
 
 func NewService(repo Repository, chatbots VisibleTemplateIDs) *Service {
