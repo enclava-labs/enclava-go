@@ -4,13 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"enclava-go/internal/artifacts"
+	"enclava-go/internal/auth"
+	"enclava-go/internal/jobs"
 	"enclava-go/internal/llm"
 	"enclava-go/internal/rag"
-	"enclava-go/internal/store/sqlite"
+	"enclava-go/internal/store/postgres"
+	"enclava-go/internal/testdb"
 )
 
 type connectorEmbeddingProvider struct{}
@@ -44,7 +48,8 @@ func (p connectorEmbeddingProvider) CreateEmbeddings(ctx context.Context, body [
 		inputs = append(inputs, v)
 	case []any:
 		for _, item := range v {
-			inputs = append(inputs, item.(string))
+			s, _ := item.(string)
+			inputs = append(inputs, s)
 		}
 	}
 	data := make([]map[string]any, 0, len(inputs))
@@ -110,28 +115,30 @@ func (s *connectorVectorStore) Search(ctx context.Context, collection string, ve
 
 func TestConnectorSyncIndexesDocumentsIntoSearchableRAG(t *testing.T) {
 	ctx := context.Background()
-	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "connector-rag.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	defer func() { _ = db.Close() }()
+	db := testdb.New(t)
+	tenant := testdb.SeedTenant(t, db, "conn-rag")
+	user := testdb.SeedUser(t, db, tenant, "conn-rag@example.test", nil)
+	p := auth.Principal{TenantID: tenant, ActorID: user.ID, ActorKind: auth.ActorKindUser, UserID: user.ID,
+		CredentialID: "key_test", CredentialKind: auth.CredentialKindAPIKey}
 
-	apiKeyID, err := sqlite.NewAPIKeysRepo(db.SQL).CreateAPIKey(ctx, "connector-rag", "enc_test_connector_rag_secret", "sha256", "", []string{"rag", "rag.manage", "connectors.manage"})
+	jobsRepo := postgres.NewJobsRepo(db)
+	jobsSvc := jobs.NewService(jobsRepo, 0)
+	artifactStore, err := artifacts.NewStore(t.TempDir(), t.TempDir(), postgres.NewArtifactRepo(db))
 	if err != nil {
-		t.Fatalf("create api key: %v", err)
+		t.Fatalf("artifact store: %v", err)
 	}
-	ragSvc := rag.NewService(sqlite.NewRAGRepo(db.SQL), newConnectorVectorStore(), connectorEmbeddingProvider{}, "embed-test")
-	access := rag.Access{APIKeyID: apiKeyID}
-	collection, err := ragSvc.CreateCollection(ctx, access, rag.CreateCollectionInput{
+	ragSvc := rag.NewService(postgres.NewRAGRepo(db), newConnectorVectorStore(), connectorEmbeddingProvider{}, "embed-test", artifactStore, jobsSvc, nil)
+	collection, err := ragSvc.CreateCollection(ctx, p, rag.CreateCollectionInput{
 		Name:         "Connector Search",
 		ChunkSize:    100,
 		ChunkOverlap: 10,
+		ACL:          map[string]any{"public": true},
 	})
 	if err != nil {
 		t.Fatalf("create rag collection: %v", err)
 	}
-	connectorSvc := NewService(sqlite.NewConnectorsRepo(db.SQL), ragSvc)
-	source, err := connectorSvc.CreateSource(ctx, CreateSourceInput{
+	connectorSvc := NewService(postgres.NewSourceRepo(db), jobsSvc, jobsRepo, ragSvc)
+	source, err := connectorSvc.CreateSource(ctx, p, CreateSourceInput{
 		Type:               SourceTypeSlack,
 		Name:               "Slack Knowledge",
 		TargetCollectionID: collection.ID,
@@ -150,11 +157,44 @@ func TestConnectorSyncIndexesDocumentsIntoSearchableRAG(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create connector source: %v", err)
 	}
-	if _, err := connectorSvc.SyncSource(ctx, Access{APIKeyID: apiKeyID}, source.ID); err != nil {
+	job, err := connectorSvc.SyncSource(ctx, p, source.ID)
+	if err != nil {
 		t.Fatalf("sync connector source: %v", err)
 	}
+	if job.Status != JobStatusQueued {
+		t.Fatalf("expected queued sync job, got %#v", job)
+	}
 
-	results, err := ragSvc.Search(ctx, access, rag.SearchInput{
+	// Drain the queued jobs: connector.sync then the rag.embed job the sync
+	// produced for the uploaded document.
+	for range 4 {
+		claim, err := jobsSvc.Lease(ctx, "test-worker", time.Minute)
+		if err != nil {
+			t.Fatalf("lease: %v", err)
+		}
+		if claim == nil {
+			break
+		}
+		var resultRef string
+		var runErr error
+		switch claim.Job().Operation {
+		case OperationSync:
+			resultRef, runErr = connectorSvc.JobHandler()(ctx, claim, nil)
+		case rag.OperationEmbed:
+			resultRef, runErr = ragSvc.JobHandler()(ctx, claim, nil)
+		default:
+			t.Fatalf("unexpected job operation %q", claim.Job().Operation)
+		}
+		if runErr != nil {
+			_ = claim.Fail(ctx, runErr, jobs.FailureFatal)
+			t.Fatalf("job %s failed: %v", claim.Job().Operation, runErr)
+		}
+		if _, err := claim.Complete(ctx, resultRef); err != nil {
+			t.Fatalf("complete: %v", err)
+		}
+	}
+
+	results, err := ragSvc.Search(ctx, p, rag.SearchInput{
 		CollectionID: collection.ID,
 		Query:        "acceptance phrase",
 		Limit:        5,

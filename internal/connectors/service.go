@@ -1,16 +1,14 @@
 package connectors
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"mime"
 	"net"
 	"net/http"
@@ -20,43 +18,55 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
+	"enclava-go/internal/auth"
+	"enclava-go/internal/jobs"
 	"enclava-go/internal/rag"
-	"enclava-go/internal/store/sqlite"
+	"enclava-go/internal/source"
 )
 
+// Repository is the tenant-scoped persistence boundary for connector
+// connections: source.Connection rows over the 003_source schema.
+// Implemented by postgres.SourceRepo.
 type Repository interface {
-	CreateSource(ctx context.Context, source sqlite.ConnectorSource) error
-	ListSources(ctx context.Context, sourceType string, limit, offset int) ([]sqlite.ConnectorSource, error)
-	GetSource(ctx context.Context, id string) (sqlite.ConnectorSource, error)
-	UpdateSource(ctx context.Context, source sqlite.ConnectorSource) error
-	DeleteSource(ctx context.Context, id string) error
-	CreateSyncJob(ctx context.Context, job sqlite.ConnectorSyncJob) error
-	UpdateSyncJob(ctx context.Context, job sqlite.ConnectorSyncJob) error
-	ListSyncJobs(ctx context.Context, sourceID, status string, limit, offset int) ([]sqlite.ConnectorSyncJob, error)
-	GetSyncJob(ctx context.Context, id string) (sqlite.ConnectorSyncJob, error)
+	CreateConnection(ctx context.Context, c source.Connection) error
+	GetConnection(ctx context.Context, tenantID, id string) (source.Connection, error)
+	ListConnections(ctx context.Context, tenantID string) ([]source.Connection, error)
+	UpdateConnection(ctx context.Context, c source.Connection) error
+	DeleteConnection(ctx context.Context, tenantID, id string) error
+	SetSyncState(ctx context.Context, tenantID, id string, syncedAt time.Time, syncStatus, syncError string) error
 }
 
+// RAGUploader is the rag ingest surface the sync attempt hands observed
+// documents to. The principal is the frozen job principal — never forged.
 type RAGUploader interface {
-	UploadDocument(ctx context.Context, access rag.Access, collectionID string, input rag.UploadDocumentInput) (rag.UploadDocumentOutput, error)
+	UploadDocument(ctx context.Context, p auth.Principal, collectionID string, input rag.UploadDocumentInput) (rag.UploadDocumentOutput, error)
+}
+
+// JobReader is the owner-bound durable job view for SyncStatus/ListJobs.
+type JobReader interface {
+	GetOwnedJob(ctx context.Context, tenantID, id, submitterKey string) (jobs.JobRow, error)
+	ListOwnedJobs(ctx context.Context, tenantID, submitterKey string, limit int) ([]jobs.JobRow, error)
 }
 
 type Service struct {
 	repo       Repository
+	jobs       *jobs.Service
+	jobRows    JobReader
 	rag        RAGUploader
 	httpClient *http.Client
-	scheduleMu sync.Mutex
 	// allowPrivateBaseURL permits loopback and private config.base_url hosts.
 	// NewService leaves it false; tests enable it for httptest servers.
 	allowPrivateBaseURL bool
 }
 
-func NewService(repo Repository, ragSvc RAGUploader) *Service {
+func NewService(repo Repository, jobSvc *jobs.Service, jobRows JobReader, ragSvc RAGUploader) *Service {
 	return &Service{
-		repo: repo,
-		rag:  ragSvc,
+		repo:    repo,
+		jobs:    jobSvc,
+		jobRows: jobRows,
+		rag:     ragSvc,
 		httpClient: &http.Client{
 			Timeout:       30 * time.Second,
 			CheckRedirect: refuseConnectorRedirect,
@@ -68,78 +78,84 @@ func (s *Service) setAllowPrivateBaseURL(allow bool) {
 	s.allowPrivateBaseURL = allow
 }
 
-func (s *Service) StartScheduler(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		return
-	}
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case now := <-ticker.C:
-				if _, err := s.RunScheduledSyncs(ctx, Access{IsAdmin: true}, now.UTC()); err != nil {
-					log.Printf("connector scheduled sync failed: %v", err)
-				}
-			}
+// ---------------------------------------------------------------------
+// View mapping: source.Connection ↔ wire-stable Source.
+
+func connectionView(c source.Connection) Source {
+	checkpoint, _ := c.Config["checkpoint"].(map[string]any)
+	cfg := map[string]any{}
+	for k, v := range c.Config {
+		if k == "checkpoint" {
+			continue
 		}
-	}()
+		cfg[k] = v
+	}
+	return Source{
+		ID:                 c.ID,
+		Type:               c.Kind,
+		Name:               c.Name,
+		TargetCollectionID: c.TargetCollectionID,
+		Config:             cfg,
+		CredentialRef:      c.CredentialRef,
+		Checkpoint:         checkpoint,
+		IsEnabled:          c.Status == "active",
+		LastSyncAt:         c.SyncedAt,
+	}
 }
 
-func (s *Service) RunScheduledSyncs(ctx context.Context, access Access, now time.Time) (int, error) {
-	if !s.scheduleMu.TryLock() {
-		return 0, nil
+func viewConnection(v Source, tenantID, actorID string) source.Connection {
+	cfg := map[string]any{}
+	for k, val := range v.Config {
+		cfg[k] = val
 	}
-	defer s.scheduleMu.Unlock()
-
-	started := 0
-	offset := 0
-	var firstErr error
-	for {
-		sources, err := s.repo.ListSources(ctx, "", 100, offset)
-		if err != nil {
-			return started, err
-		}
-		if len(sources) == 0 {
-			break
-		}
-		for _, source := range sources {
-			if !scheduledSourceDue(source, now) {
-				continue
-			}
-			if _, err := s.SyncSource(ctx, access, source.ID); err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-				log.Printf("connector scheduled source sync failed source_id=%s: %v", source.ID, err)
-				continue
-			}
-			started++
-		}
-		if len(sources) < 100 {
-			break
-		}
-		offset += len(sources)
+	if len(v.Checkpoint) > 0 {
+		cfg["checkpoint"] = v.Checkpoint
 	}
-	return started, firstErr
+	status := "disabled"
+	if v.IsEnabled {
+		status = "active"
+	}
+	return source.Connection{
+		TenantID:           tenantID,
+		ID:                 v.ID,
+		Kind:               v.Type,
+		Name:               v.Name,
+		CredentialRef:      v.CredentialRef,
+		Config:             cfg,
+		TargetCollectionID: v.TargetCollectionID,
+		Status:             status,
+		CreatedBy:          actorID,
+		SyncedAt:           v.LastSyncAt,
+	}
 }
 
-func (s *Service) CreateSource(ctx context.Context, input CreateSourceInput) (sqlite.ConnectorSource, error) {
+// ---------------------------------------------------------------------
+// Source CRUD — tenant + principal scoped.
+
+func requireTenant(p auth.Principal) error {
+	if strings.TrimSpace(p.TenantID) == "" {
+		return fmt.Errorf("%w: principal tenant is required", source.ErrDenied)
+	}
+	return nil
+}
+
+func (s *Service) CreateSource(ctx context.Context, p auth.Principal, input CreateSourceInput) (Source, error) {
+	if err := requireTenant(p); err != nil {
+		return Source{}, err
+	}
 	sourceType, err := normalizeSourceType(input.Type)
 	if err != nil {
-		return sqlite.ConnectorSource{}, err
+		return Source{}, err
 	}
 	name := strings.TrimSpace(input.Name)
 	if name == "" {
-		return sqlite.ConnectorSource{}, errors.New("name is required")
+		return Source{}, errors.New("name is required")
 	}
 	enabled := true
 	if input.IsEnabled != nil {
 		enabled = *input.IsEnabled
 	}
-	source := sqlite.ConnectorSource{
+	v := Source{
 		ID:                 newID("connsrc"),
 		Type:               sourceType,
 		Name:               name,
@@ -149,130 +165,283 @@ func (s *Service) CreateSource(ctx context.Context, input CreateSourceInput) (sq
 		Checkpoint:         map[string]any{},
 		IsEnabled:          enabled,
 	}
-	if err := s.validateConnectorSource(ctx, source); err != nil {
-		return sqlite.ConnectorSource{}, err
+	if err := s.validateConnectorSource(ctx, v); err != nil {
+		return Source{}, err
 	}
-	if err := s.repo.CreateSource(ctx, source); err != nil {
-		return sqlite.ConnectorSource{}, err
+	conn := viewConnection(v, p.TenantID, p.ActorID)
+	if err := s.repo.CreateConnection(ctx, conn); err != nil {
+		return Source{}, err
 	}
-	return s.repo.GetSource(ctx, source.ID)
-}
-
-func (s *Service) ListSources(ctx context.Context, sourceType string, limit, offset int) ([]sqlite.ConnectorSource, error) {
-	return s.repo.ListSources(ctx, strings.TrimSpace(sourceType), limit, offset)
-}
-
-func (s *Service) GetSource(ctx context.Context, id string) (sqlite.ConnectorSource, error) {
-	return s.repo.GetSource(ctx, strings.TrimSpace(id))
-}
-
-func (s *Service) UpdateSource(ctx context.Context, id string, input UpdateSourceInput) (sqlite.ConnectorSource, error) {
-	source, err := s.repo.GetSource(ctx, strings.TrimSpace(id))
+	stored, err := s.repo.GetConnection(ctx, p.TenantID, conn.ID)
 	if err != nil {
-		return sqlite.ConnectorSource{}, err
+		return Source{}, err
 	}
+	return connectionView(stored), nil
+}
+
+func (s *Service) ListSources(ctx context.Context, p auth.Principal, sourceType string, limit, offset int) ([]Source, error) {
+	if err := requireTenant(p); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	conns, err := s.repo.ListConnections(ctx, p.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	wanted := strings.TrimSpace(sourceType)
+	out := []Source{}
+	for _, c := range conns {
+		if wanted != "" && c.Kind != wanted {
+			continue
+		}
+		out = append(out, connectionView(c))
+	}
+	if offset > 0 {
+		if offset >= len(out) {
+			return out[:0], nil
+		}
+		out = out[offset:]
+	}
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (s *Service) GetSource(ctx context.Context, p auth.Principal, id string) (Source, error) {
+	if err := requireTenant(p); err != nil {
+		return Source{}, err
+	}
+	c, err := s.repo.GetConnection(ctx, p.TenantID, strings.TrimSpace(id))
+	if err != nil {
+		return Source{}, err
+	}
+	return connectionView(c), nil
+}
+
+func (s *Service) UpdateSource(ctx context.Context, p auth.Principal, id string, input UpdateSourceInput) (Source, error) {
+	if err := requireTenant(p); err != nil {
+		return Source{}, err
+	}
+	conn, err := s.repo.GetConnection(ctx, p.TenantID, strings.TrimSpace(id))
+	if err != nil {
+		return Source{}, err
+	}
+	v := connectionView(conn)
 	if input.Type != nil {
 		sourceType, err := normalizeSourceType(*input.Type)
 		if err != nil {
-			return sqlite.ConnectorSource{}, err
+			return Source{}, err
 		}
-		source.Type = sourceType
+		v.Type = sourceType
 	}
 	if input.Name != nil {
-		source.Name = strings.TrimSpace(*input.Name)
+		v.Name = strings.TrimSpace(*input.Name)
 	}
-	if source.Name == "" {
-		return sqlite.ConnectorSource{}, errors.New("name is required")
+	if v.Name == "" {
+		return Source{}, errors.New("name is required")
 	}
 	if input.TargetCollectionID != nil {
-		source.TargetCollectionID = strings.TrimSpace(*input.TargetCollectionID)
+		v.TargetCollectionID = strings.TrimSpace(*input.TargetCollectionID)
 	}
 	if input.Config != nil {
-		source.Config = nonNilMap(input.Config)
+		v.Config = nonNilMap(input.Config)
 	}
 	if input.CredentialRef != nil {
-		source.CredentialRef = strings.TrimSpace(*input.CredentialRef)
+		v.CredentialRef = strings.TrimSpace(*input.CredentialRef)
 	}
 	if input.Checkpoint != nil {
-		source.Checkpoint = nonNilMap(input.Checkpoint)
+		v.Checkpoint = nonNilMap(input.Checkpoint)
 	}
 	if input.IsEnabled != nil {
-		source.IsEnabled = *input.IsEnabled
+		v.IsEnabled = *input.IsEnabled
 	}
-	if err := s.validateConnectorSource(ctx, source); err != nil {
-		return sqlite.ConnectorSource{}, err
+	if err := s.validateConnectorSource(ctx, v); err != nil {
+		return Source{}, err
 	}
-	if err := s.repo.UpdateSource(ctx, source); err != nil {
-		return sqlite.ConnectorSource{}, err
+	updated := viewConnection(v, p.TenantID, conn.CreatedBy)
+	if err := s.repo.UpdateConnection(ctx, updated); err != nil {
+		return Source{}, err
 	}
-	return s.repo.GetSource(ctx, source.ID)
-}
-
-func (s *Service) DeleteSource(ctx context.Context, id string) error {
-	return s.repo.DeleteSource(ctx, strings.TrimSpace(id))
-}
-
-func (s *Service) SyncSource(ctx context.Context, access Access, sourceID string) (sqlite.ConnectorSyncJob, error) {
-	source, err := s.repo.GetSource(ctx, strings.TrimSpace(sourceID))
+	stored, err := s.repo.GetConnection(ctx, p.TenantID, conn.ID)
 	if err != nil {
-		return sqlite.ConnectorSyncJob{}, err
+		return Source{}, err
 	}
-	if !source.IsEnabled {
-		return sqlite.ConnectorSyncJob{}, errors.New("connector source is disabled")
-	}
-	now := time.Now().UTC()
-	job := sqlite.ConnectorSyncJob{
-		ID:                newID("connsync"),
-		ConnectorSourceID: source.ID,
-		Status:            JobStatusRunning,
-		StartedAt:         &now,
-		Stats:             map[string]any{},
-	}
-	if err := s.repo.CreateSyncJob(ctx, job); err != nil {
-		return sqlite.ConnectorSyncJob{}, err
-	}
+	return connectionView(stored), nil
+}
 
-	stats, checkpoint, syncErr := s.syncDocuments(ctx, access, source)
-	completedAt := time.Now().UTC()
-	job.CompletedAt = &completedAt
-	job.Stats = stats
-	if syncErr != nil {
-		job.Status = JobStatusFailed
-		job.ErrorMessage = syncErr.Error()
-		_ = s.repo.UpdateSyncJob(ctx, job)
-		stored, err := s.repo.GetSyncJob(ctx, job.ID)
-		if err != nil {
-			return sqlite.ConnectorSyncJob{}, err
+func (s *Service) DeleteSource(ctx context.Context, p auth.Principal, id string) error {
+	if err := requireTenant(p); err != nil {
+		return err
+	}
+	return s.repo.DeleteConnection(ctx, p.TenantID, strings.TrimSpace(id))
+}
+
+// ---------------------------------------------------------------------
+// Durable sync: SyncSource enqueues connector.sync and returns the queued
+// job view — the job persists with NO dispatch until the executor registers
+// the handler. Idempotency binds tenant + connection + config identity.
+
+func (s *Service) SyncSource(ctx context.Context, p auth.Principal, sourceID string) (SyncJob, error) {
+	if err := requireTenant(p); err != nil {
+		return SyncJob{}, err
+	}
+	if s.jobs == nil {
+		return SyncJob{}, errors.New("connectors: durable jobs are not configured")
+	}
+	conn, err := s.repo.GetConnection(ctx, p.TenantID, strings.TrimSpace(sourceID))
+	if err != nil {
+		return SyncJob{}, err
+	}
+	if conn.Status != "active" {
+		return SyncJob{}, errors.New("connector source is disabled")
+	}
+	cfgBytes, err := json.Marshal(conn.Config)
+	if err != nil {
+		return SyncJob{}, fmt.Errorf("hash connection config: %w", err)
+	}
+	sum := sha256.Sum256(append(cfgBytes, []byte("\x00"+conn.CredentialRef)...))
+	job, _, err := s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
+		TenantID:       p.TenantID,
+		Operation:      OperationSync,
+		IdempotencyKey: "connector.sync:" + conn.ID + ":" + hex.EncodeToString(sum[:]),
+		Subject:        jobs.Subject{ConnectionID: conn.ID},
+		InputRef:       conn.ID,
+		InputHash:      hex.EncodeToString(sum[:]),
+		Policy:         map[string]any{"connection_id": conn.ID},
+	})
+	if err != nil {
+		return SyncJob{}, err
+	}
+	return jobView(job), nil
+}
+
+func jobView(j jobs.Job) SyncJob {
+	var stats map[string]any
+	if len(j.Policy) > 0 {
+		stats = map[string]any{"policy": j.Policy}
+	}
+	return SyncJob{
+		ID:                j.ID,
+		ConnectorSourceID: j.Subject.ConnectionID,
+		Status:            j.Status,
+		StartedAt:         nil,
+		CompletedAt:       j.CompletedAt,
+		ErrorMessage:      j.Error,
+		Stats:             stats,
+		CreatedAt:         j.CreatedAt,
+	}
+}
+
+// ListSyncJobs returns the caller's durable connector.sync jobs, newest
+// first, optionally narrowed to one connection. Reads are owner-bound: other
+// submitters' jobs are indistinguishable from absent.
+func (s *Service) ListSyncJobs(ctx context.Context, p auth.Principal, sourceID, status string, limit, offset int) ([]SyncJob, error) {
+	if err := requireTenant(p); err != nil {
+		return nil, err
+	}
+	if s.jobRows == nil {
+		return nil, errors.New("connectors: durable jobs are not configured")
+	}
+	if limit <= 0 {
+		limit = 25
+	}
+	rows, err := s.jobRows.ListOwnedJobs(ctx, p.TenantID, jobs.SubmitterKey(p), limit*4+offset)
+	if err != nil {
+		return nil, err
+	}
+	out := []SyncJob{}
+	for _, row := range rows {
+		if row.Operation != OperationSync {
+			continue
 		}
-		return stored, syncErr
+		if wanted := strings.TrimSpace(sourceID); wanted != "" && row.Subject.ConnectionID != wanted {
+			continue
+		}
+		if wanted := strings.TrimSpace(status); wanted != "" && row.Status != wanted {
+			continue
+		}
+		out = append(out, jobView(row.Job))
 	}
-
-	job.Status = JobStatusSucceeded
-	if err := s.repo.UpdateSyncJob(ctx, job); err != nil {
-		return sqlite.ConnectorSyncJob{}, err
+	if offset > 0 {
+		if offset >= len(out) {
+			return out[:0], nil
+		}
+		out = out[offset:]
 	}
-	source.Checkpoint = nonNilMap(source.Checkpoint)
-	for key, value := range checkpoint {
-		source.Checkpoint[key] = value
+	if len(out) > limit {
+		out = out[:limit]
 	}
-	source.Checkpoint["last_job_id"] = job.ID
-	source.Checkpoint["last_sync_status"] = job.Status
-	source.LastSyncAt = &completedAt
-	if err := s.repo.UpdateSource(ctx, source); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return sqlite.ConnectorSyncJob{}, err
-	}
-	return s.repo.GetSyncJob(ctx, job.ID)
+	return out, nil
 }
 
-func (s *Service) ListSyncJobs(ctx context.Context, sourceID, status string, limit, offset int) ([]sqlite.ConnectorSyncJob, error) {
-	return s.repo.ListSyncJobs(ctx, strings.TrimSpace(sourceID), strings.TrimSpace(status), limit, offset)
+func (s *Service) GetSyncJob(ctx context.Context, p auth.Principal, id string) (SyncJob, error) {
+	if err := requireTenant(p); err != nil {
+		return SyncJob{}, err
+	}
+	if s.jobRows == nil {
+		return SyncJob{}, errors.New("connectors: durable jobs are not configured")
+	}
+	row, err := s.jobRows.GetOwnedJob(ctx, p.TenantID, strings.TrimSpace(id), jobs.SubmitterKey(p))
+	if err != nil || row.Operation != OperationSync {
+		return SyncJob{}, source.ErrDenied
+	}
+	return jobView(row.Job), nil
 }
 
-func (s *Service) GetSyncJob(ctx context.Context, id string) (sqlite.ConnectorSyncJob, error) {
-	return s.repo.GetSyncJob(ctx, strings.TrimSpace(id))
+// JobHandler is the jobs.Runner handler for connector.sync. It runs the
+// fetch/upload pipeline under the fenced lease using the frozen submitting
+// principal — registered by the executor plan; not dispatched until then.
+func (s *Service) JobHandler() jobs.HandlerFunc {
+	return func(ctx context.Context, claim *jobs.Claim, _ jobs.InputFunc) (string, error) {
+		return s.attemptSync(ctx, claim)
+	}
 }
 
-func (s *Service) syncDocuments(ctx context.Context, access Access, source sqlite.ConnectorSource) (map[string]any, map[string]any, error) {
+func (s *Service) attemptSync(ctx context.Context, claim *jobs.Claim) (string, error) {
+	job := claim.Job()
+	var p auth.Principal
+	if err := json.Unmarshal(job.PrincipalSnapshot, &p); err != nil {
+		return "", fmt.Errorf("decode frozen principal: %w", err)
+	}
+	conn, err := s.repo.GetConnection(ctx, job.TenantID, job.Subject.ConnectionID)
+	if err != nil {
+		return "", err
+	}
+	if err := claim.MarkDispatched(ctx); err != nil {
+		return "", err
+	}
+	v := connectionView(conn)
+	stats, checkpoint, syncErr := s.syncDocuments(ctx, p, v)
+	completedAt := time.Now().UTC()
+	status := JobStatusSucceeded
+	errMsg := ""
+	if syncErr != nil {
+		status = JobStatusFailed
+		errMsg = syncErr.Error()
+	}
+	_ = s.repo.SetSyncState(ctx, job.TenantID, conn.ID, completedAt, status, errMsg)
+	if syncErr != nil {
+		return "", syncErr
+	}
+	if len(checkpoint) > 0 {
+		v.Checkpoint = checkpoint
+		conn2 := viewConnection(v, job.TenantID, conn.CreatedBy)
+		conn2.Status = conn.Status
+		if err := s.repo.UpdateConnection(ctx, conn2); err != nil && !errors.Is(err, source.ErrDenied) {
+			return "", err
+		}
+	}
+	statsJSON, _ := json.Marshal(stats)
+	return string(statsJSON), nil
+}
+
+// ---------------------------------------------------------------------
+// Fetch/upload pipeline — worker-side only now; SyncSource enqueues.
+
+func (s *Service) syncDocuments(ctx context.Context, p auth.Principal, source Source) (map[string]any, map[string]any, error) {
 	if s.rag == nil {
 		return map[string]any{"uploaded_documents": 0}, nil, errors.New("rag service is not configured")
 	}
@@ -320,7 +489,7 @@ func (s *Service) syncDocuments(ctx context.Context, access Access, source sqlit
 			skippedUnchanged++
 			continue
 		}
-		if _, err := s.rag.UploadDocument(ctx, rag.Access{APIKeyID: access.APIKeyID, IsAdmin: access.IsAdmin}, source.TargetCollectionID, rag.UploadDocumentInput{
+		if _, err := s.rag.UploadDocument(ctx, p, source.TargetCollectionID, rag.UploadDocumentInput{
 			FileName:   fileName,
 			MimeType:   mimeType,
 			Bytes:      content,
@@ -369,7 +538,7 @@ type connectorDocument struct {
 	SourceURI string
 }
 
-func (s *Service) documentsForSource(ctx context.Context, source sqlite.ConnectorSource) ([]connectorDocument, string, map[string]any, error) {
+func (s *Service) documentsForSource(ctx context.Context, source Source) ([]connectorDocument, string, map[string]any, error) {
 	if documents := documentsFromConfig(source.Config); len(documents) > 0 {
 		return documents, "config", nil, nil
 	}
@@ -411,7 +580,7 @@ func documentsFromConfig(config map[string]any) []connectorDocument {
 	return out
 }
 
-func (s *Service) fetchAPIDocuments(ctx context.Context, source sqlite.ConnectorSource) ([]connectorDocument, map[string]any, error) {
+func (s *Service) fetchAPIDocuments(ctx context.Context, source Source) ([]connectorDocument, map[string]any, error) {
 	switch source.Type {
 	case SourceTypeGitHub:
 		docs, err := s.fetchGitHubDocuments(ctx, source)
@@ -421,15 +590,12 @@ func (s *Service) fetchAPIDocuments(ctx context.Context, source sqlite.Connector
 	case SourceTypeNotion:
 		docs, err := s.fetchNotionDocuments(ctx, source)
 		return docs, nil, err
-	case SourceTypeLinear:
-		docs, err := s.fetchLinearDocuments(ctx, source)
-		return docs, nil, err
 	default:
 		return nil, nil, errors.New("unsupported connector source type")
 	}
 }
 
-func (s *Service) fetchGitHubDocuments(ctx context.Context, source sqlite.ConnectorSource) ([]connectorDocument, error) {
+func (s *Service) fetchGitHubDocuments(ctx context.Context, source Source) ([]connectorDocument, error) {
 	owner := strings.TrimSpace(stringFromAny(source.Config["owner"]))
 	repo := strings.TrimSpace(stringFromAny(source.Config["repo"]))
 	if owner == "" || repo == "" {
@@ -496,7 +662,7 @@ func (s *Service) fetchGitHubDocuments(ctx context.Context, source sqlite.Connec
 	return docs, nil
 }
 
-func (s *Service) fetchSlackDocuments(ctx context.Context, source sqlite.ConnectorSource) ([]connectorDocument, map[string]any, error) {
+func (s *Service) fetchSlackDocuments(ctx context.Context, source Source) ([]connectorDocument, map[string]any, error) {
 	channelID := strings.TrimSpace(firstNonEmpty(stringFromAny(source.Config["channel_id"]), stringFromAny(source.Config["channel"])))
 	if channelID == "" {
 		return nil, nil, errors.New("slack config.channel_id is required")
@@ -563,7 +729,7 @@ func (s *Service) fetchSlackDocuments(ctx context.Context, source sqlite.Connect
 	}}, checkpoint, nil
 }
 
-func (s *Service) fetchNotionDocuments(ctx context.Context, source sqlite.ConnectorSource) ([]connectorDocument, error) {
+func (s *Service) fetchNotionDocuments(ctx context.Context, source Source) ([]connectorDocument, error) {
 	pageID := strings.TrimSpace(firstNonEmpty(stringFromAny(source.Config["page_id"]), stringFromAny(source.Config["block_id"])))
 	if pageID == "" {
 		return nil, errors.New("notion config.page_id is required")
@@ -598,66 +764,7 @@ func (s *Service) fetchNotionDocuments(ctx context.Context, source sqlite.Connec
 	}}, nil
 }
 
-func (s *Service) fetchLinearDocuments(ctx context.Context, source sqlite.ConnectorSource) ([]connectorDocument, error) {
-	limit := intFromAny(source.Config["limit"], 50)
-	if limit < 1 {
-		limit = 50
-	}
-	if limit > 100 {
-		limit = 100
-	}
-	query := `query ConnectorIssues($first: Int!) { issues(first: $first) { nodes { identifier title description url } } }`
-	variables := map[string]any{"first": limit}
-	if teamID := strings.TrimSpace(stringFromAny(source.Config["team_id"])); teamID != "" {
-		query = `query ConnectorIssues($first: Int!, $teamID: String!) { issues(first: $first, filter: { team: { id: { eq: $teamID } } }) { nodes { identifier title description url } } }`
-		variables["teamID"] = teamID
-	}
-	body, err := json.Marshal(map[string]any{
-		"query":     query,
-		"variables": variables,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("marshal linear query: %w", err)
-	}
-	endpoint := connectorBaseURL(source, "https://api.linear.app/graphql")
-	req, err := s.newConnectorRequest(ctx, source, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	var payload struct {
-		Data struct {
-			Issues struct {
-				Nodes []struct {
-					Identifier  string `json:"identifier"`
-					Title       string `json:"title"`
-					Description string `json:"description"`
-					URL         string `json:"url"`
-				} `json:"nodes"`
-			} `json:"issues"`
-		} `json:"data"`
-		Errors []map[string]any `json:"errors"`
-	}
-	if err := s.doJSON(req, &payload); err != nil {
-		return nil, err
-	}
-	if len(payload.Errors) > 0 {
-		return nil, errors.New("linear graphql returned errors")
-	}
-	var b strings.Builder
-	for _, issue := range payload.Data.Issues.Nodes {
-		_, _ = fmt.Fprintf(&b, "%s %s\n%s\n%s\n\n", issue.Identifier, issue.Title, issue.Description, issue.URL)
-	}
-	return []connectorDocument{{
-		FileName:  "linear-issues.txt",
-		MimeType:  "text/plain",
-		Content:   strings.TrimSpace(b.String()),
-		SourceID:  "linear:issues",
-		SourceURI: "linear://issues",
-	}}, nil
-}
-
-func (s *Service) newConnectorRequest(ctx context.Context, source sqlite.ConnectorSource, method, endpoint string, body io.Reader) (*http.Request, error) {
+func (s *Service) newConnectorRequest(ctx context.Context, source Source, method, endpoint string, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {
 		return nil, fmt.Errorf("build connector request: %w", err)
@@ -699,27 +806,15 @@ func normalizeSourceType(raw string) (string, error) {
 		return SourceTypeGitHub, nil
 	case SourceTypeSlack:
 		return SourceTypeSlack, nil
+	case SourceTypeTeams:
+		return SourceTypeTeams, nil
 	case SourceTypeNotion:
 		return SourceTypeNotion, nil
-	case SourceTypeLinear:
-		return SourceTypeLinear, nil
+	case SourceTypeGoogleDrive:
+		return SourceTypeGoogleDrive, nil
 	default:
-		return "", errors.New("type must be one of: github, slack, notion, linear")
+		return "", errors.New("type must be one of: github, slack, teams, notion, google_drive")
 	}
-}
-
-func scheduledSourceDue(source sqlite.ConnectorSource, now time.Time) bool {
-	if !source.IsEnabled {
-		return false
-	}
-	intervalSeconds := intFromAny(firstNonNil(source.Config["sync_interval_seconds"], source.Config["schedule_interval_seconds"]), 0)
-	if intervalSeconds <= 0 {
-		return false
-	}
-	if source.LastSyncAt == nil || source.LastSyncAt.IsZero() {
-		return true
-	}
-	return !source.LastSyncAt.Add(time.Duration(intervalSeconds) * time.Second).After(now)
 }
 
 func nonNilMap(v map[string]any) map[string]any {
@@ -872,11 +967,11 @@ func firstNonNil(values ...any) any {
 	return nil
 }
 
-func connectorBaseURL(source sqlite.ConnectorSource, fallback string) string {
+func connectorBaseURL(source Source, fallback string) string {
 	return firstNonEmpty(stringFromAny(source.Config["base_url"]), fallback)
 }
 
-func connectorToken(source sqlite.ConnectorSource) (string, error) {
+func connectorToken(source Source) (string, error) {
 	if err := validateCredentialRef(source); err != nil {
 		return "", err
 	}
@@ -891,7 +986,7 @@ func connectorToken(source sqlite.ConnectorSource) (string, error) {
 	return token, nil
 }
 
-func connectorRequiresCredential(source sqlite.ConnectorSource) bool {
+func connectorRequiresCredential(source Source) bool {
 	// Inline documents are stored locally and are not fetched with a bearer token.
 	if len(documentsFromConfig(source.Config)) > 0 {
 		return false
@@ -900,27 +995,27 @@ func connectorRequiresCredential(source sqlite.ConnectorSource) bool {
 		return false
 	}
 	switch source.Type {
-	case SourceTypeSlack, SourceTypeNotion, SourceTypeLinear:
+	case SourceTypeSlack, SourceTypeNotion:
 		return true
 	default:
 		return false
 	}
 }
 
-var connectorCredentialRefPattern = regexp.MustCompile(`^CONNECTOR_(GITHUB|SLACK|NOTION|LINEAR)_[A-Z0-9_]+$`)
+var connectorCredentialRefPattern = regexp.MustCompile(`^CONNECTOR_(GITHUB|SLACK|TEAMS|NOTION|GOOGLE_DRIVE)_[A-Z0-9_]+$`)
 
 func refuseConnectorRedirect(*http.Request, []*http.Request) error {
 	return errors.New("connector redirects are not followed")
 }
 
-func (s *Service) validateConnectorSource(ctx context.Context, source sqlite.ConnectorSource) error {
+func (s *Service) validateConnectorSource(ctx context.Context, source Source) error {
 	if err := validateCredentialRef(source); err != nil {
 		return err
 	}
 	return s.validateBaseURL(ctx, source)
 }
 
-func validateCredentialRef(source sqlite.ConnectorSource) error {
+func validateCredentialRef(source Source) error {
 	ref := strings.TrimSpace(source.CredentialRef)
 	if ref == "" {
 		if connectorRequiresCredential(source) {
@@ -941,16 +1036,18 @@ func credentialProviderForType(sourceType string) string {
 		return "GITHUB"
 	case SourceTypeSlack:
 		return "SLACK"
+	case SourceTypeTeams:
+		return "TEAMS"
 	case SourceTypeNotion:
 		return "NOTION"
-	case SourceTypeLinear:
-		return "LINEAR"
+	case SourceTypeGoogleDrive:
+		return "GOOGLE_DRIVE"
 	default:
 		return ""
 	}
 }
 
-func (s *Service) validateBaseURL(ctx context.Context, source sqlite.ConnectorSource) error {
+func (s *Service) validateBaseURL(ctx context.Context, source Source) error {
 	raw := strings.TrimSpace(stringFromAny(source.Config["base_url"]))
 	if raw == "" {
 		return nil
