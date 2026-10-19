@@ -83,31 +83,37 @@ type ObjectVersion struct {
 }
 
 // SourceIdentity binds a source-native principal to a tenant identity through
-// an explicit verified tenant-and-connection-scoped mapping.
+// an explicit verified tenant-and-connection-scoped mapping. ID is the
+// tenant-scoped row identity grants/memberships reference; NativeID is the
+// source-native user ID.
 type SourceIdentity struct {
 	TenantID     string
 	ConnectionID string
 	SourceKind   string
+	ID           string
+	NativeID     string
 	MappedUserID string
-	SubjectID    string
-	SubjectKind  string
 }
 
-// SourceGroup is a source-native group within a connection.
+// SourceGroup is a source-native group within a connection. ID is the
+// tenant-scoped row identity; NativeID the source-native group ID.
 type SourceGroup struct {
 	TenantID     string
 	ConnectionID string
 	SourceKind   string
+	ID           string
 	NativeID     string
 	Name         string
 }
 
-// SourceGroupMembership records source-native group membership.
+// SourceGroupMembership records source-native group membership. MemberID is
+// the source_identities row ID (tenant, connection-scoped), not a native ID.
 type SourceGroupMembership struct {
-	TenantID     string
-	ConnectionID string
-	GroupID      string
-	MemberID     string
+	TenantID       string
+	ConnectionID   string
+	GroupID        string
+	MemberID       string // source_identities.id
+	AccessRevision int64  // snapshot revision under which this was observed
 }
 
 // Grant subjects and effects.
@@ -120,12 +126,15 @@ const (
 )
 
 // SourceGrant is a revision-qualified source-native effective grant.
-// Deny overrides allow within the same authoritative snapshot.
+// Deny overrides allow within the same authoritative snapshot. SubjectID is
+// a source_identities.id for GrantSubjectUser, source_groups.id for
+// GrantSubjectGroup.
 type SourceGrant struct {
 	TenantID       string
+	ConnectionID   string // snapshot scope the grant was observed under
 	ObjectID       string
 	SubjectKind    string // GrantSubject* const set
-	SubjectID      string
+	SubjectID      string // source_identities.id or source_groups.id
 	Effect         string // GrantEffect* const set
 	AccessRevision int64
 }
