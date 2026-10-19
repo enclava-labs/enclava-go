@@ -240,6 +240,19 @@ func (r *JobsRepo) ListOwnedJobs(ctx context.Context, tenantID, submitterKey str
 	return out, rows.Err()
 }
 
+// CountOwnedJobs counts the submitter's non-deleted rows — the total the
+// owner-scoped list is paged over.
+func (r *JobsRepo) CountOwnedJobs(ctx context.Context, tenantID, submitterKey string) (int, error) {
+	var total int
+	if err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM jobs
+		WHERE tenant_id = $1 AND submitter_key = $2 AND deleted_at IS NULL`,
+		tenantID, submitterKey).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count owned jobs: %w", err)
+	}
+	return total, nil
+}
+
 // Claim is the atomic lease grant (JOB-02). Inside one transaction it:
 //  1. sweeps running jobs with an expired lease AND an unfinished dispatched
 //     attempt to status=unknown — their upstream outcome was never observed

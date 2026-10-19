@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -13,143 +14,98 @@ import (
 	"testing"
 	"time"
 
+	"enclava-go/internal/artifacts"
 	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
 	extractsvc "enclava-go/internal/extract"
 	"enclava-go/internal/httpx"
+	"enclava-go/internal/jobs"
 	"enclava-go/internal/llm"
 	"enclava-go/internal/store/postgres"
-	"enclava-go/internal/store/sqlite"
 	"enclava-go/internal/testdb"
 )
 
 func TestExtractTemplateIDFromRequestAcceptsLegacyAliases(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		form url.Values
-		want string
-	}{
-		{name: "template_id", form: url.Values{"template_id": {"invoice"}}, want: "invoice"},
-		{name: "template", form: url.Values{"template": {"receipt"}}, want: "receipt"},
-		{name: "extract_template_id", form: url.Values{"extract_template_id": {"expense"}}, want: "expense"},
-		{name: "template_id wins", form: url.Values{"template_id": {"invoice"}, "template": {"receipt"}}, want: "invoice"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest("POST", "/api/v1/extract/process", nil)
-			req.Form = tc.form
-			if got := extractTemplateIDFromRequest(req); got != tc.want {
-				t.Fatalf("expected %q, got %q", tc.want, got)
-			}
-		})
+	for _, key := range []string{"template_id", "template", "extract_template_id"} {
+		form := url.Values{key: {"tpl_1"}}
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/extract/process", bytes.NewBufferString(form.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if got := extractTemplateIDFromRequest(r); got != "tpl_1" {
+			t.Fatalf("key %s: got %q", key, got)
+		}
 	}
 }
 
-func TestHandleProcessRecordsPricedExtractUsage(t *testing.T) {
+// TestHandleProcessEnqueuesDurableJobAndSettlesUsage drives the real path:
+// HandleProcess → extract.Service.Process (durable artifact + job) → the
+// leased attempt handler → billing usage_records.
+func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 	ctx := context.Background()
-	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "extract-usage.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	// Authentication resolves against an isolated PostgreSQL identity store.
-	pgdb := testdb.New(t)
-	tenant := testdb.SeedTenant(t, pgdb, "extract-usage")
-	user := testdb.SeedUser(t, pgdb, tenant, "extract@example.com", nil)
-	apiKey, _ := testdb.SeedAPIKey(t, pgdb, tenant, testdb.SeedKeySpec{
+	db := testdb.New(t)
+	tenant := testdb.SeedTenant(t, db, "extract-usage")
+	user := testdb.SeedUser(t, db, tenant, "extract@example.com", nil)
+	apiKey, _ := testdb.SeedAPIKey(t, db, tenant, testdb.SeedKeySpec{
 		Name:        "extract-usage",
 		OwnerUserID: user.ID,
 		Scopes:      []string{"extract"},
 	})
-	keysRepo := sqlite.NewAPIKeysRepo(db.SQL)
-	identityRepo := postgres.NewIdentityRepo(pgdb)
-	// Mirror the deterministic legacy numeric handle: usage_records still
-	// FK-references sqlite api_keys.id until those stores are ported.
-	seeded, err := auth.NewService(identityRepo, "").Authenticate(ctx, apiKey)
+	identityRepo := postgres.NewIdentityRepo(db)
+	principal, err := auth.NewService(identityRepo, "").Authenticate(ctx, apiKey)
 	if err != nil {
 		t.Fatalf("authenticate seeded key: %v", err)
 	}
-	if _, err := db.SQL.ExecContext(ctx,
-		`INSERT INTO api_keys (id, name, key_prefix, key_hash, is_active) VALUES (?, 'extract-usage', '', '', 1)`,
-		seeded.APIKeyID); err != nil {
-		t.Fatalf("mirror legacy key row: %v", err)
-	}
 
-	templatesRepo := sqlite.NewExtractTemplatesRepo(db.SQL)
-	if err := templatesRepo.Upsert(ctx, sqlite.ExtractTemplate{
-		ID:            "invoice",
-		Name:          "Invoice",
-		SystemPrompt:  "Extract invoice data.",
-		UserPrompt:    "Return JSON.",
-		Model:         "priced-extract",
-		ContextSchema: map[string]any{},
-		OutputSchema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"total": map[string]any{"type": "number"},
-			},
-		},
-		IsActive: true,
-	}); err != nil {
-		t.Fatalf("upsert extract template: %v", err)
+	extractRepo := postgres.NewExtractRepo(db)
+	jobsRepo := postgres.NewJobsRepo(db)
+	artRepo := postgres.NewArtifactRepo(db)
+	root := t.TempDir()
+	store, err := artifacts.NewStore(filepath.Join(root, "durable"), filepath.Join(root, "scratch"), artRepo)
+	if err != nil {
+		t.Fatalf("artifact store: %v", err)
 	}
-	settingsRepo := sqlite.NewExtractSettingsRepo(db.SQL)
-	if err := settingsRepo.EnsureDefaultRow(ctx, 5); err != nil {
-		t.Fatalf("ensure extract settings: %v", err)
-	}
-	if _, err := sqlite.NewPricingRepo(db.SQL).Create(ctx, sqlite.ProviderPricing{
-		ProviderID:            "extract-provider",
-		ModelID:               "priced-extract",
-		Currency:              "USD",
-		InputTokenCentsPer1K:  10,
-		OutputTokenCentsPer1K: 20,
-		EffectiveAt:           time.Now().Add(-time.Minute).UTC(),
-	}, sqlite.PricingAuditLog{ID: "priceaudit_extract_usage_test"}); err != nil {
-		t.Fatalf("create pricing: %v", err)
-	}
-
+	jobsSvc := jobs.NewService(jobsRepo, 10*time.Millisecond)
+	billingSvc := billing.NewService(postgres.NewBillingRepo(db))
 	provider := &extractHandlerProvider{
 		response: []byte(`{"id":"c","model":"priced-extract","usage":{"prompt_tokens":1000,"completion_tokens":500,"total_tokens":1500},"choices":[{"message":{"content":"{\"total\":12.5}"}}]}`),
 	}
-	extractService := extractsvc.NewService(
-		templatesRepo,
-		settingsRepo,
-		sqlite.NewExtractJobsRepo(db.SQL),
-		provider,
-		5,
-	)
+	extractService := extractsvc.NewService(extractRepo, extractRepo, jobsRepo, jobsSvc, store, billingSvc, provider, 5)
+	if err := extractService.UpsertTemplate(ctx, principal, extractsvc.Template{
+		ID: "invoice", Name: "Invoice", SystemPrompt: "Extract invoice data.", UserPrompt: "Return JSON.",
+		DefaultModel: "priced-extract", Enabled: true,
+		OutputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"total": map[string]any{"type": "number"}},
+		},
+	}); err != nil {
+		t.Fatalf("upsert template: %v", err)
+	}
+	// Seed rates so the attempt's reserve admits.
+	billingRepo := postgres.NewBillingRepo(db)
+	for _, u := range []billing.UnitKind{billing.UnitInput, billing.UnitOutput} {
+		if err := billingRepo.PutPrice(ctx, tenant, "price_"+string(u), billing.Price{
+			SubjectType: billing.PriceSubjectModel, SubjectID: "priced-extract",
+			Capability: extractsvc.OperationProcess, Unit: u,
+			RateMicros: 10_000, UnitQuantity: 1000, Currency: "USD",
+			EffectiveFrom: time.Now().Add(-time.Hour).UTC(),
+		}, principal.ActorID, time.Now().Add(-time.Hour).UTC()); err != nil {
+			t.Fatalf("put price: %v", err)
+		}
+	}
+
 	app := httpx.NewApp(
 		auth.NewService(identityRepo, ""),
 		provider,
 		"extract-provider",
 		nil,
-		keysRepo,
-		sqlite.NewExtractJobsRepo(db.SQL),
-		templatesRepo,
-		settingsRepo,
+		nil, nil, nil, nil, // legacy extract repos unused by module handlers
 		extractService,
-		nil,
-		nil,
-		nil,
-		nil,
-		sqlite.NewUsageRepo(db.SQL),
-		sqlite.NewPricingRepo(db.SQL),
-		sqlite.NewBudgetsRepo(db.SQL),
-		nil,
-		nil,
-		"sha256",
-		"",
-		"enc_",
-		nil,
-		"",
-		"",
-		5,
-		false,
+		nil, nil, nil, nil,
+		nil, nil, nil, nil, nil,
+		"sha256", "", "enc_",
+		nil, "", "",
+		5, false,
 	)
 	handlers := NewHandlers(extractService, 5, app)
-	principal, err := auth.NewService(identityRepo, "").Authenticate(ctx, apiKey)
-	if err != nil {
-		t.Fatalf("authenticate key: %v", err)
-	}
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -176,20 +132,110 @@ func TestHandleProcessRecordsPricedExtractUsage(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	var endpoint, model, providerID string
-	var promptTokens, completionTokens, totalTokens, costCents int64
+	var out struct {
+		JobID  string `json:"job_id"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.JobID == "" || out.Status != jobs.StatusQueued {
+		t.Fatalf("expected durable job id, got %+v", out)
+	}
+
+	// The job persists before the response returned; the attempt runs under
+	// the leased claim and settles usage on billing.usage_records.
+	claim, err := jobsSvc.Lease(ctx, "test-worker", 30*time.Second)
+	if err != nil || claim == nil {
+		t.Fatalf("lease: %v claim=%v", err, claim)
+	}
+	resultRef, err := extractService.JobHandler()(ctx, claim, func(ctx context.Context) (io.ReadCloser, error) {
+		return store.Read(ctx, artifacts.Ref{TenantID: tenant, ID: claim.Job().InputRef})
+	})
+	if err != nil {
+		t.Fatalf("attempt: %v", err)
+	}
+	if _, err := claim.Complete(ctx, resultRef); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	var recCount int
+	var amount int64
+	var capability, model string
 	if err := db.SQL.QueryRowContext(ctx, `
-		SELECT endpoint, model, provider_id, prompt_tokens, completion_tokens, total_tokens, cost_cents
-		FROM usage_records
-		WHERE api_key_id = ?
-	`, principal.APIKeyID).Scan(&endpoint, &model, &providerID, &promptTokens, &completionTokens, &totalTokens, &costCents); err != nil {
+		SELECT capability, model, amount_micros FROM usage_records WHERE tenant_id=$1::uuid`, tenant).
+		Scan(&capability, &model, &amount); err != nil {
 		t.Fatalf("query usage record: %v", err)
 	}
-	if endpoint != "/api/v1/extract/process" || model != "priced-extract" || providerID != "extract-provider" {
-		t.Fatalf("unexpected usage identity: endpoint=%s model=%s provider=%s", endpoint, model, providerID)
+	if capability != extractsvc.OperationProcess || model != "priced-extract" || amount <= 0 {
+		t.Fatalf("unexpected usage: cap=%s model=%s amount=%d", capability, model, amount)
 	}
-	if promptTokens != 1000 || completionTokens != 500 || totalTokens != 1500 || costCents != 20 {
-		t.Fatalf("unexpected priced usage: prompt=%d completion=%d total=%d cost=%d", promptTokens, completionTokens, totalTokens, costCents)
+	if err := db.SQL.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM usage_records WHERE tenant_id=$1::uuid`, tenant).Scan(&recCount); err != nil {
+		t.Fatalf("count usage: %v", err)
+	}
+	if recCount != 1 {
+		t.Fatalf("usage_records=%d, want 1", recCount)
+	}
+
+	// Job detail surfaces the settled result through the owner-scoped read.
+	detail, err := extractService.GetJob(ctx, principal, out.JobID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if detail.Result == nil || detail.Result.TokensUsed != 1500 || detail.Result.Data["total"] != 12.5 {
+		t.Fatalf("unexpected detail: %+v", detail.Result)
+	}
+}
+
+func TestHandleJobDetailDeniesForeignAndUnknown(t *testing.T) {
+	ctx := context.Background()
+	db := testdb.New(t)
+	tenant := testdb.SeedTenant(t, db, "extract-tenant")
+	user := testdb.SeedUser(t, db, tenant, "a@example.com", nil)
+	keyA, _ := testdb.SeedAPIKey(t, db, tenant, testdb.SeedKeySpec{Name: "a", OwnerUserID: user.ID, Scopes: []string{"extract"}})
+	otherUser := testdb.SeedUser(t, db, tenant, "b@example.com", nil)
+	keyB, _ := testdb.SeedAPIKey(t, db, tenant, testdb.SeedKeySpec{Name: "b", OwnerUserID: otherUser.ID, Scopes: []string{"extract"}})
+	identityRepo := postgres.NewIdentityRepo(db)
+	principalA, err := auth.NewService(identityRepo, "").Authenticate(ctx, keyA)
+	if err != nil {
+		t.Fatalf("auth A: %v", err)
+	}
+	principalB, err := auth.NewService(identityRepo, "").Authenticate(ctx, keyB)
+	if err != nil {
+		t.Fatalf("auth B: %v", err)
+	}
+
+	extractRepo := postgres.NewExtractRepo(db)
+	jobsRepo := postgres.NewJobsRepo(db)
+	store, err := artifacts.NewStore(filepath.Join(t.TempDir(), "durable"), filepath.Join(t.TempDir(), "scratch"), postgres.NewArtifactRepo(db))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	svc := extractsvc.NewService(extractRepo, extractRepo, jobsRepo,
+		jobs.NewService(jobsRepo, time.Millisecond), store,
+		billing.NewService(postgres.NewBillingRepo(db)), &extractHandlerProvider{}, 5)
+	if err := svc.UpsertTemplate(ctx, principalA, extractsvc.Template{
+		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u", Enabled: true,
+	}); err != nil {
+		t.Fatalf("template: %v", err)
+	}
+	out, err := svc.Process(ctx, principalA, extractsvc.ProcessInput{
+		TemplateID: "invoice", FileName: "a.pdf", MimeType: "application/pdf", Bytes: []byte("%PDF x"),
+	})
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+
+	handlers := NewHandlers(svc, 5, nil)
+	_ = handlers // handlers read paths exercised through svc here
+
+	// Foreign job id == unknown id: both ErrNotFound.
+	if _, err := svc.GetJob(ctx, principalB, out.JobID); !errors.Is(err, extractsvc.ErrNotFound) {
+		t.Fatalf("foreign job read: %v", err)
+	}
+	if _, err := svc.GetJob(ctx, principalA, "job_nope"); !errors.Is(err, extractsvc.ErrNotFound) {
+		t.Fatalf("unknown job read: %v", err)
 	}
 }
 

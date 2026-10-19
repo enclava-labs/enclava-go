@@ -11,12 +11,15 @@ import (
 	"syscall"
 	"time"
 
+	"enclava-go/internal/artifacts"
 	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
 	"enclava-go/internal/chatbot"
 	"enclava-go/internal/config"
 	"enclava-go/internal/connectors"
 	"enclava-go/internal/extract"
 	"enclava-go/internal/httpx"
+	"enclava-go/internal/jobs"
 	"enclava-go/internal/llm"
 	extractmodule "enclava-go/internal/modules/extract"
 	"enclava-go/internal/prompts"
@@ -68,9 +71,11 @@ func main() {
 	}()
 
 	apiKeysRepo := sqlite.NewAPIKeysRepo(db.SQL)
-	templatesRepo := sqlite.NewExtractTemplatesRepo(db.SQL)
-	settingsRepo := sqlite.NewExtractSettingsRepo(db.SQL)
-	jobsRepo := sqlite.NewExtractJobsRepo(db.SQL)
+	// Extract job/template/settings sqlite repos stay ONLY for dashboard stat
+	// reads (dashboard.go:475/893/911); 01-19 migrates those and removes them.
+	extractJobsRepo := sqlite.NewExtractJobsRepo(db.SQL)
+	extractTemplatesRepo := sqlite.NewExtractTemplatesRepo(db.SQL)
+	extractSettingsRepo := sqlite.NewExtractSettingsRepo(db.SQL)
 	usageRepo := sqlite.NewUsageRepo(db.SQL)
 	ragRepo := sqlite.NewRAGRepo(db.SQL)
 	promptRepo := sqlite.NewPromptTemplatesRepo(db.SQL)
@@ -81,12 +86,18 @@ func main() {
 	providersRepo := sqlite.NewProvidersRepo(db.SQL)
 	connectorsRepo := sqlite.NewConnectorsRepo(db.SQL)
 
-	if err := settingsRepo.EnsureDefaultRow(ctx, cfg.MaxUploadSizeMB); err != nil {
-		log.Fatalf("settings init error: %v", err)
+	// Durable extract stack: postgres domain repo + artifact store + jobs +
+	// billing (CORE-05/JOB-01/JOB-04).
+	extractRepo := postgres.NewExtractRepo(pgDB)
+	jobsRepoPG := postgres.NewJobsRepo(pgDB)
+	artifactRepo := postgres.NewArtifactRepo(pgDB)
+	artifactStore, err := artifacts.NewStore(cfg.DataDir, cfg.DataDir+"/scratch", artifactRepo)
+	if err != nil {
+		log.Fatalf("artifact store init error: %v", err)
 	}
-	if err := templatesRepo.EnsureDefaults(ctx, extract.DefaultTemplates()); err != nil {
-		log.Fatalf("template seed error: %v", err)
-	}
+	jobsSvc := jobs.NewService(jobsRepoPG, 0)
+	billingSvc := billing.NewService(postgres.NewBillingRepo(pgDB))
+
 	if err := promptRepo.EnsureDefaults(ctx, prompts.DefaultTemplates()); err != nil {
 		log.Fatalf("prompt template seed error: %v", err)
 	}
@@ -103,12 +114,21 @@ func main() {
 	go prober.Start(ctx)
 
 	extractSvc := extract.NewService(
-		templatesRepo,
-		settingsRepo,
-		jobsRepo,
+		extractRepo,
+		extractRepo,
+		jobsRepoPG,
+		jobsSvc,
+		artifactStore,
+		billingSvc,
 		provider,
 		cfg.MaxUploadSizeMB,
 	)
+	// The runner carries the extract.process handler registration; the
+	// worker loop itself starts with the executor plan (01-25).
+	jobsRunner := jobs.NewRunner(jobsSvc, artifactStore, map[string]jobs.HandlerFunc{
+		extract.OperationProcess: extractSvc.JobHandler(),
+	}, jobs.RunnerConfig{})
+	_ = jobsRunner
 	qdrantClient := rag.NewQdrantClient(cfg.QdrantURL, cfg.UpstreamTimeout)
 	ragSvc := rag.NewService(ragRepo, qdrantClient, provider, cfg.DefaultEmbeddingModel)
 	promptSvc := prompts.NewService(promptRepo)
@@ -122,9 +142,9 @@ func main() {
 		cfg.Provider,
 		prober,
 		apiKeysRepo,
-		jobsRepo,
-		templatesRepo,
-		settingsRepo,
+		extractJobsRepo,
+		extractTemplatesRepo,
+		extractSettingsRepo,
 		extractSvc,
 		ragSvc,
 		promptSvc,

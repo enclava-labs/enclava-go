@@ -1,9 +1,7 @@
 package extract
 
-import "enclava-go/internal/store/sqlite"
-
-func DefaultTemplates() []sqlite.ExtractTemplate {
-	return []sqlite.ExtractTemplate{
+func DefaultTemplates() []Template {
+	return []Template{
 		{
 			ID:           "detailed_invoice",
 			Name:         "Detailed Invoice",
@@ -37,7 +35,7 @@ invoice_number, invoice_date, due_date, service_provider, buyer, subtotal, tax_a
 				},
 			},
 			IsDefault: true,
-			IsActive:  true,
+			Enabled:   true,
 		},
 		{
 			ID:           "simple_receipt",
@@ -64,7 +62,7 @@ merchant_name, merchant_address, date, items, subtotal, tax, total, currency, pa
 				},
 			},
 			IsDefault: true,
-			IsActive:  true,
+			Enabled:   true,
 		},
 		{
 			ID:           "expense_report",
@@ -98,7 +96,7 @@ vendor, date, amount, currency, category, description, payment_method, tax_amoun
 				},
 			},
 			IsDefault: true,
-			IsActive:  true,
+			Enabled:   true,
 		},
 	}
 }
