@@ -299,7 +299,13 @@ func (w *Writer) Finalize(ctx context.Context) error {
 		w.abort(ctx)
 		return fmt.Errorf("artifacts: finalize rename: %w", err)
 	}
-	fsyncDir(dir)
+	if err := fsyncDir(dir); err != nil {
+		// The rename must be durable before the metadata commit records the
+		// artifact as finalized; otherwise a crash could leave finalized
+		// metadata pointing at bytes the filesystem never persisted.
+		w.abort(ctx)
+		return fmt.Errorf("artifacts: fsync tenant dir: %w", err)
+	}
 
 	if err := w.s.meta.FinalizeCommit(ctx, w.row.TenantID, w.row.ID,
 		w.row.LeaseOwner, w.row.FenceToken, sum, w.written); err != nil {
@@ -464,9 +470,11 @@ func newFenceToken() int64 {
 	return int64(binary.LittleEndian.Uint64(buf[:]) & (1<<63 - 1))
 }
 
-func fsyncDir(dir string) {
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
 	}
+	defer d.Close()
+	return d.Sync()
 }
