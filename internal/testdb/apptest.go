@@ -11,6 +11,7 @@
 package testdb
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -21,6 +22,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -44,8 +46,28 @@ type AppHandle struct {
 	BaseURL string
 	Client  *http.Client
 
-	cmd  *exec.Cmd
-	port int
+	cmd *exec.Cmd
+	buf *lockedBuffer
+}
+
+// lockedBuffer accumulates child output safely for later inspection.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+// Logs returns everything the child process logged so far — diagnostics on
+// failure, never a substitute for behavior assertions.
+func (h *AppHandle) Logs() string {
+	h.buf.mu.Lock()
+	defer h.buf.mu.Unlock()
+	return h.buf.b.String()
 }
 
 // StartApp builds ./cmd/enclava into t.TempDir, optionally runs bootstrap,
@@ -57,7 +79,7 @@ func StartApp(t testing.TB, opts StartOpts) *AppHandle {
 	}
 
 	bin := filepath.Join(t.TempDir(), "enclava")
-	build := exec.Command("go", "build", "-o", bin, "./cmd/enclava")
+	build := exec.Command("go", "build", "-o", bin, "enclava-go/cmd/enclava")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build enclava binary: %v\n%s", err, out)
 	}
@@ -84,6 +106,9 @@ func StartApp(t testing.TB, opts StartOpts) *AppHandle {
 
 	cmd := exec.Command(bin)
 	cmd.Env = append(env, fmt.Sprintf("APP_PORT=%d", port))
+	buf := &lockedBuffer{}
+	cmd.Stdout = buf
+	cmd.Stderr = buf
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start app process: %v", err)
 	}
@@ -91,7 +116,7 @@ func StartApp(t testing.TB, opts StartOpts) *AppHandle {
 	h := &AppHandle{
 		BaseURL: fmt.Sprintf("http://127.0.0.1:%d", port),
 		cmd:     cmd,
-		port:    port,
+		buf:     buf,
 	}
 	jar, err := cookiejar.New(nil)
 	if err != nil {
@@ -155,6 +180,17 @@ func (h *AppHandle) Stop() {
 		_ = h.cmd.Process.Kill()
 		<-done
 	}
+}
+
+// Kill terminates the process immediately (SIGKILL), simulating a crash —
+// unlike Stop's graceful SIGTERM. Reservations in flight are left for the
+// database to report as still-held/unknown.
+func (h *AppHandle) Kill() {
+	if h.cmd == nil || h.cmd.Process == nil {
+		return
+	}
+	_ = h.cmd.Process.Kill()
+	_ = h.cmd.Wait()
 }
 
 func freePort(t testing.TB) int {

@@ -144,7 +144,7 @@ func newOpenAIContractFixture(t *testing.T) *openaiFx {
 	}
 	authSvc := auth.NewService(repo, "")
 	app := NewApp(authSvc, nil, "", nil, repo, nil, nil, nil, nil, nil, nil, nil, brepo, erepo,
-		"sha256", "", "enc_", nil, nil, 1, false, svc, postgres.NewResponseBindingsRepo(db))
+		"sha256", "", "enc_", nil, nil, 1, false, svc, postgres.NewResponseBindingsRepo(db), GateConfig{})
 	fx := &openaiFx{t: t, db: db, tenant: tenant, app: app, up: up, brepo: brepo, erepo: erepo}
 	fx.keyID = key
 	fx.mustEndpoint(t, "ep-chat", []string{
@@ -465,7 +465,7 @@ func TestOfficialSDKInProcessContract(t *testing.T) {
 	}
 	app := NewApp(auth.NewService(postgres.NewIdentityRepo(f.db), ""), nil, "", nil, postgres.NewIdentityRepo(f.db),
 		nil, nil, nil, nil, nil, nil, nil, f.brepo, f.erepo,
-		"sha256", "", "enc_", nil, nil, 1, false, svc, postgres.NewResponseBindingsRepo(f.db))
+		"sha256", "", "enc_", nil, nil, 1, false, svc, postgres.NewResponseBindingsRepo(f.db), GateConfig{})
 	server := httptest.NewServer(app.Handler())
 	defer server.Close()
 

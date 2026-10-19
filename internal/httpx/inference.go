@@ -296,10 +296,14 @@ func (a *App) writeInferenceError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, inference.ErrDenied), errors.Is(err, inference.ErrNoRoute):
 		WriteForbidden(w, "request denied")
+	case errors.Is(err, inference.ErrOverloaded):
+		writeOverloaded(w)
 	case errors.Is(err, inference.ErrUnbounded), errors.Is(err, inference.ErrUnsupportedCapability):
 		WriteOpenAIError(w, http.StatusBadRequest, "invalid inference request", "invalid_request_error", "unsupported_request")
 	case errors.Is(err, billing.ErrBudgetExceeded):
-		a.WriteBudgetError(w, err)
+		// The sentinel comes straight from the shared admission boundary —
+		// it is a bounded 429, not the endpoint-policy error shape.
+		WriteOpenAIError(w, http.StatusTooManyRequests, "budget exceeded", "rate_limit_error", "budget_exceeded")
 	case errors.Is(err, context.DeadlineExceeded):
 		WriteOpenAIError(w, http.StatusGatewayTimeout, "upstream request timed out", "server_error", "gateway_timeout")
 	default:

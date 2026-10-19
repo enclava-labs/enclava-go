@@ -135,7 +135,21 @@ func main() {
 		Secrets:       secretResolver,
 		Artifacts:     artifactRepo,
 		Conversations: postgres.NewChatbotConversationStore(chatbotRepo),
-	})
+	}, inference.WithAdmission(inference.NewAdmission(inference.AdmissionConfig{
+		Execute: inference.ClassLimit{
+			MaxActive: cfg.InferenceMaxActive,
+			MaxQueued: cfg.InferenceMaxQueued,
+			PerTenant: cfg.InferencePerTenant,
+		},
+		Manage: inference.ClassLimit{
+			MaxActive: cfg.InferenceManageActive,
+			MaxQueued: cfg.InferenceManageQueued,
+		},
+		FanOut: inference.ClassLimit{
+			MaxActive: cfg.InferenceFanOutActive,
+			MaxQueued: cfg.InferenceFanOutQueued,
+		},
+	})))
 	if err != nil {
 		log.Fatalf("inference service init error: %v", err)
 	}
@@ -216,6 +230,11 @@ func main() {
 		cfg.TrustProxyHeaders,
 		inferenceSvc,
 		bindingsRepo,
+		httpx.GateConfig{
+			MaxInflight:  cfg.InferenceMaxInflight,
+			MaxQueued:    cfg.InferenceMaxHTTPQueue,
+			MaxBodyBytes: cfg.InferenceMaxBodyBytes,
+		},
 	)
 
 	// The extract module mounts its API routes on the app's mux — every
@@ -361,23 +380,20 @@ func ensureEnvEndpoint(ctx context.Context, identity *postgres.IdentityRepo, end
 func buildProvider(cfg config.Config) (llm.Provider, error) {
 	switch cfg.Provider {
 	case "privatemode", "openai":
-		return llm.NewModelCacheProvider(llm.NewOpenAICompatibleAdapter(
+		return llm.NewModelCacheProvider(envAdapter(
 			cfg.UpstreamOpenAIBaseURL,
 			cfg.UpstreamOpenAIAPIKey,
-			cfg.UpstreamTimeout,
-		).WithProviderName(cfg.Provider), cfg.ProviderModelCacheTTL, cfg.Provider), nil
+			cfg.UpstreamTimeout, cfg.Provider), cfg.ProviderModelCacheTTL, cfg.Provider), nil
 	case "openai_compatible":
-		return llm.NewModelCacheProvider(llm.NewOpenAICompatibleAdapter(
+		return llm.NewModelCacheProvider(envAdapter(
 			cfg.OpenAICompatibleBaseURL,
 			cfg.OpenAICompatibleAPIKey,
-			cfg.UpstreamTimeout,
-		).WithProviderName(cfg.Provider), cfg.ProviderModelCacheTTL, cfg.Provider), nil
+			cfg.UpstreamTimeout, cfg.Provider), cfg.ProviderModelCacheTTL, cfg.Provider), nil
 	case "redpill":
-		return llm.NewModelCacheProvider(llm.NewOpenAICompatibleAdapter(
+		return llm.NewModelCacheProvider(envAdapter(
 			cfg.RedPillBaseURL,
 			cfg.RedPillAPIKey,
-			cfg.UpstreamTimeout,
-		).WithProviderName(cfg.Provider), cfg.ProviderModelCacheTTL, cfg.Provider), nil
+			cfg.UpstreamTimeout, cfg.Provider), cfg.ProviderModelCacheTTL, cfg.Provider), nil
 	case "tinfoil":
 		provider, err := llm.NewTinfoilProvider(
 			cfg.TinfoilAPIKey,
@@ -401,4 +417,16 @@ func buildProvider(cfg config.Config) (llm.Provider, error) {
 	default:
 		return nil, fmt.Errorf("unsupported INFERENCE_PROVIDER %q", cfg.Provider)
 	}
+}
+
+// envAdapter builds the env provider's transport. A cleartext (http://)
+// origin mirrors runtimeProviderConfig's AuthorizedPrivate marking: the
+// operator explicitly configured this origin, so the adapter is approved
+// for the same private target the seeded endpoint record carries.
+func envAdapter(baseURL, apiKey string, timeout time.Duration, provider string) *llm.OpenAICompatibleAdapter {
+	a := llm.NewOpenAICompatibleAdapter(baseURL, apiKey, timeout).WithProviderName(provider)
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(baseURL)), "http://") {
+		a.WithAllowPrivateEndpoint()
+	}
+	return a
 }
