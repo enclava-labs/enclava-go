@@ -1,11 +1,11 @@
 package prompts
 
-import "enclava-go/internal/store/sqlite"
-
 const DefaultTemplateID = "default-chatbot-assistant"
 
-func DefaultTemplates() []sqlite.PromptTemplate {
-	return []sqlite.PromptTemplate{
+// DefaultTemplates seeds the built-in per-tenant prompt template. Callers
+// must set TenantID before inserting.
+func DefaultTemplates() []Template {
+	return []Template{
 		{
 			ID:          DefaultTemplateID,
 			Name:        "Default Chatbot Assistant",
