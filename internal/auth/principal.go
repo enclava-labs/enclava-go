@@ -72,7 +72,6 @@ type Principal struct {
 	DelegatedByActorID string
 	BillingSubjectID   string
 	BillingSubjectKind string
-
 }
 
 type contextKey string

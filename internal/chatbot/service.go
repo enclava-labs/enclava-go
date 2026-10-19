@@ -80,7 +80,6 @@ func requireTenant(p auth.Principal) error {
 	return nil
 }
 
-
 // actorKey is the conversation-owner identity.
 func actorKey(p auth.Principal) string {
 	return strings.TrimSpace(p.ActorID)

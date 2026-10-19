@@ -133,9 +133,9 @@ func (s *Service) Authenticate(ctx context.Context, plaintext string) (Principal
 func (s *Service) principalFromKey(ctx context.Context, key APIKeyRecord) (Principal, error) {
 	tenantID := key.TenantID
 	principal := Principal{
-		TenantID:        tenantID,
-		CredentialID:    key.ID,
-		CredentialKind:  CredentialKindAPIKey,
+		TenantID:       tenantID,
+		CredentialID:   key.ID,
+		CredentialKind: CredentialKindAPIKey,
 
 		RateLimitPerMinute: key.RateLimitPerMinute,
 		RateLimitPerHour:   key.RateLimitPerHour,
@@ -186,7 +186,6 @@ func (s *Service) principalFromKey(ctx context.Context, key APIKeyRecord) (Princ
 	_ = s.repo.TouchAPIKeyUsage(ctx, tenantID, key.ID, time.Now().UTC())
 	return principal, nil
 }
-
 
 // AuthenticatePassword verifies a local account's bcrypt password and returns
 // the user's principal (password auth precedes session issuance).
