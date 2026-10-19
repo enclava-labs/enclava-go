@@ -50,8 +50,8 @@ func setKeyGrant(t *testing.T, repo *postgres.IdentityRepo, tenant, keyID string
 	}
 }
 
-func endpointMiddlewareApp(repo *postgres.IdentityRepo, svc *auth.Service) *App {
-	app := &App{authSvc: svc, identity: repo, mux: http.NewServeMux(), maxUploadMB: 1}
+func endpointMiddlewareApp(repo *postgres.IdentityRepo, svc *auth.Service, endpoints *postgres.EndpointsRepo) *App {
+	app := &App{authSvc: svc, identity: repo, endpoints: endpoints, mux: http.NewServeMux(), maxUploadMB: 1}
 	app.mux.HandleFunc("/api/v1/models", app.authenticated("models.list", app.handleModels))
 	app.mux.HandleFunc("/api/v1/probe", app.authenticated("models.list", func(w http.ResponseWriter, r *http.Request, _ auth.Principal) {
 		WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -66,7 +66,7 @@ func TestEndpointGrantEmptyAndMalformedDenyAll(t *testing.T) {
 	apiKey, rec := testdb.SeedAPIKey(t, db, tenant, testdb.SeedKeySpec{
 		Name: "mw", OwnerUserID: user.ID, Scopes: []string{"models.list"},
 	})
-	app := endpointMiddlewareApp(repo, svc)
+	app := endpointMiddlewareApp(repo, svc, postgres.NewEndpointsRepo(db))
 
 	for name, grant := range map[string]json.RawMessage{
 		"malformed": json.RawMessage(`{"mode":"bogus"}`),
@@ -95,7 +95,7 @@ func TestEndpointGrantListModeDispatchesListedEndpointOnly(t *testing.T) {
 	setKeyGrant(t, repo, tenant, rec.ID, func(k *auth.APIKeyRecord) {
 		k.AllowedEndpoints = json.RawMessage(`{"mode":"list","items":["models"]}`)
 	})
-	app := endpointMiddlewareApp(repo, svc)
+	app := endpointMiddlewareApp(repo, svc, postgres.NewEndpointsRepo(db))
 	app.provider = &stubListProvider{}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/models", nil)
@@ -125,7 +125,7 @@ func TestIPGrantListModeAllowsListedIPDeniesOthers(t *testing.T) {
 	setKeyGrant(t, repo, tenant, rec.ID, func(k *auth.APIKeyRecord) {
 		k.AllowedIPs = json.RawMessage(`{"mode":"list","items":["203.0.113.7"]}`)
 	})
-	app := endpointMiddlewareApp(repo, svc)
+	app := endpointMiddlewareApp(repo, svc, postgres.NewEndpointsRepo(db))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/probe", nil)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
@@ -154,7 +154,7 @@ func TestSessionCookieAuthAndCSRFGuard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("issue session: %v", err)
 	}
-	app := endpointMiddlewareApp(repo, svc)
+	app := endpointMiddlewareApp(repo, svc, postgres.NewEndpointsRepo(db))
 	cookie := &http.Cookie{Name: sessionCookieName, Value: token}
 
 	// GET with the session cookie authenticates.

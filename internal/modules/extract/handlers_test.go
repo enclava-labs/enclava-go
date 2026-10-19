@@ -100,7 +100,7 @@ func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 		nil, nil, nil, nil,
 		"sha256", "", "enc_",
 		nil, nil,
-		5, false,
+		5, false, nil,
 	)
 	handlers := NewHandlers(extractService, 5, app)
 

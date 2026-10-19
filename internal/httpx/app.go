@@ -1,12 +1,9 @@
 package httpx
 
 import (
-	"bufio"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -17,6 +14,7 @@ import (
 	"enclava-go/internal/chatbot"
 	"enclava-go/internal/connectors"
 	"enclava-go/internal/extract"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/llm"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
@@ -46,6 +44,7 @@ type App struct {
 	sessionAuth  *SessionAuth
 	maxUploadMB  int64
 	trustProxy   bool
+	executor     *inference.Service
 	rl           *RateLimiter
 	mux          *http.ServeMux
 }
@@ -86,6 +85,7 @@ func NewApp(
 	sessionAuth *SessionAuth,
 	maxUploadMB int64,
 	trustProxy bool,
+	executor *inference.Service,
 ) *App {
 	a := &App{
 		authSvc:    authSvc,
@@ -110,6 +110,7 @@ func NewApp(
 		sessionAuth:  sessionAuth,
 		maxUploadMB:  maxUploadMB,
 		trustProxy:   trustProxy,
+		executor:     executor,
 		rl:           NewRateLimiter(),
 	}
 
@@ -162,6 +163,14 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/api/v1/chatbots/", a.authenticated("chatbot", a.handleChatbotByID))
 
 	a.mux.HandleFunc("/api/v1/connectors/sources", a.authenticated("connectors.manage", a.handleConnectorSources))
+	// 01-29: the selected public OpenAI core API — model-alias metadata plus
+	// chat/embedding dispatch — runs only through the shared executor. There
+	// is no catch-all: unselected /v1 products and legacy aliases 404.
+	a.mux.HandleFunc("/v1/models", a.authenticated("models.list", a.handleModels))
+	a.mux.HandleFunc("/v1/models/", a.authenticated("models.list", a.handleModelByID))
+	a.mux.HandleFunc("/v1/chat/completions", a.authenticated("chat.completions", a.handleChatCompletions))
+	a.mux.HandleFunc("/v1/embeddings", a.authenticated("embeddings.create", a.handleEmbeddings))
+
 	a.mux.HandleFunc("/api/v1/connectors/sources/", a.authenticated("connectors.manage", a.handleConnectorSourceByID))
 	a.mux.HandleFunc("/api/v1/connectors/sync-jobs", a.authenticated("connectors.manage", a.handleConnectorSyncJobs))
 	a.mux.HandleFunc("/api/v1/connectors/sync-jobs/", a.authenticated("connectors.manage", a.handleConnectorSyncJobByID))
@@ -274,67 +283,6 @@ func (a *App) authenticated(scope string, next func(http.ResponseWriter, *http.R
 	}
 }
 
-// enforceAllowlists applies the stored endpoint and IP grants at dispatch.
-// Grants carry the decoded {"mode":"all"}→All or {"mode":"list"}→item map
-// shape: All==true is unrestricted; an empty/absent/malformed list denies
-// everything (fail closed — it never "skips the check"). Endpoint grants
-// hold inference endpoint IDs (route families like "chat/completions"),
-// never URL path patterns. Only API-key credentials carry endpoint/IP
-// grants — session-authenticated dashboard requests are scope-gated only.
-func (a *App) enforceAllowlists(w http.ResponseWriter, r *http.Request, principal auth.Principal, next func(http.ResponseWriter, *http.Request, auth.Principal)) {
-	if principal.CredentialKind == auth.CredentialKindAPIKey {
-		if !principal.AllowedEndpointsAll {
-			if len(principal.AllowedEndpoints) == 0 {
-				WriteForbidden(w, "endpoint is not allowed for this API key")
-				return
-			}
-			if id := inferenceEndpointID(r.URL.Path); id != "" && !auth.EndpointAllowed(principal, id) {
-				WriteForbidden(w, "endpoint is not allowed for this API key")
-				return
-			}
-		}
-		if !principal.AllowedIPsAll {
-			ip := clientIP(r, a.trustProxy)
-			if ip == "" {
-				WriteForbidden(w, "source IP could not be determined")
-				return
-			}
-			if !sourceIPAllowed(principal.AllowedIPs, ip) {
-				WriteForbidden(w, "source IP is not allowed for this API key")
-				return
-			}
-		}
-	}
-	next(w, r.WithContext(auth.WithPrincipal(r.Context(), principal)), principal)
-}
-
-// inferenceEndpointID maps an inference route to its endpoint ID — the
-// route family: "/api/v1/responses/resp_1/cancel" and the "/v1" alias both
-// resolve to "responses"; "/api/v1/chat/completions" → "chat/completions".
-// Non-inference paths return "" and are governed by scopes only.
-func inferenceEndpointID(path string) string {
-	var rest string
-	switch {
-	case strings.HasPrefix(path, "/api/v1/"):
-		rest = strings.TrimPrefix(path, "/api/v1/")
-	case strings.HasPrefix(path, "/v1/"):
-		rest = strings.TrimPrefix(path, "/v1/")
-	default:
-		return ""
-	}
-	rest = strings.Trim(rest, "/")
-	if rest == "" {
-		return ""
-	}
-	if strings.HasPrefix(rest, "chat/completions") {
-		return "chat/completions"
-	}
-	if i := strings.Index(rest, "/"); i > 0 {
-		return rest[:i]
-	}
-	return rest
-}
-
 func (a *App) unauthenticatedRateLimitKey(r *http.Request, apiKey string) string {
 	if key := strings.TrimSpace(apiKey); key != "" {
 		if len(key) > 12 {
@@ -419,303 +367,8 @@ func (a *App) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, snap)
 }
 
-func (a *App) handleModels(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
-	if r.Method != http.MethodGet {
-		if a.maybeHandleOpenAIPassthrough(w, r, principal) {
-			return
-		}
-		WriteMethodNotAllowed(w)
-		return
-	}
-	if a.prober != nil && !a.prober.Ready() {
-		WriteOpenAIError(w, http.StatusServiceUnavailable, "provider not ready", "server_error", "provider_not_ready")
-		return
-	}
-	modelsResp, err := a.provider.ListModels(r.Context())
-	if err != nil {
-		a.WriteProviderError(w, err)
-		return
-	}
-	if len(principal.AllowedModels) > 0 {
-		filtered := make([]llm.Model, 0, len(modelsResp.Data))
-		for _, m := range modelsResp.Data {
-			if auth.ModelAllowed(principal, m.ID) {
-				filtered = append(filtered, m)
-			}
-		}
-		modelsResp.Data = filtered
-	}
-	WriteJSON(w, http.StatusOK, modelsResp)
-}
-
-func (a *App) handleModelsCacheInvalidate(w http.ResponseWriter, r *http.Request, _ auth.Principal) {
-	if r.Method != http.MethodPost {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	invalidator, ok := a.provider.(llm.ModelCacheInvalidator)
-	if !ok {
-		WriteJSON(w, http.StatusOK, map[string]any{"invalidated": false, "reason": "provider has no model cache"})
-		return
-	}
-	invalidator.InvalidateModelCache()
-	WriteJSON(w, http.StatusOK, map[string]any{"invalidated": true})
-}
-
-func (a *App) handleModelByID(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
-	if a.prober != nil && !a.prober.Ready() {
-		WriteOpenAIError(w, http.StatusServiceUnavailable, "provider not ready", "server_error", "provider_not_ready")
-		return
-	}
-	modelID := modelIDFromPath(r.URL.Path)
-	if strings.TrimSpace(modelID) == "" {
-		WriteOpenAIError(w, http.StatusBadRequest, "model id is required", "invalid_request_error", "missing_model")
-		return
-	}
-	if !auth.ModelAllowed(principal, modelID) {
-		WriteForbidden(w, "model is not allowed for this API key")
-		return
-	}
-	if r.Method == http.MethodDelete {
-		a.handleOpenAIPassthroughWithPrincipal(w, r, principal)
-		return
-	}
-	if r.Method != http.MethodGet {
-		if a.maybeHandleOpenAIPassthrough(w, r, principal) {
-			return
-		}
-		WriteMethodNotAllowed(w)
-		return
-	}
-	model, err := a.provider.GetModel(r.Context(), modelID)
-	if err != nil {
-		a.WriteProviderError(w, err)
-		return
-	}
-	WriteJSON(w, http.StatusOK, model)
-}
-
 func modelIDFromPath(path string) string {
-	for _, prefix := range []string{"/api/v1/models/", "/v1/models/"} {
-		if strings.HasPrefix(path, prefix) {
-			return strings.TrimPrefix(path, prefix)
-		}
-	}
-	return ""
-}
-
-func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
-	if r.Method != http.MethodPost {
-		a.handleOpenAIPassthroughWithPrincipal(w, r, principal)
-		return
-	}
-	if a.prober != nil && !a.prober.Ready() {
-		WriteOpenAIError(w, http.StatusServiceUnavailable, "provider not ready", "server_error", "provider_not_ready")
-		return
-	}
-	if err := a.EnforceBudget(r.Context(), principal); err != nil {
-		a.WriteBudgetError(w, err)
-		return
-	}
-	requestBytes, err := io.ReadAll(io.LimitReader(r.Body, 16*1024*1024))
-	if err != nil {
-		WriteOpenAIError(w, http.StatusBadRequest, "invalid request body", "invalid_request_error", "invalid_body")
-		return
-	}
-
-	var chatReq llm.ChatRequest
-	if err := json.Unmarshal(requestBytes, &chatReq); err != nil {
-		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
-		return
-	}
-	if strings.TrimSpace(chatReq.Model) == "" {
-		WriteOpenAIError(w, http.StatusBadRequest, "model is required", "invalid_request_error", "missing_model")
-		return
-	}
-	if !auth.ModelAllowed(principal, chatReq.Model) {
-		WriteForbidden(w, "model is not allowed for this API key")
-		return
-	}
-
-	if chatReq.Stream {
-		stream, err := a.provider.CreateChatCompletionStream(r.Context(), requestBytes)
-		if err != nil {
-			a.recordParsedUsage(r.Context(), principal, "/api/v1/chat/completions", chatReq.Model, usageParsed{Model: chatReq.Model}, statusForProviderError(err))
-			a.WriteProviderError(w, err)
-			return
-		}
-		defer func() {
-			_ = stream.Close()
-		}()
-
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
-		w.WriteHeader(http.StatusOK)
-
-		flusher, _ := w.(http.Flusher)
-		scanner := bufio.NewScanner(stream)
-		scanner.Buffer(make([]byte, 0, maxSSELineBytes), maxSSELineBytes)
-		usage := usageParsed{Model: chatReq.Model}
-		streamStatusCode := http.StatusOK
-		eventData := make([]byte, 0, 256)
-
-		for scanner.Scan() {
-			line := scanner.Text()
-			if _, writeErr := io.WriteString(w, line); writeErr != nil {
-				streamStatusCode = http.StatusBadGateway
-				break
-			}
-			if _, writeErr := w.Write([]byte{'\n'}); writeErr != nil {
-				streamStatusCode = http.StatusBadGateway
-				break
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
-
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "data:") {
-				data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
-				if data == "" || data == "[DONE]" {
-					continue
-				}
-				if len(eventData)+len(data)+1 > maxSSEEventBytes {
-					eventData = eventData[:0]
-					continue
-				}
-				if len(eventData) > 0 {
-					eventData = append(eventData, '\n')
-				}
-				eventData = append(eventData, []byte(data)...)
-			} else if trimmed == "" && len(eventData) > 0 {
-				if parsed := parseUsageFromResponse(eventData); parsed != (usageParsed{}) {
-					usage = parsed
-				}
-				eventData = eventData[:0]
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			streamStatusCode = http.StatusBadGateway
-		}
-		if len(eventData) > 0 {
-			if parsed := parseUsageFromResponse(eventData); parsed != (usageParsed{}) {
-				usage = parsed
-			}
-		}
-		if usage.Model == "" {
-			usage.Model = chatReq.Model
-		}
-		if a.usageRepo != nil {
-			recordCtx, recordCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-			defer recordCancel()
-			a.RecordUsage(recordCtx, sqlite.UsageRecord{
-				ID:               NewID("usage"),
-				APIKeyID:         principal.APIKeyID,
-				Endpoint:         "/api/v1/chat/completions",
-				Model:            usage.Model,
-				PromptTokens:     usage.PromptTokens,
-				CompletionTokens: usage.CompletionTokens,
-				TotalTokens:      usage.TotalTokens,
-				StatusCode:       streamStatusCode,
-			})
-		}
-		return
-	}
-
-	resp, err := a.provider.CreateChatCompletion(r.Context(), requestBytes)
-	if err != nil {
-		a.recordParsedUsage(r.Context(), principal, "/api/v1/chat/completions", chatReq.Model, usageParsed{Model: chatReq.Model}, statusForProviderError(err))
-		a.WriteProviderError(w, err)
-		return
-	}
-	if a.usageRepo != nil {
-		u := parseUsageFromResponse(resp)
-		recordCtx, recordCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-		defer recordCancel()
-		a.RecordUsage(recordCtx, sqlite.UsageRecord{
-			ID:               NewID("usage"),
-			APIKeyID:         principal.APIKeyID,
-			Endpoint:         "/api/v1/chat/completions",
-			Model:            u.Model,
-			PromptTokens:     u.PromptTokens,
-			CompletionTokens: u.CompletionTokens,
-			TotalTokens:      u.TotalTokens,
-			StatusCode:       http.StatusOK,
-		})
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(resp)
-}
-
-func (a *App) handleEmbeddings(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
-	if r.Method != http.MethodPost {
-		if a.maybeHandleOpenAIPassthrough(w, r, principal) {
-			return
-		}
-		WriteMethodNotAllowed(w)
-		return
-	}
-	if a.prober != nil && !a.prober.Ready() {
-		WriteOpenAIError(w, http.StatusServiceUnavailable, "provider not ready", "server_error", "provider_not_ready")
-		return
-	}
-	if err := a.EnforceBudget(r.Context(), principal); err != nil {
-		a.WriteBudgetError(w, err)
-		return
-	}
-	requestBytes, err := io.ReadAll(io.LimitReader(r.Body, 8*1024*1024))
-	if err != nil {
-		WriteOpenAIError(w, http.StatusBadRequest, "invalid request body", "invalid_request_error", "invalid_body")
-		return
-	}
-
-	var payload struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(requestBytes, &payload); err != nil {
-		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
-		return
-	}
-	if strings.TrimSpace(payload.Model) == "" {
-		WriteOpenAIError(w, http.StatusBadRequest, "model is required", "invalid_request_error", "missing_model")
-		return
-	}
-	if !auth.ModelAllowed(principal, payload.Model) {
-		WriteForbidden(w, "model is not allowed for this API key")
-		return
-	}
-
-	resp, err := a.provider.CreateEmbeddings(r.Context(), requestBytes)
-	if err != nil {
-		a.recordParsedUsage(r.Context(), principal, "/api/v1/embeddings", payload.Model, usageParsed{Model: payload.Model}, statusForProviderError(err))
-		a.WriteProviderError(w, err)
-		return
-	}
-	if a.usageRepo != nil {
-		u := parseUsageFromResponse(resp)
-		if u.TotalTokens == 0 {
-			u.TotalTokens = u.PromptTokens + u.CompletionTokens
-		}
-		recordCtx, recordCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-		defer recordCancel()
-		a.RecordUsage(recordCtx, sqlite.UsageRecord{
-			ID:               NewID("usage"),
-			APIKeyID:         principal.APIKeyID,
-			Endpoint:         "/api/v1/embeddings",
-			Model:            payload.Model,
-			PromptTokens:     u.PromptTokens,
-			CompletionTokens: u.CompletionTokens,
-			TotalTokens:      u.TotalTokens,
-			CostCents:        0,
-			StatusCode:       http.StatusOK,
-		})
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(resp)
+	return strings.TrimPrefix(path, "/v1/models/")
 }
 
 func (a *App) handleAttestationStatus(w http.ResponseWriter, r *http.Request, _ auth.Principal) {
