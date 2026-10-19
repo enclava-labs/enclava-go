@@ -62,7 +62,7 @@
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/>
             </svg>
           </button>
-          {{if eq .AuthMode "password"}}
+          {{if eq .AuthMode "session"}}
           <details class="dashboard-menu dashboard-account-menu">
             <summary class="dashboard-icon-button" title="User menu" aria-label="User menu">
               <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -70,7 +70,7 @@
               </svg>
             </summary>
             <div class="dashboard-menu-panel dashboard-menu-panel-right dashboard-account-panel">
-              <div class="dashboard-menu-header">{{.AdminEmail}}</div>
+              <div class="dashboard-menu-header">Account</div>
               <form method="post" action="/dashboard/logout">
                 <button type="submit" class="dashboard-menu-item dashboard-menu-danger" title="Sign out">
                   Logout

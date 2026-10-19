@@ -142,6 +142,10 @@ func main() {
 	promptSvc := prompts.NewService(promptRepo, chatbotSvc)
 	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG, ragSvc)
 
+	// Browser dashboard login runs on the server-session handlers from 01-12;
+	// the bootstrap slug resolves per request so `enclava bootstrap` order is free.
+	sessionAuth := httpx.NewSessionAuth(authSvc, auth.NewOIDCService(identityRepo, auth.EnvSecretResolver), cfg.SessionTTL, httpx.DashboardTemplates(), "bootstrap")
+
 	app := httpx.NewApp(
 		authSvc,
 		provider,
@@ -161,8 +165,7 @@ func main() {
 		cfg.APIKeyPepper,
 		cfg.APIKeyPrefix,
 		cfg.CORSAllowedOrigins,
-		cfg.AdminEmail,
-		cfg.AdminPassword,
+		sessionAuth,
 		cfg.MaxUploadSizeMB,
 		cfg.TrustProxyHeaders,
 	)

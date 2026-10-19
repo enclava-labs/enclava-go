@@ -2,10 +2,7 @@ package httpx
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 	"embed"
-	"encoding/base64"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -29,6 +26,12 @@ var dashboardTemplateFS embed.FS
 var dashboardStaticFS embed.FS
 
 var dashboardTemplates = template.Must(template.New("").ParseFS(dashboardTemplateFS, "dashboard/templates/*.tmpl"))
+
+// DashboardTemplates exposes the embedded dashboard template set for the
+// session auth handlers constructed in main.
+func DashboardTemplates() *template.Template {
+	return dashboardTemplates
+}
 
 var dashboardStaticFiles fs.FS = func() fs.FS {
 	files, err := fs.Sub(dashboardStaticFS, "dashboard/static")
@@ -106,7 +109,6 @@ type dashboardPageCommon struct {
 	ActivePage    string
 	PageTitle     string
 	AuthMode      string
-	AdminEmail    string
 	DefaultScopes string
 }
 
@@ -139,54 +141,61 @@ type dashboardExtractData struct {
 
 const dashboardBudgetTotalCents int64 = 10000
 
-const dashboardSessionCookieName = "enclava_dashboard_session"
-const dashboardSessionTTL = 12 * time.Hour
-
 func (a *App) registerDashboardRoutes() {
 	a.mux.Handle("/dashboard/static/", http.StripPrefix("/dashboard/static/", http.FileServer(http.FS(dashboardStaticFiles))))
-	a.mux.HandleFunc("/dashboard/login", a.handleDashboardLogin)
-	a.mux.HandleFunc("/dashboard/logout", a.handleDashboardLogout)
-	a.mux.HandleFunc("/dashboard/partials/stats", a.dashboardPartialsAuth(a.handleDashboardStats))
-	a.mux.HandleFunc("/dashboard/partials/keys", a.dashboardPartialsAuth(a.handleDashboardAPIKeys))
-	a.mux.HandleFunc("/dashboard/partials/usage", a.dashboardPartialsAuth(a.handleDashboardUsage))
-	a.mux.HandleFunc("/dashboard/partials/budgets", a.dashboardPartialsAuth(a.handleDashboardBudgets))
-	a.mux.HandleFunc("/dashboard/partials/extract", a.dashboardPartialsAuth(a.handleDashboardExtract))
-	a.mux.HandleFunc("/dashboard/partials/extract/templates", a.dashboardPartialsAuth(a.handleDashboardExtractTemplates))
-	a.mux.HandleFunc("/dashboard/partials/extract/templates/", a.dashboardPartialsAuth(a.handleDashboardExtractTemplateByID))
-	a.mux.HandleFunc("/dashboard/partials/extract/reset-defaults", a.dashboardPartialsAuth(a.handleDashboardExtractResetDefaults))
-	a.mux.HandleFunc("/dashboard/partials/extract/settings", a.dashboardPartialsAuth(a.handleDashboardExtractSettings))
-	a.mux.HandleFunc("/dashboard/partials/extract/process", a.dashboardPartialsAuth(a.handleDashboardExtractProcess))
-	a.mux.HandleFunc("/dashboard/partials/extract/jobs", a.dashboardPartialsAuth(a.handleDashboardExtractJobs))
-	a.mux.HandleFunc("/dashboard/partials/extract/models", a.dashboardPartialsAuth(a.handleDashboardExtractModels))
-	a.mux.HandleFunc("/dashboard/partials/providers", a.dashboardPartialsAuth(a.handleDashboardProviders))
-	a.mux.HandleFunc("/dashboard/partials/pricing", a.dashboardPartialsAuth(a.handleDashboardPricing))
-	a.mux.HandleFunc("/dashboard/partials/billing-audit", a.dashboardPartialsAuth(a.handleDashboardBillingAudit))
-	a.mux.HandleFunc("/dashboard/partials/rag", a.dashboardPartialsAuth(a.handleDashboardRAG))
-	a.mux.HandleFunc("/dashboard/partials/chatbots", a.dashboardPartialsAuth(a.handleDashboardChatbots))
-	a.mux.HandleFunc("/dashboard/partials/prompt-templates", a.dashboardPartialsAuth(a.handleDashboardPromptTemplates))
-	a.mux.HandleFunc("/dashboard/partials/connectors", a.dashboardPartialsAuth(a.handleDashboardConnectors))
-	a.mux.HandleFunc("/dashboard/rag/documents/", a.dashboardPartialsAuth(a.handleDashboardRAGDocumentDownload))
-	a.mux.HandleFunc("/dashboard/extract", a.handleDashboardPageExtract)
-	a.mux.HandleFunc("/dashboard/keys", a.handleDashboardPageKeys)
-	a.mux.HandleFunc("/dashboard/budgets", a.handleDashboardPageBudgets)
-	a.mux.HandleFunc("/dashboard/analytics", a.handleDashboardPageAnalytics)
-	a.mux.HandleFunc("/dashboard/providers", a.handleDashboardPageProviders)
-	a.mux.HandleFunc("/dashboard/pricing", a.handleDashboardPagePricing)
-	a.mux.HandleFunc("/dashboard/billing-audit", a.handleDashboardPageBillingAudit)
-	a.mux.HandleFunc("/dashboard/rag", a.handleDashboardPageRAG)
-	a.mux.HandleFunc("/dashboard/chatbots", a.handleDashboardPageChatbots)
-	a.mux.HandleFunc("/dashboard/prompt-templates", a.handleDashboardPagePromptTemplates)
-	a.mux.HandleFunc("/dashboard/connectors", a.handleDashboardPageConnectors)
-	a.mux.HandleFunc("/dashboard", a.handleDashboardPage)
-	a.mux.HandleFunc("/dashboard/", a.handleDashboardPage)
+	a.mux.HandleFunc("/dashboard/login", a.sessionAuth.HandleLogin)
+	a.mux.HandleFunc("/dashboard/logout", a.sessionAuth.HandleLogout)
+	a.mux.HandleFunc("/auth/oidc/link", a.sessionAuth.HandleLinkIdentity)
+	a.mux.HandleFunc("/auth/oidc/", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/start"):
+			a.sessionAuth.HandleOIDCStart(w, r)
+		case strings.HasSuffix(r.URL.Path, "/callback"):
+			a.sessionAuth.HandleOIDCCallback(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	a.mux.HandleFunc("/dashboard/partials/stats", a.sessionAuth.RequireSession(a.handleDashboardStats))
+	a.mux.HandleFunc("/dashboard/partials/keys", a.sessionAuth.RequireSession(a.handleDashboardAPIKeys))
+	a.mux.HandleFunc("/dashboard/partials/usage", a.sessionAuth.RequireSession(a.handleDashboardUsage))
+	a.mux.HandleFunc("/dashboard/partials/budgets", a.sessionAuth.RequireSession(a.handleDashboardBudgets))
+	a.mux.HandleFunc("/dashboard/partials/extract", a.sessionAuth.RequireSession(a.handleDashboardExtract))
+	a.mux.HandleFunc("/dashboard/partials/extract/templates", a.sessionAuth.RequireSession(a.handleDashboardExtractTemplates))
+	a.mux.HandleFunc("/dashboard/partials/extract/templates/", a.sessionAuth.RequireSession(a.handleDashboardExtractTemplateByID))
+	a.mux.HandleFunc("/dashboard/partials/extract/reset-defaults", a.sessionAuth.RequireSession(a.handleDashboardExtractResetDefaults))
+	a.mux.HandleFunc("/dashboard/partials/extract/settings", a.sessionAuth.RequireSession(a.handleDashboardExtractSettings))
+	a.mux.HandleFunc("/dashboard/partials/extract/process", a.sessionAuth.RequireSession(a.handleDashboardExtractProcess))
+	a.mux.HandleFunc("/dashboard/partials/extract/jobs", a.sessionAuth.RequireSession(a.handleDashboardExtractJobs))
+	a.mux.HandleFunc("/dashboard/partials/extract/models", a.sessionAuth.RequireSession(a.handleDashboardExtractModels))
+	a.mux.HandleFunc("/dashboard/partials/providers", a.sessionAuth.RequireSession(a.handleDashboardProviders))
+	a.mux.HandleFunc("/dashboard/partials/pricing", a.sessionAuth.RequireSession(a.handleDashboardPricing))
+	a.mux.HandleFunc("/dashboard/partials/billing-audit", a.sessionAuth.RequireSession(a.handleDashboardBillingAudit))
+	a.mux.HandleFunc("/dashboard/partials/rag", a.sessionAuth.RequireSession(a.handleDashboardRAG))
+	a.mux.HandleFunc("/dashboard/partials/chatbots", a.sessionAuth.RequireSession(a.handleDashboardChatbots))
+	a.mux.HandleFunc("/dashboard/partials/prompt-templates", a.sessionAuth.RequireSession(a.handleDashboardPromptTemplates))
+	a.mux.HandleFunc("/dashboard/partials/connectors", a.sessionAuth.RequireSession(a.handleDashboardConnectors))
+	a.mux.HandleFunc("/dashboard/rag/documents/", a.sessionAuth.RequireSession(a.handleDashboardRAGDocumentDownload))
+	a.mux.HandleFunc("/dashboard/extract", a.sessionAuth.RequireSession(a.handleDashboardPageExtract))
+	a.mux.HandleFunc("/dashboard/keys", a.sessionAuth.RequireSession(a.handleDashboardPageKeys))
+	a.mux.HandleFunc("/dashboard/budgets", a.sessionAuth.RequireSession(a.handleDashboardPageBudgets))
+	a.mux.HandleFunc("/dashboard/analytics", a.sessionAuth.RequireSession(a.handleDashboardPageAnalytics))
+	a.mux.HandleFunc("/dashboard/providers", a.sessionAuth.RequireSession(a.handleDashboardPageProviders))
+	a.mux.HandleFunc("/dashboard/pricing", a.sessionAuth.RequireSession(a.handleDashboardPagePricing))
+	a.mux.HandleFunc("/dashboard/billing-audit", a.sessionAuth.RequireSession(a.handleDashboardPageBillingAudit))
+	a.mux.HandleFunc("/dashboard/rag", a.sessionAuth.RequireSession(a.handleDashboardPageRAG))
+	a.mux.HandleFunc("/dashboard/chatbots", a.sessionAuth.RequireSession(a.handleDashboardPageChatbots))
+	a.mux.HandleFunc("/dashboard/prompt-templates", a.sessionAuth.RequireSession(a.handleDashboardPagePromptTemplates))
+	a.mux.HandleFunc("/dashboard/connectors", a.sessionAuth.RequireSession(a.handleDashboardPageConnectors))
+	a.mux.HandleFunc("/dashboard", a.sessionAuth.RequireSession(a.handleDashboardPage))
+	a.mux.HandleFunc("/dashboard/", a.sessionAuth.RequireSession(a.handleDashboardPage))
 }
 
 func (a *App) dashboardPageData(activePage, pageTitle string) dashboardPageCommon {
 	return dashboardPageCommon{
 		ActivePage:    activePage,
 		PageTitle:     pageTitle,
-		AuthMode:      a.dashboardAuthMode(),
-		AdminEmail:    a.adminEmail,
+		AuthMode:      "session",
 		DefaultScopes: strings.Join(dashboardDefaultScopes, ", "),
 	}
 }
@@ -194,10 +203,6 @@ func (a *App) dashboardPageData(activePage, pageTitle string) dashboardPageCommo
 func (a *App) handleDashboardPage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		WriteMethodNotAllowed(w)
-		return
-	}
-	if a.dashboardPasswordAuthEnabled() && !a.dashboardSessionValid(r) {
-		http.Redirect(w, r, "/dashboard/login", http.StatusSeeOther)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -212,10 +217,6 @@ func (a *App) handleDashboardPageKeys(w http.ResponseWriter, r *http.Request) {
 		WriteMethodNotAllowed(w)
 		return
 	}
-	if a.dashboardPasswordAuthEnabled() && !a.dashboardSessionValid(r) {
-		http.Redirect(w, r, "/dashboard/login", http.StatusSeeOther)
-		return
-	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := dashboardTemplates.ExecuteTemplate(w, "page-keys", a.dashboardPageData("keys", "API Keys")); err != nil {
 		log.Printf("failed to render dashboard keys page: %v", err)
@@ -226,10 +227,6 @@ func (a *App) handleDashboardPageKeys(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleDashboardPageAnalytics(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		WriteMethodNotAllowed(w)
-		return
-	}
-	if a.dashboardPasswordAuthEnabled() && !a.dashboardSessionValid(r) {
-		http.Redirect(w, r, "/dashboard/login", http.StatusSeeOther)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -244,10 +241,6 @@ func (a *App) handleDashboardPageBudgets(w http.ResponseWriter, r *http.Request)
 		WriteMethodNotAllowed(w)
 		return
 	}
-	if a.dashboardPasswordAuthEnabled() && !a.dashboardSessionValid(r) {
-		http.Redirect(w, r, "/dashboard/login", http.StatusSeeOther)
-		return
-	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := dashboardTemplates.ExecuteTemplate(w, "page-budgets", a.dashboardPageData("budgets", "Budgets")); err != nil {
 		log.Printf("failed to render dashboard budgets page: %v", err)
@@ -260,196 +253,11 @@ func (a *App) handleDashboardPageExtract(w http.ResponseWriter, r *http.Request)
 		WriteMethodNotAllowed(w)
 		return
 	}
-	if a.dashboardPasswordAuthEnabled() && !a.dashboardSessionValid(r) {
-		http.Redirect(w, r, "/dashboard/login", http.StatusSeeOther)
-		return
-	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := dashboardTemplates.ExecuteTemplate(w, "page-extract", a.dashboardPageData("extract", "Extract")); err != nil {
 		log.Printf("failed to render dashboard extract page: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_extract_page_render_failed")
 	}
-}
-
-func (a *App) handleDashboardLogin(w http.ResponseWriter, r *http.Request) {
-	setNoStoreHeaders(w)
-	if !a.dashboardPasswordAuthEnabled() {
-		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
-		return
-	}
-	switch r.Method {
-	case http.MethodGet:
-		if a.dashboardSessionValid(r) {
-			http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
-			return
-		}
-		a.renderDashboardLogin(w, dashboardLoginData{Email: a.adminEmail})
-	case http.MethodPost:
-		if err := r.ParseForm(); err != nil {
-			a.renderDashboardLogin(w, dashboardLoginData{
-				Email: strings.TrimSpace(r.FormValue("email")),
-				Error: "Invalid form submission",
-			})
-			return
-		}
-		email := strings.TrimSpace(r.FormValue("email"))
-		password := r.FormValue("password")
-		if !a.dashboardCredentialsValid(email, password) {
-			a.renderDashboardLogin(w, dashboardLoginData{
-				Email: email,
-				Error: "Invalid email or password",
-			})
-			return
-		}
-		a.setDashboardSession(w, r, a.adminEmail)
-		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
-	default:
-		WriteMethodNotAllowed(w)
-	}
-}
-
-func (a *App) handleDashboardLogout(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	a.clearDashboardSession(w, r)
-	target := "/dashboard"
-	if a.dashboardPasswordAuthEnabled() {
-		target = "/dashboard/login"
-	}
-	http.Redirect(w, r, target, http.StatusSeeOther)
-}
-
-func (a *App) renderDashboardLogin(w http.ResponseWriter, data dashboardLoginData) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "login.tmpl", data); err != nil {
-		log.Printf("failed to render dashboard login page: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_login_render_failed")
-	}
-}
-
-func (a *App) dashboardPartialsAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if a.dashboardPasswordAuthEnabled() {
-			if !a.dashboardSessionValid(r) {
-				WriteUnauthorized(w, "dashboard login required")
-				return
-			}
-			next(w, r)
-			return
-		}
-		a.authenticated("platform.admin", func(w http.ResponseWriter, r *http.Request, _ auth.Principal) {
-			next(w, r)
-		})(w, r)
-	}
-}
-
-func (a *App) dashboardAuthMode() string {
-	if a.dashboardPasswordAuthEnabled() {
-		return "password"
-	}
-	return "api_key"
-}
-
-func (a *App) dashboardPasswordAuthEnabled() bool {
-	return strings.TrimSpace(a.adminEmail) != "" && strings.TrimSpace(a.adminPassword) != ""
-}
-
-func (a *App) dashboardCredentialsValid(email, password string) bool {
-	configuredEmail := strings.ToLower(strings.TrimSpace(a.adminEmail))
-	inputEmail := strings.ToLower(strings.TrimSpace(email))
-	return secureStringEqual(configuredEmail, inputEmail) && secureStringEqual(a.adminPassword, password)
-}
-
-func secureStringEqual(left, right string) bool {
-	l := sha256.Sum256([]byte(left))
-	r := sha256.Sum256([]byte(right))
-	return hmac.Equal(l[:], r[:])
-}
-
-func (a *App) setDashboardSession(w http.ResponseWriter, r *http.Request, email string) {
-	expiresAt := time.Now().UTC().Add(dashboardSessionTTL)
-	payload := fmt.Sprintf("%s|%d", strings.TrimSpace(email), expiresAt.Unix())
-	signature := a.signDashboardPayload(payload)
-	token := base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + base64.RawURLEncoding.EncodeToString(signature)
-	http.SetCookie(w, &http.Cookie{
-		Name:     dashboardSessionCookieName,
-		Value:    token,
-		Path:     "/dashboard",
-		Expires:  expiresAt,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil,
-	})
-}
-
-func (a *App) clearDashboardSession(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     dashboardSessionCookieName,
-		Value:    "",
-		Path:     "/dashboard",
-		MaxAge:   -1,
-		Expires:  time.Unix(0, 0),
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil,
-	})
-}
-
-func (a *App) dashboardSessionValid(r *http.Request) bool {
-	cookie, err := r.Cookie(dashboardSessionCookieName)
-	if err != nil || strings.TrimSpace(cookie.Value) == "" {
-		return false
-	}
-
-	parts := strings.Split(cookie.Value, ".")
-	if len(parts) != 2 {
-		return false
-	}
-	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil {
-		return false
-	}
-	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return false
-	}
-
-	payload := string(payloadBytes)
-	expected := a.signDashboardPayload(payload)
-	if !hmac.Equal(signature, expected) {
-		return false
-	}
-
-	sep := strings.LastIndex(payload, "|")
-	if sep <= 0 {
-		return false
-	}
-	email := strings.TrimSpace(payload[:sep])
-	expRaw := payload[sep+1:]
-	expUnix, err := strconv.ParseInt(expRaw, 10, 64)
-	if err != nil || expUnix <= 0 {
-		return false
-	}
-	if time.Now().UTC().After(time.Unix(expUnix, 0)) {
-		return false
-	}
-	return secureStringEqual(strings.ToLower(email), strings.ToLower(strings.TrimSpace(a.adminEmail)))
-}
-
-func (a *App) signDashboardPayload(payload string) []byte {
-	mac := hmac.New(sha256.New, []byte(a.dashboardSessionSecret()))
-	_, _ = mac.Write([]byte(payload))
-	return mac.Sum(nil)
-}
-
-func (a *App) dashboardSessionSecret() string {
-	pepper := strings.TrimSpace(a.apiKeyPepper)
-	if pepper != "" {
-		return pepper + "|" + a.adminPassword
-	}
-	return "enclava-dashboard|" + a.apiKeyPrefix + "|" + a.adminPassword
 }
 
 func (a *App) handleDashboardStats(w http.ResponseWriter, r *http.Request) {

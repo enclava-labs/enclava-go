@@ -985,8 +985,7 @@ func newOpenAIContractApp(t *testing.T, ctx context.Context) (*sqlite.DB, contra
 		"",
 		"enc_",
 		nil,
-		"",
-		"",
+		nil,
 		5,
 		false,
 	)

@@ -144,10 +144,6 @@ func (a *App) renderDashboardResourcePage(w http.ResponseWriter, r *http.Request
 		WriteMethodNotAllowed(w)
 		return
 	}
-	if a.dashboardPasswordAuthEnabled() && !a.dashboardSessionValid(r) {
-		http.Redirect(w, r, "/dashboard/login", http.StatusSeeOther)
-		return
-	}
 	data := dashboardResourcePageData{
 		dashboardPageCommon: a.dashboardPageData(activePage, pageTitle),
 		Heading:             pageTitle,
