@@ -89,10 +89,10 @@ type AttestationProvider interface {
 const (
 	maxJSONBodyBytes      int64 = 8 * 1024 * 1024
 	maxErrorBodyBytes     int64 = 2 * 1024 * 1024
-	defaultResponseHeader      = 30 * time.Second
-	defaultStreamHeader        = 5 * time.Minute
-	defaultStreamIdle          = 3 * time.Minute
-	defaultStreamWall          = 30 * time.Minute
+	defaultResponseHeader       = 30 * time.Second
+	defaultStreamHeader         = 5 * time.Minute
+	defaultStreamIdle           = 3 * time.Minute
+	defaultStreamWall           = 30 * time.Minute
 )
 
 var errResponseTooLarge = errors.New("upstream response body exceeds maximum size")
