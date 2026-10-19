@@ -16,6 +16,7 @@ import (
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/chatbot"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/llm"
 )
 
@@ -172,22 +173,21 @@ func (a *App) handleExternalChatbotCompletion(w http.ResponseWriter, r *http.Req
 }
 
 func (a *App) handleExternalChatbotCompletionStream(w http.ResponseWriter, r *http.Request, principal auth.Principal, ref string, requestBytes []byte) {
-	prepared, err := a.chatbotSvc.PrepareChatCompletion(r.Context(), principal, ref, requestBytes, true)
+	ctx := r.Context()
+	prepared, err := a.chatbotSvc.PrepareChatCompletion(ctx, principal, ref, requestBytes, true)
 	if err != nil {
-		a.writeChatbotCompletionError(w, r.Context(), err)
+		a.writeChatbotCompletionError(w, ctx, err)
 		return
 	}
-	stream, err := a.provider.CreateChatCompletionStream(r.Context(), prepared.UpstreamRequest)
+	res, err := a.chatbotSvc.ExecutePrepared(ctx, principal, prepared)
 	if err != nil {
-		recordCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-		defer cancel()
-		a.chatbotSvc.RecordFailure(recordCtx, principal, prepared, statusForProviderError(err))
-		a.WriteProviderError(w, err)
+		a.writeChatbotCompletionError(w, ctx, err)
 		return
 	}
-	defer func() {
-		_ = stream.Close()
-	}()
+	// The executor's accounting stream owns settlement: closing it after a
+	// completed, errored or abandoned read settles or retains liability —
+	// the upstream body is never left open on client disconnect.
+	defer func() { _ = res.Body.Close() }()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -198,28 +198,24 @@ func (a *App) handleExternalChatbotCompletionStream(w http.ResponseWriter, r *ht
 	w.WriteHeader(http.StatusOK)
 
 	flusher, _ := w.(http.Flusher)
-	scanner := bufio.NewScanner(stream)
+	scanner := bufio.NewScanner(res.Body)
 	scanner.Buffer(make([]byte, 0, maxSSELineBytes), maxSSELineBytes)
-	usage := usageParsed{Model: prepared.Model}
-	streamStatusCode := http.StatusOK
 	eventData := make([]byte, 0, 256)
 	var assistant strings.Builder
 
 	for {
+		if ctx.Err() != nil {
+			break
+		}
 		if !scanner.Scan() {
-			if err := scanner.Err(); err != nil {
-				streamStatusCode = http.StatusBadGateway
-			}
 			break
 		}
 
 		line := scanner.Text()
 		if _, writeErr := io.WriteString(w, line); writeErr != nil {
-			streamStatusCode = http.StatusBadGateway
 			break
 		}
 		if _, writeErr := w.Write([]byte{'\n'}); writeErr != nil {
-			streamStatusCode = http.StatusBadGateway
 			break
 		}
 		if flusher != nil {
@@ -241,34 +237,23 @@ func (a *App) handleExternalChatbotCompletionStream(w http.ResponseWriter, r *ht
 			}
 			eventData = append(eventData, []byte(data)...)
 		} else if trimmed == "" && len(eventData) > 0 {
-			a.applyChatbotStreamEvent(eventData, &usage, &assistant)
+			if delta := parseChatbotStreamingAssistantDelta(eventData); delta != "" {
+				assistant.WriteString(delta)
+			}
 			eventData = eventData[:0]
 		}
 	}
 	if len(eventData) > 0 {
-		a.applyChatbotStreamEvent(eventData, &usage, &assistant)
-	}
-	if usage.Model == "" {
-		usage.Model = prepared.Model
+		if delta := parseChatbotStreamingAssistantDelta(eventData); delta != "" {
+			assistant.WriteString(delta)
+		}
 	}
 
-	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	a.chatbotSvc.RecordCompletion(recordCtx, principal, prepared, assistant.String(), usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, streamStatusCode)
-}
-
-func (a *App) applyChatbotStreamEvent(eventData []byte, usage *usageParsed, assistant *strings.Builder) {
-	if delta := parseChatbotStreamingAssistantDelta(eventData); delta != "" {
-		assistant.WriteString(delta)
+	if err := a.chatbotSvc.PersistAssistantMessage(recordCtx, principal, prepared, assistant.String()); err != nil {
+		log.Printf("chatbot assistant message persist failed: %v", err)
 	}
-	parsed := parseUsageFromResponse(eventData)
-	if parsed == (usageParsed{}) {
-		return
-	}
-	if parsed.Model == "" {
-		parsed.Model = usage.Model
-	}
-	*usage = parsed
 }
 
 func chatbotRequestWantsStream(body []byte) bool {
@@ -342,6 +327,16 @@ func (a *App) writeChatbotCompletionError(w http.ResponseWriter, ctx context.Con
 	var upstream *llm.UpstreamError
 	if errors.As(err, &upstream) {
 		a.WriteProviderError(w, upstream)
+		return
+	}
+	// Executor denial families map to typed public outcomes; internal detail
+	// never reaches the client.
+	if errors.Is(err, inference.ErrDenied) || errors.Is(err, inference.ErrNoRoute) {
+		WriteForbidden(w, "request denied")
+		return
+	}
+	if errors.Is(err, inference.ErrUnbounded) || errors.Is(err, inference.ErrUnsupportedCapability) {
+		WriteOpenAIError(w, http.StatusBadRequest, "invalid inference request", "invalid_request_error", "chatbot_completion_failed")
 		return
 	}
 	status, message, code := classifyChatbotCompletionError(ctx, err)

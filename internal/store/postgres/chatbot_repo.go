@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"enclava-go/internal/chatbot"
+	"enclava-go/internal/inference"
 )
 
 // ChatbotRepo implements chatbot.Repository over the tenant-scoped chatbots,
@@ -231,3 +232,28 @@ func (r *ChatbotRepo) ListMessages(ctx context.Context, tenantID, conversationID
 	}
 	return out, nil
 }
+
+// ChatbotConversationStore adapts ChatbotRepo to inference.ConversationStore
+// so retained conversations are first-class authorized inputs at the shared
+// executor boundary.
+type ChatbotConversationStore struct {
+	repo *ChatbotRepo
+}
+
+func NewChatbotConversationStore(repo *ChatbotRepo) *ChatbotConversationStore {
+	return &ChatbotConversationStore{repo: repo}
+}
+
+func (s *ChatbotConversationStore) GetConversation(ctx context.Context, tenantID, id string) (inference.Conversation, error) {
+	c, err := s.repo.GetConversation(ctx, tenantID, id)
+	if err != nil {
+		return inference.Conversation{}, err
+	}
+	return inference.Conversation{
+		TenantID:     c.TenantID,
+		ID:           c.ID,
+		OwnerActorID: c.OwnerActorID,
+	}, nil
+}
+
+var _ inference.ConversationStore = (*ChatbotConversationStore)(nil)

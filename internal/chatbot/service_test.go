@@ -8,10 +8,14 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
 	"enclava-go/internal/chatbot"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/llm"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
@@ -20,20 +24,17 @@ import (
 	"enclava-go/internal/testdb"
 )
 
-type fakeChatProvider struct {
+// fakeChatUpstream is the transport seam the executor dispatches on —
+// tests drive the real inference.Service, never a provider shortcut.
+type fakeChatUpstream struct {
 	lastRequest []byte
+	streamBody  io.ReadCloser
 	err         error
+	calls       int32
 }
 
-func (f *fakeChatProvider) ListModels(ctx context.Context) (llm.ModelsResponse, error) {
-	return llm.ModelsResponse{Object: "list", Data: []llm.Model{{ID: "chat-test-model"}}}, nil
-}
-
-func (f *fakeChatProvider) GetModel(ctx context.Context, modelID string) (llm.Model, error) {
-	return llm.Model{ID: modelID, Object: "model"}, nil
-}
-
-func (f *fakeChatProvider) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
+func (f *fakeChatUpstream) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
+	atomic.AddInt32(&f.calls, 1)
 	f.lastRequest = append([]byte(nil), body...)
 	if f.err != nil {
 		return nil, f.err
@@ -41,12 +42,25 @@ func (f *fakeChatProvider) CreateChatCompletion(ctx context.Context, body []byte
 	return []byte(`{"id":"chatcmpl_test","object":"chat.completion","model":"chat-test-model","choices":[{"index":0,"message":{"role":"assistant","content":"RAG answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`), nil
 }
 
-func (f *fakeChatProvider) CreateChatCompletionStream(ctx context.Context, body []byte) (io.ReadCloser, error) {
+func (f *fakeChatUpstream) CreateChatCompletionStream(ctx context.Context, body []byte) (io.ReadCloser, error) {
+	atomic.AddInt32(&f.calls, 1)
+	f.lastRequest = append([]byte(nil), body...)
+	if f.streamBody != nil {
+		return f.streamBody, nil
+	}
 	return io.NopCloser(strings.NewReader("")), nil
 }
 
-func (f *fakeChatProvider) CreateEmbeddings(ctx context.Context, body []byte) ([]byte, error) {
+func (f *fakeChatUpstream) CreateEmbeddings(ctx context.Context, body []byte) ([]byte, error) {
 	return nil, nil
+}
+
+func (f *fakeChatUpstream) DoResponsesRequest(ctx context.Context, method, path string, body []byte) ([]byte, error) {
+	return nil, inference.ErrUnsupportedCapability
+}
+
+func (f *fakeChatUpstream) DoResponsesStream(ctx context.Context, method, path string, body []byte) (io.ReadCloser, error) {
+	return nil, inference.ErrUnsupportedCapability
 }
 
 type fakeRAGSearcher struct {
@@ -72,59 +86,91 @@ func (f *fakeRAGSearcher) Search(ctx context.Context, p auth.Principal, input ra
 	}, nil
 }
 
-type fakeUsageRecorder struct {
-	records []chatbot.UsageRecord
-}
-
-func (f *fakeUsageRecorder) Record(ctx context.Context, rec chatbot.UsageRecord) error {
-	f.records = append(f.records, rec)
-	return nil
-}
-
 type chatFixture struct {
-	svc        *chatbot.Service
-	chatRepo   *postgres.ChatbotRepo
-	promptRepo *postgres.PromptsRepo
-	provider   *fakeChatProvider
-	rag        *fakeRAGSearcher
-	usage      *fakeUsageRecorder
-	tenantA    string
-	tenantB    string
+	svc         *chatbot.Service
+	chatRepo    *postgres.ChatbotRepo
+	promptRepo  *postgres.PromptsRepo
+	sourceRepo  *postgres.SourceRepo
+	billingRepo *postgres.BillingRepo
+	upstream    *fakeChatUpstream
+	rag         *fakeRAGSearcher
+	tenantA     string
+	tenantB     string
 }
 
-func newChatFixture(t *testing.T, searcher *fakeRAGSearcher, provider *fakeChatProvider) *chatFixture {
+// newChatFixture composes the real shared executor over postgres seams with
+// the fake transport, a chat-capable endpoint and input/output prices so
+// completions exercise the same reservation path as production.
+func newChatFixture(t *testing.T, searcher *fakeRAGSearcher, upstream *fakeChatUpstream) *chatFixture {
 	t.Helper()
+	ctx := context.Background()
 	db := testdb.New(t)
 	tenantA := testdb.SeedTenant(t, db, "chat-a")
 	tenantB := testdb.SeedTenant(t, db, "chat-b")
 	chatRepo := postgres.NewChatbotRepo(db)
 	promptRepo := postgres.NewPromptsRepo(db)
-	if provider == nil {
-		provider = &fakeChatProvider{}
+	sourceRepo := postgres.NewSourceRepo(db)
+	billingRepo := postgres.NewBillingRepo(db)
+	endpoints := postgres.NewEndpointsRepo(db)
+	if upstream == nil {
+		upstream = &fakeChatUpstream{}
 	}
-	usage := &fakeUsageRecorder{}
-	svc := chatbot.NewService(chatRepo, promptRepo, searcher, provider, usage)
+	if err := endpoints.Create(ctx, inference.Endpoint{
+		ID: "ep-chat", TenantID: tenantA, Protocol: "openai_compatible",
+		BaseOrigin:   "https://chat.upstream.example",
+		Capabilities: []string{inference.CapabilityChat, inference.CapabilityVision, "model:chat-test-model"},
+		Enabled:      true,
+	}); err != nil {
+		t.Fatalf("create endpoint: %v", err)
+	}
+	for _, unit := range []billing.UnitKind{billing.UnitInput, billing.UnitOutput} {
+		if err := billingRepo.PutPrice(ctx, tenantA,
+			fmt.Sprintf("p-chat-%s-%d", unit, time.Now().UnixNano()),
+			billing.Price{
+				SubjectType: billing.PriceSubjectEndpoint, SubjectID: "ep-chat",
+				Capability: inference.CapabilityChat, Unit: unit,
+				RateMicros: 1, UnitQuantity: 1, Currency: "USD",
+			}, "tester", time.Now().UTC().Add(-time.Minute)); err != nil {
+			t.Fatalf("put price: %v", err)
+		}
+	}
+	executor, err := inference.NewService(inference.Deps{
+		Endpoints:     endpoints,
+		Sources:       sourceRepo,
+		Authorizer:    source.NewAuthorizer(sourceRepo, 0),
+		Billing:       billing.NewService(billingRepo),
+		Artifacts:     postgres.NewArtifactRepo(db),
+		Conversations: postgres.NewChatbotConversationStore(chatRepo),
+	}, inference.WithTransportFactory(func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {
+		return upstream, nil
+	}))
+	if err != nil {
+		t.Fatalf("new inference service: %v", err)
+	}
+	svc := chatbot.NewService(chatRepo, promptRepo, searcher, executor)
 	return &chatFixture{
-		svc:        svc,
-		chatRepo:   chatRepo,
-		promptRepo: promptRepo,
-		provider:   provider,
-		rag:        searcher,
-		usage:      usage,
-		tenantA:    tenantA,
-		tenantB:    tenantB,
+		svc:         svc,
+		chatRepo:    chatRepo,
+		promptRepo:  promptRepo,
+		sourceRepo:  sourceRepo,
+		billingRepo: billingRepo,
+		upstream:    upstream,
+		rag:         searcher,
+		tenantA:     tenantA,
+		tenantB:     tenantB,
 	}
 }
 
 func openPrincipal(tenantID string) auth.Principal {
 	return auth.Principal{
-		TenantID:           tenantID,
-		ActorID:            "key_actor_1",
-		ActorKind:          auth.ActorKindServiceAccount,
-		APIKeyID:           7,
-		AllowedModelsAll:   true,
-		AllowedChatbotsAll: true,
-		AllowedAgentsAll:   true,
+		TenantID:            tenantID,
+		ActorID:             "key_actor_1",
+		ActorKind:           auth.ActorKindServiceAccount,
+		APIKeyID:            7,
+		AllowedModelsAll:    true,
+		AllowedChatbotsAll:  true,
+		AllowedAgentsAll:    true,
+		AllowedEndpointsAll: true,
 	}
 }
 
@@ -140,6 +186,9 @@ func TestCreateChatCompletionInjectsRAGAndPersistsConversation(t *testing.T) {
 	searcher := &fakeRAGSearcher{}
 	f := newChatFixture(t, searcher, nil)
 	p := openPrincipal(f.tenantA)
+	// The retrieved chunk references a real readable source object so the
+	// executor sees the same evidence the searcher returned.
+	seedReadableObject(t, f, p, "doc_1")
 
 	err := f.promptRepo.Create(ctx, prompts.Template{
 		TenantID:     f.tenantA,
@@ -198,7 +247,7 @@ func TestCreateChatCompletionInjectsRAGAndPersistsConversation(t *testing.T) {
 			Content string `json:"content"`
 		} `json:"messages"`
 	}
-	if err := json.Unmarshal(f.provider.lastRequest, &upstream); err != nil {
+	if err := json.Unmarshal(f.upstream.lastRequest, &upstream); err != nil {
 		t.Fatalf("decode upstream request: %v", err)
 	}
 	if upstream.Model != "chat-test-model" {
@@ -236,18 +285,80 @@ func TestCreateChatCompletionInjectsRAGAndPersistsConversation(t *testing.T) {
 		t.Fatalf("unexpected persisted assistant message: %#v", messages[1])
 	}
 
-	if len(f.usage.records) != 1 {
-		t.Fatalf("expected one usage record, got %d", len(f.usage.records))
-	}
-	rec := f.usage.records[0]
-	if rec.ChatbotID != bot.ID || rec.TotalTokens != 10 || rec.APIKeyID != p.APIKeyID {
-		t.Fatalf("unexpected usage record: %#v", rec)
+	// The executor's settlement record is the single accounting artifact —
+	// no duplicate usage row exists on the assistant path.
+	if out.Usage == nil || out.Usage.Units[billing.UnitInput] != 7 || out.Usage.Units[billing.UnitOutput] != 3 {
+		t.Fatalf("unexpected settlement evidence: %#v", out.Usage)
 	}
 }
 
-func TestPrepareChatCompletionSupportsStreamingAndRecordCompletion(t *testing.T) {
+func TestRestrictedRAGSourceDeniesIncompatibleEndpoint(t *testing.T) {
+	ctx := context.Background()
+	searcher := &fakeRAGSearcher{}
+	f := newChatFixture(t, searcher, nil)
+	p := openPrincipal(f.tenantA)
+	seedReadableObject(t, f, p, "doc_1")
+
+	// Require "high" assurance on the retrieved object: the seeded
+	// openai_compatible endpoint cannot prove it, so dispatch must never
+	// happen.
+	if err := f.sourceRepo.SetRestriction(ctx, source.SourceRestriction{
+		TenantID:          f.tenantA,
+		SubjectKind:       source.RestrictionObject,
+		SubjectID:         "doc_1",
+		RequiredAssurance: "high",
+	}); err != nil {
+		t.Fatalf("set restriction: %v", err)
+	}
+
+	if _, err := f.svc.Create(ctx, p, chatbot.CreateChatbotInput{
+		Name:             "Restricted Bot",
+		Model:            "chat-test-model",
+		ExternalID:       "restricted_bot",
+		RAGCollectionIDs: []string{"ragcol_test"},
+	}); err != nil {
+		t.Fatalf("create chatbot: %v", err)
+	}
+
+	_, err := f.svc.CreateChatCompletion(ctx, p, "restricted_bot", []byte(`{
+		"messages": [{"role":"user","content":"tell me about the launch note"}]
+	}`))
+	if err == nil {
+		t.Fatal("restricted source reached dispatch")
+	}
+	if !errors.Is(err, inference.ErrNoRoute) && !errors.Is(err, inference.ErrDenied) {
+		t.Fatalf("expected executor denial, got %v", err)
+	}
+	if atomic.LoadInt32(&f.upstream.calls) != 0 {
+		t.Fatalf("upstream dispatched %d times on a denied route", f.upstream.calls)
+	}
+}
+
+// seedReadableObject inserts a tenant-owned source object the actor may read,
+// matching what rag search returns as evidence.
+func seedReadableObject(t *testing.T, f *chatFixture, p auth.Principal, id string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := f.sourceRepo.UpsertObject(ctx, source.Object{
+		TenantID: f.tenantA, ID: id, Kind: "file", NativeID: "n-" + id,
+		AuthorizationMode: source.AuthorizationOwner, OwnerActorID: p.ActorID,
+		ObservedSeq: 1}); err != nil {
+		t.Fatalf("upsert object: %v", err)
+	}
+	if err := f.sourceRepo.InsertObjectVersion(ctx, f.tenantA, source.ObjectVersion{
+		ObjectID: id, ObservedSeq: 1, ArtifactRef: "art-" + id,
+		SHA256: "aa", ByteSize: 10, MimeType: "text/plain"}); err != nil {
+		t.Fatalf("insert version: %v", err)
+	}
+}
+
+func TestPrepareChatCompletionSupportsStreamingAndPersistAssistant(t *testing.T) {
 	ctx := context.Background()
 	f := newChatFixture(t, nil, nil)
+	f.upstream.streamBody = io.NopCloser(strings.NewReader(
+		"data: {\"choices\":[{\"delta\":{\"content\":\"streamed \"}}]}\n\n" +
+			"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"total_tokens\":16}}\n\n" +
+			"data: [DONE]\n\n"))
 	p := openPrincipal(f.tenantA)
 
 	bot, err := f.svc.Create(ctx, p, chatbot.CreateChatbotInput{
@@ -267,8 +378,8 @@ func TestPrepareChatCompletionSupportsStreamingAndRecordCompletion(t *testing.T)
 	if err != nil {
 		t.Fatalf("prepare streaming completion: %v", err)
 	}
-	if prepared.Chatbot.ID != bot.ID || prepared.APIKeyID != p.APIKeyID {
-		t.Fatalf("unexpected prepared metadata: %#v", prepared)
+	if prepared.Chatbot.ID != bot.ID {
+		t.Fatalf("unexpected prepared chatbot: %#v", prepared.Chatbot.ID)
 	}
 
 	var upstream struct {
@@ -279,10 +390,10 @@ func TestPrepareChatCompletionSupportsStreamingAndRecordCompletion(t *testing.T)
 			Content string `json:"content"`
 		} `json:"messages"`
 	}
-	if err := json.Unmarshal(prepared.UpstreamRequest, &upstream); err != nil {
+	if err := json.Unmarshal(prepared.Request.Payload, &upstream); err != nil {
 		t.Fatalf("decode upstream request: %v", err)
 	}
-	if upstream.Model != "chat-test-model" || !upstream.Stream {
+	if upstream.Model != "chat-test-model" || !upstream.Stream || !prepared.Request.Stream {
 		t.Fatalf("unexpected upstream model/stream: model=%q stream=%v", upstream.Model, upstream.Stream)
 	}
 
@@ -294,9 +405,22 @@ func TestPrepareChatCompletionSupportsStreamingAndRecordCompletion(t *testing.T)
 		t.Fatalf("expected only request message after prepare, got %#v", messages)
 	}
 
-	record := f.svc.RecordCompletion(ctx, p, prepared, "streamed answer", 11, 5, 16, 200)
-	if record.APIKeyID != p.APIKeyID || record.ChatbotID != bot.ID || record.TotalTokens != 16 {
-		t.Fatalf("unexpected usage record: %#v", record)
+	// Dispatch runs only through the shared executor.
+	res, err := f.svc.ExecutePrepared(ctx, p, prepared)
+	if err != nil {
+		t.Fatalf("execute prepared: %v", err)
+	}
+	streamed, err := io.ReadAll(res.Body)
+	_ = res.Body.Close()
+	if err != nil {
+		t.Fatalf("read stream: %v", err)
+	}
+	if !strings.Contains(string(streamed), "streamed ") {
+		t.Fatalf("unexpected stream body: %s", streamed)
+	}
+
+	if err := f.svc.PersistAssistantMessage(ctx, p, prepared, "streamed answer"); err != nil {
+		t.Fatalf("persist assistant message: %v", err)
 	}
 
 	messages, err = f.chatRepo.ListMessages(ctx, f.tenantA, prepared.Conversation.ID)
@@ -311,33 +435,32 @@ func TestPrepareChatCompletionSupportsStreamingAndRecordCompletion(t *testing.T)
 	}
 }
 
-func TestCreateChatCompletionProviderFailureRecordsUsage(t *testing.T) {
+func TestCreateChatCompletionUpstreamFailurePreservesError(t *testing.T) {
 	ctx := context.Background()
-	f := newChatFixture(t, nil, &fakeChatProvider{err: &llm.UpstreamError{StatusCode: 429, Message: "upstream rate limited"}})
+	upErr := &llm.UpstreamError{StatusCode: 429, Message: "upstream rate limited"}
+	f := newChatFixture(t, nil, &fakeChatUpstream{err: upErr})
 	p := openPrincipal(f.tenantA)
 
-	bot, err := f.svc.Create(ctx, p, chatbot.CreateChatbotInput{
+	if _, err := f.svc.Create(ctx, p, chatbot.CreateChatbotInput{
 		Name:       "Failure Bot",
 		Model:      "chat-test-model",
 		ExternalID: "failure_bot",
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("create chatbot: %v", err)
 	}
 
-	_, err = f.svc.CreateChatCompletion(ctx, p, "failure_bot", []byte(`{
+	_, err := f.svc.CreateChatCompletion(ctx, p, "failure_bot", []byte(`{
 		"messages": [{"role":"user","content":"will fail"}]
 	}`))
 	if err == nil {
 		t.Fatalf("expected provider error")
 	}
-
-	if len(f.usage.records) != 1 {
-		t.Fatalf("expected one usage record, got %d", len(f.usage.records))
+	var upstreamErr *llm.UpstreamError
+	if !errors.As(err, &upstreamErr) || upstreamErr.StatusCode != 429 {
+		t.Fatalf("real upstream error must surface, got %v", err)
 	}
-	rec := f.usage.records[0]
-	if rec.ChatbotID != bot.ID || rec.StatusCode != 429 || rec.TotalTokens != 0 {
-		t.Fatalf("unexpected failed usage record: %#v", rec)
+	if atomic.LoadInt32(&f.upstream.calls) != 1 {
+		t.Fatalf("expected one upstream dispatch, got %d", f.upstream.calls)
 	}
 }
 

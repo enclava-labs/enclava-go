@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
+	"io"
 	"strings"
-	"time"
+	"unicode/utf8"
 
 	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/llm"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
@@ -43,27 +45,33 @@ type RAGSearcher interface {
 	Search(ctx context.Context, p auth.Principal, input rag.SearchInput) ([]rag.SearchResult, error)
 }
 
-type UsageRecorder interface {
-	Record(ctx context.Context, rec UsageRecord) error
+// Executor is the single authorized priced model-dispatch boundary;
+// *inference.Service satisfies it. The assistant never calls a provider or
+// records billing usage directly — reservation, dispatch and settlement all
+// happen inside Execute under the caller's principal.
+type Executor interface {
+	Execute(ctx context.Context, p auth.Principal, req inference.Request) (*inference.Result, error)
 }
 
 type Service struct {
-	repo      Repository
-	prompts   PromptRepository
-	rag       RAGSearcher
-	provider  llm.Provider
-	usageRepo UsageRecorder
+	repo     Repository
+	prompts  PromptRepository
+	rag      RAGSearcher
+	executor Executor
 }
 
-func NewService(repo Repository, promptRepo PromptRepository, ragSvc RAGSearcher, provider llm.Provider, usageRepo UsageRecorder) *Service {
+func NewService(repo Repository, promptRepo PromptRepository, ragSvc RAGSearcher, executor Executor) *Service {
 	return &Service{
-		repo:      repo,
-		prompts:   promptRepo,
-		rag:       ragSvc,
-		provider:  provider,
-		usageRepo: usageRepo,
+		repo:     repo,
+		prompts:  promptRepo,
+		rag:      ragSvc,
+		executor: executor,
 	}
 }
+
+// maxOutputEstimate is the declared upper bound for generated units; it
+// matches the executor's operation bound for chat/vision.
+const maxOutputEstimate = 1 << 17
 
 func requireTenant(p auth.Principal) error {
 	if strings.TrimSpace(p.TenantID) == "" {
@@ -255,20 +263,11 @@ func (s *Service) ExternalModels(ctx context.Context, p auth.Principal, chatbotR
 	if !auth.ModelAllowed(p, bot.Model) {
 		return llm.ModelsResponse{}, ErrModelNotAllowed
 	}
-	models, err := s.provider.ListModels(ctx)
-	if err != nil {
-		return llm.ModelsResponse{}, err
-	}
-	model := llm.Model{ID: bot.Model, Object: "model"}
-	for _, candidate := range models.Data {
-		if candidate.ID == bot.Model {
-			model = candidate
-			break
-		}
-	}
+	// Model catalog access goes through the executor's endpoint binding —
+	// this endpoint reports the assistant's configured alias only.
 	return llm.ModelsResponse{
 		Object: "list",
-		Data:   []llm.Model{model},
+		Data:   []llm.Model{{ID: bot.Model, Object: "model"}},
 	}, nil
 }
 
@@ -277,20 +276,27 @@ func (s *Service) CreateChatCompletion(ctx context.Context, p auth.Principal, ch
 	if err != nil {
 		return CompletionOutput{}, err
 	}
-	resp, err := s.provider.CreateChatCompletion(ctx, prepared.UpstreamRequest)
+	res, err := s.executePrepared(ctx, p, prepared)
 	if err != nil {
-		s.RecordFailure(ctx, p, prepared, providerErrorStatus(err))
 		return CompletionOutput{}, err
 	}
-	usage := parseUsage(resp)
-	assistantContent := extractAssistantContent(resp)
-	record := s.RecordCompletion(ctx, p, prepared, assistantContent, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, 200)
+	defer func() { _ = res.Body.Close() }()
+	if res.SettlementError != nil {
+		return CompletionOutput{}, fmt.Errorf("settle reservation: %w", res.SettlementError)
+	}
+	resp, err := io.ReadAll(res.Body)
+	if err != nil {
+		return CompletionOutput{}, fmt.Errorf("read provider response: %w", err)
+	}
+	if err := s.PersistAssistantMessage(ctx, p, prepared, extractAssistantContent(resp)); err != nil {
+		return CompletionOutput{}, err
+	}
 	resp = appendCompletionMetadata(resp, prepared.Chatbot.ID, prepared.Conversation.ID)
 	return CompletionOutput{
 		Response:       resp,
 		Conversation:   prepared.Conversation,
 		Chatbot:        prepared.Chatbot,
-		Usage:          record,
+		Usage:          res.Usage,
 		RAGResultCount: prepared.RAGResultCount,
 	}, nil
 }
@@ -358,20 +364,44 @@ func (s *Service) PrepareChatCompletion(ctx context.Context, p auth.Principal, c
 		return PreparedCompletion{}, err
 	}
 	return PreparedCompletion{
-		UpstreamRequest: upstreamRequest,
-		Conversation:    conversation,
-		Chatbot:         bot,
-		APIKeyID:        p.APIKeyID,
-		Model:           bot.Model,
-		RAGResultCount:  len(ragResults),
+		Request: inference.Request{
+			Capability: inference.CapabilityChat,
+			Model:      bot.Model,
+			EndpointID: strings.TrimSpace(bot.ProviderID),
+			Payload:    upstreamRequest,
+			Stream:     stream,
+			Inputs:     ragInputs(ragResults),
+			Estimate:   completionEstimate(upstreamRequest),
+		},
+		Conversation:   conversation,
+		Chatbot:        bot,
+		Model:          bot.Model,
+		RAGResultCount: len(ragResults),
 	}, nil
 }
 
-func (s *Service) RecordCompletion(ctx context.Context, p auth.Principal, prepared PreparedCompletion, assistantContent string, promptTokens, completionTokens, totalTokens int64, statusCode int) UsageRecord {
-	if totalTokens == 0 {
-		totalTokens = promptTokens + completionTokens
+// ExecutePrepared dispatches one prepared completion through the shared
+// executor — policy, reservation, dispatch and settlement all live inside
+// Execute. The returned stream/Body stays open until the caller closes it.
+func (s *Service) ExecutePrepared(ctx context.Context, p auth.Principal, prepared PreparedCompletion) (*inference.Result, error) {
+	return s.executePrepared(ctx, p, prepared)
+}
+
+func (s *Service) executePrepared(ctx context.Context, p auth.Principal, prepared PreparedCompletion) (*inference.Result, error) {
+	if s.executor == nil {
+		return nil, errors.New("chatbot: inference executor is not configured")
 	}
-	_ = s.repo.AddMessage(ctx, Message{
+	return s.executor.Execute(ctx, p, prepared.Request)
+}
+
+// PersistAssistantMessage retains the completed assistant turn. Persistence
+// failures return the real repository error — a lost assistant message is
+// never reported as a successful completion.
+func (s *Service) PersistAssistantMessage(ctx context.Context, p auth.Principal, prepared PreparedCompletion, assistantContent string) error {
+	if strings.TrimSpace(assistantContent) == "" {
+		return nil
+	}
+	return s.repo.AddMessage(ctx, Message{
 		TenantID:       p.TenantID,
 		ID:             newID("chatmsg"),
 		ConversationID: prepared.Conversation.ID,
@@ -379,39 +409,35 @@ func (s *Service) RecordCompletion(ctx context.Context, p auth.Principal, prepar
 		Content:        assistantContent,
 		OwnerActorID:   p.ActorID,
 	})
-	record := s.usageRecord(p, prepared, promptTokens, completionTokens, totalTokens, statusCode)
-	s.recordUsage(ctx, record)
-	return record
 }
 
-func (s *Service) RecordFailure(ctx context.Context, p auth.Principal, prepared PreparedCompletion, statusCode int) UsageRecord {
-	record := s.usageRecord(p, prepared, 0, 0, 0, statusCode)
-	s.recordUsage(ctx, record)
-	return record
-}
-
-func (s *Service) usageRecord(p auth.Principal, prepared PreparedCompletion, promptTokens, completionTokens, totalTokens int64, statusCode int) UsageRecord {
-	return UsageRecord{
-		ID:               newID("usage"),
-		APIKeyID:         p.APIKeyID,
-		Endpoint:         "/api/v1/chatbot/external/{chatbot_id}/chat/completions",
-		Model:            prepared.Model,
-		ChatbotID:        prepared.Chatbot.ID,
-		ProviderID:       prepared.Chatbot.ProviderID,
-		PromptTokens:     promptTokens,
-		CompletionTokens: completionTokens,
-		TotalTokens:      totalTokens,
-		StatusCode:       statusCode,
+// ragInputs converts retrieved evidence into the immutable object refs the
+// executor re-authorizes and merges into effective restrictions before
+// routing — a restricted source can never reach an incompatible endpoint.
+func ragInputs(results []rag.SearchResult) []source.ObjectRef {
+	seen := map[string]struct{}{}
+	var refs []source.ObjectRef
+	for _, r := range results {
+		id := strings.TrimSpace(r.DocumentID)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		refs = append(refs, source.ObjectRef{ObjectID: id})
 	}
+	return refs
 }
 
-func (s *Service) recordUsage(ctx context.Context, record UsageRecord) {
-	if s.usageRepo == nil {
-		return
+// completionEstimate declares the per-kind unit bound: input is sized from
+// the marshaled payload, output at the operation's configured maximum.
+func completionEstimate(payload []byte) billing.Usage {
+	return billing.Usage{
+		InputUnits:  int64((utf8.RuneCount(payload) + 3) / 4),
+		OutputUnits: maxOutputEstimate,
 	}
-	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	_ = s.usageRepo.Record(recordCtx, record)
 }
 
 func (s *Service) getByRef(ctx context.Context, p auth.Principal, ref string) (Instance, error) {
@@ -553,40 +579,6 @@ type chatCompletionRequest struct {
 	ConversationID string           `json:"conversation_id,omitempty"`
 	User           string           `json:"user,omitempty"`
 	Metadata       map[string]any   `json:"metadata,omitempty"`
-}
-
-type parsedUsage struct {
-	Model            string
-	PromptTokens     int64
-	CompletionTokens int64
-	TotalTokens      int64
-}
-
-func parseUsage(raw []byte) parsedUsage {
-	var env map[string]any
-	if json.Unmarshal(raw, &env) != nil {
-		return parsedUsage{}
-	}
-	out := parsedUsage{}
-	if model, ok := env["model"].(string); ok {
-		out.Model = model
-	}
-	usageRaw, ok := env["usage"].(map[string]any)
-	if !ok {
-		return out
-	}
-	out.PromptTokens = int64(floatFromAny(usageRaw["prompt_tokens"]))
-	out.CompletionTokens = int64(floatFromAny(usageRaw["completion_tokens"]))
-	out.TotalTokens = int64(floatFromAny(usageRaw["total_tokens"]))
-	return out
-}
-
-func providerErrorStatus(err error) int {
-	var upstream *llm.UpstreamError
-	if errors.As(err, &upstream) && upstream.StatusCode > 0 {
-		return upstream.StatusCode
-	}
-	return http.StatusBadGateway
 }
 
 func extractAssistantContent(raw []byte) string {
@@ -808,4 +800,3 @@ func floatFromAny(v any) float64 {
 		return 0
 	}
 }
-

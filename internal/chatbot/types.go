@@ -3,6 +3,9 @@ package chatbot
 import (
 	"errors"
 	"time"
+
+	"enclava-go/internal/billing"
+	"enclava-go/internal/inference"
 )
 
 var (
@@ -55,22 +58,6 @@ type Message struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
-// UsageRecord is the observability view written for one completion attempt.
-// Priced settlement flows through billing; this record feeds the legacy usage
-// stats repo until the billing port lands.
-type UsageRecord struct {
-	ID               string
-	APIKeyID         int64
-	Endpoint         string
-	Model            string
-	ChatbotID        string
-	ProviderID       string
-	PromptTokens     int64
-	CompletionTokens int64
-	TotalTokens      int64
-	StatusCode       int
-}
-
 type CreateChatbotInput struct {
 	Name             string         `json:"name"`
 	Description      string         `json:"description,omitempty"`
@@ -99,15 +86,16 @@ type CompletionOutput struct {
 	Response       []byte
 	Conversation   Conversation
 	Chatbot        Instance
-	Usage          UsageRecord
+	Usage          *billing.UsageRecord
 	RAGResultCount int
 }
 
 type PreparedCompletion struct {
-	UpstreamRequest []byte
-	Conversation    Conversation
-	Chatbot         Instance
-	APIKeyID        int64
-	Model           string
-	RAGResultCount  int
+	// Request is the executor input; dispatch goes only through
+	// Service.ExecutePrepared — never a direct provider call.
+	Request        inference.Request
+	Conversation   Conversation
+	Chatbot        Instance
+	Model          string
+	RAGResultCount int
 }
