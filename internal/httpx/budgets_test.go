@@ -191,3 +191,24 @@ func TestUsedForPeriodReadsSettledAggregates(t *testing.T) {
 		t.Fatalf("expected 100 units / 500000 micros, got %d / %d", units, micros)
 	}
 }
+
+func TestCheckedBudgetAdd(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		a, b int64
+		want int64
+		ok   bool
+	}{
+		{name: "positive", a: 7, b: 5, want: 12, ok: true},
+		{name: "positive overflow", a: int64(^uint64(0) >> 1), b: 1},
+		{name: "negative overflow", a: -int64(^uint64(0)>>1) - 1, b: -1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := checkedBudgetAdd(tt.a, tt.b)
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("checkedBudgetAdd(%d, %d) = (%d, %v), want (%d, %v)",
+					tt.a, tt.b, got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}

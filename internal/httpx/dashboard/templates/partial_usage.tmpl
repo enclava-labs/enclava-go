@@ -16,33 +16,18 @@
         </div>
       </div>
     </div>
-    <!-- Total Tokens -->
     <div class="rounded-lg border bg-card text-card-foreground shadow-sm p-5">
-      <div class="flex items-center justify-between">
-        <div>
-          <p class="text-sm font-medium text-muted-foreground">Total Tokens</p>
-          <p class="text-2xl font-bold mt-1">{{.TotalTokens}}</p>
-        </div>
-        <div class="p-3 rounded-full bg-purple-500/10 text-purple-500">
-          <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A2 2 0 013 12V7a4 4 0 014-4z"/>
-          </svg>
-        </div>
-      </div>
+      <p class="text-sm font-medium text-muted-foreground">Raw settled usage ({{.Days}} days)</p>
+      <p class="text-2xl font-bold mt-1">{{.TotalTokens}} units</p>
     </div>
-    <!-- Total Cost -->
     <div class="rounded-lg border bg-card text-card-foreground shadow-sm p-5">
-      <div class="flex items-center justify-between">
-        <div>
-          <p class="text-sm font-medium text-muted-foreground">Total Cost</p>
-          <p class="text-2xl font-bold mt-1">{{.TotalCostDisplay}}</p>
-        </div>
-        <div class="p-3 rounded-full bg-green-500/10 text-green-500">
-          <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
-          </svg>
-        </div>
-      </div>
+      <p class="text-sm font-medium text-muted-foreground">Settled cost ({{.Days}} days)</p>
+      {{range .CurrencyTotals}}
+      <p class="text-2xl font-bold mt-1">{{.Currency}} {{formatCurrencyMicros .Currency .AmountMicros}}</p>
+      {{else}}
+      <p class="text-2xl font-bold mt-1">No settled cost</p>
+      {{end}}
+      <p class="text-xs text-muted-foreground mt-2">Settled usage only; see Budgets for held and unknown liability.</p>
     </div>
   </div>
 
@@ -62,7 +47,9 @@
             <div class="flex items-center gap-3 shrink-0">
               <span class="text-muted-foreground">{{.RequestCount}} req</span>
               <span class="text-muted-foreground">&middot;</span>
-              <span class="text-muted-foreground">{{.TotalUnits}} tok</span>
+              <span class="text-muted-foreground">{{.TotalUnits}} raw units</span>
+              <span class="text-muted-foreground">&middot;</span>
+              <span class="text-muted-foreground">{{.Currency}} {{formatCurrencyMicros .Currency .AmountMicros}}</span>
             </div>
           </div>
           {{end}}
@@ -86,7 +73,9 @@
             <div class="flex items-center gap-3 shrink-0">
               <span class="text-muted-foreground">{{.RequestCount}} req</span>
               <span class="text-muted-foreground">&middot;</span>
-              <span class="text-muted-foreground">{{.TotalUnits}} tok</span>
+              <span class="text-muted-foreground">{{.TotalUnits}} raw units</span>
+              <span class="text-muted-foreground">&middot;</span>
+              <span class="text-muted-foreground">{{.Currency}} {{formatCurrencyMicros .Currency .AmountMicros}}</span>
             </div>
           </div>
           {{end}}
@@ -101,29 +90,29 @@
   <!-- Per-key breakdown table -->
   <div class="rounded-lg border bg-card text-card-foreground shadow-sm">
     <div class="p-5 pb-3 border-b">
-      <h4 class="text-sm font-semibold">Usage by API Key</h4>
+      <h4 class="text-sm font-semibold">Settled usage by API key</h4>
     </div>
     <div class="rounded-md overflow-hidden">
       <table class="w-full caption-bottom text-sm">
         <thead class="[&_tr]:border-b bg-muted/50">
           <tr class="border-b transition-colors">
-            <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">API Key</th>
-            <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">Requests</th>
-            <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">Tokens</th>
-            <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">Cost</th>
+            <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">API key</th>
+            <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">Settled requests</th>
+            <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">Raw units</th>
+            <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">Settled cost</th>
           </tr>
         </thead>
         <tbody class="[&_tr:last-child]:border-0">
           {{range .Rows}}
           <tr class="border-b transition-colors hover:bg-muted/50">
-            <td class="p-4 align-middle">#{{.APIKeyID}} {{.APIKeyName}}</td>
+            <td class="p-4 align-middle">{{.APIKeyName}}</td>
             <td class="p-4 align-middle">{{.RequestCount}}</td>
             <td class="p-4 align-middle">{{.TotalTokens}}</td>
             <td class="p-4 align-middle">{{.CostDisplay}}</td>
           </tr>
           {{else}}
           <tr>
-            <td colspan="4" class="p-8 text-center text-muted-foreground">No usage activity in this window.</td>
+            <td colspan="4" class="p-8 text-center text-muted-foreground">No settled usage attributed to API keys in this window.</td>
           </tr>
           {{end}}
         </tbody>

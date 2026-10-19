@@ -96,12 +96,29 @@ func (a *App) liabilityForBudget(ctx context.Context, tenantID string, budget bi
 	}
 	var units, micros int64
 	for _, row := range rows {
-		micros += row.AmountMicros
+		var ok bool
+		micros, ok = checkedBudgetAdd(micros, row.AmountMicros)
+		if !ok {
+			return math.MaxInt64, math.MaxInt64, nil
+		}
 		for _, u := range row.Units {
-			units += u
+			units, ok = checkedBudgetAdd(units, u)
+			if !ok {
+				return math.MaxInt64, math.MaxInt64, nil
+			}
 		}
 	}
 	return units, micros, nil
+}
+
+func checkedBudgetAdd(a, b int64) (int64, bool) {
+	if b > 0 && a > math.MaxInt64-b {
+		return 0, false
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return 0, false
+	}
+	return a + b, true
 }
 
 // usedForPeriod reads settled usage aggregates for a subject over the period
