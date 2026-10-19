@@ -1,7 +1,6 @@
 package llm
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/openai/openai-go/v3/option"
 	tinfoil "github.com/tinfoilsh/tinfoil-go"
+	verifierclient "github.com/tinfoilsh/tinfoil-go/verifier/client"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -36,6 +36,12 @@ type TinfoilProvider struct {
 	verifyPerCall bool
 	verifyMaxAge  time.Duration
 	verifyGroup   singleflight.Group
+	// verifyCtx is the application shutdown context: verification work is
+	// bounded by verifyTimeout and survives a single cancelled caller.
+	verifyCtx     context.Context
+	verifyTimeout time.Duration
+	streamIdle    time.Duration
+	streamWall    time.Duration
 
 	mu     sync.RWMutex
 	status AttestationStatus
@@ -71,6 +77,10 @@ func NewTinfoilProvider(
 		timeout:       timeout,
 		verifyPerCall: verifyPerCall,
 		verifyMaxAge:  verifyMaxAge,
+		verifyCtx:     context.Background(),
+		verifyTimeout: 60 * time.Second,
+		streamIdle:    defaultStreamIdle,
+		streamWall:    defaultStreamWall,
 		status: AttestationStatus{
 			Enabled:  true,
 			Verified: false,
@@ -89,6 +99,23 @@ func NewTinfoilProvider(
 	return provider, nil
 }
 
+// WithShutdownContext binds shared verification work to the application
+// shutdown lifecycle instead of any single caller's context.
+func (p *TinfoilProvider) WithShutdownContext(ctx context.Context) *TinfoilProvider {
+	if ctx != nil {
+		p.verifyCtx = ctx
+	}
+	return p
+}
+
+// WithStreamLimits bounds streaming reads: idle is the max gap between reads,
+// wall the max lifetime of one stream. Zero disables a limit.
+func (p *TinfoilProvider) WithStreamLimits(idle, wall time.Duration) *TinfoilProvider {
+	p.streamIdle = idle
+	p.streamWall = wall
+	return p
+}
+
 func (p *TinfoilProvider) AttestationStatus() AttestationStatus {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -102,7 +129,15 @@ func (p *TinfoilProvider) VerifyAttestation(ctx context.Context) (AttestationSta
 	}
 
 	ch := p.verifyGroup.DoChan("verify", func() (any, error) {
-		return p.verifyAttestationOnce()
+		// Verification runs on the shutdown context with a bounded deadline so a
+		// cancelled waiter neither kills the shared work nor leaks a goroutine.
+		ctx := p.verifyCtx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		vctx, cancel := context.WithTimeout(ctx, p.verifyTimeout)
+		defer cancel()
+		return p.verifyAttestationOnce(vctx)
 	})
 
 	select {
@@ -118,8 +153,8 @@ func (p *TinfoilProvider) VerifyAttestation(ctx context.Context) (AttestationSta
 	}
 }
 
-func (p *TinfoilProvider) verifyAttestationOnce() (AttestationStatus, error) {
-	client, err := p.ensureClient(nil)
+func (p *TinfoilProvider) verifyAttestationOnce(ctx context.Context) (AttestationStatus, error) {
+	client, err := p.ensureClient(ctx, nil)
 	status := p.AttestationStatus()
 	status.Enabled = true
 	status.Provider = "tinfoil"
@@ -133,7 +168,7 @@ func (p *TinfoilProvider) verifyAttestationOnce() (AttestationStatus, error) {
 		return status, err
 	}
 
-	groundTruth, err := client.Verify()
+	groundTruth, err := verifyWithContext(ctx, client)
 	if err != nil {
 		status.Verified = false
 		status.LastError = err.Error()
@@ -153,6 +188,27 @@ func (p *TinfoilProvider) verifyAttestationOnce() (AttestationStatus, error) {
 	}
 	p.setStatus(status)
 	return status, nil
+}
+
+// verifyWithContext runs the SDK's blocking Verify in a goroutine bounded by
+// ctx. If Verify itself hangs past the deadline it still leaks one goroutine,
+// but callers and the singleflight group are released truthfully.
+func verifyWithContext(ctx context.Context, client *tinfoil.Client) (*verifierclient.GroundTruth, error) {
+	type result struct {
+		gt  *verifierclient.GroundTruth
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		gt, err := client.Verify()
+		ch <- result{gt, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.gt, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (p *TinfoilProvider) ListModels(ctx context.Context) (ModelsResponse, error) {
@@ -234,10 +290,18 @@ func (p *TinfoilProvider) DoPassthroughRequest(ctx context.Context, method, path
 		return PassthroughResponse{}, err
 	}
 	client := jsonClient
-	if passthroughStreamClientSelected(path, headers, body) {
+	streaming := passthroughStreamClientSelected(path, headers, body)
+	if streaming {
 		client = streamClient
 	}
-	return doPassthroughHTTP(ctx, client, p.baseURL, p.apiKey, method, path, body, headers)
+	resp, err := doPassthroughHTTP(ctx, client, p.baseURL, p.apiKey, method, path, body, headers)
+	if err != nil {
+		return PassthroughResponse{}, err
+	}
+	if streaming {
+		resp.Body = newBoundedStreamBody(resp.Body, p.streamIdle, p.streamWall)
+	}
+	return resp, nil
 }
 
 func (p *TinfoilProvider) doStream(ctx context.Context, method, path string, body []byte) (io.ReadCloser, error) {
@@ -246,7 +310,7 @@ func (p *TinfoilProvider) doStream(ctx context.Context, method, path string, bod
 		return nil, err
 	}
 	requestURL := p.baseURL + path
-	req, err := http.NewRequestWithContext(ctx, method, requestURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, requestURL, noRetryBody(body))
 	if err != nil {
 		return nil, fmt.Errorf("build stream request: %w", err)
 	}
@@ -259,13 +323,10 @@ func (p *TinfoilProvider) doStream(ctx context.Context, method, path string, bod
 		return nil, fmt.Errorf("upstream chat stream request failed: %w", err)
 	}
 	if resp.StatusCode >= 300 {
-		defer func() {
-			_ = resp.Body.Close()
-		}()
-		upstreamBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+		upstreamBody, _ := readBoundedBody(resp.Body, maxErrorBodyBytes)
 		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: upstreamBody}
 	}
-	return resp.Body, nil
+	return newBoundedStreamBody(resp.Body, p.streamIdle, p.streamWall), nil
 }
 
 func (p *TinfoilProvider) ensureVerified(ctx context.Context) error {
@@ -285,11 +346,7 @@ func (p *TinfoilProvider) doJSON(ctx context.Context, method, path string, body 
 		return nil, err
 	}
 	requestURL := p.baseURL + path
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, requestURL, reader)
+	req, err := http.NewRequestWithContext(ctx, method, requestURL, noRetryBody(body))
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
@@ -302,20 +359,15 @@ func (p *TinfoilProvider) doJSON(ctx context.Context, method, path string, body 
 	if err != nil {
 		return nil, fmt.Errorf("upstream request failed: %w", err)
 	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
 
-	if resp.StatusCode >= 300 {
-		upstreamBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
-		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: upstreamBody}
-	}
-
-	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024*1024))
+	respBody, err := readBoundedBody(resp.Body, 64*1024*1024)
 	if err != nil {
-		return nil, fmt.Errorf("read upstream response: %w", err)
+		return nil, err
 	}
-	return responseBody, nil
+	if resp.StatusCode >= 300 {
+		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: respBody}
+	}
+	return respBody, nil
 }
 
 func (p *TinfoilProvider) setStatus(status AttestationStatus) {
@@ -324,14 +376,16 @@ func (p *TinfoilProvider) setStatus(status AttestationStatus) {
 	p.status = status
 }
 
-func (p *TinfoilProvider) ensureClient(opts []option.RequestOption) (*tinfoil.Client, error) {
+func (p *TinfoilProvider) ensureClient(ctx context.Context, opts []option.RequestOption) (*tinfoil.Client, error) {
 	p.clientMu.Lock()
 	defer p.clientMu.Unlock()
 	if p.client != nil {
 		return p.client, nil
 	}
 	if opts == nil {
-		opts = []option.RequestOption{option.WithAPIKey(p.apiKey)}
+		// WithMaxRetries(0): the SDK must never replay a possibly accepted
+		// mutation or a partially observed stream on the verified enclave.
+		opts = []option.RequestOption{option.WithAPIKey(p.apiKey), option.WithMaxRetries(0)}
 	}
 
 	var (
@@ -353,10 +407,14 @@ func (p *TinfoilProvider) ensureClient(opts []option.RequestOption) (*tinfoil.Cl
 	}
 
 	streamClient := *httpClient
-	// Streaming client has no timeout: long-running SSE streams must not be killed.
-	// Mitigation: Go's net/http cancels the request when the client disconnects (via r.Context()).
-	// Known limitation: if the upstream hangs without the client disconnecting, the goroutine leaks.
+	// Streaming client has no overall timeout: SSE streams are bounded by the
+	// idle/wall limits applied to the returned body instead.
 	streamClient.Timeout = 0
+	// Enclave-bound clients never follow redirects to another origin: the EHBP
+	// transport already refuses non-enclave hosts, and credentials must not
+	// leak to a redirect target.
+	httpClient.CheckRedirect = sameOriginRedirectPolicy
+	streamClient.CheckRedirect = sameOriginRedirectPolicy
 
 	p.client = tinfoilClient
 	p.enclave = tinfoilClient.Enclave()
@@ -373,7 +431,7 @@ func (p *TinfoilProvider) ensureClient(opts []option.RequestOption) (*tinfoil.Cl
 }
 
 func (p *TinfoilProvider) requestClients() (*http.Client, *http.Client, error) {
-	if _, err := p.ensureClient(nil); err != nil {
+	if _, err := p.ensureClient(context.Background(), nil); err != nil {
 		return nil, nil, err
 	}
 

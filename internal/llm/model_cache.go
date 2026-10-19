@@ -32,7 +32,7 @@ func (p *ModelCacheProvider) ListModels(ctx context.Context) (ModelsResponse, er
 	if p.ttl > 0 {
 		p.mu.RLock()
 		if !p.cachedAt.IsZero() && time.Since(p.cachedAt) < p.ttl {
-			cached := p.models
+			cached := cloneModelsResponse(p.models)
 			p.mu.RUnlock()
 			return cached, nil
 		}
@@ -47,7 +47,7 @@ func (p *ModelCacheProvider) GetModel(ctx context.Context, modelID string) (Mode
 		if !p.cachedAt.IsZero() && time.Since(p.cachedAt) < p.ttl {
 			if model, ok := p.modelMap[modelID]; ok {
 				p.mu.RUnlock()
-				return model, nil
+				return cloneModel(model), nil
 			}
 		}
 		p.mu.RUnlock()
@@ -60,7 +60,33 @@ func (p *ModelCacheProvider) GetModel(ctx context.Context, modelID string) (Mode
 	p.mu.Lock()
 	p.modelMap[model.ID] = model
 	p.mu.Unlock()
-	return model, nil
+	return cloneModel(model), nil
+}
+
+// cloneModel deep-copies a cached Model so callers cannot mutate shared
+// per-endpoint observations in place.
+func cloneModel(m Model) Model {
+	out := m
+	out.InputModalities = append([]string(nil), m.InputModalities...)
+	out.OutputModalities = append([]string(nil), m.OutputModalities...)
+	out.Tasks = append([]string(nil), m.Tasks...)
+	if m.Metadata != nil {
+		md := make(map[string]any, len(m.Metadata))
+		for k, v := range m.Metadata {
+			md[k] = v
+		}
+		out.Metadata = md
+	}
+	return out
+}
+
+func cloneModelsResponse(r ModelsResponse) ModelsResponse {
+	out := r
+	out.Data = make([]Model, len(r.Data))
+	for i, m := range r.Data {
+		out.Data[i] = cloneModel(m)
+	}
+	return out
 }
 
 func (p *ModelCacheProvider) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
@@ -149,5 +175,5 @@ func (p *ModelCacheProvider) refreshModels(ctx context.Context) (ModelsResponse,
 	p.modelMap = modelMap
 	p.cachedAt = time.Now()
 	p.mu.Unlock()
-	return models, nil
+	return cloneModelsResponse(models), nil
 }

@@ -111,7 +111,10 @@ func (p *Prober) probeOnce(parent context.Context) {
 		if err != nil {
 			delay = big.NewInt(0)
 		}
-		time.Sleep(time.Duration(delay.Int64()) * time.Millisecond)
+		select {
+		case <-time.After(time.Duration(delay.Int64()) * time.Millisecond):
+		case <-parent.Done():
+		}
 	}
 
 	p.mu.Lock()
