@@ -1,81 +1,24 @@
 {{define "partial-budgets"}}
 <div class="space-y-4">
-  {{/* Summary bar */}}
-  <div class="flex flex-wrap items-center gap-4 text-sm">
-    <p class="text-muted-foreground">Total used: <span class="font-semibold text-foreground">{{.TotalUsed}}</span></p>
-    <p class="text-muted-foreground">Total limit: <span class="font-semibold text-foreground">{{.TotalLimit}}</span></p>
-    <p class="text-muted-foreground">Active keys: <span class="font-semibold text-foreground">{{.ActiveKeys}}</span></p>
-    {{if gt .OverCount 0}}
-    <p class="font-semibold text-red-600 dark:text-red-400">{{.OverCount}} over budget</p>
-    {{end}}
-  </div>
-
   {{if not .Rows}}
-  {{/* Empty state */}}
-  <div class="flex flex-col items-center justify-center py-16 text-center">
-    <div class="p-4 rounded-full bg-muted mb-4">
-      <svg class="h-8 w-8 text-muted-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z"/>
-      </svg>
-    </div>
-    <h3 class="text-lg font-semibold">No budget limits configured</h3>
-    <p class="text-sm text-muted-foreground mt-1 max-w-sm">Set budget limits on API keys to track spending.</p>
+  <div class="py-16 text-center">
+    <h3 class="text-lg font-semibold">No active budgets</h3>
+    <p class="text-sm text-muted-foreground mt-1">No allowance is configured for this billing subject.</p>
   </div>
   {{else}}
-  {{/* Card grid */}}
   <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
     {{range .Rows}}
-    <div class="rounded-lg border bg-card text-card-foreground shadow-sm flex flex-col">
-      {{/* Card header */}}
-      <div class="flex items-center justify-between px-5 pt-5 pb-3">
-        <span class="font-semibold truncate mr-2">{{.APIKeyName}}</span>
-        <div class="flex items-center gap-1.5 shrink-0">
-          {{if eq .BudgetPeriod "monthly"}}
-          <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold bg-blue-100 dark:bg-blue-900/20 text-blue-800 dark:text-blue-200">Monthly</span>
-          <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold bg-green-100 dark:bg-green-900/20 text-green-700 dark:text-green-300">Auto-renew</span>
-          {{else}}
-          <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300">Total</span>
-          {{end}}
-        </div>
+    <section class="rounded-lg border bg-card text-card-foreground shadow-sm">
+      <h2 class="px-5 py-4 border-b font-semibold">{{.Subject}}</h2>
+      <div class="px-5 py-4 space-y-2 text-sm">
+        <p>Window: <span class="font-semibold">{{.Window}}</span></p>
+        <p>Limit: <span class="font-semibold">{{.Limit}}</span></p>
+        <p>Held: {{.Held}}</p>
+        <p>Unknown: {{.Unknown}}</p>
+        <p>Settled: {{.Settled}}</p>
+        <p>Remaining allowance: <span class="font-semibold">{{.Remaining}}</span></p>
       </div>
-
-      {{/* Used / limit */}}
-      <div class="px-5 pb-3">
-        <p class="text-2xl font-bold leading-none">{{.UsedDisplay}}</p>
-        <p class="text-sm text-muted-foreground mt-1">of {{.LimitDisplay}} limit</p>
-      </div>
-
-      {{/* Progress bar */}}
-      <div class="px-5 pb-1">
-        <div class="h-2 w-full bg-muted rounded-full overflow-hidden">
-          <div class="h-full rounded-full transition-all {{if .IsOverBudget}}bg-red-500{{else}}bg-primary{{end}}" style="width: {{if gt .UsedPercent 100}}100{{else}}{{.UsedPercent}}{{end}}%"></div>
-        </div>
-        <p class="text-xs text-muted-foreground mt-1.5">
-          {{.UsedPercent}}% used
-          {{if .IsOverBudget}}<span class="text-red-600 dark:text-red-400 font-semibold ml-1">— over budget</span>{{end}}
-        </p>
-      </div>
-
-      {{/* Divider */}}
-      <div class="mx-5 my-3 border-t"></div>
-
-      {{/* Footer: key status */}}
-      <div class="px-5 pb-4 flex items-center gap-2 text-xs text-muted-foreground">
-        {{if .IsActive}}
-        <span class="inline-flex items-center gap-1">
-          <span class="h-1.5 w-1.5 rounded-full bg-green-500"></span>
-          Active
-        </span>
-        {{else}}
-        <span class="inline-flex items-center gap-1">
-          <span class="h-1.5 w-1.5 rounded-full bg-gray-400 dark:bg-gray-600"></span>
-          Inactive
-        </span>
-        {{end}}
-        <span class="text-muted-foreground/40">·</span>
-        <span>Key #{{.APIKeyID}}</span>
-      </div>
-    </div>
+    </section>
     {{end}}
   </div>
   {{end}}

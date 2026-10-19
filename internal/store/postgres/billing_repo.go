@@ -218,7 +218,7 @@ type billingQuerier interface {
 
 func queryLiabilities(ctx context.Context, q billingQuerier, tenantID string, scope billing.Subject, from time.Time) ([]billing.LiabilityRow, error) {
 	rows, err := q.QueryContext(ctx, `
-		SELECT limit_amount_micros, currency::text, reserved_units::text
+		SELECT state, limit_amount_micros, currency::text, reserved_units::text
 		FROM reservations
 		WHERE tenant_id = $1::uuid
 		  AND state IN ('held','unknown')
@@ -236,13 +236,13 @@ func queryLiabilities(ctx context.Context, q billingQuerier, tenantID string, sc
 	var urows *sql.Rows
 	if scope.Type == billing.BudgetSubjectTenant {
 		urows, err = q.QueryContext(ctx, `
-			SELECT amount_micros, currency::text, units::text
+			SELECT 'settled', amount_micros, currency::text, units::text
 			FROM usage_records
 			WHERE tenant_id = $1::uuid AND created_at >= $2`,
 			tenantID, from)
 	} else {
 		urows, err = q.QueryContext(ctx, `
-			SELECT amount_micros, currency::text, units::text
+			SELECT 'settled', amount_micros, currency::text, units::text
 			FROM usage_records
 			WHERE tenant_id = $1::uuid AND created_at >= $2
 			  AND subject_type = $3 AND subject_id = $4`,
@@ -264,7 +264,7 @@ func scanLiabilityRows(rows *sql.Rows) ([]billing.LiabilityRow, error) {
 	for rows.Next() {
 		var l billing.LiabilityRow
 		var unitsJSON string
-		if err := rows.Scan(&l.AmountMicros, &l.Currency, &unitsJSON); err != nil {
+		if err := rows.Scan(&l.State, &l.AmountMicros, &l.Currency, &unitsJSON); err != nil {
 			return nil, fmt.Errorf("scan liability: %w", err)
 		}
 		units, err := decodeUnits(json.RawMessage(unitsJSON))

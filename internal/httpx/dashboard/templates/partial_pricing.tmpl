@@ -1,5 +1,21 @@
 {{define "partial-pricing"}}
 <div class="space-y-6">
+  <section class="rounded-lg border bg-card p-5">
+    <h2 class="font-semibold">Create or revise a price</h2>
+    <p class="mt-1 text-sm text-muted-foreground">Revisions create a new effective rate; existing reservation snapshots are unchanged.</p>
+    <form id="pricing-form" class="mt-4 grid gap-3 md:grid-cols-2">
+      <label class="space-y-1 text-sm">Subject type <select name="subject_type" required class="w-full rounded-md border bg-background px-3 py-2"><option value="endpoint">Endpoint</option><option value="model">Model</option></select></label>
+      <label class="space-y-1 text-sm">Subject ID <input name="subject_id" required class="w-full rounded-md border bg-background px-3 py-2"></label>
+      <label class="space-y-1 text-sm">Capability <input name="capability" required class="w-full rounded-md border bg-background px-3 py-2"></label>
+      <label class="space-y-1 text-sm">Unit <select name="unit" required class="w-full rounded-md border bg-background px-3 py-2"><option value="input">Input</option><option value="output">Output</option><option value="cached_input">Cached input</option></select></label>
+      <label class="space-y-1 text-sm">Rate in currency micros <input name="rate_micros" type="number" min="0" step="1" required class="w-full rounded-md border bg-background px-3 py-2"></label>
+      <label class="space-y-1 text-sm">Unit quantity <input name="unit_quantity" type="number" min="1" step="1" value="1" required class="w-full rounded-md border bg-background px-3 py-2"></label>
+      <label class="space-y-1 text-sm">Currency <input name="currency" maxlength="3" value="USD" required class="w-full rounded-md border bg-background px-3 py-2"></label>
+      <label class="space-y-1 text-sm">Effective from <input name="effective_from" type="datetime-local" class="w-full rounded-md border bg-background px-3 py-2"></label>
+      <button type="submit" class="rounded-md border px-4 py-2 text-sm font-medium md:col-span-2">Create price</button>
+      <p id="pricing-message" role="status" aria-live="polite" class="md:col-span-2 text-sm"></p>
+    </form>
+  </section>
   <div class="rounded-lg border bg-card overflow-hidden">
     <div class="border-b px-5 py-4">
       <h3 class="font-semibold">Billing Prices</h3>
@@ -16,7 +32,7 @@
             <th class="px-4 py-3 text-left font-medium">Unit</th>
             <th class="px-4 py-3 text-right font-medium">Rate</th>
             <th class="px-4 py-3 text-left font-medium">Effective</th>
-          </tr>
+            <th class="px-4 py-3 text-left font-medium">Actions</th>
         </thead>
         <tbody class="divide-y">
           {{range .Pricing}}
@@ -24,8 +40,9 @@
             <td class="px-4 py-3">{{.SubjectType}} <span class="font-mono">{{.SubjectID}}</span></td>
             <td class="px-4 py-3 font-mono">{{.Capability}}</td>
             <td class="px-4 py-3">{{.Unit}}</td>
-            <td class="px-4 py-3 text-right">{{.RateMicros}} {{.Currency}} micros / {{.UnitQuantity}}</td>
+            <td class="px-4 py-3 text-right">{{.RateMicros}} {{.Currency}} micros / {{.UnitQuantity}} {{.Unit}}</td>
             <td class="px-4 py-3">{{.EffectiveFrom}}</td>
+            <td class="px-4 py-3"><button type="button" class="pricing-edit rounded-md border px-2 py-1" data-subject-type="{{.SubjectType}}" data-subject-id="{{.SubjectID}}" data-capability="{{.Capability}}" data-unit="{{.Unit}}" data-rate-micros="{{.RateMicros}}" data-unit-quantity="{{.UnitQuantity}}" data-currency="{{.Currency}}">Edit / revise</button></td>
           </tr>
           {{end}}
         </tbody>
@@ -67,3 +84,4 @@
   </div>
 </div>
 {{end}}
+<script src="/dashboard/static/pricing.js" defer></script>

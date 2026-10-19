@@ -27,10 +27,9 @@
       <div class="stat-value">{{.TotalExtractJobs}}</div>
     </div>
     <div class="stat">
-      <div class="eyebrow">Budget used</div>
-      <div class="stat-value">{{.BudgetPercent}}<span style="font-size:0.95rem;color:hsl(var(--muted-foreground));margin-left:0.1rem">%</span></div>
-      <div class="stat-sub">{{.BudgetUsed}} / {{.BudgetTotal}}</div>
-      <div class="stat-meter{{if ge .BudgetPercent 80}} warn{{end}}"><span style="width:{{.BudgetPercent}}%"></span></div>
+      <div class="eyebrow">Budgets</div>
+      <div class="stat-value"><a href="/dashboard/budgets" class="text-primary hover:underline">Open budget view</a></div>
+      <div class="stat-sub">Current billing liability and limit details</div>
     </div>
   </div>
 

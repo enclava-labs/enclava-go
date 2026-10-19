@@ -15,6 +15,7 @@ import (
 // reservation bound or the settled amount; Units is the reserved or settled
 // per-kind units so token budgets reconstruct liability even at zero rates.
 type LiabilityRow struct {
+	State        string
 	AmountMicros int64
 	Currency     string
 	Units        map[UnitKind]int64
