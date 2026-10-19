@@ -14,6 +14,7 @@ import (
 	"enclava-go/internal/auth"
 	"enclava-go/internal/chatbot"
 	"enclava-go/internal/connectors"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/llm"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
@@ -32,6 +33,7 @@ type dashboardProvidersData struct {
 	Snapshot    llm.ReadinessSnapshot
 	Models      []llm.Model
 	Attestation any
+	Endpoints   []inference.Endpoint
 	Error       string
 }
 
@@ -179,6 +181,19 @@ func (a *App) handleDashboardProviders(w http.ResponseWriter, r *http.Request) {
 			log.Printf("failed to load dashboard provider models: %v", err)
 		} else {
 			data.Models = models.Data
+		}
+	}
+	if a.endpoints != nil {
+		tenantID, ok := a.dashboardTenantID(w, r)
+		if !ok {
+			return
+		}
+		endpoints, err := a.endpoints.List(r.Context(), tenantID)
+		if err != nil {
+			data.Error = "Endpoint list failed"
+			log.Printf("failed to load dashboard endpoints: %v", err)
+		} else {
+			data.Endpoints = endpoints
 		}
 	}
 	if err := dashboardTemplates.ExecuteTemplate(w, "partial-providers", data); err != nil {

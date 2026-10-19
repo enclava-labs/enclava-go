@@ -41,7 +41,7 @@ type App struct {
 	usageRepo        *sqlite.UsageRepo
 	billingSvc       *billing.Service
 	billingRepo      *postgres.BillingRepo
-	providersRepo    *sqlite.ProvidersRepo
+	endpoints        *postgres.EndpointsRepo
 	apiKeyAlgo       string
 	apiKeyPepper     string
 	apiKeyPrefix     string
@@ -85,7 +85,7 @@ func NewApp(
 	usageRepo *sqlite.UsageRepo,
 	billingSvc *billing.Service,
 	billingRepo *postgres.BillingRepo,
-	providersRepo *sqlite.ProvidersRepo,
+	endpoints *postgres.EndpointsRepo,
 	apiKeyAlgo string,
 	apiKeyPepper string,
 	apiKeyPrefix string,
@@ -112,7 +112,7 @@ func NewApp(
 		usageRepo:        usageRepo,
 		billingSvc:       billingSvc,
 		billingRepo:      billingRepo,
-		providersRepo:    providersRepo,
+		endpoints:        endpoints,
 		apiKeyAlgo:       apiKeyAlgo,
 		apiKeyPepper:     apiKeyPepper,
 		apiKeyPrefix:     apiKeyPrefix,
