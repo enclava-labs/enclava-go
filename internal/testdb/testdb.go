@@ -26,6 +26,13 @@ import (
 
 // New opens an isolated, migrated *postgres.DB for a test.
 func New(t *testing.T) *postgres.DB {
+	db, _ := NewWithDSN(t)
+	return db
+}
+
+// NewWithDSN is New plus the schema-scoped DSN, so a test that needs a second
+// connection into the same isolated schema can pass it to Secondary.
+func NewWithDSN(t *testing.T) (*postgres.DB, string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -65,6 +72,19 @@ func New(t *testing.T) *postgres.DB {
 		}
 		_ = admin.Close()
 	})
+	return db, dsnWithSearchPath(dsn, schema)
+}
+
+// Secondary opens a second connection into the schema a NewWithDSN call
+// already created — pass its returned DSN. Two connections over one schema
+// prove cross-process accounting.
+func Secondary(t *testing.T, dsn string) *postgres.DB {
+	t.Helper()
+	db, err := postgres.Open(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("open secondary test store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
 	return db
 }
 
