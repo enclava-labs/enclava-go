@@ -10,6 +10,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -205,6 +206,9 @@ func (r *IdentityRepo) GetUser(ctx context.Context, tenantID, userID string) (au
 		 WHERE tenant_id = $1::uuid AND id = $2`,
 		tenantID, userID))
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.User{}, auth.ErrNotFound
+		}
 		return auth.User{}, fmt.Errorf("get user: %w", err)
 	}
 	return u, nil
@@ -216,6 +220,9 @@ func (r *IdentityRepo) GetUserByEmail(ctx context.Context, tenantID, email strin
 		 WHERE tenant_id = $1::uuid AND email = $2`,
 		tenantID, email))
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.User{}, auth.ErrNotFound
+		}
 		return auth.User{}, fmt.Errorf("get user by email: %w", err)
 	}
 	return u, nil
@@ -285,6 +292,9 @@ func (r *IdentityRepo) GetServiceAccount(ctx context.Context, tenantID, id strin
 		tenantID, id).
 		Scan(&sa.ID, &sa.TenantID, &sa.Name, &raw, &sa.Status, &sa.CreatedAt)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.ServiceAccount{}, auth.ErrNotFound
+		}
 		return auth.ServiceAccount{}, fmt.Errorf("get service account: %w", err)
 	}
 	sa.Scopes = scopeSlice(raw)
@@ -375,6 +385,9 @@ func (r *IdentityRepo) GetAPIKey(ctx context.Context, tenantID, id string) (auth
 		 WHERE tenant_id = $1::uuid AND id = $2`,
 		tenantID, id))
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.APIKeyRecord{}, auth.ErrNotFound
+		}
 		return auth.APIKeyRecord{}, fmt.Errorf("get api key: %w", err)
 	}
 	return k, nil
@@ -528,6 +541,9 @@ func (r *IdentityRepo) GetSession(ctx context.Context, tenantID, id string) (aut
 		 WHERE tenant_id = $1::uuid AND id = $2`,
 		tenantID, id))
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.Session{}, auth.ErrNotFound
+		}
 		return auth.Session{}, fmt.Errorf("get session: %w", err)
 	}
 	return s, nil
@@ -542,6 +558,9 @@ func (r *IdentityRepo) GetSessionByTokenHash(ctx context.Context, tokenHash stri
 		 WHERE token_hash = $1`,
 		tokenHash))
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.Session{}, auth.ErrNotFound
+		}
 		return auth.Session{}, fmt.Errorf("get session by token hash: %w", err)
 	}
 	return s, nil
@@ -605,6 +624,12 @@ func (r *IdentityRepo) GetAuthIdentity(ctx context.Context, tenantID, issuer, su
 		tenantID, issuer, subject).
 		Scan(&a.ID, &a.UserID, &a.Issuer, &a.Subject, &a.LinkedAt, &linkedBy)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.AuthIdentity{}, auth.ErrNotFound
+		}
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.AuthIdentity{}, auth.ErrNotFound
+		}
 		return auth.AuthIdentity{}, fmt.Errorf("get auth identity: %w", err)
 	}
 	a.LinkedByUserID = linkedBy.String
@@ -651,6 +676,9 @@ func (r *IdentityRepo) GetDelegation(ctx context.Context, tenantID, id string) (
 		 WHERE tenant_id = $1::uuid AND id = $2`,
 		tenantID, id))
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.Delegation{}, auth.ErrNotFound
+		}
 		return auth.Delegation{}, fmt.Errorf("get delegation: %w", err)
 	}
 	return d, nil
@@ -667,6 +695,9 @@ func (r *IdentityRepo) FindDelegation(ctx context.Context, tenantID, delegatorUs
 		 LIMIT 1`,
 		tenantID, delegatorUserID, delegateServiceAccountID))
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.Delegation{}, auth.ErrNotFound
+		}
 		return auth.Delegation{}, fmt.Errorf("find delegation: %w", err)
 	}
 	return d, nil
@@ -693,6 +724,9 @@ func (r *IdentityRepo) GetOIDCProvider(ctx context.Context, tenantID, id string)
 		 WHERE tenant_id = $1::uuid AND id = $2`,
 		tenantID, id))
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.OIDCProvider{}, auth.ErrNotFound
+		}
 		return auth.OIDCProvider{}, fmt.Errorf("get oidc provider: %w", err)
 	}
 	return p, nil
@@ -735,4 +769,92 @@ func (r *IdentityRepo) CreateOIDCProvider(ctx context.Context, tenantID string, 
 		return fmt.Errorf("create oidc provider: %w", err)
 	}
 	return nil
+}
+
+// --- tenants ---------------------------------------------------------------
+
+func (r *IdentityRepo) GetTenantBySlug(ctx context.Context, slug string) (string, error) {
+	var id string
+	err := r.db.QueryRowContext(ctx,
+		`SELECT id FROM tenants WHERE slug = $1`, slug).Scan(&id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", auth.ErrNotFound
+		}
+		return "", fmt.Errorf("get tenant by slug: %w", err)
+	}
+	return id, nil
+}
+
+// --- OIDC states -----------------------------------------------------------
+
+const oidcStateColumns = `id, state_hash, provider_id, COALESCE(user_id::text,''),
+	nonce, pkce_verifier, return_to, subject, email,
+	COALESCE(pending_link_user_id,''), expires_at, consumed_at, created_at`
+
+func scanOIDCState(row rowScanner, tenantID string) (auth.OIDCState, error) {
+	var s auth.OIDCState
+	s.TenantID = tenantID
+	err := row.Scan(&s.ID, &s.StateHash, &s.ProviderID, &s.UserID,
+		&s.Nonce, &s.PKCEVerifier, &s.ReturnTo, &s.Subject, &s.Email,
+		&s.PendingLinkUserID, &s.ExpiresAt, &s.ConsumedAt, &s.CreatedAt)
+	if err != nil {
+		return auth.OIDCState{}, err
+	}
+	return s, nil
+}
+
+func (r *IdentityRepo) CreateOIDCState(ctx context.Context, tenantID string, s auth.OIDCState) error {
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO oidc_states
+		 (tenant_id, id, state_hash, provider_id, user_id, nonce,
+		  pkce_verifier, return_to, subject, email, pending_link_user_id,
+		  expires_at, consumed_at)
+		 VALUES ($1::uuid, $2, $3, $4, NULLIF($5,''), $6, $7, $8, $9, $10,
+		         NULLIF($11,''), $12, $13)`,
+		tenantID, s.ID, s.StateHash, s.ProviderID, s.UserID, s.Nonce,
+		s.PKCEVerifier, s.ReturnTo, s.Subject, s.Email,
+		s.PendingLinkUserID, s.ExpiresAt, s.ConsumedAt)
+	if err != nil {
+		return fmt.Errorf("create oidc state: %w", err)
+	}
+	return nil
+}
+
+func (r *IdentityRepo) GetOIDCState(ctx context.Context, tenantID, stateHash string) (auth.OIDCState, error) {
+	s, err := scanOIDCState(r.db.QueryRowContext(ctx,
+		`SELECT `+oidcStateColumns+` FROM oidc_states
+		 WHERE tenant_id = $1::uuid AND state_hash = $2`,
+		tenantID, stateHash), tenantID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.OIDCState{}, auth.ErrNotFound
+		}
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.OIDCState{}, auth.ErrNotFound
+		}
+		return auth.OIDCState{}, fmt.Errorf("get oidc state: %w", err)
+	}
+	return s, nil
+}
+
+// ConsumeOIDCState performs the single-use transition: only a row still
+// unconsumed flips consumed_at and returns itself; a replay or unknown hash
+// reports auth.ErrNotFound.
+func (r *IdentityRepo) ConsumeOIDCState(ctx context.Context, tenantID, stateHash string) (auth.OIDCState, error) {
+	s, err := scanOIDCState(r.db.QueryRowContext(ctx,
+		`UPDATE oidc_states SET consumed_at = now()
+		 WHERE tenant_id = $1::uuid AND state_hash = $2 AND consumed_at IS NULL
+		 RETURNING `+oidcStateColumns,
+		tenantID, stateHash), tenantID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.OIDCState{}, auth.ErrNotFound
+		}
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.OIDCState{}, auth.ErrNotFound
+		}
+		return auth.OIDCState{}, fmt.Errorf("consume oidc state: %w", err)
+	}
+	return s, nil
 }

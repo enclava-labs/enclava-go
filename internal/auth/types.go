@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 )
 
@@ -82,6 +83,10 @@ type AuthIdentity struct {
 	LinkedByUserID string
 }
 
+// ErrNotFound is the auth-package sentinel for an absent identity row —
+// callers distinguish "no such row" (deny) from a store failure.
+var ErrNotFound = errors.New("auth: not found")
+
 // OIDCProvider is a tenant-configured identity provider row.
 type OIDCProvider struct {
 	ID              string
@@ -92,6 +97,28 @@ type OIDCProvider struct {
 	RedirectPath    string
 	Enabled         bool
 	CreatedAt       time.Time
+}
+
+// OIDCState is a stored oidc_states row — the single-use artifact bridging
+// an authorization request to its callback. StateHash is sha256 of the
+// plaintext state value carried in the authorize URL. PendingLinkUserID,
+// Email and Subject turn a consumed flow into a one-shot interactive link
+// challenge (migration 007); they are empty on a plain begin-flow row.
+type OIDCState struct {
+	ID                string
+	TenantID          string
+	StateHash         string
+	ProviderID        string
+	UserID            string
+	Nonce             string
+	PKCEVerifier      string
+	ReturnTo          string
+	Subject           string
+	Email             string
+	PendingLinkUserID string
+	ExpiresAt         time.Time
+	ConsumedAt        *time.Time
+	CreatedAt         time.Time
 }
 
 // IdentityRepository owns every identity row consumed by authentication
@@ -105,9 +132,11 @@ type OIDCProvider struct {
 // lookup). The service verifies the secret/hash, expiry and revocation
 // BEFORE trusting the row's tenant_id; everything after is tenant-scoped.
 type IdentityRepository interface {
-	// Tenants (bootstrap/admin writes).
+	// Tenants (bootstrap/admin writes + the login-path slug locator).
 	CreateTenant(ctx context.Context, slug, displayName string) (tenantID string, err error)
-
+	// GetTenantBySlug resolves the login-path tenant locator: the browser
+	// asserts only a slug, and the stored row supplies the UUID.
+	GetTenantBySlug(ctx context.Context, slug string) (tenantID string, err error)
 	// Roles.
 	CreateRole(ctx context.Context, tenantID string, r Role) error
 	AssignRole(ctx context.Context, tenantID, userID, roleID string) error
@@ -157,7 +186,13 @@ type IdentityRepository interface {
 	FindDelegation(ctx context.Context, tenantID, delegatorUserID, delegateServiceAccountID string) (Delegation, error)
 
 	// OIDC providers (read side + admin write).
+	CreateOIDCProvider(ctx context.Context, tenantID string, p OIDCProvider) error
 	GetOIDCProvider(ctx context.Context, tenantID, id string) (OIDCProvider, error)
 	ListOIDCProviders(ctx context.Context, tenantID string) ([]OIDCProvider, error)
-	CreateOIDCProvider(ctx context.Context, tenantID string, p OIDCProvider) error
+	// table; ConsumeOIDCState is the atomic single-use transition
+	// (UPDATE ... WHERE consumed_at IS NULL): a second consume reports
+	// ErrNotFound, which callers treat as invalid/replayed state.
+	CreateOIDCState(ctx context.Context, tenantID string, s OIDCState) error
+	GetOIDCState(ctx context.Context, tenantID, stateHash string) (OIDCState, error)
+	ConsumeOIDCState(ctx context.Context, tenantID, stateHash string) (OIDCState, error)
 }
