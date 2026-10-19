@@ -125,9 +125,11 @@ func (r *IdentityRepo) CreateRole(ctx context.Context, tenantID string, role aut
 }
 
 func (r *IdentityRepo) AssignRole(ctx context.Context, tenantID, userID, roleID string) error {
+	// Idempotent: re-assigning the same membership is a no-op, so the admin
+	// API never reports a conflict for an already-true grant.
 	_, err := r.db.ExecContext(ctx,
 		`INSERT INTO user_roles (tenant_id, user_id, role_id)
-		 VALUES ($1::uuid, $2, $3)`,
+		 VALUES ($1::uuid, $2, $3) ON CONFLICT DO NOTHING`,
 		tenantID, userID, roleID)
 	if err != nil {
 		return fmt.Errorf("assign role: %w", err)
@@ -163,6 +165,82 @@ func (r *IdentityRepo) RolesForUser(ctx context.Context, tenantID, userID string
 		return nil, fmt.Errorf("roles for user: %w", err)
 	}
 	return out, nil
+}
+
+// ListRoles returns every role in tenant order — the administration list
+// path (01-24); RolesForUser stays the per-user membership query.
+func (r *IdentityRepo) ListRoles(ctx context.Context, tenantID string) ([]auth.Role, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id, name, scopes, created_at FROM roles
+		 WHERE tenant_id = $1::uuid ORDER BY id`,
+		tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list roles: %w", err)
+	}
+	defer rows.Close()
+	var out []auth.Role
+	for rows.Next() {
+		var role auth.Role
+		var raw json.RawMessage
+		if err := rows.Scan(&role.ID, &role.Name, &raw, &role.CreatedAt); err != nil {
+			return nil, fmt.Errorf("list roles: scan: %w", err)
+		}
+		role.Scopes = scopeSlice(raw)
+		out = append(out, role)
+	}
+	return out, rows.Err()
+}
+
+// GetRole fetches one tenant-scoped role; auth.ErrNotFound when absent.
+func (r *IdentityRepo) GetRole(ctx context.Context, tenantID, roleID string) (auth.Role, error) {
+	var role auth.Role
+	var raw json.RawMessage
+	err := r.db.QueryRowContext(ctx,
+		`SELECT id, name, scopes, created_at FROM roles
+		 WHERE tenant_id = $1::uuid AND id = $2`,
+		tenantID, roleID).Scan(&role.ID, &role.Name, &raw, &role.CreatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.Role{}, auth.ErrNotFound
+		}
+		return auth.Role{}, fmt.Errorf("get role: %w", err)
+	}
+	role.Scopes = scopeSlice(raw)
+	return role, nil
+}
+
+// UnassignRole removes one membership row; the last-administrator guard lives
+// in the httpx layer, which checks the resulting holder counts.
+func (r *IdentityRepo) UnassignRole(ctx context.Context, tenantID, userID, roleID string) error {
+	_, err := r.db.ExecContext(ctx,
+		`DELETE FROM user_roles
+		 WHERE tenant_id = $1::uuid AND user_id = $2 AND role_id = $3`,
+		tenantID, userID, roleID)
+	if err != nil {
+		return fmt.Errorf("unassign role: %w", err)
+	}
+	return nil
+}
+
+// RoleUsers lists the users a role is assigned to (tenant-scoped).
+func (r *IdentityRepo) RoleUsers(ctx context.Context, tenantID, roleID string) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT user_id FROM user_roles
+		 WHERE tenant_id = $1::uuid AND role_id = $2 ORDER BY user_id`,
+		tenantID, roleID)
+	if err != nil {
+		return nil, fmt.Errorf("role users: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("role users: scan: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 // --- users -----------------------------------------------------------------
@@ -261,6 +339,27 @@ func (r *IdentityRepo) TouchLastLogin(ctx context.Context, tenantID, userID stri
 	return nil
 }
 
+// ListUsers returns every tenant user for the administration list path.
+func (r *IdentityRepo) ListUsers(ctx context.Context, tenantID string) ([]auth.User, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT `+userColumns+` FROM users
+		 WHERE tenant_id = $1::uuid ORDER BY id`,
+		tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list users: %w", err)
+	}
+	defer rows.Close()
+	var out []auth.User
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list users: scan: %w", err)
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
 // --- service accounts ------------------------------------------------------
 
 func (r *IdentityRepo) CreateServiceAccount(ctx context.Context, tenantID string, sa auth.ServiceAccount) error {
@@ -310,6 +409,30 @@ func (r *IdentityRepo) UpdateServiceAccountStatus(ctx context.Context, tenantID,
 		return fmt.Errorf("update service account status: %w", err)
 	}
 	return nil
+}
+
+// ListServiceAccounts returns every tenant service account (admin list).
+func (r *IdentityRepo) ListServiceAccounts(ctx context.Context, tenantID string) ([]auth.ServiceAccount, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id, tenant_id::text, name, scopes, status, created_at
+		 FROM service_accounts
+		 WHERE tenant_id = $1::uuid ORDER BY id`,
+		tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list service accounts: %w", err)
+	}
+	defer rows.Close()
+	var out []auth.ServiceAccount
+	for rows.Next() {
+		var sa auth.ServiceAccount
+		var raw json.RawMessage
+		if err := rows.Scan(&sa.ID, &sa.TenantID, &sa.Name, &raw, &sa.Status, &sa.CreatedAt); err != nil {
+			return nil, fmt.Errorf("list service accounts: scan: %w", err)
+		}
+		sa.Scopes = scopeSlice(raw)
+		out = append(out, sa)
+	}
+	return out, rows.Err()
 }
 
 // --- API keys --------------------------------------------------------------
@@ -613,6 +736,28 @@ func (r *IdentityRepo) RevokeUserSessions(ctx context.Context, tenantID, userID 
 	return nil
 }
 
+// ListSessionsForUser returns a user's sessions for the session-management
+// path; callers redact token/csrf before rendering.
+func (r *IdentityRepo) ListSessionsForUser(ctx context.Context, tenantID, userID string) ([]auth.Session, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT `+sessionColumns+` FROM sessions
+		 WHERE tenant_id = $1::uuid AND user_id = $2 ORDER BY created_at`,
+		tenantID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list sessions for user: %w", err)
+	}
+	defer rows.Close()
+	var out []auth.Session
+	for rows.Next() {
+		s, err := scanSession(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list sessions for user: scan: %w", err)
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 // --- external identities ---------------------------------------------------
 
 func (r *IdentityRepo) RecordAuthIdentity(ctx context.Context, tenantID string, a auth.AuthIdentity) error {
@@ -648,6 +793,84 @@ func (r *IdentityRepo) GetAuthIdentity(ctx context.Context, tenantID, issuer, su
 	}
 	a.LinkedByUserID = linkedBy.String
 	return a, nil
+}
+
+// ListAuthIdentitiesForUser returns a user's external issuer+subject links.
+func (r *IdentityRepo) ListAuthIdentitiesForUser(ctx context.Context, tenantID, userID string) ([]auth.AuthIdentity, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id, user_id, issuer, subject, linked_at, linked_by_user_id
+		 FROM auth_identities
+		 WHERE tenant_id = $1::uuid AND user_id = $2 ORDER BY id`,
+		tenantID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list auth identities: %w", err)
+	}
+	defer rows.Close()
+	var out []auth.AuthIdentity
+	for rows.Next() {
+		var a auth.AuthIdentity
+		var linkedBy sql.NullString
+		if err := rows.Scan(&a.ID, &a.UserID, &a.Issuer, &a.Subject, &a.LinkedAt, &linkedBy); err != nil {
+			return nil, fmt.Errorf("list auth identities: scan: %w", err)
+		}
+		a.LinkedByUserID = linkedBy.String
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// AdminHolderCounts backs the last-administrator lockout guard: it reports
+// the active users carrying the scope through a role and the active keys
+// carrying it directly. A disabled user cannot authenticate, so only
+// status='active' users count.
+func (r *IdentityRepo) AdminHolderCounts(ctx context.Context, tenantID, scope string) (adminUsers []string, adminKeys []string, err error) {
+	userRows, err := r.db.QueryContext(ctx,
+		`SELECT DISTINCT ur.user_id FROM user_roles ur
+		 JOIN roles ro ON ro.tenant_id = ur.tenant_id AND ro.id = ur.role_id
+		 JOIN users u ON u.tenant_id = ur.tenant_id AND u.id = ur.user_id
+		 WHERE ur.tenant_id = $1::uuid AND u.status = 'active'
+		   AND ro.scopes ? $2`,
+		tenantID, scope)
+	if err != nil {
+		return nil, nil, fmt.Errorf("count admin users: %w", err)
+	}
+	defer userRows.Close()
+	for userRows.Next() {
+		var id string
+		if err := userRows.Scan(&id); err != nil {
+			return nil, nil, fmt.Errorf("count admin users: scan: %w", err)
+		}
+		adminUsers = append(adminUsers, id)
+	}
+	if err := userRows.Err(); err != nil {
+		return nil, nil, err
+	}
+	// A key counts only while it can actually authenticate: active row and
+	// an active owner user or service account.
+	keyRows, err := r.db.QueryContext(ctx,
+		`SELECT k.id FROM api_keys k
+		 LEFT JOIN users u ON u.tenant_id = k.tenant_id AND u.id = k.owner_user_id
+		 LEFT JOIN service_accounts sa ON sa.tenant_id = k.tenant_id AND sa.id = k.service_account_id
+		 WHERE k.tenant_id = $1::uuid AND k.revoked_at IS NULL
+		   AND (k.expires_at IS NULL OR k.expires_at > now())
+		   AND COALESCE(k.scopes -> 'items', '[]'::jsonb) ? $2
+		   AND COALESCE(u.status, sa.status, '') = 'active'`,
+		tenantID, scope)
+	if err != nil {
+		return nil, nil, fmt.Errorf("count admin keys: %w", err)
+	}
+	defer keyRows.Close()
+	for keyRows.Next() {
+		var id string
+		if err := keyRows.Scan(&id); err != nil {
+			return nil, nil, fmt.Errorf("count admin keys: scan: %w", err)
+		}
+		adminKeys = append(adminKeys, id)
+	}
+	if err := keyRows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return adminUsers, adminKeys, nil
 }
 
 // --- delegations -----------------------------------------------------------

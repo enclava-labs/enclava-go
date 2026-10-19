@@ -172,6 +172,20 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/api/v1/admin/pricing", a.authenticated("pricing.manage", a.handleAdminPricing))
 	a.mux.HandleFunc("/api/v1/admin/billing-audit", a.authenticated("platform.admin", a.handleAdminBillingAudit))
 
+	// 01-24 identity administration: tenant-scoped user/role/service-account
+	// and session/link management over the shared auth services. Mutations on
+	// the /me and /link paths run through the same session/CSRF rules as every
+	// other authenticated route.
+	a.mux.HandleFunc("/api/v1/identities/users", a.authenticated("platform.admin", a.handleIdentityUsers))
+	a.mux.HandleFunc("/api/v1/identities/users/", a.authenticated("platform.admin", a.handleIdentityUserByID))
+	a.mux.HandleFunc("/api/v1/identities/roles", a.authenticated("platform.admin", a.handleIdentityRoles))
+	a.mux.HandleFunc("/api/v1/identities/roles/", a.authenticated("platform.admin", a.handleIdentityRoleByID))
+	a.mux.HandleFunc("/api/v1/identities/service-accounts", a.authenticated("platform.admin", a.handleIdentityServiceAccounts))
+	a.mux.HandleFunc("/api/v1/identities/service-accounts/", a.authenticated("platform.admin", a.handleIdentityServiceAccountByID))
+	a.mux.HandleFunc("/api/v1/identities/me", a.authenticated("", a.handleIdentityMe))
+	a.mux.HandleFunc("/api/v1/identities/me/", a.authenticated("", a.handleIdentityMe))
+	a.mux.HandleFunc("/api/v1/identities/link", a.authenticated("", a.handleIdentityLink))
+
 	a.registerDashboardRoutes()
 }
 
@@ -252,7 +266,7 @@ func (a *App) authenticated(scope string, next func(http.ResponseWriter, *http.R
 				return
 			}
 		}
-		if !auth.HasScope(principal, scope) {
+		if scope != "" && !auth.HasScope(principal, scope) {
 			WriteForbidden(w, fmt.Sprintf("missing required scope: %s", scope))
 			return
 		}
