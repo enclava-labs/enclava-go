@@ -5,8 +5,13 @@ package inference
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrEndpointNotFound is returned for unknown or cross-tenant endpoint ids —
+// the same outcome either way.
+var ErrEndpointNotFound = errors.New("inference: endpoint not found")
 
 // Endpoint is a tenant-scoped configured inference endpoint. Administrative
 // configuration must explicitly authorize a private endpoint
@@ -33,4 +38,7 @@ type EndpointRepository interface {
 	Create(ctx context.Context, e Endpoint) error
 	Update(ctx context.Context, e Endpoint) error
 	SetEnabled(ctx context.Context, tenantID, id string, enabled bool) error
+	// ListCapabilities returns the tenant's enabled endpoints advertising the
+	// capability — deterministic routing input for the executor.
+	ListCapabilities(ctx context.Context, tenantID, capability string) ([]Endpoint, error)
 }
