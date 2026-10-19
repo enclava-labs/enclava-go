@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +18,8 @@ import (
 	"enclava-go/internal/llm"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
-	"enclava-go/internal/store/sqlite"
+	"enclava-go/internal/store/postgres"
+	"enclava-go/internal/testdb"
 )
 
 type completionProvider struct {
@@ -68,28 +68,30 @@ func (e dialNetError) Error() string   { return e.msg }
 func (e dialNetError) Timeout() bool   { return true }
 func (e dialNetError) Temporary() bool { return false }
 
+func openChatPrincipal(tenantID string) auth.Principal {
+	return auth.Principal{
+		TenantID:           tenantID,
+		ActorID:            "http_key_actor",
+		ActorKind:          auth.ActorKindServiceAccount,
+		APIKeyID:           42,
+		AllowedModelsAll:   true,
+		AllowedChatbotsAll: true,
+	}
+}
+
 func TestExternalChatbotCompletionHidesServiceErrors(t *testing.T) {
 	ctx := context.Background()
-	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "chatbot.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	defer func() { _ = db.Close() }()
+	db := testdb.New(t)
+	tenantID := testdb.SeedTenant(t, db, "chatbot-http")
+	promptRepo := postgres.NewPromptsRepo(db)
 
-	keyID, err := sqlite.NewAPIKeysRepo(db.SQL).CreateAPIKey(ctx, "chatbot-http", "enc_test_key_chatbot_http_secret", "sha256", "", []string{"chatbot"})
-	if err != nil {
-		t.Fatalf("create api key: %v", err)
-	}
-	promptRepo := sqlite.NewPromptTemplatesRepo(db.SQL)
-	if err := promptRepo.EnsureDefaults(ctx, prompts.DefaultTemplates()); err != nil {
-		t.Fatalf("seed prompts: %v", err)
-	}
 	const secret = "supersecret-qdrant-dsn"
 	provider := &completionProvider{err: errors.New("sql: " + secret + " no such table")}
-	chatSvc := chatbot.NewService(sqlite.NewChatbotRepo(db.SQL), promptRepo, staticRAG{
+	chatSvc := chatbot.NewService(postgres.NewChatbotRepo(db), promptRepo, staticRAG{
 		err: errors.New("qdrant search failed at " + secret),
 	}, provider, nil)
-	if _, err := chatSvc.Create(ctx, chatbot.CreateChatbotInput{
+	p := openChatPrincipal(tenantID)
+	if _, err := chatSvc.Create(ctx, p, chatbot.CreateChatbotInput{
 		Name:             "RAG Bot",
 		Model:            "chat-test-model",
 		ExternalID:       "rag_http_bot",
@@ -97,7 +99,7 @@ func TestExternalChatbotCompletionHidesServiceErrors(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create rag chatbot: %v", err)
 	}
-	if _, err := chatSvc.Create(ctx, chatbot.CreateChatbotInput{
+	if _, err := chatSvc.Create(ctx, p, chatbot.CreateChatbotInput{
 		Name:       "Plain Bot",
 		Model:      "chat-test-model",
 		ExternalID: "plain_http_bot",
@@ -105,16 +107,15 @@ func TestExternalChatbotCompletionHidesServiceErrors(t *testing.T) {
 		t.Fatalf("create plain chatbot: %v", err)
 	}
 	app := &App{chatbotSvc: chatSvc, provider: provider}
-	principal := auth.Principal{APIKeyID: keyID, AllowedModelsAll: true, AllowedChatbotsAll: true}
 
 	valid := `{"messages":[{"role":"user","content":"hello"}]}`
 	stream := `{"stream":true,"messages":[{"role":"user","content":"hello"}]}`
-	assertCompletionStatus(t, app, principal, "rag_http_bot", valid, http.StatusInternalServerError, secret)
-	assertCompletionStatus(t, app, principal, "rag_http_bot", stream, http.StatusInternalServerError, secret)
-	assertCompletionStatus(t, app, principal, "plain_http_bot", valid, http.StatusInternalServerError, secret)
-	assertCompletionStatus(t, app, principal, "plain_http_bot", "{", http.StatusBadRequest, secret)
+	assertCompletionStatus(t, app, p, "rag_http_bot", valid, http.StatusInternalServerError, secret)
+	assertCompletionStatus(t, app, p, "rag_http_bot", stream, http.StatusInternalServerError, secret)
+	assertCompletionStatus(t, app, p, "plain_http_bot", valid, http.StatusInternalServerError, secret)
+	assertCompletionStatus(t, app, p, "plain_http_bot", "{", http.StatusBadRequest, secret)
 
-	malformed := postChatbotCompletion(t, app, principal, "plain_http_bot", "{")
+	malformed := postChatbotCompletion(t, app, p, "plain_http_bot", "{")
 	if !strings.Contains(malformed.Body.String(), "invalid JSON") {
 		t.Fatalf("malformed body status %d, body %s", malformed.Code, malformed.Body.String())
 	}
@@ -215,10 +216,10 @@ func TestWriteChatbotCompletionErrorClassifiesFailures(t *testing.T) {
 			want:   "chatbot not found",
 		},
 		{
-			name:   "invalid input",
+			name:    "invalid input",
 			ctx:    context.Background(),
 			err:    chatbot.ErrInvalidInput,
-			status: http.StatusBadRequest,
+			status:  http.StatusBadRequest,
 			want:   "invalid chatbot input",
 		},
 		{
@@ -250,16 +251,15 @@ func TestWriteChatbotCompletionErrorClassifiesFailures(t *testing.T) {
 
 func TestChatbotAndPromptReadsHonorAllowlist(t *testing.T) {
 	ctx := context.Background()
-	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "chatbot.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	defer func() { _ = db.Close() }()
+	db := testdb.New(t)
+	tenantID := testdb.SeedTenant(t, db, "chatbot-reads")
 
-	promptRepo := sqlite.NewPromptTemplatesRepo(db.SQL)
-	promptSvc := prompts.NewService(promptRepo)
-	chatSvc := chatbot.NewService(sqlite.NewChatbotRepo(db.SQL), promptRepo, nil, &completionProvider{}, nil)
-	allowedTemplate, err := promptSvc.Create(ctx, prompts.CreateTemplateInput{
+	promptRepo := postgres.NewPromptsRepo(db)
+	chatSvc := chatbot.NewService(postgres.NewChatbotRepo(db), promptRepo, nil, &completionProvider{}, nil)
+	promptSvc := prompts.NewService(promptRepo, chatSvc)
+	open := openChatPrincipal(tenantID)
+
+	allowedTemplate, err := promptSvc.Create(ctx, open, prompts.CreateTemplateInput{
 		ID:         "tmpl_allowed",
 		Name:       "Allowed",
 		UserPrompt: "{{.user_input}}",
@@ -267,7 +267,7 @@ func TestChatbotAndPromptReadsHonorAllowlist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create allowed template: %v", err)
 	}
-	hiddenTemplate, err := promptSvc.Create(ctx, prompts.CreateTemplateInput{
+	hiddenTemplate, err := promptSvc.Create(ctx, open, prompts.CreateTemplateInput{
 		ID:         "tmpl_hidden",
 		Name:       "Hidden",
 		UserPrompt: "{{.user_input}}",
@@ -275,7 +275,7 @@ func TestChatbotAndPromptReadsHonorAllowlist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create hidden template: %v", err)
 	}
-	allowedBot, err := chatSvc.Create(ctx, chatbot.CreateChatbotInput{
+	allowedBot, err := chatSvc.Create(ctx, open, chatbot.CreateChatbotInput{
 		Name:             "Allowed Bot",
 		Model:            "chat-test-model",
 		ExternalID:       "allowed_ext",
@@ -284,7 +284,7 @@ func TestChatbotAndPromptReadsHonorAllowlist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create allowed bot: %v", err)
 	}
-	hiddenBot, err := chatSvc.Create(ctx, chatbot.CreateChatbotInput{
+	hiddenBot, err := chatSvc.Create(ctx, open, chatbot.CreateChatbotInput{
 		Name:             "Hidden Bot",
 		Model:            "chat-test-model",
 		ExternalID:       "hidden_ext",
@@ -294,10 +294,8 @@ func TestChatbotAndPromptReadsHonorAllowlist(t *testing.T) {
 		t.Fatalf("create hidden bot: %v", err)
 	}
 	app := &App{chatbotSvc: chatSvc, promptSvc: promptSvc}
-	byExternal := auth.Principal{AllowedChatbots: map[string]struct{}{"allowed_ext": {}}}
-	byInternal := auth.Principal{AllowedChatbots: map[string]struct{}{hiddenBot.ID: {}}}
-	allowAll := auth.Principal{AllowedChatbotsAll: true}
-	open := auth.Principal{AllowedChatbotsAll: true}
+	byExternal := auth.Principal{TenantID: tenantID, AllowedChatbots: map[string]struct{}{"allowed_ext": {}}}
+	byInternal := auth.Principal{TenantID: tenantID, AllowedChatbots: map[string]struct{}{hiddenBot.ID: {}}}
 
 	if got := listChatbotIDs(t, app, byExternal); !sameIDs(got, []string{allowedBot.ID}) {
 		t.Fatalf("external allowlist chatbots = %#v", got)
@@ -326,22 +324,22 @@ func TestChatbotAndPromptReadsHonorAllowlist(t *testing.T) {
 	if got := listPromptIDs(t, app, byInternal); !sameIDs(got, []string{hiddenTemplate.ID}) {
 		t.Fatalf("internal allowlist prompts = %#v", got)
 	}
-	if got := listChatbotIDs(t, app, allowAll); !sameIDs(got, []string{allowedBot.ID, hiddenBot.ID}) {
-		t.Fatalf("star allowlist chatbots = %#v", got)
+	if got := listChatbotIDs(t, app, open); !sameIDs(got, []string{allowedBot.ID, hiddenBot.ID}) {
+		t.Fatalf("open allowlist chatbots = %#v", got)
 	}
 	if got := listPromptIDs(t, app, open); !sameIDs(got, []string{allowedTemplate.ID, hiddenTemplate.ID}) {
 		t.Fatalf("open allowlist prompts = %#v", got)
 	}
 
-	bare := &App{promptSvc: promptSvc}
+	bare := &App{promptSvc: prompts.NewService(promptRepo, nil)}
 	if got := listPromptIDs(t, bare, byExternal); len(got) != 0 {
-		t.Fatalf("nil chatbot service returned templates to a restricted key: %#v", got)
+		t.Fatalf("nil chatbot visibility returned templates to a restricted key: %#v", got)
 	}
 	if rec := getPrompt(t, bare, byExternal, allowedTemplate.ID); rec.Code != http.StatusNotFound {
-		t.Fatalf("nil chatbot service get status = %d body = %s", rec.Code, rec.Body.String())
+		t.Fatalf("nil chatbot visibility get status = %d body = %s", rec.Code, rec.Body.String())
 	}
 	if got := listPromptIDs(t, bare, open); !sameIDs(got, []string{allowedTemplate.ID, hiddenTemplate.ID}) {
-		t.Fatalf("nil chatbot service open allowlist prompts = %#v", got)
+		t.Fatalf("nil chatbot visibility open allowlist prompts = %#v", got)
 	}
 }
 

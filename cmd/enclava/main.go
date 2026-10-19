@@ -77,8 +77,8 @@ func main() {
 	extractTemplatesRepo := sqlite.NewExtractTemplatesRepo(db.SQL)
 	extractSettingsRepo := sqlite.NewExtractSettingsRepo(db.SQL)
 	usageRepo := sqlite.NewUsageRepo(db.SQL)
-	promptRepo := sqlite.NewPromptTemplatesRepo(db.SQL)
-	chatbotRepo := sqlite.NewChatbotRepo(db.SQL)
+	promptRepo := postgres.NewPromptsRepo(pgDB)
+	chatbotRepo := postgres.NewChatbotRepo(pgDB)
 	pricingRepo := sqlite.NewPricingRepo(db.SQL)
 	budgetsRepo := sqlite.NewBudgetsRepo(db.SQL)
 	billingAuditRepo := sqlite.NewBillingAuditRepo(db.SQL)
@@ -96,9 +96,6 @@ func main() {
 	jobsSvc := jobs.NewService(jobsRepoPG, 0)
 	billingSvc := billing.NewService(postgres.NewBillingRepo(pgDB))
 
-	if err := promptRepo.EnsureDefaults(ctx, prompts.DefaultTemplates()); err != nil {
-		log.Fatalf("prompt template seed error: %v", err)
-	}
 	if err := providersRepo.EnsureDefault(ctx, runtimeProviderConfig(cfg)); err != nil {
 		log.Fatalf("provider config seed error: %v", err)
 	}
@@ -131,8 +128,8 @@ func main() {
 	ragRepo := postgres.NewRAGRepo(pgDB)
 	sourceRepo := postgres.NewSourceRepo(pgDB)
 	ragSvc := rag.NewService(ragRepo, qdrantClient, provider, cfg.DefaultEmbeddingModel, artifactStore, jobsSvc, billingSvc)
-	promptSvc := prompts.NewService(promptRepo)
-	chatbotSvc := chatbot.NewService(chatbotRepo, promptRepo, ragSvc, provider, usageRepo)
+	chatbotSvc := chatbot.NewService(chatbotRepo, promptRepo, ragSvc, provider, legacyUsageRecorder{repo: usageRepo})
+	promptSvc := prompts.NewService(promptRepo, chatbotSvc)
 	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG, ragSvc)
 
 	app := httpx.NewApp(
@@ -273,4 +270,29 @@ func buildProvider(cfg config.Config) (llm.Provider, error) {
 	default:
 		return nil, fmt.Errorf("unsupported INFERENCE_PROVIDER %q", cfg.Provider)
 	}
+}
+
+// legacyUsageRecorder bridges the chatbot completion usage records to the
+// legacy sqlite usage stats repo until the billing port (01-17) replaces
+// observability writes. Keyed attribution still flows through APIKeyID.
+type legacyUsageRecorder struct {
+	repo *sqlite.UsageRepo
+}
+
+func (r legacyUsageRecorder) Record(ctx context.Context, rec chatbot.UsageRecord) error {
+	if r.repo == nil || rec.APIKeyID <= 0 {
+		return nil
+	}
+	return r.repo.Record(ctx, sqlite.UsageRecord{
+		ID:               rec.ID,
+		APIKeyID:         rec.APIKeyID,
+		Endpoint:         rec.Endpoint,
+		Model:            rec.Model,
+		ChatbotID:        rec.ChatbotID,
+		ProviderID:       rec.ProviderID,
+		PromptTokens:     rec.PromptTokens,
+		CompletionTokens: rec.CompletionTokens,
+		TotalTokens:      rec.TotalTokens,
+		StatusCode:       rec.StatusCode,
+	})
 }

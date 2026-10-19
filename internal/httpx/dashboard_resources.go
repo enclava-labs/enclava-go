@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/chatbot"
@@ -16,7 +17,6 @@ import (
 	"enclava-go/internal/llm"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
-	"enclava-go/internal/store/sqlite"
 )
 
 type dashboardResourcePageData struct {
@@ -35,13 +35,51 @@ type dashboardProvidersData struct {
 	Error       string
 }
 
+// Legacy billing/pricing view rows — the billing repo itself ports in 01-17;
+// these stay wire-identical to the sqlite rows until then.
+type dashboardProviderPricing struct {
+	ID                       int64
+	ProviderID               string
+	ModelID                  string
+	Currency                 string
+	InputTokenCentsPer1K     float64
+	OutputTokenCentsPer1K    float64
+	EmbeddingTokenCentsPer1K float64
+	EffectiveAt              time.Time
+	CreatedAt                time.Time
+}
+
+type dashboardPricingAudit struct {
+	ID                string
+	ProviderPricingID *int64
+	Action            string
+	ActorType         string
+	ActorID           string
+	Before            map[string]any
+	After             map[string]any
+	CreatedAt         time.Time
+}
+
+type dashboardBillingAudit struct {
+	ID          string
+	APIKeyID    *int64
+	SubjectType string
+	SubjectID   string
+	Action      string
+	ActorType   string
+	ActorID     string
+	AmountCents *int64
+	Metadata    map[string]any
+	CreatedAt   time.Time
+}
+
 type dashboardPricingData struct {
-	Pricing []sqlite.ProviderPricing
-	Audit   []sqlite.PricingAuditLog
+	Pricing []dashboardProviderPricing
+	Audit   []dashboardPricingAudit
 }
 
 type dashboardBillingAuditData struct {
-	Audit []sqlite.BillingAuditLog
+	Audit []dashboardBillingAudit
 }
 
 type dashboardRAGData struct {
@@ -52,15 +90,15 @@ type dashboardRAGData struct {
 }
 
 type dashboardChatbotsData struct {
-	Chatbots        []sqlite.ChatbotInstance
-	PromptTemplates []sqlite.PromptTemplate
+	Chatbots        []chatbot.Instance
+	PromptTemplates []prompts.Template
 	Collections     []rag.Collection
 	Success         string
 	Error           string
 }
 
 type dashboardPromptTemplatesData struct {
-	Templates []sqlite.PromptTemplate
+	Templates []prompts.Template
 	Success   string
 	Error     string
 }
@@ -172,7 +210,22 @@ func (a *App) handleDashboardPricing(w http.ResponseWriter, r *http.Request) {
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_pricing_audit_failed")
 		return
 	}
-	if err := dashboardTemplates.ExecuteTemplate(w, "partial-pricing", dashboardPricingData{Pricing: pricing, Audit: audit}); err != nil {
+	pricingView := make([]dashboardProviderPricing, 0, len(pricing))
+	for _, row := range pricing {
+		pricingView = append(pricingView, dashboardProviderPricing{
+			ID: row.ID, ProviderID: row.ProviderID, ModelID: row.ModelID, Currency: row.Currency,
+			InputTokenCentsPer1K: row.InputTokenCentsPer1K, OutputTokenCentsPer1K: row.OutputTokenCentsPer1K,
+			EmbeddingTokenCentsPer1K: row.EmbeddingTokenCentsPer1K, EffectiveAt: row.EffectiveAt, CreatedAt: row.CreatedAt,
+		})
+	}
+	auditView := make([]dashboardPricingAudit, 0, len(audit))
+	for _, row := range audit {
+		auditView = append(auditView, dashboardPricingAudit{
+			ID: row.ID, ProviderPricingID: row.ProviderPricingID, Action: row.Action,
+			ActorType: row.ActorType, ActorID: row.ActorID, Before: row.Before, After: row.After, CreatedAt: row.CreatedAt,
+		})
+	}
+	if err := dashboardTemplates.ExecuteTemplate(w, "partial-pricing", dashboardPricingData{Pricing: pricingView, Audit: auditView}); err != nil {
 		log.Printf("failed to render dashboard pricing: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_pricing_render_failed")
 	}
@@ -193,7 +246,15 @@ func (a *App) handleDashboardBillingAudit(w http.ResponseWriter, r *http.Request
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_billing_audit_failed")
 		return
 	}
-	if err := dashboardTemplates.ExecuteTemplate(w, "partial-billing-audit", dashboardBillingAuditData{Audit: audit}); err != nil {
+	auditView := make([]dashboardBillingAudit, 0, len(audit))
+	for _, row := range audit {
+		auditView = append(auditView, dashboardBillingAudit{
+			ID: row.ID, APIKeyID: row.APIKeyID, SubjectType: row.SubjectType, SubjectID: row.SubjectID,
+			Action: row.Action, ActorType: row.ActorType, ActorID: row.ActorID,
+			AmountCents: row.AmountCents, Metadata: row.Metadata, CreatedAt: row.CreatedAt,
+		})
+	}
+	if err := dashboardTemplates.ExecuteTemplate(w, "partial-billing-audit", dashboardBillingAuditData{Audit: auditView}); err != nil {
 		log.Printf("failed to render dashboard billing audit: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_billing_audit_render_failed")
 	}
@@ -280,10 +341,14 @@ func (a *App) handleDashboardChatbots(w http.ResponseWriter, r *http.Request) {
 	}
 	successMessage := ""
 	errorMessage := ""
-	if r.Method == http.MethodPost {
-		successMessage, errorMessage = a.handleDashboardChatbotAction(r)
+	p, ok := a.extractPrincipal(w, r)
+	if !ok {
+		return
 	}
-	chatbots, err := a.chatbotSvc.List(r.Context())
+	if r.Method == http.MethodPost {
+		successMessage, errorMessage = a.handleDashboardChatbotAction(r, p)
+	}
+	chatbots, err := a.chatbotSvc.List(r.Context(), p)
 	if err != nil {
 		log.Printf("failed to load dashboard chatbots: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_chatbots_failed")
@@ -291,12 +356,10 @@ func (a *App) handleDashboardChatbots(w http.ResponseWriter, r *http.Request) {
 	}
 	data := dashboardChatbotsData{Chatbots: chatbots, Success: successMessage, Error: errorMessage}
 	if a.promptSvc != nil {
-		data.PromptTemplates, _ = a.promptSvc.List(r.Context())
+		data.PromptTemplates, _ = a.promptSvc.List(r.Context(), p)
 	}
 	if a.ragSvc != nil {
-		if p, ok := auth.PrincipalFromContext(r.Context()); ok {
-			data.Collections, _ = a.ragSvc.ListCollections(r.Context(), p)
-		}
+		data.Collections, _ = a.ragSvc.ListCollections(r.Context(), p)
 	}
 	if err := dashboardTemplates.ExecuteTemplate(w, "partial-chatbots", data); err != nil {
 		log.Printf("failed to render dashboard chatbots: %v", err)
@@ -313,12 +376,16 @@ func (a *App) handleDashboardPromptTemplates(w http.ResponseWriter, r *http.Requ
 		WriteOpenAIError(w, http.StatusNotImplemented, "prompt templates are not configured", "server_error", "not_configured")
 		return
 	}
+	p, ok := a.extractPrincipal(w, r)
+	if !ok {
+		return
+	}
 	successMessage := ""
 	errorMessage := ""
 	if r.Method == http.MethodPost {
-		successMessage, errorMessage = a.handleDashboardPromptTemplateAction(r)
+		successMessage, errorMessage = a.handleDashboardPromptTemplateAction(r, p)
 	}
-	templates, err := a.promptSvc.List(r.Context())
+	templates, err := a.promptSvc.List(r.Context(), p)
 	if err != nil {
 		log.Printf("failed to load dashboard prompt templates: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_prompt_templates_failed")
@@ -442,7 +509,7 @@ func (a *App) handleDashboardRAGAction(r *http.Request, p auth.Principal) (strin
 	}
 }
 
-func (a *App) handleDashboardChatbotAction(r *http.Request) (string, string) {
+func (a *App) handleDashboardChatbotAction(r *http.Request, p auth.Principal) (string, string) {
 	if err := parseDashboardForm(r, a.maxUploadMB); err != nil {
 		return "", "Invalid form data"
 	}
@@ -456,7 +523,7 @@ func (a *App) handleDashboardChatbotAction(r *http.Request) (string, string) {
 		if err != nil {
 			return "", "Settings must be valid JSON"
 		}
-		if _, err := a.chatbotSvc.Create(r.Context(), chatbot.CreateChatbotInput{
+		if _, err := a.chatbotSvc.Create(r.Context(), p, chatbot.CreateChatbotInput{
 			Name:             r.FormValue("name"),
 			Description:      r.FormValue("description"),
 			PromptTemplateID: r.FormValue("prompt_template_id"),
@@ -475,7 +542,7 @@ func (a *App) handleDashboardChatbotAction(r *http.Request) (string, string) {
 		if id == "" {
 			return "", "Chatbot ID is required"
 		}
-		if _, err := a.chatbotSvc.Update(r.Context(), id, chatbot.UpdateChatbotInput{IsEnabled: &enabled}); err != nil {
+		if _, err := a.chatbotSvc.Update(r.Context(), p, id, chatbot.UpdateChatbotInput{IsEnabled: &enabled}); err != nil {
 			return "", err.Error()
 		}
 		if enabled {
@@ -487,7 +554,7 @@ func (a *App) handleDashboardChatbotAction(r *http.Request) (string, string) {
 		if id == "" {
 			return "", "Chatbot ID is required"
 		}
-		if err := a.chatbotSvc.Delete(r.Context(), id); err != nil {
+		if err := a.chatbotSvc.Delete(r.Context(), p, id); err != nil {
 			return "", err.Error()
 		}
 		return "Chatbot deleted", ""
@@ -496,7 +563,7 @@ func (a *App) handleDashboardChatbotAction(r *http.Request) (string, string) {
 	}
 }
 
-func (a *App) handleDashboardPromptTemplateAction(r *http.Request) (string, string) {
+func (a *App) handleDashboardPromptTemplateAction(r *http.Request, p auth.Principal) (string, string) {
 	if err := parseDashboardForm(r, a.maxUploadMB); err != nil {
 		return "", "Invalid form data"
 	}
@@ -504,7 +571,7 @@ func (a *App) handleDashboardPromptTemplateAction(r *http.Request) (string, stri
 	if err != nil {
 		return "", "Variables schema must be valid JSON"
 	}
-	if _, err := a.promptSvc.Create(r.Context(), prompts.CreateTemplateInput{
+	if _, err := a.promptSvc.Create(r.Context(), p, prompts.CreateTemplateInput{
 		ID:              r.FormValue("id"),
 		Name:            r.FormValue("name"),
 		Description:     r.FormValue("description"),

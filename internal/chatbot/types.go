@@ -2,8 +2,7 @@ package chatbot
 
 import (
 	"errors"
-
-	"enclava-go/internal/store/sqlite"
+	"time"
 )
 
 var (
@@ -14,15 +13,62 @@ var (
 	ErrInvalidInput       = errors.New("invalid chatbot input")
 )
 
-type Access struct {
-	APIKeyID           int64
-	IsAdmin            bool
-	AllowedModels      map[string]struct{}
-	AllowedChatbots    map[string]struct{}
-	AllowedAgents      map[string]struct{}
-	AllowedModelsAll   bool
-	AllowedChatbotsAll bool
-	AllowedAgentsAll   bool
+// Instance is the tenant-scoped chatbots domain row. TenantID and
+// OwnerActorID are server-owned authorization fields — never serialized.
+type Instance struct {
+	TenantID         string         `json:"-"`
+	ID               string         `json:"id"`
+	Name             string         `json:"name"`
+	Description      string         `json:"description,omitempty"`
+	PromptTemplateID string         `json:"prompt_template_id,omitempty"`
+	ProviderID       string         `json:"provider_id,omitempty"`
+	Model            string         `json:"model"`
+	RAGCollectionIDs []string       `json:"rag_collection_ids,omitempty"`
+	Settings         map[string]any `json:"settings,omitempty"`
+	ExternalID       string         `json:"external_id"`
+	IsEnabled        bool           `json:"is_enabled"`
+	OwnerActorID     string         `json:"-"`
+	CreatedAt        time.Time      `json:"created_at"`
+	UpdatedAt        time.Time      `json:"updated_at"`
+}
+
+// Conversation is the tenant-scoped conversations row. OwnerActorID carries
+// the initiating actor's identity — resume is owner-or-admin only.
+type Conversation struct {
+	TenantID       string    `json:"-"`
+	ID             string    `json:"id"`
+	ChatbotID      string    `json:"chatbot_id"`
+	OwnerActorID   string    `json:"-"`
+	ExternalUserID string    `json:"external_user_id,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+// Message is a tenant-scoped messages row. Token accounting lives on the
+// usage record, not the message row.
+type Message struct {
+	TenantID       string    `json:"-"`
+	ID             string    `json:"id"`
+	ConversationID string    `json:"conversation_id"`
+	Role           string    `json:"role"`
+	Content        string    `json:"content"`
+	OwnerActorID   string    `json:"-"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+// UsageRecord is the observability view written for one completion attempt.
+// Priced settlement flows through billing; this record feeds the legacy usage
+// stats repo until the billing port lands.
+type UsageRecord struct {
+	ID               string
+	APIKeyID         int64
+	Endpoint         string
+	Model            string
+	ChatbotID        string
+	ProviderID       string
+	PromptTokens     int64
+	CompletionTokens int64
+	TotalTokens      int64
+	StatusCode       int
 }
 
 type CreateChatbotInput struct {
@@ -51,16 +97,16 @@ type UpdateChatbotInput struct {
 
 type CompletionOutput struct {
 	Response       []byte
-	Conversation   sqlite.ChatbotConversation
-	Chatbot        sqlite.ChatbotInstance
-	Usage          sqlite.UsageRecord
+	Conversation   Conversation
+	Chatbot        Instance
+	Usage          UsageRecord
 	RAGResultCount int
 }
 
 type PreparedCompletion struct {
 	UpstreamRequest []byte
-	Conversation    sqlite.ChatbotConversation
-	Chatbot         sqlite.ChatbotInstance
+	Conversation    Conversation
+	Chatbot         Instance
 	APIKeyID        int64
 	Model           string
 	RAGResultCount  int

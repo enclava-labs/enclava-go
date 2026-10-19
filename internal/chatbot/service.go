@@ -14,36 +14,37 @@ import (
 	"enclava-go/internal/llm"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
-	"enclava-go/internal/store/sqlite"
+	"enclava-go/internal/source"
 )
 
+// Repository is the tenant-scoped persistence boundary over the chatbots,
+// conversations and messages domain tables. Implemented by
+// postgres.ChatbotRepo.
 type Repository interface {
-	Create(ctx context.Context, b sqlite.ChatbotInstance) error
-	List(ctx context.Context) ([]sqlite.ChatbotInstance, error)
-	GetByID(ctx context.Context, id string) (sqlite.ChatbotInstance, error)
-	GetByExternalID(ctx context.Context, externalID string) (sqlite.ChatbotInstance, error)
-	Update(ctx context.Context, b sqlite.ChatbotInstance) error
-	Delete(ctx context.Context, id string) error
-	CreateConversation(ctx context.Context, c sqlite.ChatbotConversation) error
-	GetConversation(ctx context.Context, id string) (sqlite.ChatbotConversation, error)
-	AddMessage(ctx context.Context, m sqlite.ChatbotMessage) error
+	Create(ctx context.Context, b Instance) error
+	List(ctx context.Context, tenantID string) ([]Instance, error)
+	GetByID(ctx context.Context, tenantID, id string) (Instance, error)
+	GetByExternalID(ctx context.Context, tenantID, externalID string) (Instance, error)
+	Update(ctx context.Context, b Instance) error
+	Delete(ctx context.Context, tenantID, id string) error
+	CreateConversation(ctx context.Context, c Conversation) error
+	GetConversation(ctx context.Context, tenantID, id string) (Conversation, error)
+	AddMessage(ctx context.Context, m Message) error
 }
 
 type PromptRepository interface {
-	GetByID(ctx context.Context, id string) (sqlite.PromptTemplate, error)
-	GetDefault(ctx context.Context) (sqlite.PromptTemplate, error)
+	GetByID(ctx context.Context, tenantID, id string) (prompts.Template, error)
+	GetDefault(ctx context.Context, tenantID string) (prompts.Template, error)
 }
 
 // RAGSearcher is the rag.Service search surface. The request principal is
-// resolved from the call context (auth.PrincipalFromContext) — chatbot's
-// caller-facing Access struct is not passed down so a caller can never
-// forge collection authority.
+// passed through unchanged so a caller can never forge collection authority.
 type RAGSearcher interface {
 	Search(ctx context.Context, p auth.Principal, input rag.SearchInput) ([]rag.SearchResult, error)
 }
 
 type UsageRecorder interface {
-	Record(ctx context.Context, rec sqlite.UsageRecord) error
+	Record(ctx context.Context, rec UsageRecord) error
 }
 
 type Service struct {
@@ -64,25 +65,73 @@ func NewService(repo Repository, promptRepo PromptRepository, ragSvc RAGSearcher
 	}
 }
 
-func (s *Service) Create(ctx context.Context, input CreateChatbotInput) (sqlite.ChatbotInstance, error) {
+func requireTenant(p auth.Principal) error {
+	if strings.TrimSpace(p.TenantID) == "" {
+		return fmt.Errorf("%w: principal tenant is required", source.ErrDenied)
+	}
+	return nil
+}
+
+// actorKey is the conversation-owner identity used for resume authorization.
+// It prefers the canonical ActorID and falls back to the legacy API-key id
+// for principals built before ActorID was populated.
+func actorKey(p auth.Principal) string {
+	if id := strings.TrimSpace(p.ActorID); id != "" {
+		return id
+	}
+	if p.APIKeyID > 0 {
+		return fmt.Sprintf("apikey:%d", p.APIKeyID)
+	}
+	return ""
+}
+
+func chatbotAllowed(p auth.Principal, bot Instance) bool {
+	ids := []string{bot.ID}
+	if ext := strings.TrimSpace(bot.ExternalID); ext != "" {
+		ids = append(ids, ext)
+	}
+	return auth.ChatbotAllowed(p, ids...) || auth.AgentAllowed(p, ids...)
+}
+
+// VisiblePromptTemplateIDs implements prompts.VisibleTemplateIDs: the set of
+// prompt template ids attached to chatbots the principal may see.
+func (s *Service) VisiblePromptTemplateIDs(ctx context.Context, p auth.Principal) (map[string]struct{}, error) {
+	bots, err := s.List(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	allowed := map[string]struct{}{}
+	for _, bot := range bots {
+		if id := strings.TrimSpace(bot.PromptTemplateID); id != "" {
+			allowed[id] = struct{}{}
+		}
+	}
+	return allowed, nil
+}
+
+func (s *Service) Create(ctx context.Context, p auth.Principal, input CreateChatbotInput) (Instance, error) {
+	if err := requireTenant(p); err != nil {
+		return Instance{}, err
+	}
 	name := strings.TrimSpace(input.Name)
 	if name == "" {
-		return sqlite.ChatbotInstance{}, errors.New("name is required")
+		return Instance{}, errors.New("name is required")
 	}
 	model := strings.TrimSpace(input.Model)
 	if model == "" {
-		return sqlite.ChatbotInstance{}, errors.New("model is required")
+		return Instance{}, errors.New("model is required")
 	}
 	id := newID("chatbot")
 	externalID, err := normalizeExternalID(input.ExternalID, id)
 	if err != nil {
-		return sqlite.ChatbotInstance{}, err
+		return Instance{}, err
 	}
 	enabled := true
 	if input.IsEnabled != nil {
 		enabled = *input.IsEnabled
 	}
-	b := sqlite.ChatbotInstance{
+	b := Instance{
+		TenantID:         p.TenantID,
 		ID:               id,
 		Name:             name,
 		Description:      strings.TrimSpace(input.Description),
@@ -93,31 +142,60 @@ func (s *Service) Create(ctx context.Context, input CreateChatbotInput) (sqlite.
 		Settings:         nonNilMap(input.Settings),
 		ExternalID:       externalID,
 		IsEnabled:        enabled,
+		OwnerActorID:     p.ActorID,
 	}
 	if err := s.repo.Create(ctx, b); err != nil {
-		return sqlite.ChatbotInstance{}, err
+		return Instance{}, err
 	}
-	return s.repo.GetByID(ctx, id)
+	return s.repo.GetByID(ctx, p.TenantID, id)
 }
 
-func (s *Service) List(ctx context.Context) ([]sqlite.ChatbotInstance, error) {
-	return s.repo.List(ctx)
-}
-
-func (s *Service) Get(ctx context.Context, id string) (sqlite.ChatbotInstance, error) {
-	return s.repo.GetByID(ctx, strings.TrimSpace(id))
-}
-
-func (s *Service) Update(ctx context.Context, id string, input UpdateChatbotInput) (sqlite.ChatbotInstance, error) {
-	b, err := s.repo.GetByID(ctx, strings.TrimSpace(id))
+// List returns only chatbots the principal's allowlists grant. An empty
+// allowlist denies; only explicit all-mode is unrestricted.
+func (s *Service) List(ctx context.Context, p auth.Principal) ([]Instance, error) {
+	if err := requireTenant(p); err != nil {
+		return nil, err
+	}
+	bots, err := s.repo.List(ctx, p.TenantID)
 	if err != nil {
-		return sqlite.ChatbotInstance{}, err
+		return nil, err
+	}
+	out := make([]Instance, 0, len(bots))
+	for _, bot := range bots {
+		if chatbotAllowed(p, bot) {
+			out = append(out, bot)
+		}
+	}
+	return out, nil
+}
+
+func (s *Service) Get(ctx context.Context, p auth.Principal, id string) (Instance, error) {
+	if err := requireTenant(p); err != nil {
+		return Instance{}, err
+	}
+	bot, err := s.repo.GetByID(ctx, p.TenantID, strings.TrimSpace(id))
+	if err != nil {
+		return Instance{}, err
+	}
+	if !chatbotAllowed(p, bot) {
+		return Instance{}, sql.ErrNoRows
+	}
+	return bot, nil
+}
+
+func (s *Service) Update(ctx context.Context, p auth.Principal, id string, input UpdateChatbotInput) (Instance, error) {
+	if err := requireTenant(p); err != nil {
+		return Instance{}, err
+	}
+	b, err := s.repo.GetByID(ctx, p.TenantID, strings.TrimSpace(id))
+	if err != nil {
+		return Instance{}, err
 	}
 	if input.Name != nil {
 		b.Name = strings.TrimSpace(*input.Name)
 	}
 	if b.Name == "" {
-		return sqlite.ChatbotInstance{}, errors.New("name is required")
+		return Instance{}, errors.New("name is required")
 	}
 	if input.Description != nil {
 		b.Description = strings.TrimSpace(*input.Description)
@@ -132,7 +210,7 @@ func (s *Service) Update(ctx context.Context, id string, input UpdateChatbotInpu
 		b.Model = strings.TrimSpace(*input.Model)
 	}
 	if b.Model == "" {
-		return sqlite.ChatbotInstance{}, errors.New("model is required")
+		return Instance{}, errors.New("model is required")
 	}
 	if input.RAGCollectionIDs != nil {
 		b.RAGCollectionIDs = normalizeStringList(input.RAGCollectionIDs)
@@ -143,7 +221,7 @@ func (s *Service) Update(ctx context.Context, id string, input UpdateChatbotInpu
 	if input.ExternalID != nil {
 		externalID, err := normalizeExternalID(*input.ExternalID, b.ID)
 		if err != nil {
-			return sqlite.ChatbotInstance{}, err
+			return Instance{}, err
 		}
 		b.ExternalID = externalID
 	}
@@ -151,27 +229,30 @@ func (s *Service) Update(ctx context.Context, id string, input UpdateChatbotInpu
 		b.IsEnabled = *input.IsEnabled
 	}
 	if err := s.repo.Update(ctx, b); err != nil {
-		return sqlite.ChatbotInstance{}, err
+		return Instance{}, err
 	}
-	return s.repo.GetByID(ctx, b.ID)
+	return s.repo.GetByID(ctx, p.TenantID, b.ID)
 }
 
-func (s *Service) Delete(ctx context.Context, id string) error {
-	return s.repo.Delete(ctx, strings.TrimSpace(id))
+func (s *Service) Delete(ctx context.Context, p auth.Principal, id string) error {
+	if err := requireTenant(p); err != nil {
+		return err
+	}
+	return s.repo.Delete(ctx, p.TenantID, strings.TrimSpace(id))
 }
 
-func (s *Service) ExternalModels(ctx context.Context, access Access, chatbotRef string) (llm.ModelsResponse, error) {
-	bot, err := s.getByRef(ctx, chatbotRef)
+func (s *Service) ExternalModels(ctx context.Context, p auth.Principal, chatbotRef string) (llm.ModelsResponse, error) {
+	bot, err := s.getByRef(ctx, p, chatbotRef)
 	if err != nil {
 		return llm.ModelsResponse{}, err
 	}
 	if !bot.IsEnabled {
 		return llm.ModelsResponse{}, ErrDisabled
 	}
-	if !chatbotAllowed(access, bot) {
+	if !chatbotAllowed(p, bot) {
 		return llm.ModelsResponse{}, ErrChatbotNotAllowed
 	}
-	if !modelAllowed(access, bot.Model) {
+	if !auth.ModelAllowed(p, bot.Model) {
 		return llm.ModelsResponse{}, ErrModelNotAllowed
 	}
 	models, err := s.provider.ListModels(ctx)
@@ -191,19 +272,19 @@ func (s *Service) ExternalModels(ctx context.Context, access Access, chatbotRef 
 	}, nil
 }
 
-func (s *Service) CreateChatCompletion(ctx context.Context, access Access, chatbotRef string, rawRequest []byte) (CompletionOutput, error) {
-	prepared, err := s.PrepareChatCompletion(ctx, access, chatbotRef, rawRequest, false)
+func (s *Service) CreateChatCompletion(ctx context.Context, p auth.Principal, chatbotRef string, rawRequest []byte) (CompletionOutput, error) {
+	prepared, err := s.PrepareChatCompletion(ctx, p, chatbotRef, rawRequest, false)
 	if err != nil {
 		return CompletionOutput{}, err
 	}
 	resp, err := s.provider.CreateChatCompletion(ctx, prepared.UpstreamRequest)
 	if err != nil {
-		s.RecordFailure(ctx, prepared, providerErrorStatus(err))
+		s.RecordFailure(ctx, p, prepared, providerErrorStatus(err))
 		return CompletionOutput{}, err
 	}
 	usage := parseUsage(resp)
 	assistantContent := extractAssistantContent(resp)
-	record := s.RecordCompletion(ctx, prepared, assistantContent, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, 200)
+	record := s.RecordCompletion(ctx, p, prepared, assistantContent, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, 200)
 	resp = appendCompletionMetadata(resp, prepared.Chatbot.ID, prepared.Conversation.ID)
 	return CompletionOutput{
 		Response:       resp,
@@ -214,18 +295,21 @@ func (s *Service) CreateChatCompletion(ctx context.Context, access Access, chatb
 	}, nil
 }
 
-func (s *Service) PrepareChatCompletion(ctx context.Context, access Access, chatbotRef string, rawRequest []byte, stream bool) (PreparedCompletion, error) {
-	bot, err := s.getByRef(ctx, chatbotRef)
+func (s *Service) PrepareChatCompletion(ctx context.Context, p auth.Principal, chatbotRef string, rawRequest []byte, stream bool) (PreparedCompletion, error) {
+	if err := requireTenant(p); err != nil {
+		return PreparedCompletion{}, err
+	}
+	bot, err := s.getByRef(ctx, p, chatbotRef)
 	if err != nil {
 		return PreparedCompletion{}, err
 	}
 	if !bot.IsEnabled {
 		return PreparedCompletion{}, ErrDisabled
 	}
-	if !chatbotAllowed(access, bot) {
+	if !chatbotAllowed(p, bot) {
 		return PreparedCompletion{}, ErrChatbotNotAllowed
 	}
-	if !modelAllowed(access, bot.Model) {
+	if !auth.ModelAllowed(p, bot.Model) {
 		return PreparedCompletion{}, ErrModelNotAllowed
 	}
 
@@ -246,11 +330,11 @@ func (s *Service) PrepareChatCompletion(ctx context.Context, access Access, chat
 		return PreparedCompletion{}, invalidInput(errors.New("at least one user message is required"))
 	}
 
-	ragResults, ragContext, err := s.retrieveRAG(ctx, access, bot, userInput)
+	ragResults, ragContext, err := s.retrieveRAG(ctx, p, bot, userInput)
 	if err != nil {
 		return PreparedCompletion{}, err
 	}
-	rendered, err := s.renderPrompt(ctx, bot, userInput, ragContext, req.Metadata)
+	rendered, err := s.renderPrompt(ctx, p, bot, userInput, ragContext, req.Metadata)
 	if err != nil {
 		return PreparedCompletion{}, err
 	}
@@ -266,44 +350,50 @@ func (s *Service) PrepareChatCompletion(ctx context.Context, access Access, chat
 		return PreparedCompletion{}, fmt.Errorf("marshal upstream chat request: %w", err)
 	}
 
-	conversation, err := s.ensureConversation(ctx, access, bot, req, userInput, len(ragResults))
+	conversation, err := s.ensureConversation(ctx, p, bot, req)
 	if err != nil {
 		return PreparedCompletion{}, err
 	}
-	if err := s.recordRequestMessages(ctx, conversation.ID, originalMessages, bot.Model); err != nil {
+	if err := s.recordRequestMessages(ctx, p, conversation.ID, originalMessages); err != nil {
 		return PreparedCompletion{}, err
 	}
 	return PreparedCompletion{
 		UpstreamRequest: upstreamRequest,
 		Conversation:    conversation,
 		Chatbot:         bot,
-		APIKeyID:        access.APIKeyID,
+		APIKeyID:        p.APIKeyID,
 		Model:           bot.Model,
 		RAGResultCount:  len(ragResults),
 	}, nil
 }
 
-func (s *Service) RecordCompletion(ctx context.Context, prepared PreparedCompletion, assistantContent string, promptTokens, completionTokens, totalTokens int64, statusCode int) sqlite.UsageRecord {
+func (s *Service) RecordCompletion(ctx context.Context, p auth.Principal, prepared PreparedCompletion, assistantContent string, promptTokens, completionTokens, totalTokens int64, statusCode int) UsageRecord {
 	if totalTokens == 0 {
 		totalTokens = promptTokens + completionTokens
 	}
-	_ = s.repo.AddMessage(ctx, sqlite.ChatbotMessage{
-		ID:               newID("chatmsg"),
-		ConversationID:   prepared.Conversation.ID,
-		Role:             "assistant",
-		Content:          assistantContent,
-		Model:            prepared.Model,
-		PromptTokens:     int(promptTokens),
-		CompletionTokens: int(completionTokens),
-		TotalTokens:      int(totalTokens),
-		Metadata: map[string]any{
-			"source":           "provider",
-			"rag_result_count": prepared.RAGResultCount,
-		},
+	_ = s.repo.AddMessage(ctx, Message{
+		TenantID:       p.TenantID,
+		ID:             newID("chatmsg"),
+		ConversationID: prepared.Conversation.ID,
+		Role:           "assistant",
+		Content:        assistantContent,
+		OwnerActorID:   p.ActorID,
 	})
-	record := sqlite.UsageRecord{
+	record := s.usageRecord(p, prepared, promptTokens, completionTokens, totalTokens, statusCode)
+	s.recordUsage(ctx, record)
+	return record
+}
+
+func (s *Service) RecordFailure(ctx context.Context, p auth.Principal, prepared PreparedCompletion, statusCode int) UsageRecord {
+	record := s.usageRecord(p, prepared, 0, 0, 0, statusCode)
+	s.recordUsage(ctx, record)
+	return record
+}
+
+func (s *Service) usageRecord(p auth.Principal, prepared PreparedCompletion, promptTokens, completionTokens, totalTokens int64, statusCode int) UsageRecord {
+	return UsageRecord{
 		ID:               newID("usage"),
-		APIKeyID:         0,
+		APIKeyID:         p.APIKeyID,
 		Endpoint:         "/api/v1/chatbot/external/{chatbot_id}/chat/completions",
 		Model:            prepared.Model,
 		ChatbotID:        prepared.Chatbot.ID,
@@ -311,64 +401,36 @@ func (s *Service) RecordCompletion(ctx context.Context, prepared PreparedComplet
 		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
 		TotalTokens:      totalTokens,
-		CostCents:        0,
 		StatusCode:       statusCode,
 	}
-	if prepared.Conversation.APIKeyID != nil {
-		record.APIKeyID = *prepared.Conversation.APIKeyID
-	}
-	if prepared.APIKeyID > 0 {
-		record.APIKeyID = prepared.APIKeyID
-	}
-	if s.usageRepo != nil && record.APIKeyID > 0 {
-		recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		_ = s.usageRepo.Record(recordCtx, record)
-	}
-	return record
 }
 
-func (s *Service) RecordFailure(ctx context.Context, prepared PreparedCompletion, statusCode int) sqlite.UsageRecord {
-	record := sqlite.UsageRecord{
-		ID:         newID("usage"),
-		APIKeyID:   prepared.APIKeyID,
-		Endpoint:   "/api/v1/chatbot/external/{chatbot_id}/chat/completions",
-		Model:      prepared.Model,
-		ChatbotID:  prepared.Chatbot.ID,
-		ProviderID: prepared.Chatbot.ProviderID,
-		StatusCode: statusCode,
+func (s *Service) recordUsage(ctx context.Context, record UsageRecord) {
+	if s.usageRepo == nil {
+		return
 	}
-	if prepared.Conversation.APIKeyID != nil {
-		record.APIKeyID = *prepared.Conversation.APIKeyID
-	}
-	if prepared.APIKeyID > 0 {
-		record.APIKeyID = prepared.APIKeyID
-	}
-	if s.usageRepo != nil && record.APIKeyID > 0 {
-		recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		_ = s.usageRepo.Record(recordCtx, record)
-	}
-	return record
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = s.usageRepo.Record(recordCtx, record)
 }
 
-func (s *Service) getByRef(ctx context.Context, ref string) (sqlite.ChatbotInstance, error) {
+func (s *Service) getByRef(ctx context.Context, p auth.Principal, ref string) (Instance, error) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
-		return sqlite.ChatbotInstance{}, sql.ErrNoRows
+		return Instance{}, sql.ErrNoRows
 	}
-	bot, err := s.repo.GetByID(ctx, ref)
+	bot, err := s.repo.GetByID(ctx, p.TenantID, ref)
 	if err == nil {
 		return bot, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return sqlite.ChatbotInstance{}, err
+		return Instance{}, err
 	}
-	return s.repo.GetByExternalID(ctx, ref)
+	return s.repo.GetByExternalID(ctx, p.TenantID, ref)
 }
 
-func (s *Service) renderPrompt(ctx context.Context, bot sqlite.ChatbotInstance, userInput, ragContext string, metadata map[string]any) (prompts.RenderedPrompt, error) {
-	tmpl, err := s.promptTemplate(ctx, bot)
+func (s *Service) renderPrompt(ctx context.Context, p auth.Principal, bot Instance, userInput, ragContext string, metadata map[string]any) (prompts.RenderedPrompt, error) {
+	tmpl, err := s.promptTemplate(ctx, p, bot)
 	if err != nil {
 		return prompts.RenderedPrompt{}, err
 	}
@@ -385,29 +447,29 @@ func (s *Service) renderPrompt(ctx context.Context, bot sqlite.ChatbotInstance, 
 	})
 }
 
-func (s *Service) promptTemplate(ctx context.Context, bot sqlite.ChatbotInstance) (sqlite.PromptTemplate, error) {
+func (s *Service) promptTemplate(ctx context.Context, p auth.Principal, bot Instance) (prompts.Template, error) {
 	if strings.TrimSpace(bot.PromptTemplateID) != "" {
-		tmpl, err := s.prompts.GetByID(ctx, bot.PromptTemplateID)
+		tmpl, err := s.prompts.GetByID(ctx, p.TenantID, bot.PromptTemplateID)
 		if err != nil {
-			return sqlite.PromptTemplate{}, err
+			return prompts.Template{}, err
 		}
 		if !tmpl.IsActive {
-			return sqlite.PromptTemplate{}, invalidInput(errors.New("prompt template is inactive"))
+			return prompts.Template{}, invalidInput(errors.New("prompt template is inactive"))
 		}
 		return tmpl, nil
 	}
-	tmpl, err := s.prompts.GetDefault(ctx)
+	tmpl, err := s.prompts.GetDefault(ctx, p.TenantID)
 	if err == nil {
 		return tmpl, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return sqlite.PromptTemplate{}, err
+		return prompts.Template{}, err
 	}
 	defaults := prompts.DefaultTemplates()
 	return defaults[0], nil
 }
 
-func (s *Service) retrieveRAG(ctx context.Context, access Access, bot sqlite.ChatbotInstance, query string) ([]rag.SearchResult, string, error) {
+func (s *Service) retrieveRAG(ctx context.Context, p auth.Principal, bot Instance, query string) ([]rag.SearchResult, string, error) {
 	if s.rag == nil || len(bot.RAGCollectionIDs) == 0 {
 		return nil, "", nil
 	}
@@ -418,16 +480,6 @@ func (s *Service) retrieveRAG(ctx context.Context, access Access, bot sqlite.Cha
 		collectionID = strings.TrimSpace(collectionID)
 		if collectionID == "" {
 			continue
-		}
-		p, ok := auth.PrincipalFromContext(ctx)
-		if !ok {
-			// Non-HTTP callers construct only the minimal key identity —
-			// never platform.admin; collection authorization stays inside
-			// rag against the real principal.
-			p = auth.Principal{
-				ActorID:  fmt.Sprintf("apikey:%d", access.APIKeyID),
-				ActorKind: auth.ActorKindServiceAccount,
-			}
 		}
 		found, err := s.rag.Search(ctx, p, rag.SearchInput{
 			CollectionID: collectionID,
@@ -445,54 +497,48 @@ func (s *Service) retrieveRAG(ctx context.Context, access Access, bot sqlite.Cha
 	return results, buildRAGContext(results, maxChars), nil
 }
 
-func (s *Service) ensureConversation(ctx context.Context, access Access, bot sqlite.ChatbotInstance, req chatCompletionRequest, title string, ragResultCount int) (sqlite.ChatbotConversation, error) {
+func (s *Service) ensureConversation(ctx context.Context, p auth.Principal, bot Instance, req chatCompletionRequest) (Conversation, error) {
 	if strings.TrimSpace(req.ConversationID) != "" {
-		conversation, err := s.repo.GetConversation(ctx, strings.TrimSpace(req.ConversationID))
+		conversation, err := s.repo.GetConversation(ctx, p.TenantID, strings.TrimSpace(req.ConversationID))
 		if err != nil {
-			return sqlite.ChatbotConversation{}, err
+			return Conversation{}, err
 		}
 		if conversation.ChatbotID != bot.ID {
-			return sqlite.ChatbotConversation{}, sql.ErrNoRows
+			return Conversation{}, sql.ErrNoRows
 		}
-		if !access.IsAdmin {
-			if conversation.APIKeyID == nil || *conversation.APIKeyID != access.APIKeyID {
-				return sqlite.ChatbotConversation{}, sql.ErrNoRows
-			}
+		// Resume is owner-or-admin only: the principal's actor key must match
+		// the stored owner unless it carries the platform.admin scope.
+		if !auth.HasScope(p, "platform.admin") && conversation.OwnerActorID != actorKey(p) {
+			return Conversation{}, sql.ErrNoRows
 		}
 		return conversation, nil
 	}
-	apiKeyID := access.APIKeyID
-	c := sqlite.ChatbotConversation{
+	c := Conversation{
+		TenantID:       p.TenantID,
 		ID:             newID("chatconv"),
 		ChatbotID:      bot.ID,
-		APIKeyID:       &apiKeyID,
+		OwnerActorID:   actorKey(p),
 		ExternalUserID: strings.TrimSpace(req.User),
-		Title:          truncate(title, 120),
-		Metadata: map[string]any{
-			"rag_result_count": ragResultCount,
-		},
 	}
 	if err := s.repo.CreateConversation(ctx, c); err != nil {
-		return sqlite.ChatbotConversation{}, err
+		return Conversation{}, err
 	}
-	return s.repo.GetConversation(ctx, c.ID)
+	return s.repo.GetConversation(ctx, p.TenantID, c.ID)
 }
 
-func (s *Service) recordRequestMessages(ctx context.Context, conversationID string, messages []map[string]any, model string) error {
+func (s *Service) recordRequestMessages(ctx context.Context, p auth.Principal, conversationID string, messages []map[string]any) error {
 	for _, msg := range messages {
 		role := strings.TrimSpace(stringFromAny(msg["role"]))
 		if role == "" {
 			continue
 		}
-		if err := s.repo.AddMessage(ctx, sqlite.ChatbotMessage{
+		if err := s.repo.AddMessage(ctx, Message{
+			TenantID:       p.TenantID,
 			ID:             newID("chatmsg"),
 			ConversationID: conversationID,
 			Role:           role,
 			Content:        contentToString(msg["content"]),
-			Model:          model,
-			Metadata: map[string]any{
-				"source": "request",
-			},
+			OwnerActorID:   p.ActorID,
 		}); err != nil {
 			return err
 		}
@@ -725,42 +771,6 @@ func invalidInput(err error) error {
 	return invalidInputError{err: err}
 }
 
-func modelAllowed(access Access, model string) bool {
-	if access.AllowedModelsAll {
-		return true
-	}
-	if _, ok := access.AllowedModels["*"]; ok {
-		return true
-	}
-	_, ok := access.AllowedModels[model]
-	return ok
-}
-
-func chatbotAllowed(access Access, bot sqlite.ChatbotInstance) bool {
-	if access.AllowedChatbotsAll || access.AllowedAgentsAll {
-		return true
-	}
-	if _, ok := access.AllowedChatbots["*"]; ok {
-		return true
-	}
-	if _, ok := access.AllowedAgents["*"]; ok {
-		return true
-	}
-	if _, ok := access.AllowedChatbots[bot.ID]; ok {
-		return true
-	}
-	if _, ok := access.AllowedChatbots[bot.ExternalID]; ok {
-		return true
-	}
-	if _, ok := access.AllowedAgents[bot.ID]; ok {
-		return true
-	}
-	if _, ok := access.AllowedAgents[bot.ExternalID]; ok {
-		return true
-	}
-	return false
-}
-
 func stringFromAny(v any) string {
 	s, _ := v.(string)
 	return s
@@ -799,10 +809,3 @@ func floatFromAny(v any) float64 {
 	}
 }
 
-func truncate(value string, max int) string {
-	value = strings.TrimSpace(value)
-	if len(value) <= max {
-		return value
-	}
-	return strings.TrimSpace(value[:max])
-}
