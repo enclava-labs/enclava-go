@@ -2,120 +2,301 @@ package extract
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"enclava-go/internal/artifacts"
+	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
+	"enclava-go/internal/jobs"
 	"enclava-go/internal/llm"
-	"enclava-go/internal/store/sqlite"
 )
 
-type TemplateRepository interface {
-	List(ctx context.Context) ([]sqlite.ExtractTemplate, error)
-	GetByID(ctx context.Context, id string) (sqlite.ExtractTemplate, error)
-	Upsert(ctx context.Context, t sqlite.ExtractTemplate) error
-	Delete(ctx context.Context, id string) error
-	ReplaceDefaults(ctx context.Context, templates []sqlite.ExtractTemplate) error
+// TemplatesRepo is the tenant-scoped extract_templates persistence boundary.
+type TemplatesRepo interface {
+	ListTemplates(ctx context.Context, tenantID string) ([]Template, error)
+	GetTemplate(ctx context.Context, tenantID, id string) (Template, error)
+	UpsertTemplate(ctx context.Context, tenantID string, t Template) error
+	DeleteTemplate(ctx context.Context, tenantID, id string) error
+	ReplaceDefaultTemplates(ctx context.Context, tenantID string, templates []Template) error
 }
 
-type SettingsRepository interface {
-	Get(ctx context.Context) (sqlite.ExtractSettings, error)
-	Update(ctx context.Context, defaultModel string, maxFileSizeMB int64) (sqlite.ExtractSettings, error)
+// SettingsRepo is the tenant-scoped extract_settings persistence boundary.
+type SettingsRepo interface {
+	GetSettings(ctx context.Context, tenantID string) (Settings, error)
+	UpsertSettings(ctx context.Context, tenantID string, s Settings) (Settings, error)
 }
 
-type JobsRepository interface {
-	Create(ctx context.Context, job sqlite.ExtractJob) error
-	UpdateStatus(ctx context.Context, jobID, status, modelUsed, errorMessage string, markCompleted bool) error
-	List(ctx context.Context, apiKeyID int64, limit, offset int) ([]sqlite.ExtractJob, int, error)
-	Get(ctx context.Context, apiKeyID int64, jobID string) (sqlite.ExtractJob, error)
-	SaveResult(ctx context.Context, result sqlite.ExtractResult) error
-	GetResultByJobID(ctx context.Context, jobID string) (sqlite.ExtractResult, error)
+// JobReader is the owner-scoped read view over durable job rows. Every
+// method binds the caller's submitter identity — unknown and forbidden ids
+// resolve to the same jobs.ErrJobNotFound outcome.
+type JobReader interface {
+	GetOwnedJob(ctx context.Context, tenantID, id, submitterKey string) (jobs.JobRow, error)
+	ListOwnedJobs(ctx context.Context, tenantID, submitterKey string, limit int) ([]jobs.JobRow, error)
+	CountOwnedJobs(ctx context.Context, tenantID, submitterKey string) (int, error)
 }
 
+// Service owns the extract pipeline: Process persists the upload as a durable
+// input artifact and enqueues an "extract.process" job — it never calls the
+// provider synchronously. JobHandler is the worker-side fenced attempt:
+// reserve → dispatch → provider → result artifact → settle.
 type Service struct {
-	templatesRepo TemplateRepository
-	settingsRepo  SettingsRepository
-	jobsRepo      JobsRepository
+	templatesRepo TemplatesRepo
+	settingsRepo  SettingsRepo
+	jobRows       JobReader
+	jobs          *jobs.Service
+	artifacts     *artifacts.Store
+	billing       *billing.Service
 	provider      llm.Provider
 	maxUploadMB   int64
 }
 
 func NewService(
-	templatesRepo TemplateRepository,
-	settingsRepo SettingsRepository,
-	jobsRepo JobsRepository,
+	templatesRepo TemplatesRepo,
+	settingsRepo SettingsRepo,
+	jobRows JobReader,
+	jobSvc *jobs.Service,
+	artifactStore *artifacts.Store,
+	billingSvc *billing.Service,
 	provider llm.Provider,
 	maxUploadMB int64,
 ) *Service {
 	return &Service{
 		templatesRepo: templatesRepo,
 		settingsRepo:  settingsRepo,
-		jobsRepo:      jobsRepo,
+		jobRows:       jobRows,
+		jobs:          jobSvc,
+		artifacts:     artifactStore,
+		billing:       billingSvc,
 		provider:      provider,
 		maxUploadMB:   maxUploadMB,
 	}
 }
 
-func (s *Service) SeedDefaults(ctx context.Context) error {
-	return s.templatesRepo.ReplaceDefaults(ctx, DefaultTemplates())
+// maxExtractOutputTokens bounds the reserved output-side estimate; settle
+// records the truthful actual usage without clipping.
+const maxExtractOutputTokens = 8192
+
+// writeLeaseTTL covers the input upload stream; the attempt's own writes
+// get a fresh lease.
+const writeLeaseTTL = 10 * time.Minute
+
+// SeedDefaults seeds the tenant's default templates (idempotent upserts).
+func (s *Service) SeedDefaults(ctx context.Context, p auth.Principal) error {
+	for _, t := range DefaultTemplates() {
+		if err := s.templatesRepo.UpsertTemplate(ctx, p.TenantID, t); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (s *Service) Process(ctx context.Context, apiKeyID int64, input ProcessInput, allowedModels map[string]struct{}) (ProcessOutput, error) {
+// Process authorizes the request, persists the input bytes as a durable
+// artifact BEFORE any job work, then enqueues the extract job and returns
+// its durable id. No provider dispatch happens here — the worker runs the
+// attempt through JobHandler under the fenced lease.
+func (s *Service) Process(ctx context.Context, p auth.Principal, input ProcessInput) (ProcessOutput, error) {
 	start := time.Now()
+	if p.TenantID == "" {
+		return ProcessOutput{}, fmt.Errorf("%w: tenant is required", ErrForbidden)
+	}
 	if err := s.validateInput(input); err != nil {
 		return ProcessOutput{}, err
 	}
-
-	template, err := s.templatesRepo.GetByID(ctx, input.TemplateID)
-	if err != nil {
-		return ProcessOutput{}, fmt.Errorf("load template: %w", err)
+	if !auth.ExtractTemplateAllowed(p, input.TemplateID) {
+		return ProcessOutput{}, ErrForbidden
 	}
-	if !template.IsActive {
+	if s.artifacts == nil || s.jobs == nil {
+		return ProcessOutput{}, errors.New("extract: durable pipeline is not configured")
+	}
+
+	template, err := s.templatesRepo.GetTemplate(ctx, p.TenantID, input.TemplateID)
+	if err != nil {
+		return ProcessOutput{}, mapNotFound(err)
+	}
+	if !template.Enabled {
 		return ProcessOutput{}, errors.New("template is inactive")
 	}
 
-	jobID := newID("job")
-	job := sqlite.ExtractJob{
-		ID:            jobID,
-		APIKeyID:      apiKeyID,
-		TemplateID:    template.ID,
-		Status:        StatusPending,
-		FileName:      input.FileName,
-		FileMimeType:  input.MimeType,
-		FileSizeBytes: int64(len(input.Bytes)),
-		NumPages:      1,
+	model, err := s.resolveModel(ctx, p.TenantID, template)
+	if err != nil {
+		return ProcessOutput{}, err
 	}
-	if err := s.jobsRepo.Create(ctx, job); err != nil {
-		return ProcessOutput{}, fmt.Errorf("create job: %w", err)
+	if !auth.ModelAllowed(p, model) {
+		return ProcessOutput{}, fmt.Errorf("%w: model is not allowed for this credential", ErrForbidden)
 	}
-	_ = s.jobsRepo.UpdateStatus(ctx, jobID, StatusProcessing, "", "", false)
 
-	model, err := s.resolveModel(ctx, template)
+	// Persist the input BEFORE the job row exists — the job's input_ref binds
+	// the finalized artifact version.
+	w, ref, err := s.artifacts.Begin(ctx, artifacts.Meta{
+		Ref:      artifacts.Ref{TenantID: p.TenantID, Kind: artifacts.KindOriginal},
+		MimeType: input.MimeType,
+	}, writeLeaseTTL, s.maxUploadMB*1024*1024)
 	if err != nil {
-		_ = s.jobsRepo.UpdateStatus(ctx, jobID, StatusFailed, "", err.Error(), true)
-		return ProcessOutput{}, err
+		return ProcessOutput{}, fmt.Errorf("begin input artifact: %w", err)
 	}
-	if !isModelAllowed(model, allowedModels) {
-		err := fmt.Errorf("model is not allowed for this API key")
-		_ = s.jobsRepo.UpdateStatus(ctx, jobID, StatusFailed, model, err.Error(), true)
-		return ProcessOutput{}, err
+	if _, err := w.Write(input.Bytes); err != nil {
+		_ = w.Abort(ctx)
+		return ProcessOutput{}, fmt.Errorf("write input artifact: %w", err)
 	}
-	promptSystem, promptUser := interpolate(template.SystemPrompt, template.UserPrompt, input.Context)
-	requestPayload := s.buildProviderRequest(model, template, promptSystem, promptUser, input)
-	requestBytes, err := json.Marshal(requestPayload)
+	if err := w.Finalize(ctx); err != nil {
+		return ProcessOutput{}, fmt.Errorf("finalize input artifact: %w", err)
+	}
+	ref = w.Ref()
+
+	idem := strings.TrimSpace(input.IdempotencyKey)
+	sum := sha256.Sum256(input.Bytes)
+	inputHash := hex.EncodeToString(sum[:])
+	if idem == "" {
+		idem = "extract:" + input.TemplateID + ":" + inputHash
+	}
+
+	job, _, err := s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
+		TenantID:       p.TenantID,
+		Operation:      OperationProcess,
+		IdempotencyKey: idem,
+		Subject: jobs.Subject{
+			ObjectID:         ref.ID,
+			ObservedRevision: int64(ref.Version),
+		},
+		InputRef:  ref.ID,
+		InputHash: inputHash,
+		Policy: map[string]any{
+			"template_id": template.ID,
+			"model":       model,
+			"file_name":   input.FileName,
+			"mime_type":   input.MimeType,
+			"file_size":   int64(len(input.Bytes)),
+			"context":     input.Context,
+		},
+	})
 	if err != nil {
-		_ = s.jobsRepo.UpdateStatus(ctx, jobID, StatusFailed, model, err.Error(), true)
-		return ProcessOutput{}, fmt.Errorf("marshal provider request: %w", err)
+		return ProcessOutput{}, fmt.Errorf("enqueue extract job: %w", err)
+	}
+
+	return ProcessOutput{
+		Success:          true,
+		JobID:            job.ID,
+		Status:           job.Status,
+		ModelUsed:        model,
+		ProcessingTimeMS: time.Since(start).Milliseconds(),
+		// data/tokens are populated by the attempt; replayed jobs surface the
+		// stored identity, not a new execution.
+		Data:                 map[string]any{},
+		ValidationWarnings:   []string{},
+		ValidationErrors:     []string{},
+		CompletionTokensUsed: 0,
+		PromptTokensUsed:     0,
+		TokensUsed:           0,
+		CostMicros:           0,
+	}, nil
+}
+
+// JobHandler is the jobs.Runner handler for OperationProcess. It is
+// code-complete but not dispatched by composition yet — the runner wiring
+// for workers lands with the executor plan; Process only enqueues.
+func (s *Service) JobHandler() jobs.HandlerFunc {
+	return func(ctx context.Context, claim *jobs.Claim, input jobs.InputFunc) (string, error) {
+		return s.attempt(ctx, claim, input)
+	}
+}
+
+// attempt executes one claimed extract job under the fenced lease:
+// Reserve → MarkDispatched → provider → result artifact → Settle. The
+// initiating principal is read back from the frozen job snapshot and every
+// authorization is re-checked before privileged work.
+func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.InputFunc) (string, error) {
+	job := claim.Job()
+
+	var p auth.Principal
+	if err := json.Unmarshal(job.PrincipalSnapshot, &p); err != nil {
+		return "", fmt.Errorf("decode frozen principal: %w", err)
+	}
+
+	templateID, _ := job.Policy["template_id"].(string)
+	template, err := s.templatesRepo.GetTemplate(ctx, job.TenantID, templateID)
+	if err != nil {
+		return "", fmt.Errorf("load template: %w", mapNotFound(err))
+	}
+	if !template.Enabled {
+		return "", errors.New("template is inactive")
+	}
+	model, _ := job.Policy["model"].(string)
+	if strings.TrimSpace(model) == "" {
+		if model, err = s.resolveModel(ctx, job.TenantID, template); err != nil {
+			return "", err
+		}
+	}
+	if !auth.ExtractTemplateAllowed(p, template.ID) || !auth.ModelAllowed(p, model) {
+		return "", ErrForbidden
+	}
+
+	in, err := input(ctx)
+	if err != nil {
+		return "", fmt.Errorf("read input artifact: %w", err)
+	}
+	defer func() { _ = in.Close() }()
+	inBytes, err := io.ReadAll(in)
+	if err != nil {
+		return "", fmt.Errorf("read input bytes: %w", err)
+	}
+
+	promptSystem, promptUser := interpolate(template.SystemPrompt, template.UserPrompt, contextMap(job.Policy["context"]))
+
+	// Bounded per-kind estimate: reserve before any provider call. Missing
+	// price refuses dispatch (ErrPriceMissing) — no silent free units.
+	estimate := billing.Usage{
+		InputUnits:  estimateInputTokens(int64(len(inBytes)), promptSystem, promptUser),
+		OutputUnits: maxExtractOutputTokens,
+	}
+	res, err := s.billing.Reserve(ctx, p, billing.ReserveRequest{
+		Capability: OperationProcess,
+		Model:      model,
+		JobID:      job.ID,
+		AttemptID:  claim.AttemptID(),
+		Estimate:   estimate,
+		Price:      billing.PriceKey{SubjectType: billing.PriceSubjectModel, SubjectID: model},
+	})
+	if err != nil {
+		return "", err
+	}
+	releaseHold := func() { _ = s.billing.ReleaseUndispatched(context.WithoutCancel(ctx), p, res.ID) }
+
+	if err := claim.MarkDispatched(ctx); err != nil {
+		releaseHold()
+		return "", err
+	}
+	if err := s.billing.MarkDispatched(ctx, p, res.ID); err != nil {
+		releaseHold()
+		return "", fmt.Errorf("mark reservation dispatched: %w", err)
+	}
+
+	inInput := ProcessInput{
+		TemplateID: template.ID,
+		Context:    contextMap(job.Policy["context"]),
+		FileName:   stringValue(job.Policy["file_name"]),
+		MimeType:   stringValue(job.Policy["mime_type"]),
+		Bytes:      inBytes,
+	}
+	requestBytes, err := json.Marshal(s.buildProviderRequest(model, template, promptSystem, promptUser, inInput))
+	if err != nil {
+		return "", fmt.Errorf("marshal provider request: %w", err)
 	}
 
 	chatRespRaw, err := s.provider.CreateChatCompletion(ctx, requestBytes)
 	if err != nil {
-		_ = s.jobsRepo.UpdateStatus(ctx, jobID, StatusFailed, model, err.Error(), true)
-		return ProcessOutput{}, fmt.Errorf("provider chat completion: %w", err)
+		// The upstream call was dispatched; its outcome is unobserved —
+		// retain liability, never silently retry.
+		_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, res.ID)
+		return "", fmt.Errorf("provider chat completion: %w", err)
 	}
 
 	parsed, rawContent, usage, parseErr := parseProviderExtraction(chatRespRaw)
@@ -127,52 +308,60 @@ func (s *Service) Process(ctx context.Context, apiKeyID int64, input ProcessInpu
 	}
 	validationErrors, validationWarnings := s.validateOutput(parsed, template)
 
-	status := StatusCompleted
-	if len(validationErrors) > 0 {
-		status = StatusCompletedWithErrors
-	}
-
-	result := sqlite.ExtractResult{
-		ID:                 newID("res"),
-		JobID:              jobID,
-		Data:               parsed,
-		RawResponse:        rawContent,
-		ValidationErrors:   validationErrors,
-		ValidationWarnings: validationWarnings,
-		TokensUsed:         usage.Total,
-		CostCents:          0,
-	}
-	if err := s.jobsRepo.SaveResult(ctx, result); err != nil {
-		_ = s.jobsRepo.UpdateStatus(ctx, jobID, StatusFailed, model, err.Error(), true)
-		return ProcessOutput{}, fmt.Errorf("save extract result: %w", err)
-	}
-	_ = s.jobsRepo.UpdateStatus(ctx, jobID, status, model, "", true)
-
-	return ProcessOutput{
-		Success:              len(validationErrors) == 0,
-		JobID:                jobID,
-		ModelUsed:            model,
+	resultDoc := ResultView{
+		ID:                   newID("res"),
+		JobID:                job.ID,
 		Data:                 parsed,
 		RawResponse:          rawContent,
 		ValidationErrors:     validationErrors,
 		ValidationWarnings:   validationWarnings,
-		ProcessingTimeMS:     time.Since(start).Milliseconds(),
 		PromptTokensUsed:     usage.Prompt,
 		CompletionTokensUsed: usage.Completion,
 		TokensUsed:           usage.Total,
-		CostCents:            0,
-	}, nil
-}
-
-func isModelAllowed(model string, allowed map[string]struct{}) bool {
-	if len(allowed) == 0 {
-		return true
+		CreatedAt:            time.Now().UTC(),
 	}
-	_, ok := allowed[model]
-	return ok
+	docBytes, err := json.Marshal(resultDoc)
+	if err != nil {
+		return "", fmt.Errorf("marshal result: %w", err)
+	}
+	rw, rref, err := s.artifacts.Begin(ctx, artifacts.Meta{
+		Ref:      artifacts.Ref{TenantID: job.TenantID, Kind: artifacts.KindResult},
+		MimeType: "application/json",
+	}, writeLeaseTTL, int64(len(docBytes))+4096)
+	if err != nil {
+		_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, res.ID)
+		return "", fmt.Errorf("begin result artifact: %w", err)
+	}
+	if _, err := rw.Write(docBytes); err != nil {
+		_ = rw.Abort(ctx)
+		_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, res.ID)
+		return "", fmt.Errorf("write result artifact: %w", err)
+	}
+	if err := rw.Finalize(ctx); err != nil {
+		_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, res.ID)
+		return "", fmt.Errorf("finalize result artifact: %w", err)
+	}
+	rref = rw.Ref()
+
+	usageRecord, err := s.billing.Settle(ctx, p, res.ID, billing.Usage{
+		InputUnits:       int64(usage.Prompt),
+		OutputUnits:      int64(usage.Completion),
+		CachedInputUnits: 0,
+	})
+	if err != nil {
+		// Result bytes exist but settlement failed: retain liability and fail —
+		// a stale retry reserves a fresh hold under the same fenced attempt.
+		_ = s.artifacts.Delete(context.WithoutCancel(ctx), rref)
+		_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, res.ID)
+		return "", fmt.Errorf("settle reservation: %w", err)
+	}
+	_ = usageRecord
+	return rref.ID, nil
 }
 
-func (s *Service) ListJobs(ctx context.Context, apiKeyID int64, limit, offset int) ([]sqlite.ExtractJob, int, error) {
+// ListJobs returns the caller's newest jobs plus the total row count for
+// paging — owner-bound through the jobs submitter key.
+func (s *Service) ListJobs(ctx context.Context, p auth.Principal, limit, offset int) ([]JobView, int, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -182,30 +371,67 @@ func (s *Service) ListJobs(ctx context.Context, apiKeyID int64, limit, offset in
 	if offset < 0 {
 		offset = 0
 	}
-	return s.jobsRepo.List(ctx, apiKeyID, limit, offset)
-}
-
-func (s *Service) GetJob(ctx context.Context, apiKeyID int64, jobID string) (JobDetail, error) {
-	job, err := s.jobsRepo.Get(ctx, apiKeyID, jobID)
+	key := jobs.SubmitterKey(p)
+	total, err := s.jobRows.CountOwnedJobs(ctx, p.TenantID, key)
 	if err != nil {
-		return JobDetail{}, err
+		return nil, 0, err
 	}
-	result, err := s.jobsRepo.GetResultByJobID(ctx, jobID)
+	rows, err := s.jobRows.ListOwnedJobs(ctx, p.TenantID, key, limit+offset)
 	if err != nil {
-		return JobDetail{Job: job}, nil
+		return nil, 0, err
 	}
-	return JobDetail{Job: job, Result: &result}, nil
+	if offset > len(rows) {
+		offset = len(rows)
+	}
+	rows = rows[offset:]
+	out := make([]JobView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, jobView(row))
+	}
+	return out, total, nil
 }
 
-func (s *Service) ListTemplates(ctx context.Context) ([]sqlite.ExtractTemplate, error) {
-	return s.templatesRepo.List(ctx)
+// GetJob returns the owner-bound job detail; the decoded result artifact is
+// attached when the job completed. Unknown and foreign ids both resolve to
+// ErrNotFound.
+func (s *Service) GetJob(ctx context.Context, p auth.Principal, jobID string) (JobDetail, error) {
+	row, err := s.jobRows.GetOwnedJob(ctx, p.TenantID, jobID, jobs.SubmitterKey(p))
+	if err != nil {
+		return JobDetail{}, mapNotFound(err)
+	}
+	view := jobView(row)
+	detail := JobDetail{Job: view}
+	if row.ResultRef == "" || s.artifacts == nil {
+		return detail, nil
+	}
+	rc, err := s.artifacts.Read(ctx, artifacts.Ref{TenantID: p.TenantID, ID: row.ResultRef})
+	if err != nil {
+		// A missing/tombstoned result artifact degrades to "no result" —
+		// never reveals storage detail.
+		return detail, nil
+	}
+	defer func() { _ = rc.Close() }()
+	var res ResultView
+	if err := json.NewDecoder(io.LimitReader(rc, 8<<20)).Decode(&res); err != nil {
+		return detail, nil
+	}
+	detail.Result = &res
+	return detail, nil
 }
 
-func (s *Service) GetTemplate(ctx context.Context, id string) (sqlite.ExtractTemplate, error) {
-	return s.templatesRepo.GetByID(ctx, id)
+func (s *Service) ListTemplates(ctx context.Context, p auth.Principal) ([]Template, error) {
+	return s.templatesRepo.ListTemplates(ctx, p.TenantID)
 }
 
-func (s *Service) UpsertTemplate(ctx context.Context, t sqlite.ExtractTemplate) error {
+func (s *Service) GetTemplate(ctx context.Context, p auth.Principal, id string) (Template, error) {
+	t, err := s.templatesRepo.GetTemplate(ctx, p.TenantID, id)
+	if err != nil {
+		return Template{}, mapNotFound(err)
+	}
+	return t, nil
+}
+
+func (s *Service) UpsertTemplate(ctx context.Context, p auth.Principal, t Template) error {
 	if strings.TrimSpace(t.ID) == "" {
 		return errors.New("template id is required")
 	}
@@ -227,26 +453,41 @@ func (s *Service) UpsertTemplate(ctx context.Context, t sqlite.ExtractTemplate) 
 	if len(t.OutputSchema) > 0 && !isObjectSchema(t.OutputSchema) {
 		return errors.New("output_schema must be a JSON object schema")
 	}
-	return s.templatesRepo.Upsert(ctx, t)
-}
-
-func (s *Service) DeleteTemplate(ctx context.Context, id string) error {
-	return s.templatesRepo.Delete(ctx, id)
-}
-
-func (s *Service) ResetDefaultTemplates(ctx context.Context) error {
-	return s.templatesRepo.ReplaceDefaults(ctx, DefaultTemplates())
-}
-
-func (s *Service) GetSettings(ctx context.Context) (sqlite.ExtractSettings, error) {
-	return s.settingsRepo.Get(ctx)
-}
-
-func (s *Service) UpdateSettings(ctx context.Context, defaultModel string, maxFileSizeMB int64) (sqlite.ExtractSettings, error) {
-	if maxFileSizeMB <= 0 {
-		maxFileSizeMB = s.maxUploadMB
+	if t.OwnerActorID == "" {
+		t.OwnerActorID = p.ActorID
 	}
-	return s.settingsRepo.Update(ctx, defaultModel, maxFileSizeMB)
+	return s.templatesRepo.UpsertTemplate(ctx, p.TenantID, t)
+}
+
+func (s *Service) DeleteTemplate(ctx context.Context, p auth.Principal, id string) error {
+	return s.templatesRepo.DeleteTemplate(ctx, p.TenantID, id)
+}
+
+func (s *Service) ResetDefaultTemplates(ctx context.Context, p auth.Principal) error {
+	return s.templatesRepo.ReplaceDefaultTemplates(ctx, p.TenantID, DefaultTemplates())
+}
+
+func (s *Service) GetSettings(ctx context.Context, p auth.Principal) (Settings, error) {
+	set, err := s.settingsRepo.GetSettings(ctx, p.TenantID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			// First-touch: persist the tenant's default row.
+			return s.settingsRepo.UpsertSettings(ctx, p.TenantID, Settings{
+				ID:            "default",
+				MaxFileSizeMB: s.maxUploadMB,
+			})
+		}
+		return Settings{}, err
+	}
+	return set, nil
+}
+
+func (s *Service) UpdateSettings(ctx context.Context, p auth.Principal, in Settings) (Settings, error) {
+	if in.MaxFileSizeMB <= 0 {
+		in.MaxFileSizeMB = s.maxUploadMB
+	}
+	in.ID = "default"
+	return s.settingsRepo.UpsertSettings(ctx, p.TenantID, in)
 }
 
 func (s *Service) ModelsForExtract(ctx context.Context) ([]llm.Model, error) {
@@ -291,11 +532,11 @@ func (s *Service) validateInput(input ProcessInput) error {
 	return nil
 }
 
-func (s *Service) resolveModel(ctx context.Context, t sqlite.ExtractTemplate) (string, error) {
-	if strings.TrimSpace(t.Model) != "" {
-		return t.Model, nil
+func (s *Service) resolveModel(ctx context.Context, tenantID string, t Template) (string, error) {
+	if strings.TrimSpace(t.DefaultModel) != "" {
+		return t.DefaultModel, nil
 	}
-	settings, err := s.settingsRepo.Get(ctx)
+	settings, err := s.settingsRepo.GetSettings(ctx, tenantID)
 	if err == nil && strings.TrimSpace(settings.DefaultModel) != "" {
 		return settings.DefaultModel, nil
 	}
@@ -315,7 +556,7 @@ func (s *Service) resolveModel(ctx context.Context, t sqlite.ExtractTemplate) (s
 	return "", errors.New("no models available")
 }
 
-func (s *Service) buildProviderRequest(model string, template sqlite.ExtractTemplate, systemPrompt, userPrompt string, input ProcessInput) map[string]any {
+func (s *Service) buildProviderRequest(model string, template Template, systemPrompt, userPrompt string, input ProcessInput) map[string]any {
 	b64 := base64.StdEncoding.EncodeToString(input.Bytes)
 	dataURL := fmt.Sprintf("data:%s;base64,%s", input.MimeType, b64)
 
@@ -495,7 +736,7 @@ func parseJSONBody(content string) (map[string]any, error) {
 	return out, nil
 }
 
-func (s *Service) validateOutput(data map[string]any, template sqlite.ExtractTemplate) ([]string, []string) {
+func (s *Service) validateOutput(data map[string]any, template Template) ([]string, []string) {
 	errorsList := []string{}
 	warnings := []string{}
 	if data == nil || len(data) == 0 {
@@ -726,4 +967,64 @@ func toFloat(v any) float64 {
 	default:
 		return 0
 	}
+}
+
+// jobView projects a durable job row onto the consumer shape; request fields
+// come from the immutable policy document.
+func jobView(row jobs.JobRow) JobView {
+	v := JobView{
+		ID:           row.ID,
+		JobID:        row.ID,
+		Status:       row.Status,
+		InputRef:     row.InputRef,
+		ResultRef:    row.ResultRef,
+		ErrorMessage: jobError(row.Job),
+		CreatedAt:    row.CreatedAt,
+		UpdatedAt:    row.UpdatedAt,
+		CompletedAt:  row.CompletedAt,
+	}
+	v.TemplateID = stringValue(row.Policy["template_id"])
+	v.ModelUsed = stringValue(row.Policy["model"])
+	v.FileName = stringValue(row.Policy["file_name"])
+	v.FileMimeType = stringValue(row.Policy["mime_type"])
+	if n, ok := row.Policy["file_size"].(float64); ok {
+		v.FileSizeBytes = int64(n)
+	}
+	return v
+}
+
+func jobError(j jobs.Job) string {
+	return j.Error
+}
+
+func stringValue(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+func contextMap(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	return nil
+}
+
+// estimateInputTokens bounds input-side units: bytes are a conservative
+// proxy for tokens (≥1 token / ~2 bytes incl. base64 transport inflation),
+// plus prompt text and a fixed envelope allowance.
+func estimateInputTokens(fileBytes int64, systemPrompt, userPrompt string) int64 {
+	return fileBytes/2 + int64(len(systemPrompt)+len(userPrompt))/2 + 512
+}
+
+// mapNotFound collapses storage not-found errors onto the package sentinel so
+// cross-tenant and absent ids produce one public outcome.
+func mapNotFound(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, jobs.ErrJobNotFound) || errors.Is(err, artifacts.ErrNotFound) ||
+		errors.Is(err, ErrNotFound) || strings.Contains(err.Error(), "no rows") {
+		return ErrNotFound
+	}
+	return err
 }

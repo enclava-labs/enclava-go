@@ -2,7 +2,6 @@ package extractmodule
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -16,7 +15,6 @@ import (
 	"enclava-go/internal/extract"
 	"enclava-go/internal/httpx"
 	"enclava-go/internal/llm"
-	"enclava-go/internal/store/sqlite"
 )
 
 type Handlers struct {
@@ -89,22 +87,25 @@ func (h *Handlers) HandleProcess(w http.ResponseWriter, r *http.Request, princip
 		}
 	}
 
-	result, err := h.svc.Process(r.Context(), principal.APIKeyID, extract.ProcessInput{
-		TemplateID: templateID,
-		Context:    contextValues,
-		FileName:   filepath.Base(header.Filename),
-		MimeType:   mimeType,
-		Bytes:      content,
-	}, principal.AllowedModels)
+	result, err := h.svc.Process(r.Context(), principal, extract.ProcessInput{
+		TemplateID:     templateID,
+		Context:        contextValues,
+		FileName:       filepath.Base(header.Filename),
+		MimeType:       mimeType,
+		Bytes:          content,
+		IdempotencyKey: strings.TrimSpace(r.FormValue("idempotency_key")),
+	})
 	if err != nil {
+		if errors.Is(err, extract.ErrNotFound) {
+			httpx.WriteOpenAIError(w, http.StatusNotFound, err.Error(), "invalid_request_error", "not_found")
+			return
+		}
+		if errors.Is(err, extract.ErrForbidden) {
+			httpx.WriteForbidden(w, err.Error())
+			return
+		}
 		lowerErr := strings.ToLower(err.Error())
 		if strings.Contains(lowerErr, "provider chat completion") {
-			h.platform.RecordUsage(r.Context(), sqlite.UsageRecord{
-				ID:         httpx.NewID("usage"),
-				APIKeyID:   principal.APIKeyID,
-				Endpoint:   "/api/v1/extract/process",
-				StatusCode: http.StatusBadGateway,
-			})
 			httpx.WriteOpenAIError(w, http.StatusBadGateway, "provider request failed", "server_error", "provider_error")
 			return
 		}
@@ -115,17 +116,8 @@ func (h *Handlers) HandleProcess(w http.ResponseWriter, r *http.Request, princip
 		httpx.WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "extract_failed")
 		return
 	}
-	h.platform.RecordUsage(r.Context(), sqlite.UsageRecord{
-		ID:               httpx.NewID("usage"),
-		APIKeyID:         principal.APIKeyID,
-		Endpoint:         "/api/v1/extract/process",
-		Model:            result.ModelUsed,
-		PromptTokens:     int64(result.PromptTokensUsed),
-		CompletionTokens: int64(result.CompletionTokensUsed),
-		TotalTokens:      int64(result.TokensUsed),
-		CostCents:        int64(result.CostCents),
-		StatusCode:       http.StatusOK,
-	})
+	// Billing is settled inside the attempt through reserve/settle — no
+	// platform RecordUsage call here.
 	httpx.WriteJSON(w, http.StatusOK, result)
 }
 
@@ -155,13 +147,13 @@ func (h *Handlers) HandleJobsList(w http.ResponseWriter, r *http.Request, princi
 			offset = n
 		}
 	}
-	jobs, total, err := h.svc.ListJobs(r.Context(), principal.APIKeyID, limit, offset)
+	jobsList, total, err := h.svc.ListJobs(r.Context(), principal, limit, offset)
 	if err != nil {
 		httpx.WriteOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error", "jobs_list_failed")
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"jobs":   jobs,
+		"jobs":   jobsList,
 		"total":  total,
 		"limit":  limit,
 		"offset": offset,
@@ -178,9 +170,9 @@ func (h *Handlers) HandleJobDetail(w http.ResponseWriter, r *http.Request, princ
 		httpx.WriteOpenAIError(w, http.StatusBadRequest, "job id is required", "invalid_request_error", "missing_job_id")
 		return
 	}
-	detail, err := h.svc.GetJob(r.Context(), principal.APIKeyID, jobID)
+	detail, err := h.svc.GetJob(r.Context(), principal, jobID)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, extract.ErrNotFound) {
 			httpx.WriteOpenAIError(w, http.StatusNotFound, "job not found", "invalid_request_error", "not_found")
 			return
 		}
@@ -193,7 +185,7 @@ func (h *Handlers) HandleJobDetail(w http.ResponseWriter, r *http.Request, princ
 func (h *Handlers) HandleTemplates(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
 	switch r.Method {
 	case http.MethodGet:
-		templates, err := h.svc.ListTemplates(r.Context())
+		templates, err := h.svc.ListTemplates(r.Context(), principal)
 		if err != nil {
 			httpx.WriteOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error", "template_list_failed")
 			return
@@ -204,16 +196,16 @@ func (h *Handlers) HandleTemplates(w http.ResponseWriter, r *http.Request, princ
 			httpx.WriteForbidden(w, "missing required scope: extract.manage")
 			return
 		}
-		var payload sqlite.ExtractTemplate
+		var payload extract.Template
 		if err := httpx.DecodeJSON(r, &payload); err != nil {
 			httpx.WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 			return
 		}
-		if err := h.svc.UpsertTemplate(r.Context(), payload); err != nil {
+		if err := h.svc.UpsertTemplate(r.Context(), principal, payload); err != nil {
 			httpx.WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "template_invalid")
 			return
 		}
-		tpl, err := h.svc.GetTemplate(r.Context(), payload.ID)
+		tpl, err := h.svc.GetTemplate(r.Context(), principal, payload.ID)
 		if err != nil {
 			httpx.WriteOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error", "template_fetch_failed")
 			return
@@ -237,9 +229,9 @@ func (h *Handlers) HandleTemplateByID(w http.ResponseWriter, r *http.Request, pr
 
 	switch r.Method {
 	case http.MethodGet:
-		tpl, err := h.svc.GetTemplate(r.Context(), templateID)
+		tpl, err := h.svc.GetTemplate(r.Context(), principal, templateID)
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
+			if errors.Is(err, extract.ErrNotFound) {
 				httpx.WriteOpenAIError(w, http.StatusNotFound, "template not found", "invalid_request_error", "not_found")
 				return
 			}
@@ -252,9 +244,9 @@ func (h *Handlers) HandleTemplateByID(w http.ResponseWriter, r *http.Request, pr
 			httpx.WriteForbidden(w, "missing required scope: extract.manage")
 			return
 		}
-		existing, err := h.svc.GetTemplate(r.Context(), templateID)
+		existing, err := h.svc.GetTemplate(r.Context(), principal, templateID)
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
+			if errors.Is(err, extract.ErrNotFound) {
 				httpx.WriteOpenAIError(w, http.StatusNotFound, "template not found", "invalid_request_error", "not_found")
 				return
 			}
@@ -267,11 +259,11 @@ func (h *Handlers) HandleTemplateByID(w http.ResponseWriter, r *http.Request, pr
 			return
 		}
 		merged := mergeTemplate(existing, patch)
-		if err := h.svc.UpsertTemplate(r.Context(), merged); err != nil {
+		if err := h.svc.UpsertTemplate(r.Context(), principal, merged); err != nil {
 			httpx.WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "template_invalid")
 			return
 		}
-		tpl, err := h.svc.GetTemplate(r.Context(), templateID)
+		tpl, err := h.svc.GetTemplate(r.Context(), principal, templateID)
 		if err != nil {
 			httpx.WriteOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error", "template_fetch_failed")
 			return
@@ -282,7 +274,7 @@ func (h *Handlers) HandleTemplateByID(w http.ResponseWriter, r *http.Request, pr
 			httpx.WriteForbidden(w, "missing required scope: extract.manage")
 			return
 		}
-		if err := h.svc.DeleteTemplate(r.Context(), templateID); err != nil {
+		if err := h.svc.DeleteTemplate(r.Context(), principal, templateID); err != nil {
 			httpx.WriteOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error", "template_delete_failed")
 			return
 		}
@@ -297,7 +289,7 @@ func (h *Handlers) HandleTemplatesResetDefaults(w http.ResponseWriter, r *http.R
 		httpx.WriteMethodNotAllowed(w)
 		return
 	}
-	if err := h.svc.ResetDefaultTemplates(r.Context()); err != nil {
+	if err := h.svc.ResetDefaultTemplates(r.Context(), principal); err != nil {
 		httpx.WriteOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error", "template_reset_failed")
 		return
 	}
@@ -333,7 +325,7 @@ func (h *Handlers) HandleModels(w http.ResponseWriter, r *http.Request, principa
 func (h *Handlers) HandleSettings(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
 	switch r.Method {
 	case http.MethodGet:
-		settings, err := h.svc.GetSettings(r.Context())
+		settings, err := h.svc.GetSettings(r.Context(), principal)
 		if err != nil {
 			httpx.WriteOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error", "settings_fetch_failed")
 			return
@@ -356,7 +348,10 @@ func (h *Handlers) HandleSettings(w http.ResponseWriter, r *http.Request, princi
 			httpx.WriteForbidden(w, "model is not allowed for this API key")
 			return
 		}
-		updated, err := h.svc.UpdateSettings(r.Context(), payload.DefaultModel, payload.MaxFileSizeMB)
+		updated, err := h.svc.UpdateSettings(r.Context(), principal, extract.Settings{
+			DefaultModel:  payload.DefaultModel,
+			MaxFileSizeMB: payload.MaxFileSizeMB,
+		})
 		if err != nil {
 			httpx.WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "settings_update_failed")
 			return
@@ -389,7 +384,7 @@ func (h *Handlers) HandleHealth(w http.ResponseWriter, r *http.Request, principa
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
-func mergeTemplate(existing sqlite.ExtractTemplate, patch map[string]any) sqlite.ExtractTemplate {
+func mergeTemplate(existing extract.Template, patch map[string]any) extract.Template {
 	if v, ok := patch["name"].(string); ok {
 		existing.Name = v
 	}
@@ -403,13 +398,13 @@ func mergeTemplate(existing sqlite.ExtractTemplate, patch map[string]any) sqlite
 		existing.UserPrompt = v
 	}
 	if v, ok := patch["model"].(string); ok {
-		existing.Model = v
+		existing.DefaultModel = v
 	}
 	if v, ok := patch["is_default"].(bool); ok {
 		existing.IsDefault = v
 	}
 	if v, ok := patch["is_active"].(bool); ok {
-		existing.IsActive = v
+		existing.Enabled = v
 	}
 	if v, ok := patch["context_schema"].(map[string]any); ok {
 		existing.ContextSchema = v

@@ -9,20 +9,37 @@ import (
 	"strconv"
 	"strings"
 
+	"enclava-go/internal/auth"
 	"enclava-go/internal/extract"
-	"enclava-go/internal/store/sqlite"
 )
+
+// extractPrincipal resolves the real request principal for dashboard extract
+// calls — an API-key-authenticated request carries it in context. The signed
+// dashboard password cookie carries no tenant identity, so password-mode
+// dashboard extract calls get a truthful 401 rather than a fabricated
+// authority; the session-cookie principal lands with 01-16/01-20.
+func (a *App) extractPrincipal(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {
+	if p, ok := auth.PrincipalFromContext(r.Context()); ok && p.TenantID != "" {
+		return p, true
+	}
+	WriteUnauthorized(w, "authenticated principal required")
+	return auth.Principal{}, false
+}
 
 // handleDashboardExtractTemplates handles GET (list) and POST (create) for templates.
 func (a *App) handleDashboardExtractTemplates(w http.ResponseWriter, r *http.Request) {
 	setNoStoreHeaders(w)
 	switch r.Method {
 	case http.MethodGet:
-		if a.extractTemplates == nil {
+		if a.extractSvc == nil {
 			WriteJSON(w, http.StatusOK, map[string]any{"templates": []any{}})
 			return
 		}
-		templates, err := a.extractTemplates.List(r.Context())
+		p, ok := a.extractPrincipal(w, r)
+		if !ok {
+			return
+		}
+		templates, err := a.extractSvc.ListTemplates(r.Context(), p)
 		if err != nil {
 			log.Printf("dashboard: list extract templates: %v", err)
 			WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -34,16 +51,20 @@ func (a *App) handleDashboardExtractTemplates(w http.ResponseWriter, r *http.Req
 			WriteJSON(w, http.StatusNotImplemented, map[string]any{"error": "extract not configured"})
 			return
 		}
-		var payload sqlite.ExtractTemplate
+		p, ok := a.extractPrincipal(w, r)
+		if !ok {
+			return
+		}
+		var payload extract.Template
 		if err := DecodeJSON(r, &payload); err != nil {
 			WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON payload"})
 			return
 		}
-		if err := a.extractSvc.UpsertTemplate(r.Context(), payload); err != nil {
+		if err := a.extractSvc.UpsertTemplate(r.Context(), p, payload); err != nil {
 			WriteJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
-		tpl, err := a.extractSvc.GetTemplate(r.Context(), payload.ID)
+		tpl, err := a.extractSvc.GetTemplate(r.Context(), p, payload.ID)
 		if err != nil {
 			WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
@@ -61,6 +82,10 @@ func (a *App) handleDashboardExtractTemplateByID(w http.ResponseWriter, r *http.
 		WriteJSON(w, http.StatusNotImplemented, map[string]any{"error": "extract not configured"})
 		return
 	}
+	p, ok := a.extractPrincipal(w, r)
+	if !ok {
+		return
+	}
 	templateID := strings.TrimPrefix(r.URL.Path, "/dashboard/partials/extract/templates/")
 	if strings.TrimSpace(templateID) == "" {
 		WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "template id is required"})
@@ -69,7 +94,7 @@ func (a *App) handleDashboardExtractTemplateByID(w http.ResponseWriter, r *http.
 
 	switch r.Method {
 	case http.MethodPut:
-		existing, err := a.extractSvc.GetTemplate(r.Context(), templateID)
+		existing, err := a.extractSvc.GetTemplate(r.Context(), p, templateID)
 		if err != nil {
 			WriteJSON(w, http.StatusNotFound, map[string]any{"error": "template not found"})
 			return
@@ -86,18 +111,18 @@ func (a *App) handleDashboardExtractTemplateByID(w http.ResponseWriter, r *http.
 			return
 		}
 		merged := dashboardMergeTemplate(existing, patch)
-		if err := a.extractSvc.UpsertTemplate(r.Context(), merged); err != nil {
+		if err := a.extractSvc.UpsertTemplate(r.Context(), p, merged); err != nil {
 			WriteJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
-		tpl, err := a.extractSvc.GetTemplate(r.Context(), templateID)
+		tpl, err := a.extractSvc.GetTemplate(r.Context(), p, templateID)
 		if err != nil {
 			WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
 		WriteJSON(w, http.StatusOK, tpl)
 	case http.MethodDelete:
-		if err := a.extractSvc.DeleteTemplate(r.Context(), templateID); err != nil {
+		if err := a.extractSvc.DeleteTemplate(r.Context(), p, templateID); err != nil {
 			WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
@@ -118,7 +143,11 @@ func (a *App) handleDashboardExtractResetDefaults(w http.ResponseWriter, r *http
 		WriteJSON(w, http.StatusNotImplemented, map[string]any{"error": "extract not configured"})
 		return
 	}
-	if err := a.extractSvc.ResetDefaultTemplates(r.Context()); err != nil {
+	p, ok := a.extractPrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := a.extractSvc.ResetDefaultTemplates(r.Context(), p); err != nil {
 		WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
@@ -128,13 +157,17 @@ func (a *App) handleDashboardExtractResetDefaults(w http.ResponseWriter, r *http
 // handleDashboardExtractSettings handles GET (fetch) and PUT (update) for extract settings.
 func (a *App) handleDashboardExtractSettings(w http.ResponseWriter, r *http.Request) {
 	setNoStoreHeaders(w)
-	if a.extractSettings == nil {
+	if a.extractSvc == nil {
 		WriteJSON(w, http.StatusNotImplemented, map[string]any{"error": "extract settings not configured"})
+		return
+	}
+	p, ok := a.extractPrincipal(w, r)
+	if !ok {
 		return
 	}
 	switch r.Method {
 	case http.MethodGet:
-		settings, err := a.extractSettings.Get(r.Context())
+		settings, err := a.extractSvc.GetSettings(r.Context(), p)
 		if err != nil {
 			log.Printf("dashboard: get extract settings: %v", err)
 			WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -159,7 +192,10 @@ func (a *App) handleDashboardExtractSettings(w http.ResponseWriter, r *http.Requ
 		if payload.MaxFileSizeMB <= 0 {
 			payload.MaxFileSizeMB = a.maxUploadMB
 		}
-		updated, err := a.extractSettings.Update(r.Context(), payload.DefaultModel, payload.MaxFileSizeMB)
+		updated, err := a.extractSvc.UpdateSettings(r.Context(), p, extract.Settings{
+			DefaultModel:  payload.DefaultModel,
+			MaxFileSizeMB: payload.MaxFileSizeMB,
+		})
 		if err != nil {
 			WriteJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
@@ -179,6 +215,10 @@ func (a *App) handleDashboardExtractProcess(w http.ResponseWriter, r *http.Reque
 	}
 	if a.extractSvc == nil {
 		WriteJSON(w, http.StatusNotImplemented, map[string]any{"error": "extract not configured"})
+		return
+	}
+	p, ok := a.extractPrincipal(w, r)
+	if !ok {
 		return
 	}
 
@@ -221,14 +261,14 @@ func (a *App) handleDashboardExtractProcess(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// Dashboard process uses apiKeyID=0 (admin context) and no model restrictions.
-	result, err := a.extractSvc.Process(r.Context(), 0, extract.ProcessInput{
+	// The real request principal — no API-key-id-zero authority.
+	result, err := a.extractSvc.Process(r.Context(), p, extract.ProcessInput{
 		TemplateID: templateID,
 		Context:    contextValues,
 		FileName:   filepath.Base(header.Filename),
 		MimeType:   mimeType,
 		Bytes:      content,
-	}, nil)
+	})
 	if err != nil {
 		WriteJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
 		return
@@ -243,8 +283,12 @@ func (a *App) handleDashboardExtractJobs(w http.ResponseWriter, r *http.Request)
 		WriteMethodNotAllowed(w)
 		return
 	}
-	if a.extractJobs == nil {
+	if a.extractSvc == nil {
 		WriteJSON(w, http.StatusOK, map[string]any{"jobs": []any{}, "total": 0})
+		return
+	}
+	p, ok := a.extractPrincipal(w, r)
+	if !ok {
 		return
 	}
 	limit := 20
@@ -259,13 +303,13 @@ func (a *App) handleDashboardExtractJobs(w http.ResponseWriter, r *http.Request)
 			offset = n
 		}
 	}
-	jobs, total, err := a.extractJobs.ListAll(r.Context(), limit, offset)
+	jobsList, total, err := a.extractSvc.ListJobs(r.Context(), p, limit, offset)
 	if err != nil {
 		log.Printf("dashboard: list extract jobs: %v", err)
 		WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	WriteJSON(w, http.StatusOK, map[string]any{"jobs": jobs, "total": total, "limit": limit, "offset": offset})
+	WriteJSON(w, http.StatusOK, map[string]any{"jobs": jobsList, "total": total, "limit": limit, "offset": offset})
 }
 
 // handleDashboardExtractModels returns available vision models as JSON.
@@ -301,7 +345,7 @@ func (a *App) handleDashboardExtractModels(w http.ResponseWriter, r *http.Reques
 }
 
 // dashboardMergeTemplate merges a JSON patch into an existing template.
-func dashboardMergeTemplate(existing sqlite.ExtractTemplate, patch map[string]any) sqlite.ExtractTemplate {
+func dashboardMergeTemplate(existing extract.Template, patch map[string]any) extract.Template {
 	if v, ok := patch["name"].(string); ok {
 		existing.Name = v
 	}
@@ -315,13 +359,13 @@ func dashboardMergeTemplate(existing sqlite.ExtractTemplate, patch map[string]an
 		existing.UserPrompt = v
 	}
 	if v, ok := patch["model"].(string); ok {
-		existing.Model = v
+		existing.DefaultModel = v
 	}
 	if v, ok := patch["is_default"].(bool); ok {
 		existing.IsDefault = v
 	}
 	if v, ok := patch["is_active"].(bool); ok {
-		existing.IsActive = v
+		existing.Enabled = v
 	}
 	if v, ok := patch["context_schema"].(map[string]any); ok {
 		existing.ContextSchema = v

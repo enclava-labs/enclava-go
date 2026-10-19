@@ -95,6 +95,10 @@ func submitterKey(p auth.Principal) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// SubmitterKey exposes the canonical owner binding for callers that read job
+// rows through an owner-scoped repository view (e.g. extract job reads).
+func SubmitterKey(p auth.Principal) string { return submitterKey(p) }
+
 func canonicalPolicy(p map[string]any) []byte {
 	if p == nil {
 		return []byte("{}")
