@@ -321,3 +321,20 @@ func (r *UsageRepo) SumSince(ctx context.Context, apiKeyID int64, since time.Tim
 	}
 	return tokens.Int64, micro.Int64, nil
 }
+
+// KeyTotals returns the lifetime api_keys counters Record maintains — the
+// budget lifetime path needs them after the admin key surface moved to the
+// postgres identity store (01-16); both die with this store in 01-17.
+func (r *UsageRepo) KeyTotals(ctx context.Context, apiKeyID int64) (totalTokens, costMicrocents int64, err error) {
+	var tokens sql.NullInt64
+	var micro sql.NullInt64
+	err = r.db.QueryRowContext(ctx, `
+		SELECT total_tokens, total_cost_microcents
+		FROM api_keys
+		WHERE id = ? AND is_deleted = 0
+	`, apiKeyID).Scan(&tokens, &micro)
+	if err != nil {
+		return 0, 0, fmt.Errorf("key totals: %w", err)
+	}
+	return tokens.Int64, micro.Int64, nil
+}

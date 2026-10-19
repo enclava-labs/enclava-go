@@ -144,7 +144,7 @@ func (s *Service) principalFromKey(ctx context.Context, key APIKeyRecord) (Princ
 		RawAPIKeyPrefix: key.KeyPrefix,
 		// Legacy numeric id: deterministic handle derived from the stored
 		// credential row so unported callers keep working until 01-35.
-		APIKeyID:          legacyKeyID(tenantID, key.ID),
+		APIKeyID:          LegacyAPIKeyID(tenantID, key.ID),
 		IsUnlimited:       key.IsUnlimited,
 		BudgetLimitTokens: key.BudgetLimitTokens,
 		BudgetLimitCents:  key.BudgetLimitCents,
@@ -200,9 +200,9 @@ func (s *Service) principalFromKey(ctx context.Context, key APIKeyRecord) (Princ
 	return principal, nil
 }
 
-// legacyKeyID derives the retained numeric APIKeyID legacy field from the
+// LegacyAPIKeyID derives the retained numeric APIKeyID legacy field from the
 // stored credential identity. Deterministic per row; retired with the field.
-func legacyKeyID(tenantID, keyID string) int64 {
+func LegacyAPIKeyID(tenantID, keyID string) int64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(tenantID + "/" + keyID))
 	return int64(h.Sum64() & 0x7fffffffffffffff)

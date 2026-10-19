@@ -330,7 +330,9 @@ func TestEndpointRestrictionsTreatOpenAIAliasesAsEquivalent(t *testing.T) {
 	ctx := context.Background()
 	db, ident, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
-	updateStoredKey(t, ctx, ident, "allowed_endpoints", listGrantJSON("/api/v1/chat/completions", "/v1/embeddings"))
+	// allowed_endpoints carries inference endpoint IDs (route families), not
+	// URL paths: "chat/completions" and "embeddings" granted; "models" is not.
+	updateStoredKey(t, ctx, ident, "allowed_endpoints", listGrantJSON("chat/completions", "embeddings"))
 
 	chatReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"contract-model","messages":[]}`))
 	chatReq.Header.Set("Authorization", "Bearer "+apiKey)
@@ -338,7 +340,7 @@ func TestEndpointRestrictionsTreatOpenAIAliasesAsEquivalent(t *testing.T) {
 	chatRec := httptest.NewRecorder()
 	app.Handler().ServeHTTP(chatRec, chatReq)
 	if chatRec.Code != http.StatusOK {
-		t.Fatalf("expected /v1 chat to match /api/v1 allowlist, got %d body=%s", chatRec.Code, chatRec.Body.String())
+		t.Fatalf("expected /v1 chat to match chat/completions grant, got %d body=%s", chatRec.Code, chatRec.Body.String())
 	}
 
 	embedReq := httptest.NewRequest(http.MethodPost, "/api/v1/embeddings", strings.NewReader(`{"model":"embed-model","input":"hello"}`))
@@ -347,7 +349,7 @@ func TestEndpointRestrictionsTreatOpenAIAliasesAsEquivalent(t *testing.T) {
 	embedRec := httptest.NewRecorder()
 	app.Handler().ServeHTTP(embedRec, embedReq)
 	if embedRec.Code != http.StatusOK {
-		t.Fatalf("expected /api/v1 embeddings to match /v1 allowlist, got %d body=%s", embedRec.Code, embedRec.Body.String())
+		t.Fatalf("expected /api/v1 embeddings to match embeddings grant, got %d body=%s", embedRec.Code, embedRec.Body.String())
 	}
 
 	modelsReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
@@ -355,7 +357,7 @@ func TestEndpointRestrictionsTreatOpenAIAliasesAsEquivalent(t *testing.T) {
 	modelsRec := httptest.NewRecorder()
 	app.Handler().ServeHTTP(modelsRec, modelsReq)
 	if modelsRec.Code != http.StatusForbidden {
-		t.Fatalf("expected disallowed alias to be rejected, got %d body=%s", modelsRec.Code, modelsRec.Body.String())
+		t.Fatalf("expected unlisted endpoint id to be rejected, got %d body=%s", modelsRec.Code, modelsRec.Body.String())
 	}
 	if provider.chatCalls != 1 || provider.embeddingCalls != 1 {
 		t.Fatalf("unexpected provider calls: chat=%d embeddings=%d", provider.chatCalls, provider.embeddingCalls)
@@ -519,15 +521,15 @@ func TestOpenAIProxyEndpointRejectsTraversal(t *testing.T) {
 		"",
 	}
 	for _, path := range rejected {
-		if openAIProxyEndpointAllowed(path) {
+		if openAIProxyPathSafe(path) {
 			t.Fatalf("expected %q to be rejected", path)
 		}
 	}
-	if !openAIProxyEndpointAllowed("/chat/completions") {
-		t.Fatal("expected /chat/completions to be allowed")
+	if !openAIProxyPathSafe("/chat/completions") {
+		t.Fatal("expected /chat/completions to be safe")
 	}
-	if !openAIProxyEndpointAllowed("/chat/completions/abc") {
-		t.Fatal("expected chat completions subpath to be allowed")
+	if !openAIProxyPathSafe("/chat/completions/abc") {
+		t.Fatal("expected chat completions subpath to be safe")
 	}
 }
 
@@ -973,7 +975,7 @@ func newOpenAIContractApp(t *testing.T, ctx context.Context) (*sqlite.DB, contra
 		provider,
 		"contract-provider",
 		nil,
-		sqlite.NewAPIKeysRepo(db.SQL),
+		ident.repo,
 		nil,
 		nil,
 		nil,

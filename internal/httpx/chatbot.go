@@ -318,7 +318,6 @@ func chatbotContentToString(v any) string {
 	}
 }
 
-
 func (a *App) writeChatbotCompletionError(w http.ResponseWriter, ctx context.Context, err error) {
 	if errors.Is(err, chatbot.ErrCollectionNotFound) {
 		WriteOpenAIError(w, http.StatusNotFound, "knowledge collection was not found", "invalid_request_error", "not_found")

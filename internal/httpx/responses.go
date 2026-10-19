@@ -39,7 +39,7 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request, principal 
 	}
 	usageEndpoint := "/api/v1" + endpointPath
 	if !responseMethodAllowed(r.Method, endpointPath) {
-		if openAIProxyEndpointAllowed(endpointPath) && a.maybeHandleOpenAIPassthrough(w, r, principal) {
+		if openAIProxyPathSafe(endpointPath) && a.maybeHandleOpenAIPassthrough(w, r, principal) {
 			return
 		}
 		WriteMethodNotAllowed(w)

@@ -216,10 +216,10 @@ func TestWriteChatbotCompletionErrorClassifiesFailures(t *testing.T) {
 			want:   "chatbot not found",
 		},
 		{
-			name:    "invalid input",
+			name:   "invalid input",
 			ctx:    context.Background(),
 			err:    chatbot.ErrInvalidInput,
-			status:  http.StatusBadRequest,
+			status: http.StatusBadRequest,
 			want:   "invalid chatbot input",
 		},
 		{

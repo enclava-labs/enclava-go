@@ -19,35 +19,6 @@ import (
 
 const openAIProxyScope = "openai.proxy"
 
-var openAIProxyRoutePrefixes = []string{
-	"/assistants",
-	"/audio",
-	"/batches",
-	"/chat/completions",
-	"/chatkit",
-	"/completions",
-	"/containers",
-	"/conversations",
-	"/costs",
-	"/embeddings",
-	"/evals",
-	"/files",
-	"/fine_tuning",
-	"/images",
-	"/models",
-	"/moderations",
-	"/organization",
-	"/projects",
-	"/realtime",
-	"/responses",
-	"/skills",
-	"/threads",
-	"/uploads",
-	"/usage",
-	"/vector_stores",
-	"/videos",
-}
-
 func (a *App) handleOpenAIPassthrough(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
 	a.handleOpenAIPassthroughWithPrincipal(w, r, principal)
 }
@@ -74,8 +45,11 @@ func (a *App) handleOpenAIPassthroughWithPrincipal(w http.ResponseWriter, r *htt
 		WriteOpenAIError(w, http.StatusNotImplemented, "configured provider does not support OpenAI passthrough", "server_error", "openai_passthrough_unsupported")
 		return
 	}
+	// Dispatch authorization is scopes + the endpoint-ID allowlist enforced
+	// at authentication; only transport path-safety remains here — endpoint
+	// grants never compare URL paths.
 	endpointPath, ok := openAIV1EndpointPath(r.URL.Path)
-	if !ok || !openAIProxyEndpointAllowed(endpointPath) {
+	if !ok || !openAIProxyPathSafe(endpointPath) {
 		WriteOpenAIError(w, http.StatusNotFound, "OpenAI endpoint is not supported by this gateway", "invalid_request_error", "not_found")
 		return
 	}
@@ -152,19 +126,6 @@ func readProxyRequestBody(r *http.Request, limit int64) ([]byte, error) {
 		return nil, errors.New("request body too large")
 	}
 	return body, nil
-}
-
-func openAIProxyEndpointAllowed(endpoint string) bool {
-	endpoint = strings.TrimSpace(endpoint)
-	if !openAIProxyPathSafe(endpoint) {
-		return false
-	}
-	for _, prefix := range openAIProxyRoutePrefixes {
-		if endpoint == prefix || strings.HasPrefix(endpoint, prefix+"/") {
-			return true
-		}
-	}
-	return false
 }
 
 func openAIProxyPathSafe(endpoint string) bool {
