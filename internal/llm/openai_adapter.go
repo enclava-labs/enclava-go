@@ -1,15 +1,12 @@
 package llm
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"net/url"
-	"path"
 	"strings"
 	"time"
 )
@@ -150,25 +147,6 @@ func (a *OpenAICompatibleAdapter) DoResponsesStream(ctx context.Context, method,
 	return a.doStream(ctx, method, path, body)
 }
 
-func (a *OpenAICompatibleAdapter) DoPassthroughRequest(ctx context.Context, method, path string, body []byte, headers http.Header) (PassthroughResponse, error) {
-	if a.cfgErr != nil {
-		return PassthroughResponse{}, fmt.Errorf("endpoint not approved: %w", a.cfgErr)
-	}
-	client := a.client
-	streaming := passthroughStreamClientSelected(path, headers, body)
-	if streaming {
-		client = a.streamClient
-	}
-	resp, err := doPassthroughHTTP(ctx, client, a.baseURL, a.apiKey, method, path, body, headers)
-	if err != nil {
-		return PassthroughResponse{}, err
-	}
-	if streaming {
-		resp.Body = newBoundedStreamBody(resp.Body, a.streamIdle, a.streamWall)
-	}
-	return resp, nil
-}
-
 func (a *OpenAICompatibleAdapter) doStream(ctx context.Context, method, path string, body []byte) (io.ReadCloser, error) {
 	if a.cfgErr != nil {
 		return nil, fmt.Errorf("endpoint not approved: %w", a.cfgErr)
@@ -225,165 +203,4 @@ func (a *OpenAICompatibleAdapter) doJSON(ctx context.Context, method, path strin
 	}
 
 	return respBody, nil
-}
-
-func doPassthroughHTTP(ctx context.Context, client *http.Client, baseURL, apiKey, method, path string, body []byte, headers http.Header) (PassthroughResponse, error) {
-	requestURL, err := resolvePassthroughURL(baseURL, path)
-	if err != nil {
-		return PassthroughResponse{}, fmt.Errorf("build passthrough request: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, requestURL.String(), noRetryBody(body))
-	if err != nil {
-		return PassthroughResponse{}, fmt.Errorf("build passthrough request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	copyPassthroughRequestHeaders(req.Header, headers)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return PassthroughResponse{}, fmt.Errorf("upstream passthrough request failed: %w", err)
-	}
-	return PassthroughResponse{
-		StatusCode: resp.StatusCode,
-		Header:     resp.Header.Clone(),
-		Body:       resp.Body,
-	}, nil
-}
-
-func copyPassthroughRequestHeaders(dst, src http.Header) {
-	for name, values := range src {
-		if !forwardPassthroughRequestHeader(name) {
-			continue
-		}
-		for _, value := range values {
-			dst.Add(name, value)
-		}
-	}
-	if dst.Get("Accept") == "" {
-		dst.Set("Accept", "application/json")
-	}
-}
-
-func forwardPassthroughRequestHeader(name string) bool {
-	canonical := http.CanonicalHeaderKey(name)
-	switch canonical {
-	case "Accept", "Content-Type", "Idempotency-Key", "Openai-Beta", "Openai-Organization", "Openai-Project", "Openai-Version", "Openai-Intent", "X-Client-Request-Id":
-		return true
-	default:
-		return strings.HasPrefix(strings.ToLower(canonical), "openai-")
-	}
-}
-
-func passthroughShouldUseStreamClient(path string, headers http.Header) bool {
-	return passthroughStreamClientSelected(path, headers, nil)
-}
-
-func passthroughStreamClientSelected(path string, headers http.Header, body []byte) bool {
-	if strings.Contains(strings.ToLower(headers.Get("Accept")), "text/event-stream") {
-		return true
-	}
-	if strings.Contains(strings.ToLower(path), "stream=true") {
-		return true
-	}
-	if !passthroughContentTypeAllowsStreamFlag(headers) {
-		return false
-	}
-	return jsonBodyRequestsStream(body)
-}
-
-func passthroughContentTypeAllowsStreamFlag(headers http.Header) bool {
-	contentType := strings.TrimSpace(headers.Get("Content-Type"))
-	if contentType == "" {
-		return true
-	}
-	mediaType, _, err := mime.ParseMediaType(contentType)
-	if err != nil {
-		return false
-	}
-	return strings.EqualFold(mediaType, "application/json")
-}
-
-func jsonBodyRequestsStream(body []byte) bool {
-	if len(bytes.TrimSpace(body)) == 0 {
-		return false
-	}
-	var payload struct {
-		Stream bool `json:"stream"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return false
-	}
-	return payload.Stream
-}
-
-func resolvePassthroughURL(baseURL, rawPath string) (*url.URL, error) {
-	base, err := url.Parse(strings.TrimSpace(baseURL))
-	if err != nil || base.Scheme == "" || base.Host == "" {
-		return nil, fmt.Errorf("invalid provider base url")
-	}
-	ref, err := url.Parse(rawPath)
-	if err != nil {
-		return nil, fmt.Errorf("invalid passthrough path")
-	}
-	if ref.IsAbs() || ref.Host != "" {
-		return nil, fmt.Errorf("passthrough path escapes provider base")
-	}
-	rawPathPart := passthroughRawPath(rawPath)
-	if rawPathPart == "" || rawPathPart[0] != '/' || ref.Path == "" || ref.Path[0] != '/' {
-		return nil, fmt.Errorf("passthrough path must be absolute")
-	}
-	if strings.Contains(rawPathPart, `\`) || strings.Contains(ref.Path, `\`) || strings.Contains(rawPathPart, "://") {
-		return nil, fmt.Errorf("passthrough path escapes provider base")
-	}
-	if strings.Contains(strings.ToLower(rawPathPart), "%2e%2e") || strings.Contains(ref.Path, "..") {
-		return nil, fmt.Errorf("passthrough path escapes provider base")
-	}
-	basePath := base.Path
-	if basePath == "" {
-		basePath = "/"
-	}
-	joined := basePath
-	if !strings.HasSuffix(joined, "/") {
-		joined += "/"
-	}
-	joined += strings.TrimPrefix(ref.Path, "/")
-	cleaned := path.Clean(joined)
-	if !pathStaysUnderBase(basePath, cleaned) {
-		return nil, fmt.Errorf("passthrough path escapes provider base")
-	}
-	resolved := *base
-	resolved.Path = cleaned
-	resolved.RawPath = ""
-	resolved.RawQuery = ref.RawQuery
-	resolved.Fragment = ""
-	resolved.RawFragment = ""
-	if !strings.EqualFold(resolved.Scheme, base.Scheme) || !strings.EqualFold(resolved.Host, base.Host) {
-		return nil, fmt.Errorf("passthrough path escapes provider base")
-	}
-	return &resolved, nil
-}
-
-func passthroughRawPath(rawPath string) string {
-	if i := strings.IndexByte(rawPath, '?'); i >= 0 {
-		rawPath = rawPath[:i]
-	}
-	if i := strings.IndexByte(rawPath, '#'); i >= 0 {
-		rawPath = rawPath[:i]
-	}
-	return rawPath
-}
-
-func pathStaysUnderBase(basePath, cleaned string) bool {
-	baseClean := path.Clean(basePath)
-	if baseClean == "." || baseClean == "" {
-		baseClean = "/"
-	}
-	cleaned = path.Clean(cleaned)
-	if cleaned == "." || cleaned == "" || !strings.HasPrefix(cleaned, "/") || strings.Contains(cleaned, "..") || strings.Contains(cleaned, `\`) {
-		return false
-	}
-	if baseClean == "/" {
-		return true
-	}
-	return cleaned == baseClean || strings.HasPrefix(cleaned, baseClean+"/")
 }

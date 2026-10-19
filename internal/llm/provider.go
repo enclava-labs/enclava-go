@@ -43,16 +43,6 @@ type ResponsesProvider interface {
 	DoResponsesStream(ctx context.Context, method, path string, body []byte) (io.ReadCloser, error)
 }
 
-type PassthroughResponse struct {
-	StatusCode int
-	Header     http.Header
-	Body       io.ReadCloser
-}
-
-type PassthroughProvider interface {
-	DoPassthroughRequest(ctx context.Context, method, path string, body []byte, headers http.Header) (PassthroughResponse, error)
-}
-
 type HealthProvider interface {
 	Health(ctx context.Context) error
 }

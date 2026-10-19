@@ -281,29 +281,6 @@ func (p *TinfoilProvider) DoResponsesStream(ctx context.Context, method, path st
 	return p.doStream(ctx, method, path, body)
 }
 
-func (p *TinfoilProvider) DoPassthroughRequest(ctx context.Context, method, path string, body []byte, headers http.Header) (PassthroughResponse, error) {
-	if err := p.ensureVerified(ctx); err != nil {
-		return PassthroughResponse{}, err
-	}
-	jsonClient, streamClient, err := p.requestClients()
-	if err != nil {
-		return PassthroughResponse{}, err
-	}
-	client := jsonClient
-	streaming := passthroughStreamClientSelected(path, headers, body)
-	if streaming {
-		client = streamClient
-	}
-	resp, err := doPassthroughHTTP(ctx, client, p.baseURL, p.apiKey, method, path, body, headers)
-	if err != nil {
-		return PassthroughResponse{}, err
-	}
-	if streaming {
-		resp.Body = newBoundedStreamBody(resp.Body, p.streamIdle, p.streamWall)
-	}
-	return resp, nil
-}
-
 func (p *TinfoilProvider) doStream(ctx context.Context, method, path string, body []byte) (io.ReadCloser, error) {
 	_, streamClient, err := p.requestClients()
 	if err != nil {
