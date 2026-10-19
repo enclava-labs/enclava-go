@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -416,18 +417,37 @@ func (a *App) handleAttestationVerify(w http.ResponseWriter, r *http.Request, _ 
 	WriteJSON(w, http.StatusOK, status)
 }
 
+var upstreamIDPattern = regexp.MustCompile(`(?i)\b(?:resp|msg|item|chatcmpl|cmpl|call)[_-][A-Za-z0-9_-]{4,}`)
+
+// WriteProviderError surfaces the upstream failure envelope without leaking
+// upstream resource IDs: only the standard OpenAI error fields pass through,
+// and ID-shaped tokens inside the message are redacted (the public-ID
+// rewriting in responses.go does not run on this error path).
 func (a *App) WriteProviderError(w http.ResponseWriter, err error) {
 	var upstreamErr *llm.UpstreamError
 	if errors.As(err, &upstreamErr) {
 		if len(upstreamErr.Body) > 0 {
-			var existing map[string]any
-			if json.Unmarshal(upstreamErr.Body, &existing) == nil {
-				if _, ok := existing["error"]; ok {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(upstreamErr.StatusCode)
-					_, _ = w.Write(upstreamErr.Body)
-					return
+			var existing struct {
+				Error struct {
+					Message string `json:"message"`
+					Type    string `json:"type"`
+					Code    any    `json:"code"`
+					Param   any    `json:"param"`
+				} `json:"error"`
+			}
+			if json.Unmarshal(upstreamErr.Body, &existing) == nil && existing.Error.Message != "" {
+				payload := map[string]any{
+					"error": map[string]any{
+						"message": upstreamIDPattern.ReplaceAllString(existing.Error.Message, "[redacted]"),
+						"type":    existing.Error.Type,
+						"code":    existing.Error.Code,
+						"param":   existing.Error.Param,
+					},
 				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(upstreamErr.StatusCode)
+				_ = json.NewEncoder(w).Encode(payload)
+				return
 			}
 		}
 		WriteOpenAIError(w, upstreamErr.StatusCode, "upstream provider error", "server_error", "upstream_error")
