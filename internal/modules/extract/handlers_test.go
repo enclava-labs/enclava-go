@@ -96,8 +96,7 @@ func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 		auth.NewService(identityRepo, ""),
 		provider,
 		"extract-provider",
-		nil,
-		nil, nil, nil, nil, // legacy extract repos unused by module handlers
+		nil, nil, // prober, identity
 		extractService,
 		nil, nil, nil, nil,
 		nil, nil, nil, nil,

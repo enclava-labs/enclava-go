@@ -253,6 +253,20 @@ func (r *JobsRepo) CountOwnedJobs(ctx context.Context, tenantID, submitterKey st
 	return total, nil
 }
 
+// CountOwnedJobsSince counts the submitter's non-deleted rows submitted at or
+// after `since` — the "recent" window stat the dashboard renders.
+func (r *JobsRepo) CountOwnedJobsSince(ctx context.Context, tenantID, submitterKey string, since time.Time) (int, error) {
+	var total int
+	if err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM jobs
+		WHERE tenant_id = $1 AND submitter_key = $2 AND deleted_at IS NULL
+		  AND submitted_at >= $3`,
+		tenantID, submitterKey, since).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count owned jobs since: %w", err)
+	}
+	return total, nil
+}
+
 // Claim is the atomic lease grant (JOB-02). Inside one transaction it:
 //  1. sweeps running jobs with an expired lease AND an unfinished dispatched
 //     attempt to status=unknown — their upstream outcome was never observed

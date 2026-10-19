@@ -51,9 +51,9 @@
               <td class="p-4 align-middle font-mono text-sm">{{.ID}}</td>
               <td class="p-4 align-middle font-medium">{{.Name}}</td>
               <td class="p-4 align-middle text-muted-foreground">{{if .Description}}{{.Description}}{{else}}—{{end}}</td>
-              <td class="p-4 align-middle font-mono text-sm">{{if .Model}}{{.Model}}{{else}}default{{end}}</td>
+              <td class="p-4 align-middle font-mono text-sm">{{if .DefaultModel}}{{.DefaultModel}}{{else}}default{{end}}</td>
               <td class="p-4 align-middle">
-                {{if .IsActive}}
+                {{if .Enabled}}
                 <span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold bg-green-100 dark:bg-green-900/20 text-green-800 dark:text-green-200">Active</span>
                 {{else}}
                 <span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold bg-gray-100 dark:bg-gray-900/20 text-gray-800 dark:text-gray-200">Inactive</span>

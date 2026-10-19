@@ -7,7 +7,7 @@ import (
 )
 
 func TestRootRedirectsToDashboard(t *testing.T) {
-	app := NewApp(nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "", "", "", nil, "", "", 1, false)
+	app := NewApp(nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "", "", "", nil, "", "", 1, false)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
@@ -23,7 +23,7 @@ func TestRootRedirectsToDashboard(t *testing.T) {
 }
 
 func TestRootCatchAllStillReturnsNotFound(t *testing.T) {
-	app := NewApp(nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "", "", "", nil, "", "", 1, false)
+	app := NewApp(nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "", "", "", nil, "", "", 1, false)
 
 	req := httptest.NewRequest(http.MethodGet, "/missing", nil)
 	rec := httptest.NewRecorder()

@@ -75,11 +75,6 @@ func main() {
 	// The legacy sqlite API keys repo is gone — key admin runs on the
 	// postgres IdentityRepo; bootstrap key seeding is replaced by the 01-22
 	// bootstrap CLI.
-	// Extract job/template/settings sqlite repos stay ONLY for dashboard stat
-	// reads (dashboard.go:475/893/911); 01-19 migrates those and removes them.
-	extractJobsRepo := sqlite.NewExtractJobsRepo(db.SQL)
-	extractTemplatesRepo := sqlite.NewExtractTemplatesRepo(db.SQL)
-	extractSettingsRepo := sqlite.NewExtractSettingsRepo(db.SQL)
 	usageRepo := sqlite.NewUsageRepo(db.SQL)
 	promptRepo := postgres.NewPromptsRepo(pgDB)
 	chatbotRepo := postgres.NewChatbotRepo(pgDB)
@@ -97,7 +92,6 @@ func main() {
 	}
 	jobsSvc := jobs.NewService(jobsRepoPG, 0)
 	billingSvc := billing.NewService(billingRepo)
-
 	if err := ensureEnvEndpoint(ctx, identityRepo, endpointsRepo, runtimeProviderConfig(cfg)); err != nil {
 		log.Fatalf("provider config seed error: %v", err)
 	}
@@ -120,6 +114,20 @@ func main() {
 		provider,
 		cfg.MaxUploadSizeMB,
 	)
+
+	// Seed the bootstrap tenant's default extract templates and settings row
+	// through the owned service (the legacy sqlite seeding is gone).
+	bootstrapTenantID, err := identityRepo.GetTenantBySlug(ctx, "bootstrap")
+	if err != nil {
+		log.Fatalf("bootstrap tenant lookup error: %v", err)
+	}
+	bootstrapPrincipal := auth.Principal{TenantID: bootstrapTenantID, ActorID: "bootstrap"}
+	if err := extractSvc.SeedDefaults(ctx, bootstrapPrincipal); err != nil {
+		log.Fatalf("extract template seed error: %v", err)
+	}
+	if _, err := extractSvc.GetSettings(ctx, bootstrapPrincipal); err != nil {
+		log.Fatalf("extract settings seed error: %v", err)
+	}
 	// The runner carries the extract.process handler registration; the
 	// worker loop itself starts with the executor plan (01-25).
 	jobsRunner := jobs.NewRunner(jobsSvc, artifactStore, map[string]jobs.HandlerFunc{
@@ -140,9 +148,6 @@ func main() {
 		cfg.Provider,
 		prober,
 		identityRepo,
-		extractJobsRepo,
-		extractTemplatesRepo,
-		extractSettingsRepo,
 		extractSvc,
 		ragSvc,
 		promptSvc,
