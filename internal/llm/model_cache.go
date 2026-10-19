@@ -3,7 +3,6 @@ package llm
 import (
 	"context"
 	"io"
-	"net/http"
 	"sync"
 	"time"
 )
@@ -115,14 +114,6 @@ func (p *ModelCacheProvider) DoResponsesStream(ctx context.Context, method, path
 		return nil, &UpstreamError{StatusCode: 501, Message: "upstream provider does not support responses"}
 	}
 	return responses.DoResponsesStream(ctx, method, path, body)
-}
-
-func (p *ModelCacheProvider) DoPassthroughRequest(ctx context.Context, method, path string, body []byte, headers http.Header) (PassthroughResponse, error) {
-	passthrough, ok := p.upstream.(PassthroughProvider)
-	if !ok {
-		return PassthroughResponse{}, &UpstreamError{StatusCode: 501, Message: "upstream provider does not support passthrough requests"}
-	}
-	return passthrough.DoPassthroughRequest(ctx, method, path, body, headers)
 }
 
 func (p *ModelCacheProvider) Health(ctx context.Context) error {

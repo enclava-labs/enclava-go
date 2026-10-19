@@ -158,13 +158,8 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/livez", a.handleLivez)
 	a.mux.HandleFunc("/readyz", a.handleReadyz)
 
-	// 01-22 cutover: every paid path not yet backed by the shared executor is
-	// unmounted — model passthrough listings, chat completions, embeddings,
-	// responses, the openai_passthrough catch-alls and attestation all served
-	// raw provider calls; the extract module mount, chatbot completions, rag
-	// ingest/search and connector sync dispatch are likewise gone. Unmounted
-	// paths 404 (handlers stay compiling for 01-34's removal); the routes that
-	// remain are owned metadata + auth surfaces.
+	// Paid paths not backed by the shared executor remain unmounted; only
+	// owned metadata and authentication surfaces are registered here.
 	a.mux.HandleFunc("/api/v1/providers", a.authenticated("pricing.manage", a.handleProviders))
 	a.mux.HandleFunc("/api/v1/providers/", a.authenticated("pricing.manage", a.handleProviderByID))
 	a.mux.HandleFunc("/api/v1/processing-restrictions", a.authenticated("pricing.manage", a.handleProcessingRestrictions))

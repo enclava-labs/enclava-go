@@ -40,8 +40,7 @@ func streamResult(body string) *inference.Result {
 	return &inference.Result{Body: io.NopCloser(strings.NewReader(body))}
 }
 
-// completionProvider stubs the raw provider used by non-assistant routes
-// (passthrough, models, embeddings); assistant paths never see it.
+// completionProvider stubs the raw provider used by non-assistant route tests.
 type completionProvider struct {
 	err error
 }
