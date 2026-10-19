@@ -102,6 +102,13 @@
 
   // ── API key management ────────────────────────────────────────────
 
+  // Session mode: the server stores the per-session CSRF token and ships it
+  // in a script-readable cookie; mutations echo it back in X-CSRF-Token.
+  function sessionCSRFToken() {
+    var match = document.cookie.match(/(?:^|;\s*)enclava_csrf=([^;]*)/);
+    return match ? decodeURIComponent(match[1]) : '';
+  }
+
   function getSavedAPIKey() {
     return localStorage.getItem(STORAGE_KEY) || '';
   }
@@ -128,7 +135,7 @@
 
     if (!shell) return;
 
-    if (AUTH_MODE === 'password') {
+    if (AUTH_MODE === 'session') {
       if (loginPanel) loginPanel.classList.add('hidden');
       shell.classList.remove('hidden');
       if (active) active.textContent = 'Session';
@@ -251,7 +258,14 @@
   function onBeforeDashboardRequest(event) {
     var path = getEventPath(event);
     if (!path.startsWith('/dashboard/partials/')) return;
-    if (AUTH_MODE === 'password') return;
+    if (AUTH_MODE === 'session') {
+      var csrf = sessionCSRFToken();
+      if (csrf) {
+        event.detail.headers = event.detail.headers || {};
+        event.detail.headers['X-CSRF-Token'] = csrf;
+      }
+      return;
+    }
 
     var key = getSavedAPIKey();
     if (!key) {
@@ -271,7 +285,7 @@
 
     var status = event.detail.xhr && event.detail.xhr.status;
     if (status === 401) {
-      if (AUTH_MODE === 'password') {
+      if (AUTH_MODE === 'session') {
         showToast('Dashboard session expired. Redirecting to login...', 'error');
         window.location.href = '/dashboard/login';
         return;
@@ -345,12 +359,12 @@
     var keyInput = document.getElementById('api-key-input');
     var clearButton = document.getElementById('clear-api-key');
 
-    setAuthState(AUTH_MODE === 'password' || !!getSavedAPIKey());
+    setAuthState(AUTH_MODE === 'session' || !!getSavedAPIKey());
     refreshServiceStatus();
     initializeEndpointCopy();
     initExtractPage();
 
-    if (AUTH_MODE === 'password') return;
+    if (AUTH_MODE === 'session') return;
 
     if (keyForm) {
       keyForm.addEventListener('submit', function (event) {
@@ -378,7 +392,9 @@
   function extractFetch(path, options) {
     options = options || {};
     options.headers = options.headers || {};
-    if (AUTH_MODE !== 'password') {
+    if (AUTH_MODE === 'session') {
+      options.headers['X-CSRF-Token'] = sessionCSRFToken();
+    } else {
       var key = getSavedAPIKey();
       if (key) {
         options.headers['Authorization'] = 'Bearer ' + key;

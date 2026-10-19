@@ -258,6 +258,9 @@ func (s *SessionAuth) HandleLinkIdentity(w http.ResponseWriter, r *http.Request)
 // SessionPrincipal resolves the request's session cookie to a verified
 // principal — the tenant comes only from the verified session row.
 func (s *SessionAuth) SessionPrincipal(r *http.Request) (auth.Principal, bool) {
+	if s == nil || s.auth == nil {
+		return auth.Principal{}, false
+	}
 	cookie, err := r.Cookie(sessionCookieName)
 	if err != nil || strings.TrimSpace(cookie.Value) == "" {
 		return auth.Principal{}, false
@@ -270,8 +273,10 @@ func (s *SessionAuth) SessionPrincipal(r *http.Request) (auth.Principal, bool) {
 }
 
 // RequireSession gates a handler on a verified session principal: GET
-// redirects to login; API/HTMX requests deny with 401. The principal is
-// placed on the request context for downstream handlers.
+// redirects to login; API/HTMX requests deny with 401. Cookie-authenticated
+// mutations additionally require the session's CSRF token. The principal is
+// placed on the request context for downstream handlers. A nil SessionAuth
+// denies — the dashboard cannot run without constructed session handlers.
 func (s *SessionAuth) RequireSession(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		principal, ok := s.SessionPrincipal(r)
@@ -282,6 +287,13 @@ func (s *SessionAuth) RequireSession(next http.HandlerFunc) http.HandlerFunc {
 			}
 			WriteUnauthorized(w, "dashboard login required")
 			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+			if err := s.auth.ValidateCSRF(r.Context(), principal.TenantID, principal.SessionID,
+				csrfFromRequest(r)); err != nil {
+				WriteForbidden(w, "missing or invalid CSRF token")
+				return
+			}
 		}
 		next(w, r.WithContext(auth.WithPrincipal(r.Context(), principal)))
 	}

@@ -44,12 +44,13 @@ type Config struct {
 	APIKeyPepper            string
 	APIKeyPrefix            string
 	CORSAllowedOrigins      []string
-	AdminEmail              string
-	AdminPassword           string
-	TrustProxyHeaders       bool
-	BootstrapAPIKey         string
-	BootstrapEnabled        bool
-	BootstrapMinLength      int
+	// Dashboard login runs on server sessions only — there is no
+	// ADMIN_EMAIL/ADMIN_PASSWORD path; the `enclava bootstrap` CLI is the
+	// first-login story (AUTH-01/AUTH-03).
+	TrustProxyHeaders  bool
+	BootstrapAPIKey    string
+	BootstrapEnabled   bool
+	BootstrapMinLength int
 }
 
 func Load() (Config, error) {
@@ -92,8 +93,6 @@ func Load() (Config, error) {
 		APIKeyPepper:            getEnv("API_KEY_PEPPER", ""),
 		APIKeyPrefix:            getEnv("API_KEY_PREFIX", "enc_"),
 		CORSAllowedOrigins:      getEnvList("CORS_ALLOWED_ORIGINS"),
-		AdminEmail:              getEnv("ADMIN_EMAIL", ""),
-		AdminPassword:           getEnv("ADMIN_PASSWORD", ""),
 		TrustProxyHeaders:       getEnvBool("TRUST_PROXY_HEADERS", false),
 		BootstrapAPIKey:         getEnv("BOOTSTRAP_API_KEY", ""),
 		BootstrapEnabled:        getEnvBool("BOOTSTRAP_ENABLED", false),
@@ -146,13 +145,6 @@ func Load() (Config, error) {
 	}
 	if cfg.APIKeyPrefix == "" {
 		return Config{}, fmt.Errorf("API_KEY_PREFIX must be non-empty")
-	}
-	cfg.AdminEmail = strings.TrimSpace(cfg.AdminEmail)
-	if cfg.AdminEmail == "" && strings.TrimSpace(cfg.AdminPassword) != "" {
-		return Config{}, fmt.Errorf("ADMIN_EMAIL is required when ADMIN_PASSWORD is set")
-	}
-	if cfg.AdminEmail != "" && strings.TrimSpace(cfg.AdminPassword) == "" {
-		return Config{}, fmt.Errorf("ADMIN_PASSWORD is required when ADMIN_EMAIL is set")
 	}
 
 	if cfg.BootstrapAPIKey != "" {
