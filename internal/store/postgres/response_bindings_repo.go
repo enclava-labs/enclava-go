@@ -72,9 +72,6 @@ func (r *ResponseBindingsRepo) Bind(ctx context.Context, b ResponseBinding) (Res
 	if b.Kind != ResponseBindingResponse && b.Kind != ResponseBindingItem {
 		return ResponseBinding{}, fmt.Errorf("postgres: response binding kind %q", b.Kind)
 	}
-	if b.Kind == ResponseBindingItem && b.ParentPublicID == "" {
-		return ResponseBinding{}, fmt.Errorf("postgres: item binding requires parent response")
-	}
 	snapshot := b.InputSnapshot
 	if len(snapshot) == 0 {
 		snapshot = json.RawMessage(`{}`)

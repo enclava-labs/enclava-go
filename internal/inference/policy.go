@@ -77,10 +77,16 @@ var forbiddenPayloadKeys = map[string]bool{
 	"credential_ref": true, "credential": true, "credentials": true,
 	"authorization": true, "auth_token": true, "access_token": true,
 	"secret": true, "client_secret": true,
-	"previous_response_id": true, "conversation": true,
-	"file_id": true, "container_id": true,
+	"conversation": true,
+	"file_id":      true, "container_id": true,
 	"user": true,
 }
+
+// previousResponseID is the one upstream-retention reference a request may
+// carry: it is allowed only as a root-level string on Responses-capability
+// payloads, after the caller translated an owned public binding into it.
+// Anywhere else it denies like every other foreign resource reference.
+const previousResponseIDKey = "previous_response_id"
 
 // forbiddenPayloadTruths are boolean keys that may only be false/absent: a
 // request cannot enable upstream retention or background execution the
@@ -107,6 +113,7 @@ var allowedNestedTypes = map[string]bool{
 	"input_image": true, "image_url": true, "input_file": true, "file": true,
 	"input_audio": true, "message": true, "tool_call": true,
 	"tool_calls": true, "json_object": true, "json_schema": true,
+	"item_reference": true,
 }
 
 // urlPayloadKeys are keys whose string value must be an inline data URI —
@@ -302,6 +309,16 @@ func (s *Service) analyzePayload(req Request) (payloadInfo, error) {
 	if err := walkPayload(root, &info, ""); err != nil {
 		return info, err
 	}
+	if prev, present := root[previousResponseIDKey]; present {
+		// Only Responses capabilities may carry a chained reference, and
+		// only as a root-level string already resolved by the caller.
+		if req.Capability != CapabilityResponses && req.Capability != CapabilityCompact {
+			return info, fmt.Errorf("%w: %s not permitted", ErrDenied, previousResponseIDKey)
+		}
+		if s, ok := prev.(string); !ok || s == "" {
+			return info, fmt.Errorf("%w: %s must be a string", ErrDenied, previousResponseIDKey)
+		}
+	}
 	if err := validateResponsesTarget(req); err != nil {
 		return info, err
 	}
@@ -429,6 +446,9 @@ func walkPayload(node any, info *payloadInfo, parentKey string) error {
 		}
 		for k, val := range v {
 			kl := strings.ToLower(k)
+			if kl == previousResponseIDKey && parentKey != "" {
+				return fmt.Errorf("%w: %s is only allowed at the payload root", ErrDenied, k)
+			}
 			if forbiddenPayloadKeys[kl] {
 				return fmt.Errorf("%w: field %q is not permitted", ErrDenied, k)
 			}

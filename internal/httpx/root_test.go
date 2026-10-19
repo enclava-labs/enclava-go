@@ -15,7 +15,7 @@ import (
 )
 
 func TestRootRedirectsToDashboard(t *testing.T) {
-	app := NewApp(nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "", "", "", nil, nil, 1, false, nil)
+	app := NewApp(nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "", "", "", nil, nil, 1, false, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
@@ -31,7 +31,7 @@ func TestRootRedirectsToDashboard(t *testing.T) {
 }
 
 func TestRootCatchAllStillReturnsNotFound(t *testing.T) {
-	app := NewApp(nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "", "", "", nil, nil, 1, false, nil)
+	app := NewApp(nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "", "", "", nil, nil, 1, false, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/missing", nil)
 	rec := httptest.NewRecorder()
@@ -84,7 +84,7 @@ func newSessionApp(t *testing.T) (*App, *postgres.IdentityRepo, string) {
 	tenant := testdb.SeedTenant(t, db, "bootstrap")
 	authSvc := auth.NewService(repo, "")
 	sessionAuth := NewSessionAuth(authSvc, nil, time.Hour, dashboardTemplates, "bootstrap")
-	app := NewApp(authSvc, nil, "", nil, repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, "sha256", "", "enc_", nil, sessionAuth, 1, false, nil)
+	app := NewApp(authSvc, nil, "", nil, repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, "sha256", "", "enc_", nil, sessionAuth, 1, false, nil, nil)
 	return app, repo, tenant
 }
 

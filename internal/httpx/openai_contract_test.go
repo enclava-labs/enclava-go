@@ -144,7 +144,7 @@ func newOpenAIContractFixture(t *testing.T) *openaiFx {
 	}
 	authSvc := auth.NewService(repo, "")
 	app := NewApp(authSvc, nil, "", nil, repo, nil, nil, nil, nil, nil, nil, nil, brepo, erepo,
-		"sha256", "", "enc_", nil, nil, 1, false, svc)
+		"sha256", "", "enc_", nil, nil, 1, false, svc, postgres.NewResponseBindingsRepo(db))
 	fx := &openaiFx{t: t, db: db, tenant: tenant, app: app, up: up, brepo: brepo, erepo: erepo}
 	fx.keyID = key
 	fx.mustEndpoint(t, "ep-chat", []string{
@@ -368,13 +368,16 @@ func TestUnselectedAndUnsupportedRoutesFailClosed(t *testing.T) {
 		want               int
 	}{
 		// Not registered: no catch-all passthrough remains.
-		{http.MethodPost, "/v1/responses", `{"model":"gpt-fast","input":"hi"}`, http.StatusNotFound},
 		{http.MethodGet, "/v1/files", "", http.StatusNotFound},
 		{http.MethodPost, "/v1/images/generations", `{}`, http.StatusNotFound},
 		{http.MethodGet, "/api/v1/models", "", http.StatusNotFound},
 		{http.MethodPost, "/api/v1/chat/completions", `{}`, http.StatusNotFound},
 		// Registered routes still bound the method.
 		{http.MethodGet, "/v1/chat/completions", "", http.StatusMethodNotAllowed},
+		// The fixture key lacks the "responses" scope: mounted responses
+		// routes deny before method checks or dispatch.
+		{http.MethodGet, "/v1/responses", "", http.StatusForbidden},
+		{http.MethodPost, "/v1/responses", `{"model":"gpt-fast","input":"hi"}`, http.StatusForbidden},
 		{http.MethodDelete, "/v1/models/gpt-fast", "", http.StatusMethodNotAllowed},
 		{http.MethodPost, "/v1/embeddings", `{"model":"embed-1","input":"x","stream":true}`, http.StatusBadRequest},
 	}
@@ -462,7 +465,7 @@ func TestOfficialSDKInProcessContract(t *testing.T) {
 	}
 	app := NewApp(auth.NewService(postgres.NewIdentityRepo(f.db), ""), nil, "", nil, postgres.NewIdentityRepo(f.db),
 		nil, nil, nil, nil, nil, nil, nil, f.brepo, f.erepo,
-		"sha256", "", "enc_", nil, nil, 1, false, svc)
+		"sha256", "", "enc_", nil, nil, 1, false, svc, postgres.NewResponseBindingsRepo(f.db))
 	server := httptest.NewServer(app.Handler())
 	defer server.Close()
 

@@ -39,6 +39,12 @@ func usageFromJSON(raw []byte) (billing.Usage, bool) {
 			usage = usageObject(resp)
 		}
 	}
+	if usage == nil && env["object"] == "response.input_tokens" {
+		// input_tokens responses carry the count at top level rather than
+		// under "usage"; synthesize the same shape so the priced operation
+		// settles its measured input instead of retaining liability.
+		usage = map[string]any{"input_tokens": env["input_tokens"]}
+	}
 	if usage == nil {
 		return billing.Usage{}, false
 	}

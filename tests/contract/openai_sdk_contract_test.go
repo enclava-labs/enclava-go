@@ -9,20 +9,24 @@ import (
 
 	openai "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared"
 )
 
 // TestOpenAISDKCompatibility exercises the selected public OpenAI core API —
-// models, chat completions (unary + streaming tool calls) and embeddings —
-// against a configured application using the installed official Go SDK.
-// Explicitly invoked without a live target it fails rather than skips.
+// models, chat completions (unary + streaming tool calls), embeddings and the
+// owned Responses lifecycle (create → get → input items → input tokens →
+// chained previous_response_id → cancel → delete) — against a configured
+// application using the installed official Go SDK. Explicitly invoked without
+// a live target it fails rather than skips.
 func TestOpenAISDKCompatibility(t *testing.T) {
 	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("OPENAI_CONTRACT_BASE_URL")), "/")
 	apiKey := strings.TrimSpace(os.Getenv("OPENAI_CONTRACT_API_KEY"))
 	chatModel := strings.TrimSpace(os.Getenv("OPENAI_CONTRACT_CHAT_MODEL"))
 	embeddingModel := strings.TrimSpace(os.Getenv("OPENAI_CONTRACT_EMBEDDING_MODEL"))
-	if baseURL == "" || apiKey == "" || chatModel == "" || embeddingModel == "" {
-		t.Fatal("OPENAI_CONTRACT_BASE_URL, OPENAI_CONTRACT_API_KEY, OPENAI_CONTRACT_CHAT_MODEL and OPENAI_CONTRACT_EMBEDDING_MODEL are required")
+	responsesModel := strings.TrimSpace(os.Getenv("OPENAI_CONTRACT_RESPONSES_MODEL"))
+	if baseURL == "" || apiKey == "" || chatModel == "" || embeddingModel == "" || responsesModel == "" {
+		t.Fatal("OPENAI_CONTRACT_BASE_URL, OPENAI_CONTRACT_API_KEY, OPENAI_CONTRACT_CHAT_MODEL, OPENAI_CONTRACT_EMBEDDING_MODEL and OPENAI_CONTRACT_RESPONSES_MODEL are required")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -95,6 +99,47 @@ func TestOpenAISDKCompatibility(t *testing.T) {
 	}
 	if len(embedding.Data) != 2 || len(embedding.Data[0].Embedding) == 0 {
 		t.Fatalf("unexpected SDK embedding response: %#v", embedding)
+	}
+
+	// The owned Responses lifecycle round-trips through bound public IDs:
+	// create → retrieve → input items → cancel → delete.
+	resp, err := client.Responses.New(ctx, responses.ResponseNewParams{
+		Model: shared.ResponsesModel(responsesModel),
+		Input: responses.ResponseNewParamsInputUnion{OfString: openai.String("say hi")},
+	})
+	if err != nil || resp.ID == "" {
+		t.Fatalf("responses create through official SDK: %v %#v", err, resp)
+	}
+	got, err := client.Responses.Get(ctx, resp.ID, responses.ResponseGetParams{})
+	if err != nil || got.ID != resp.ID {
+		t.Fatalf("responses get through official SDK: %v %#v", err, got)
+	}
+	items, err := client.Responses.InputItems.List(ctx, resp.ID, responses.InputItemListParams{})
+	if err != nil || len(items.Data) == 0 {
+		t.Fatalf("responses input items through official SDK: %v %#v", err, items)
+	}
+	if _, err := client.Responses.InputTokens.Count(ctx, responses.InputTokenCountParams{
+		Model: openai.String(responsesModel),
+		Input: responses.InputTokenCountParamsInputUnion{OfString: openai.String("say hi")},
+	}); err != nil {
+		t.Fatalf("responses input_tokens through official SDK: %v", err)
+	}
+	chained, err := client.Responses.New(ctx, responses.ResponseNewParams{
+		Model:              shared.ResponsesModel(responsesModel),
+		Input:              responses.ResponseNewParamsInputUnion{OfString: openai.String("say hi again")},
+		PreviousResponseID: openai.String(resp.ID),
+	})
+	if err != nil || chained.ID == "" || chained.ID == resp.ID {
+		t.Fatalf("responses chained create through official SDK: %v %#v", err, chained)
+	}
+	if _, err := client.Responses.Cancel(ctx, chained.ID); err != nil {
+		t.Fatalf("responses cancel through official SDK: %v", err)
+	}
+	if err := client.Responses.Delete(ctx, resp.ID); err != nil {
+		t.Fatalf("responses delete through official SDK: %v", err)
+	}
+	if _, err := client.Responses.Get(ctx, resp.ID, responses.ResponseGetParams{}); err == nil {
+		t.Fatal("deleted response must not remain retrievable")
 	}
 
 	// Unselected products are explicit errors, never a fallback proxy.

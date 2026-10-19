@@ -256,6 +256,94 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 	return result, nil
 }
 
+// Manage dispatches one unpriced lifecycle follow-up — retrieve, cancel,
+// delete, input_items, stream-resume — on the binding-resolved endpoint.
+// There is no reservation and no model work, so it stays available under an
+// exhausted inference budget; it also never retries: one attempt on the
+// bound endpoint, whatever the outcome.
+func (s *Service) Manage(ctx context.Context, p auth.Principal, req ManageRequest) (*ManageResult, error) {
+	if p.TenantID == "" || p.ActorID == "" {
+		return nil, fmt.Errorf("%w: principal lacks tenant/actor", ErrDenied)
+	}
+	if err := s.validateManageTarget(req); err != nil {
+		return nil, err
+	}
+	e, err := s.endpoints.Get(ctx, p.TenantID, req.EndpointID)
+	if err != nil || e.TenantID != p.TenantID {
+		return nil, fmt.Errorf("%w", ErrNoRoute)
+	}
+	if !auth.EndpointAllowed(p, e.ID) {
+		return nil, fmt.Errorf("%w", ErrDenied)
+	}
+	up, err := s.transportFor(ctx, e)
+	if err != nil {
+		return nil, fmt.Errorf("transport for endpoint: %w", err)
+	}
+	path := req.Path
+	if req.Query != "" {
+		path += "?" + req.Query
+	}
+	mctx, cancel := context.WithTimeout(ctx, s.attemptTimeout)
+	if req.Stream {
+		raw, err := up.DoResponsesStream(mctx, req.Method, path, req.Body)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		return &ManageResult{EndpointID: e.ID, Body: &cancelOnClose{ReadCloser: raw, done: cancel}}, nil
+	}
+	defer cancel()
+	raw, err := up.DoResponsesRequest(mctx, req.Method, path, req.Body)
+	if err != nil {
+		return nil, err
+	}
+	return &ManageResult{EndpointID: e.ID, Body: io.NopCloser(bytes.NewReader(raw))}, nil
+}
+
+// cancelOnClose releases the attempt deadline when the stream's owner closes.
+type cancelOnClose struct {
+	io.ReadCloser
+	done context.CancelFunc
+	once sync.Once
+}
+
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.once.Do(c.done)
+	return err
+}
+
+// validateManageTarget bounds a management request to the /responses/{id}
+// operation surface: GET/POST/DELETE on a two-segment tail plus an optional
+// server-built query of plain key=value pairs.
+func (s *Service) validateManageTarget(req ManageRequest) error {
+	switch strings.ToUpper(req.Method) {
+	case http.MethodGet, http.MethodPost, http.MethodDelete:
+	default:
+		return fmt.Errorf("%w: responses method", ErrDenied)
+	}
+	if s.payloadLimit > 0 && int64(len(req.Body)) > s.payloadLimit {
+		return fmt.Errorf("%w: payload exceeds bound", ErrDenied)
+	}
+	p := req.Path
+	if !strings.HasPrefix(p, "/responses/") || strings.Contains(p, "..") ||
+		strings.ContainsAny(p, "?#") ||
+		!validPathTail(strings.TrimPrefix(p, "/responses")) {
+		return fmt.Errorf("%w: responses path", ErrDenied)
+	}
+	if len(req.Query) > 512 || strings.Contains(req.Query, " ") {
+		return fmt.Errorf("%w: responses query", ErrDenied)
+	}
+	for _, r := range req.Query {
+		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') &&
+			!(r >= '0' && r <= '9') && r != '=' && r != '&' &&
+			r != '_' && r != '-' && r != '.' && r != '%' {
+			return fmt.Errorf("%w: responses query", ErrDenied)
+		}
+	}
+	return nil
+}
+
 // failAttempt retains liability for a dispatched attempt whose outcome is
 // ambiguous: the request may have been accepted before the failure.
 func (s *Service) failAttempt(ctx context.Context, p auth.Principal, res billing.Reservation, cause error) {
