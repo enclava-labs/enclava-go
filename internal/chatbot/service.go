@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"enclava-go/internal/auth"
 	"enclava-go/internal/llm"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
@@ -33,8 +34,12 @@ type PromptRepository interface {
 	GetDefault(ctx context.Context) (sqlite.PromptTemplate, error)
 }
 
+// RAGSearcher is the rag.Service search surface. The request principal is
+// resolved from the call context (auth.PrincipalFromContext) — chatbot's
+// caller-facing Access struct is not passed down so a caller can never
+// forge collection authority.
 type RAGSearcher interface {
-	Search(ctx context.Context, access rag.Access, input rag.SearchInput) ([]rag.SearchResult, error)
+	Search(ctx context.Context, p auth.Principal, input rag.SearchInput) ([]rag.SearchResult, error)
 }
 
 type UsageRecorder interface {
@@ -414,7 +419,17 @@ func (s *Service) retrieveRAG(ctx context.Context, access Access, bot sqlite.Cha
 		if collectionID == "" {
 			continue
 		}
-		found, err := s.rag.Search(ctx, rag.Access{APIKeyID: access.APIKeyID, IsAdmin: true}, rag.SearchInput{
+		p, ok := auth.PrincipalFromContext(ctx)
+		if !ok {
+			// Non-HTTP callers construct only the minimal key identity —
+			// never platform.admin; collection authorization stays inside
+			// rag against the real principal.
+			p = auth.Principal{
+				ActorID:  fmt.Sprintf("apikey:%d", access.APIKeyID),
+				ActorKind: auth.ActorKindServiceAccount,
+			}
+		}
+		found, err := s.rag.Search(ctx, p, rag.SearchInput{
 			CollectionID: collectionID,
 			Query:        query,
 			Limit:        limit,

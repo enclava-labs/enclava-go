@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"enclava-go/internal/auth"
 	"enclava-go/internal/llm"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
@@ -47,14 +48,14 @@ func (f *fakeChatProvider) CreateEmbeddings(ctx context.Context, body []byte) ([
 }
 
 type fakeRAGSearcher struct {
-	inputs   []rag.SearchInput
-	accesses []rag.Access
-	err      error
+	inputs     []rag.SearchInput
+	principals []auth.Principal
+	err        error
 }
 
-func (f *fakeRAGSearcher) Search(ctx context.Context, access rag.Access, input rag.SearchInput) ([]rag.SearchResult, error) {
+func (f *fakeRAGSearcher) Search(ctx context.Context, p auth.Principal, input rag.SearchInput) ([]rag.SearchResult, error) {
 	f.inputs = append(f.inputs, input)
-	f.accesses = append(f.accesses, access)
+	f.principals = append(f.principals, p)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -133,8 +134,11 @@ func TestCreateChatCompletionInjectsRAGAndPersistsConversation(t *testing.T) {
 	if len(ragSearcher.inputs) != 1 || ragSearcher.inputs[0].CollectionID != "ragcol_test" {
 		t.Fatalf("unexpected RAG searches: %#v", ragSearcher.inputs)
 	}
-	if len(ragSearcher.accesses) != 1 || ragSearcher.accesses[0].APIKeyID != keyID || !ragSearcher.accesses[0].IsAdmin {
-		t.Fatalf("RAG search must use attachment admin access, got %#v", ragSearcher.accesses)
+	if len(ragSearcher.principals) != 1 || ragSearcher.principals[0].ActorID != fmt.Sprintf("apikey:%d", keyID) {
+		t.Fatalf("RAG search must carry the request principal, got %#v", ragSearcher.principals)
+	}
+	if auth.HasScope(ragSearcher.principals[0], "platform.admin") {
+		t.Fatal("RAG search must not fabricate platform.admin")
 	}
 
 	var upstream struct {
@@ -521,8 +525,8 @@ func TestRetrieveRAGUsesBotAttachmentAccess(t *testing.T) {
 	if errors.Is(err, sql.ErrNoRows) {
 		t.Fatal("missing collection must not surface as sql.ErrNoRows")
 	}
-	if len(searcher.accesses) != 1 || searcher.accesses[0].APIKeyID != keyID || !searcher.accesses[0].IsAdmin {
-		t.Fatalf("RAG search access = %#v", searcher.accesses)
+	if len(searcher.principals) != 1 || searcher.principals[0].ActorID != fmt.Sprintf("apikey:%d", keyID) {
+		t.Fatalf("RAG search principal = %#v", searcher.principals)
 	}
 
 	searcher.err = errors.New("qdrant down http://qdrant.internal/secret-collection")
@@ -533,8 +537,9 @@ func TestRetrieveRAGUsesBotAttachmentAccess(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "secret-collection") {
 		t.Fatalf("expected original RAG error, got %v", err)
 	}
-	if !searcher.accesses[len(searcher.accesses)-1].IsAdmin {
-		t.Fatalf("attachment search dropped admin access: %#v", searcher.accesses)
+	last := searcher.principals[len(searcher.principals)-1]
+	if auth.HasScope(last, "platform.admin") {
+		t.Fatalf("attachment search forged admin scope: %#v", last)
 	}
 }
 
