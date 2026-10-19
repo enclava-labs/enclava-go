@@ -1,4 +1,3 @@
-// billing_repo.go implements billing.BillingRepository over migration 005 —
 // the single transactional money/unit liability authority (JOB-03/JOB-04).
 // Admission locks applicable budgets FOR UPDATE in deterministic subject/id
 // order, reconstructs liability from persisted reserved_units and settled
@@ -89,12 +88,16 @@ func (r *BillingRepo) CreateBudget(ctx context.Context, tenantID, id string, b b
 	if b.Kind == billing.BudgetKindAmount {
 		currency = b.Currency
 	}
+	name := b.Name
+	if name == "" {
+		name = "budget"
+	}
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO budgets
 			(tenant_id, id, name, subject_type, subject_id, kind, limit_value,
 			 currency, period, starts_at, ends_at)
 		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-		tenantID, id, "budget", b.Subject.Type, b.Subject.ID, b.Kind,
+		tenantID, id, name, b.Subject.Type, b.Subject.ID, b.Kind,
 		b.LimitAmountMicros, currency, b.Period, b.StartsAt, b.EndsAt)
 	if err != nil {
 		return fmt.Errorf("insert budget: %w", err)
@@ -131,26 +134,33 @@ func (t billingTx) LockActiveBudgets(ctx context.Context, tenantID string, subje
 	for i, s := range subjects {
 		types[i], ids[i] = s.Type, s.ID
 	}
-	rows, err := t.tx.QueryContext(ctx, `
-		SELECT id, subject_type, subject_id, kind, period, limit_value,
-		       COALESCE(currency, ''), starts_at, ends_at
-		FROM budgets
-		WHERE tenant_id = $1::uuid
-		  AND active
-		  AND starts_at <= $2
-		  AND (ends_at IS NULL OR ends_at > $2)
+	rows, err := t.tx.QueryContext(ctx, budgetSelectSQL+`
 		  AND (subject_type, subject_id) IN (SELECT * FROM unnest($3::text[], $4::text[]))
 		ORDER BY subject_type, subject_id, id
 		FOR UPDATE`, tenantID, now, strArray(types), strArray(ids))
 	if err != nil {
 		return nil, fmt.Errorf("lock budgets: %w", err)
 	}
+	return scanBudgets(rows)
+}
+
+const budgetSelectSQL = `
+	SELECT id, name, subject_type, subject_id, kind, period, limit_value,
+	       COALESCE(currency, ''), starts_at, ends_at
+	FROM budgets
+	WHERE tenant_id = $1::uuid
+	  AND active
+	  AND starts_at <= $2
+	  AND (ends_at IS NULL OR ends_at > $2)
+`
+
+func scanBudgets(rows *sql.Rows) ([]billing.Budget, error) {
 	defer rows.Close()
 	var out []billing.Budget
 	for rows.Next() {
 		var b billing.Budget
 		var endsAt sql.NullTime
-		if err := rows.Scan(&b.ID, &b.Subject.Type, &b.Subject.ID, &b.Kind,
+		if err := rows.Scan(&b.ID, &b.Name, &b.Subject.Type, &b.Subject.ID, &b.Kind,
 			&b.Period, &b.LimitAmountMicros, &b.Currency, &b.StartsAt, &endsAt); err != nil {
 			return nil, fmt.Errorf("scan budget: %w", err)
 		}
@@ -198,7 +208,16 @@ func (t billingTx) SelectPrices(ctx context.Context, tenantID, subjectType, subj
 // tenant-wide over canonical rows; other subjects match their own
 // attribution rows, then their settled usage via the usage record's subject.
 func (t billingTx) Liabilities(ctx context.Context, tenantID string, scope billing.Subject, from time.Time) ([]billing.LiabilityRow, error) {
-	rows, err := t.tx.QueryContext(ctx, `
+	return queryLiabilities(ctx, t.tx, tenantID, scope, from)
+}
+
+// billingQuerier is satisfied by *sql.DB and *sql.Tx.
+type billingQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func queryLiabilities(ctx context.Context, q billingQuerier, tenantID string, scope billing.Subject, from time.Time) ([]billing.LiabilityRow, error) {
+	rows, err := q.QueryContext(ctx, `
 		SELECT limit_amount_micros, currency::text, reserved_units::text
 		FROM reservations
 		WHERE tenant_id = $1::uuid
@@ -216,13 +235,13 @@ func (t billingTx) Liabilities(ctx context.Context, tenantID string, scope billi
 
 	var urows *sql.Rows
 	if scope.Type == billing.BudgetSubjectTenant {
-		urows, err = t.tx.QueryContext(ctx, `
+		urows, err = q.QueryContext(ctx, `
 			SELECT amount_micros, currency::text, units::text
 			FROM usage_records
 			WHERE tenant_id = $1::uuid AND created_at >= $2`,
 			tenantID, from)
 	} else {
-		urows, err = t.tx.QueryContext(ctx, `
+		urows, err = q.QueryContext(ctx, `
 			SELECT amount_micros, currency::text, units::text
 			FROM usage_records
 			WHERE tenant_id = $1::uuid AND created_at >= $2
@@ -489,4 +508,328 @@ func newRowID(prefix string) string {
 		panic(err)
 	}
 	return prefix + "_" + hex.EncodeToString(b[:])
+}
+
+// --- admin/usage reads (httpx billing cutover, 01-17) -----------------------
+
+// PriceRow is one persisted price row with its storage id and provenance.
+type PriceRow struct {
+	billing.Price
+	ID        string
+	CreatedBy string
+	CreatedAt time.Time
+}
+
+// ListPrices returns tenant price rows, optionally filtered by subject,
+// newest-effective first.
+func (r *BillingRepo) ListPrices(ctx context.Context, tenantID, subjectType, subjectID, capability string, limit, offset int) ([]PriceRow, error) {
+	q := `
+		SELECT id, subject_type, subject_id, capability, unit_kind,
+		       rate_micros, unit_quantity, currency, effective_from,
+		       COALESCE(created_by, ''), created_at
+		FROM billing_prices
+		WHERE tenant_id = $1::uuid`
+	args := []any{tenantID}
+	n := 1
+	if subjectType != "" {
+		n++
+		q += fmt.Sprintf(" AND subject_type = $%d", n)
+		args = append(args, subjectType)
+	}
+	if subjectID != "" {
+		n++
+		q += fmt.Sprintf(" AND subject_id = $%d", n)
+		args = append(args, subjectID)
+	}
+	if capability != "" {
+		n++
+		q += fmt.Sprintf(" AND capability = $%d", n)
+		args = append(args, capability)
+	}
+	q += fmt.Sprintf(" ORDER BY effective_from DESC, id LIMIT $%d OFFSET $%d", n+1, n+2)
+	args = append(args, limit, offset)
+	rows, err := r.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list prices: %w", err)
+	}
+	defer rows.Close()
+	var out []PriceRow
+	for rows.Next() {
+		var p PriceRow
+		var unit string
+		if err := rows.Scan(&p.ID, &p.SubjectType, &p.SubjectID, &p.Capability,
+			&unit, &p.RateMicros, &p.UnitQuantity, &p.Currency,
+			&p.EffectiveFrom, &p.CreatedBy, &p.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan price: %w", err)
+		}
+		p.Unit = billing.UnitKind(unit)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// PriceAuditRow is one billing_price_audit row.
+type PriceAuditRow struct {
+	ID        string
+	PriceID   string
+	Action    string
+	ActorType string
+	ActorID   string
+	Detail    map[string]any
+	CreatedAt time.Time
+}
+
+// ListPriceAudit returns pricing audit rows, newest first.
+func (r *BillingRepo) ListPriceAudit(ctx context.Context, tenantID string, limit, offset int) ([]PriceAuditRow, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, price_id, action, actor_type, actor_id, detail::text, created_at
+		FROM billing_price_audit
+		WHERE tenant_id = $1::uuid
+		ORDER BY created_at DESC, id LIMIT $2 OFFSET $3`, tenantID, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("list price audit: %w", err)
+	}
+	defer rows.Close()
+	var out []PriceAuditRow
+	for rows.Next() {
+		var a PriceAuditRow
+		var detail string
+		if err := rows.Scan(&a.ID, &a.PriceID, &a.Action, &a.ActorType, &a.ActorID, &detail, &a.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan price audit: %w", err)
+		}
+		a.Detail = map[string]any{}
+		if detail != "" {
+			if err := json.Unmarshal([]byte(detail), &a.Detail); err != nil {
+				return nil, fmt.Errorf("decode price audit detail: %w", err)
+			}
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// BillingAuditRow is one billing_audit event row.
+type BillingAuditRow struct {
+	ID          string
+	SubjectType string
+	SubjectID   string
+	Action      string
+	ActorType   string
+	ActorID     string
+	Detail      map[string]any
+	CreatedAt   time.Time
+}
+
+// CreateBillingAudit appends one billing audit event.
+func (r *BillingRepo) CreateBillingAudit(ctx context.Context, tenantID string, row BillingAuditRow) error {
+	detail, err := json.Marshal(row.Detail)
+	if err != nil {
+		return fmt.Errorf("marshal billing audit detail: %w", err)
+	}
+	_, err = r.db.ExecContext(ctx, `
+		INSERT INTO billing_audit
+			(tenant_id, id, subject_type, subject_id, action, actor_type, actor_id, detail)
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8)`,
+		tenantID, row.ID, row.SubjectType, row.SubjectID, row.Action,
+		row.ActorType, row.ActorID, string(detail))
+	if err != nil {
+		return fmt.Errorf("insert billing audit: %w", err)
+	}
+	return nil
+}
+
+// ListBillingAudit returns audit rows, optionally filtered by subject.
+func (r *BillingRepo) ListBillingAudit(ctx context.Context, tenantID, subjectType, subjectID string, limit, offset int) ([]BillingAuditRow, error) {
+	q := `
+		SELECT id, subject_type, subject_id, action, actor_type, actor_id,
+		       detail::text, created_at
+		FROM billing_audit
+		WHERE tenant_id = $1::uuid`
+	args := []any{tenantID}
+	n := 1
+	if subjectType != "" {
+		n++
+		q += fmt.Sprintf(" AND subject_type = $%d", n)
+		args = append(args, subjectType)
+	}
+	if subjectID != "" {
+		n++
+		q += fmt.Sprintf(" AND subject_id = $%d", n)
+		args = append(args, subjectID)
+	}
+	q += fmt.Sprintf(" ORDER BY created_at DESC, id LIMIT $%d OFFSET $%d", n+1, n+2)
+	args = append(args, limit, offset)
+	rows, err := r.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list billing audit: %w", err)
+	}
+	defer rows.Close()
+	var out []BillingAuditRow
+	for rows.Next() {
+		var a BillingAuditRow
+		var detail string
+		if err := rows.Scan(&a.ID, &a.SubjectType, &a.SubjectID, &a.Action,
+			&a.ActorType, &a.ActorID, &detail, &a.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan billing audit: %w", err)
+		}
+		a.Detail = map[string]any{}
+		if detail != "" {
+			if err := json.Unmarshal([]byte(detail), &a.Detail); err != nil {
+				return nil, fmt.Errorf("decode billing audit detail: %w", err)
+			}
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// ListActiveBudgets returns active budgets applicable to any of subjects at
+// now — the non-transactional twin of LockActiveBudgets for reads.
+func (r *BillingRepo) ListActiveBudgets(ctx context.Context, tenantID string, subjects []billing.Subject, now time.Time) ([]billing.Budget, error) {
+	if len(subjects) == 0 {
+		return nil, nil
+	}
+	types := make([]string, len(subjects))
+	ids := make([]string, len(subjects))
+	for i, s := range subjects {
+		types[i], ids[i] = s.Type, s.ID
+	}
+	rows, err := r.db.QueryContext(ctx, budgetSelectSQL+`
+		  AND (subject_type, subject_id) IN (SELECT * FROM unnest($3::text[], $4::text[]))
+		ORDER BY subject_type, subject_id, id`, tenantID, now, strArray(types), strArray(ids))
+	if err != nil {
+		return nil, fmt.Errorf("list budgets: %w", err)
+	}
+	return scanBudgets(rows)
+}
+
+// Liabilities is the read-path liability reconstruction used by the retained
+// EnforceBudget guard — identical semantics to the transactional read.
+func (r *BillingRepo) Liabilities(ctx context.Context, tenantID string, scope billing.Subject, from time.Time) ([]billing.LiabilityRow, error) {
+	return queryLiabilities(ctx, r.db, tenantID, scope, from)
+}
+
+// UsageGroupSum aggregates settled usage_records per group key.
+type UsageGroupSum struct {
+	Key          string
+	SubjectType  string
+	SubjectID    string
+	RequestCount int64
+	TotalUnits   int64
+	AmountMicros int64
+	Currency     string
+}
+
+// usageUnitsTotalSQL sums every kind in the per-record units map.
+const usageUnitsTotalSQL = `COALESCE(SUM((
+	SELECT SUM(v::bigint) FROM jsonb_each_text(units) AS e(k, v))), 0)`
+
+// UsageTotals returns tenant-wide settled usage aggregates since `since`,
+// grouped per currency — a mixed-currency tenant yields one row each.
+func (r *BillingRepo) UsageTotals(ctx context.Context, tenantID string, since time.Time) ([]UsageGroupSum, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT currency::text, COUNT(*), `+usageUnitsTotalSQL+`,
+		       COALESCE(SUM(amount_micros), 0)
+		FROM usage_records
+		WHERE tenant_id = $1::uuid AND created_at >= $2
+		GROUP BY currency`, tenantID, since)
+	if err != nil {
+		return nil, fmt.Errorf("usage totals: %w", err)
+	}
+	defer rows.Close()
+	var out []UsageGroupSum
+	for rows.Next() {
+		var s UsageGroupSum
+		if err := rows.Scan(&s.Currency, &s.RequestCount, &s.TotalUnits, &s.AmountMicros); err != nil {
+			return nil, fmt.Errorf("scan usage totals: %w", err)
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// UsageBySubject aggregates settled usage per billing subject.
+func (r *BillingRepo) UsageBySubject(ctx context.Context, tenantID string, since time.Time) ([]UsageGroupSum, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT subject_type, subject_id, COUNT(*), `+usageUnitsTotalSQL+`,
+		       COALESCE(SUM(amount_micros), 0), currency::text
+		FROM usage_records
+		WHERE tenant_id = $1::uuid AND created_at >= $2
+		GROUP BY subject_type, subject_id, currency
+		ORDER BY subject_type, subject_id`, tenantID, since)
+	if err != nil {
+		return nil, fmt.Errorf("usage by subject: %w", err)
+	}
+	defer rows.Close()
+	var out []UsageGroupSum
+	for rows.Next() {
+		var s UsageGroupSum
+		if err := rows.Scan(&s.SubjectType, &s.SubjectID, &s.RequestCount,
+			&s.TotalUnits, &s.AmountMicros, &s.Currency); err != nil {
+			return nil, fmt.Errorf("scan usage by subject: %w", err)
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// UsageByEndpoint aggregates settled usage per endpoint id.
+func (r *BillingRepo) UsageByEndpoint(ctx context.Context, tenantID string, since time.Time) ([]UsageGroupSum, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT COALESCE(endpoint_id, ''), COUNT(*), `+usageUnitsTotalSQL+`,
+		       COALESCE(SUM(amount_micros), 0), currency::text
+		FROM usage_records
+		WHERE tenant_id = $1::uuid AND created_at >= $2
+		GROUP BY endpoint_id, currency
+		ORDER BY COUNT(*) DESC`, tenantID, since)
+	if err != nil {
+		return nil, fmt.Errorf("usage by endpoint: %w", err)
+	}
+	return scanGroupSums(rows)
+}
+
+// UsageByModel aggregates settled usage per model.
+func (r *BillingRepo) UsageByModel(ctx context.Context, tenantID string, since time.Time) ([]UsageGroupSum, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT model, COUNT(*), `+usageUnitsTotalSQL+`,
+		       COALESCE(SUM(amount_micros), 0), currency::text
+		FROM usage_records
+		WHERE tenant_id = $1::uuid AND created_at >= $2
+		GROUP BY model, currency
+		ORDER BY COUNT(*) DESC`, tenantID, since)
+	if err != nil {
+		return nil, fmt.Errorf("usage by model: %w", err)
+	}
+	return scanGroupSums(rows)
+}
+
+func scanGroupSums(rows *sql.Rows) ([]UsageGroupSum, error) {
+	defer rows.Close()
+	var out []UsageGroupSum
+	for rows.Next() {
+		var s UsageGroupSum
+		if err := rows.Scan(&s.Key, &s.RequestCount, &s.TotalUnits,
+			&s.AmountMicros, &s.Currency); err != nil {
+			return nil, fmt.Errorf("scan usage group: %w", err)
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// SubjectUsageSince aggregates settled usage for one subject since `since`
+// — the usage-display half of the retained budget guard.
+func (r *BillingRepo) SubjectUsageSince(ctx context.Context, tenantID string, subject billing.Subject, since time.Time) (totalUnits, amountMicros int64, err error) {
+	var units sql.NullInt64
+	var micros sql.NullInt64
+	err = r.db.QueryRowContext(ctx, `
+		SELECT `+usageUnitsTotalSQL+`, COALESCE(SUM(amount_micros), 0)
+		FROM usage_records
+		WHERE tenant_id = $1::uuid AND created_at >= $2
+		  AND subject_type = $3 AND subject_id = $4`,
+		tenantID, since, subject.Type, subject.ID).Scan(&units, &micros)
+	if err != nil {
+		return 0, 0, fmt.Errorf("subject usage since: %w", err)
+	}
+	return units.Int64, micros.Int64, nil
 }

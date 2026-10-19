@@ -2,32 +2,30 @@
 <div class="space-y-6">
   <div class="rounded-lg border bg-card overflow-hidden">
     <div class="border-b px-5 py-4">
-      <h3 class="font-semibold">Provider Pricing</h3>
+      <h3 class="font-semibold">Billing Prices</h3>
     </div>
     {{if not .Pricing}}
-    <div class="p-8 text-center text-sm text-muted-foreground">No provider pricing records.</div>
+    <div class="p-8 text-center text-sm text-muted-foreground">No price records.</div>
     {{else}}
     <div class="overflow-x-auto">
       <table class="w-full text-sm">
         <thead class="bg-muted/50 text-muted-foreground">
           <tr>
-            <th class="px-4 py-3 text-left font-medium">Provider</th>
-            <th class="px-4 py-3 text-left font-medium">Model</th>
-            <th class="px-4 py-3 text-right font-medium">Input / 1K</th>
-            <th class="px-4 py-3 text-right font-medium">Output / 1K</th>
-            <th class="px-4 py-3 text-right font-medium">Embedding / 1K</th>
+            <th class="px-4 py-3 text-left font-medium">Subject</th>
+            <th class="px-4 py-3 text-left font-medium">Capability</th>
+            <th class="px-4 py-3 text-left font-medium">Unit</th>
+            <th class="px-4 py-3 text-right font-medium">Rate</th>
             <th class="px-4 py-3 text-left font-medium">Effective</th>
           </tr>
         </thead>
         <tbody class="divide-y">
           {{range .Pricing}}
           <tr>
-            <td class="px-4 py-3">{{.ProviderID}}</td>
-            <td class="px-4 py-3 font-mono">{{.ModelID}}</td>
-            <td class="px-4 py-3 text-right">{{.InputTokenCentsPer1K}} {{.Currency}} cents</td>
-            <td class="px-4 py-3 text-right">{{.OutputTokenCentsPer1K}} {{.Currency}} cents</td>
-            <td class="px-4 py-3 text-right">{{.EmbeddingTokenCentsPer1K}} {{.Currency}} cents</td>
-            <td class="px-4 py-3">{{.EffectiveAt}}</td>
+            <td class="px-4 py-3">{{.SubjectType}} <span class="font-mono">{{.SubjectID}}</span></td>
+            <td class="px-4 py-3 font-mono">{{.Capability}}</td>
+            <td class="px-4 py-3">{{.Unit}}</td>
+            <td class="px-4 py-3 text-right">{{.RateMicros}} {{.Currency}} micros / {{.UnitQuantity}}</td>
+            <td class="px-4 py-3">{{.EffectiveFrom}}</td>
           </tr>
           {{end}}
         </tbody>
@@ -49,7 +47,7 @@
           <tr>
             <th class="px-4 py-3 text-left font-medium">Action</th>
             <th class="px-4 py-3 text-left font-medium">Actor</th>
-            <th class="px-4 py-3 text-left font-medium">Pricing ID</th>
+            <th class="px-4 py-3 text-left font-medium">Price ID</th>
             <th class="px-4 py-3 text-left font-medium">Created</th>
           </tr>
         </thead>
@@ -58,7 +56,7 @@
           <tr>
             <td class="px-4 py-3">{{.Action}}</td>
             <td class="px-4 py-3">{{.ActorType}} {{.ActorID}}</td>
-            <td class="px-4 py-3">{{with .ProviderPricingID}}{{.}}{{end}}</td>
+            <td class="px-4 py-3 font-mono">{{.PriceID}}</td>
             <td class="px-4 py-3">{{.CreatedAt}}</td>
           </tr>
           {{end}}

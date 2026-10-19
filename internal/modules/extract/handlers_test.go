@@ -100,7 +100,7 @@ func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 		nil, nil, nil, nil, // legacy extract repos unused by module handlers
 		extractService,
 		nil, nil, nil, nil,
-		nil, nil, nil, nil, nil,
+		nil, nil, nil, nil,
 		"sha256", "", "enc_",
 		nil, "", "",
 		5, false,

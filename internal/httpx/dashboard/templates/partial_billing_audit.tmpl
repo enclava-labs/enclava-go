@@ -12,9 +12,7 @@
         <tr>
           <th class="px-4 py-3 text-left font-medium">Action</th>
           <th class="px-4 py-3 text-left font-medium">Subject</th>
-          <th class="px-4 py-3 text-left font-medium">API Key</th>
           <th class="px-4 py-3 text-left font-medium">Actor</th>
-          <th class="px-4 py-3 text-right font-medium">Amount</th>
           <th class="px-4 py-3 text-left font-medium">Created</th>
         </tr>
       </thead>
@@ -22,10 +20,8 @@
         {{range .Audit}}
         <tr>
           <td class="px-4 py-3">{{.Action}}</td>
-          <td class="px-4 py-3">{{.SubjectType}} {{.SubjectID}}</td>
-          <td class="px-4 py-3">{{with .APIKeyID}}{{.}}{{end}}</td>
+          <td class="px-4 py-3">{{.SubjectType}} <span class="font-mono">{{.SubjectID}}</span></td>
           <td class="px-4 py-3">{{.ActorType}} {{.ActorID}}</td>
-          <td class="px-4 py-3 text-right">{{with .AmountCents}}{{.}} cents{{end}}</td>
           <td class="px-4 py-3">{{.CreatedAt}}</td>
         </tr>
         {{end}}

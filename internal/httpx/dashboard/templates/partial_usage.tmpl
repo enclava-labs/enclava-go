@@ -58,11 +58,11 @@
         <div class="space-y-3">
           {{range .ByEndpoint}}
           <div class="flex items-center justify-between text-sm">
-            <span class="font-mono text-xs truncate mr-3">{{.Endpoint}}</span>
+            <span class="font-mono text-xs truncate mr-3">{{.Key}}</span>
             <div class="flex items-center gap-3 shrink-0">
               <span class="text-muted-foreground">{{.RequestCount}} req</span>
               <span class="text-muted-foreground">&middot;</span>
-              <span class="text-muted-foreground">{{.TotalTokens}} tok</span>
+              <span class="text-muted-foreground">{{.TotalUnits}} tok</span>
             </div>
           </div>
           {{end}}
@@ -82,11 +82,11 @@
         <div class="space-y-3">
           {{range .ByModel}}
           <div class="flex items-center justify-between text-sm">
-            <span class="font-mono text-xs truncate mr-3">{{.Model}}</span>
+            <span class="font-mono text-xs truncate mr-3">{{.Key}}</span>
             <div class="flex items-center gap-3 shrink-0">
               <span class="text-muted-foreground">{{.RequestCount}} req</span>
               <span class="text-muted-foreground">&middot;</span>
-              <span class="text-muted-foreground">{{.TotalTokens}} tok</span>
+              <span class="text-muted-foreground">{{.TotalUnits}} tok</span>
             </div>
           </div>
           {{end}}
