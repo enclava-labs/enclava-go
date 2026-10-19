@@ -3,6 +3,7 @@ module enclava-go
 go 1.26.4
 
 require (
+	github.com/jackc/pgx/v5 v5.8.0
 	github.com/openai/openai-go/v3 v3.39.0
 	github.com/tinfoilsh/tinfoil-go v0.13.1
 	golang.org/x/sync v0.21.0
@@ -52,6 +53,9 @@ require (
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	github.com/in-toto/attestation v1.2.0 // indirect
 	github.com/in-toto/in-toto-golang v0.11.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/jedisct1/go-minisign v0.0.0-20241212093149-d2f9f49435c7 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
