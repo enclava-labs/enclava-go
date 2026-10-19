@@ -29,10 +29,12 @@ import (
 // oidcStateTTL bounds a begin-flow or pending-link state row.
 const oidcStateTTL = 10 * time.Minute
 
-// SecretResolver turns a stored client_secret_ref into the secret value.
-// The only supported form is "env:<NAME>" — an operator-owned
-// environment-backed binding; every other reference fails closed.
-type SecretResolver func(ref string) (string, error)
+// ClientSecretResolver turns a stored client_secret_ref into the secret
+// value. The only supported form is "env:<NAME>" — an operator-owned
+// environment-backed binding; every other reference fails closed. Distinct
+// from SecretResolver (secret_refs.go), the tenant/purpose/origin-bound
+// resolver used by inference, connectors and MCP.
+type ClientSecretResolver func(ref string) (string, error)
 
 // EnvSecretResolver resolves "env:<NAME>" references from the process
 // environment. Refs without the env: prefix are rejected so a stored value
@@ -57,13 +59,13 @@ func EnvSecretResolver(ref string) (string, error) {
 // are enabled.
 type OIDCService struct {
 	repo      IdentityRepository
-	resolve   SecretResolver
+	resolve   ClientSecretResolver
 	transport *http.Client
 }
 
 // NewOIDCService wires the flow service; EnvSecretResolver is the default
 // secret binding when resolve is nil.
-func NewOIDCService(repo IdentityRepository, resolve SecretResolver) *OIDCService {
+func NewOIDCService(repo IdentityRepository, resolve ClientSecretResolver) *OIDCService {
 	if resolve == nil {
 		resolve = EnvSecretResolver
 	}
