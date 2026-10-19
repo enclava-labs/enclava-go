@@ -70,7 +70,9 @@ func main() {
 		}
 	}()
 
-	apiKeysRepo := sqlite.NewAPIKeysRepo(db.SQL)
+	// The legacy sqlite API keys repo is gone — key admin runs on the
+	// postgres IdentityRepo; bootstrap key seeding is replaced by the 01-22
+	// bootstrap CLI.
 	// Extract job/template/settings sqlite repos stay ONLY for dashboard stat
 	// reads (dashboard.go:475/893/911); 01-19 migrates those and removes them.
 	extractJobsRepo := sqlite.NewExtractJobsRepo(db.SQL)
@@ -137,7 +139,7 @@ func main() {
 		provider,
 		cfg.Provider,
 		prober,
-		apiKeysRepo,
+		identityRepo,
 		extractJobsRepo,
 		extractTemplatesRepo,
 		extractSettingsRepo,

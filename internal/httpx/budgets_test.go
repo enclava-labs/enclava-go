@@ -20,11 +20,7 @@ func TestEnforceBudgetUsesActiveBudgetRows(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	keysRepo := sqlite.NewAPIKeysRepo(db.SQL)
-	keyID, err := keysRepo.CreateAPIKey(ctx, "budget-test", "enc_test_key_budget_secret", "sha256", "", []string{"chat.completions"})
-	if err != nil {
-		t.Fatalf("create api key: %v", err)
-	}
+	keyID := insertBudgetAPIKey(t, db, "budget-test")
 	usageRepo := sqlite.NewUsageRepo(db.SQL)
 	if err := usageRepo.Record(ctx, sqlite.UsageRecord{
 		ID:          "usage_budget_test",
@@ -51,7 +47,6 @@ func TestEnforceBudgetUsesActiveBudgetRows(t *testing.T) {
 	}
 
 	app := &App{
-		keysRepo:    keysRepo,
 		usageRepo:   usageRepo,
 		budgetsRepo: sqlite.NewBudgetsRepo(db.SQL),
 	}
@@ -73,9 +68,8 @@ func TestFractionalEmbeddingCostTripsOneCentBudget(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	keysRepo := sqlite.NewAPIKeysRepo(db.SQL)
-	singleKey := createBudgetKey(t, keysRepo, "fractional-one")
-	manyKey := createBudgetKey(t, keysRepo, "fractional-ten")
+	singleKey := insertBudgetAPIKey(t, db, "fractional-one")
+	manyKey := insertBudgetAPIKey(t, db, "fractional-ten")
 	if _, err := sqlite.NewPricingRepo(db.SQL).Create(ctx, sqlite.ProviderPricing{
 		ProviderID:               "tinfoil",
 		ModelID:                  "embed-budget",
@@ -123,7 +117,7 @@ func TestFractionalEmbeddingCostTripsOneCentBudget(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("upsert single budget: %v", err)
 	}
-	app := &App{keysRepo: keysRepo, usageRepo: usageRepo, budgetsRepo: budgetsRepo}
+	app := &App{usageRepo: usageRepo, budgetsRepo: budgetsRepo}
 	if err := app.EnforceBudget(ctx, auth.Principal{APIKeyID: singleKey}); err != nil {
 		t.Fatalf("single sub-cent row should not trip a 1 cent budget: %v", err)
 	}
@@ -167,10 +161,9 @@ func TestPeriodicBudgetsResetWhenStartsAtIsSet(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	keysRepo := sqlite.NewAPIKeysRepo(db.SQL)
 	usageRepo := sqlite.NewUsageRepo(db.SQL)
 	budgetsRepo := sqlite.NewBudgetsRepo(db.SQL)
-	app := &App{keysRepo: keysRepo, usageRepo: usageRepo, budgetsRepo: budgetsRepo}
+	app := &App{usageRepo: usageRepo, budgetsRepo: budgetsRepo}
 	now := time.Now().UTC()
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
@@ -181,7 +174,7 @@ func TestPeriodicBudgetsResetWhenStartsAtIsSet(t *testing.T) {
 	}
 
 	t.Run("monthly activated last month ignores last month", func(t *testing.T) {
-		quiet := createBudgetKey(t, keysRepo, "monthly-old-quiet")
+		quiet := insertBudgetAPIKey(t, db, "monthly-old-quiet")
 		insertBudgetUsage(t, db, "usage_monthly_old_quiet_prev", quiet, 100, lastMonth.AddDate(0, 0, 2))
 		insertBudgetUsage(t, db, "usage_monthly_old_quiet_now", quiet, 1, thisMonthUsage)
 		upsertCentBudget(t, budgetsRepo, "budget_monthly_old_quiet", quiet, 50, "monthly", &lastMonth)
@@ -189,7 +182,7 @@ func TestPeriodicBudgetsResetWhenStartsAtIsSet(t *testing.T) {
 			t.Fatalf("last month usage should not count: %v", err)
 		}
 
-		hot := createBudgetKey(t, keysRepo, "monthly-old-hot")
+		hot := insertBudgetAPIKey(t, db, "monthly-old-hot")
 		insertBudgetUsage(t, db, "usage_monthly_old_hot_now", hot, 60, thisMonthUsage)
 		upsertCentBudget(t, budgetsRepo, "budget_monthly_old_hot", hot, 50, "monthly", &lastMonth)
 		if err := app.EnforceBudget(ctx, auth.Principal{APIKeyID: hot}); err == nil {
@@ -213,7 +206,7 @@ func TestPeriodicBudgetsResetWhenStartsAtIsSet(t *testing.T) {
 			t.Skip("unable to place usage after activation")
 		}
 
-		quiet := createBudgetKey(t, keysRepo, "monthly-new-quiet")
+		quiet := insertBudgetAPIKey(t, db, "monthly-new-quiet")
 		insertBudgetUsage(t, db, "usage_monthly_new_quiet_before", quiet, 100, monthStart)
 		insertBudgetUsage(t, db, "usage_monthly_new_quiet_after", quiet, 1, after)
 		upsertCentBudget(t, budgetsRepo, "budget_monthly_new_quiet", quiet, 50, "monthly", &activation)
@@ -221,7 +214,7 @@ func TestPeriodicBudgetsResetWhenStartsAtIsSet(t *testing.T) {
 			t.Fatalf("usage before activation should not count: %v", err)
 		}
 
-		hot := createBudgetKey(t, keysRepo, "monthly-new-hot")
+		hot := insertBudgetAPIKey(t, db, "monthly-new-hot")
 		insertBudgetUsage(t, db, "usage_monthly_new_hot_before", hot, 1, monthStart)
 		insertBudgetUsage(t, db, "usage_monthly_new_hot_after", hot, 60, after)
 		upsertCentBudget(t, budgetsRepo, "budget_monthly_new_hot", hot, 50, "monthly", &activation)
@@ -237,7 +230,7 @@ func TestPeriodicBudgetsResetWhenStartsAtIsSet(t *testing.T) {
 		if todayUsage.Before(dayStart) {
 			todayUsage = dayStart
 		}
-		quiet := createBudgetKey(t, keysRepo, "daily-old-quiet")
+		quiet := insertBudgetAPIKey(t, db, "daily-old-quiet")
 		insertBudgetUsage(t, db, "usage_daily_old_quiet_prev", quiet, 100, yesterday)
 		insertBudgetUsage(t, db, "usage_daily_old_quiet_now", quiet, 1, todayUsage)
 		upsertCentBudget(t, budgetsRepo, "budget_daily_old_quiet", quiet, 50, "daily", &activation)
@@ -245,7 +238,7 @@ func TestPeriodicBudgetsResetWhenStartsAtIsSet(t *testing.T) {
 			t.Fatalf("yesterday usage should not count: %v", err)
 		}
 
-		hot := createBudgetKey(t, keysRepo, "daily-old-hot")
+		hot := insertBudgetAPIKey(t, db, "daily-old-hot")
 		insertBudgetUsage(t, db, "usage_daily_old_hot_now", hot, 60, todayUsage)
 		upsertCentBudget(t, budgetsRepo, "budget_daily_old_hot", hot, 50, "daily", &activation)
 		if err := app.EnforceBudget(ctx, auth.Principal{APIKeyID: hot}); err == nil {
@@ -269,7 +262,7 @@ func TestPeriodicBudgetsResetWhenStartsAtIsSet(t *testing.T) {
 			t.Skip("unable to place usage after activation")
 		}
 
-		quiet := createBudgetKey(t, keysRepo, "daily-new-quiet")
+		quiet := insertBudgetAPIKey(t, db, "daily-new-quiet")
 		insertBudgetUsage(t, db, "usage_daily_new_quiet_before", quiet, 100, dayStart)
 		insertBudgetUsage(t, db, "usage_daily_new_quiet_after", quiet, 1, after)
 		upsertCentBudget(t, budgetsRepo, "budget_daily_new_quiet", quiet, 50, "daily", &activation)
@@ -277,7 +270,7 @@ func TestPeriodicBudgetsResetWhenStartsAtIsSet(t *testing.T) {
 			t.Fatalf("usage before today's activation should not count: %v", err)
 		}
 
-		hot := createBudgetKey(t, keysRepo, "daily-new-hot")
+		hot := insertBudgetAPIKey(t, db, "daily-new-hot")
 		insertBudgetUsage(t, db, "usage_daily_new_hot_before", hot, 1, dayStart)
 		insertBudgetUsage(t, db, "usage_daily_new_hot_after", hot, 60, after)
 		upsertCentBudget(t, budgetsRepo, "budget_daily_new_hot", hot, 50, "daily", &activation)
@@ -297,7 +290,7 @@ func TestPeriodicBudgetsResetWhenStartsAtIsSet(t *testing.T) {
 			after = activation
 		}
 
-		quiet := createBudgetKey(t, keysRepo, "total-start-quiet")
+		quiet := insertBudgetAPIKey(t, db, "total-start-quiet")
 		setKeyLifetimeCost(t, db, quiet, 500)
 		insertBudgetUsage(t, db, "usage_total_start_quiet_before", quiet, 500, before)
 		insertBudgetUsage(t, db, "usage_total_start_quiet_after", quiet, 1, after)
@@ -306,7 +299,7 @@ func TestPeriodicBudgetsResetWhenStartsAtIsSet(t *testing.T) {
 			t.Fatalf("total budget should ignore usage before starts_at: %v", err)
 		}
 
-		hot := createBudgetKey(t, keysRepo, "total-start-hot")
+		hot := insertBudgetAPIKey(t, db, "total-start-hot")
 		setKeyLifetimeCost(t, db, hot, 0)
 		insertBudgetUsage(t, db, "usage_total_start_hot_before", hot, 1, before)
 		insertBudgetUsage(t, db, "usage_total_start_hot_after", hot, 20, after)
@@ -317,7 +310,7 @@ func TestPeriodicBudgetsResetWhenStartsAtIsSet(t *testing.T) {
 	})
 
 	t.Run("total without starts_at uses lifetime totals", func(t *testing.T) {
-		key := createBudgetKey(t, keysRepo, "total-lifetime")
+		key := insertBudgetAPIKey(t, db, "total-lifetime")
 		if err := usageRepo.Record(ctx, sqlite.UsageRecord{
 			ID:          "usage_total_lifetime_recorded",
 			APIKeyID:    key,
@@ -336,12 +329,20 @@ func TestPeriodicBudgetsResetWhenStartsAtIsSet(t *testing.T) {
 	})
 }
 
-func createBudgetKey(t *testing.T, keys *sqlite.APIKeysRepo, name string) int64 {
+// insertBudgetAPIKey seeds a legacy sqlite api_keys row directly — the
+// numeric id is what budgets/usage still FK against until 01-17 ports them.
+// (The admin key surface lives on the postgres identity store; httpx has no
+// sqlite keys repo anymore.)
+func insertBudgetAPIKey(t *testing.T, db *sqlite.DB, name string) int64 {
 	t.Helper()
-	id, err := keys.CreateAPIKey(context.Background(), name, "enc_test_budget_"+name+"_secret", "sha256", "", []string{"chat.completions"})
+	res, err := db.SQL.ExecContext(context.Background(), `
+		INSERT INTO api_keys(name, key_prefix, key_hash, key_hash_algo, is_active, scopes)
+		VALUES (?, 'enc_test_', ?, 'sha256', 1, '[]')
+	`, name, name+"-secret")
 	if err != nil {
-		t.Fatalf("create api key %s: %v", name, err)
+		t.Fatalf("insert api key %s: %v", name, err)
 	}
+	id, _ := res.LastInsertId()
 	return id
 }
 

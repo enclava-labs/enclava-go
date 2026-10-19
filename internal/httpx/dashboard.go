@@ -76,7 +76,7 @@ type dashboardAnalyticsData struct {
 }
 
 type dashboardKeysData struct {
-	Keys       []sqlite.APIKey
+	Keys       []auth.APIKeyRecord
 	Message    string
 	CreatedKey string
 }
@@ -456,12 +456,16 @@ func (a *App) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 		WriteMethodNotAllowed(w)
 		return
 	}
-	if a.keysRepo == nil {
+	tenantID, ok := a.dashboardTenantID(w, r)
+	if !ok {
+		return
+	}
+	if a.identity == nil {
 		WriteOpenAIError(w, http.StatusNotImplemented, "API key store not configured", "server_error", "not_configured")
 		return
 	}
 
-	keys, err := a.keysRepo.List(r.Context(), false)
+	keys, err := a.identity.ListAPIKeys(r.Context(), tenantID)
 	if err != nil {
 		log.Printf("failed to load dashboard stats keys: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_stats_keys_failed")
@@ -526,8 +530,12 @@ func (a *App) handleDashboardUsage(w http.ResponseWriter, r *http.Request) {
 		WriteMethodNotAllowed(w)
 		return
 	}
-	if a.keysRepo == nil || a.usageRepo == nil {
+	if a.identity == nil || a.usageRepo == nil {
 		WriteOpenAIError(w, http.StatusNotImplemented, "usage tracking not configured", "server_error", "not_configured")
+		return
+	}
+	tenantID, ok := a.dashboardTenantID(w, r)
+	if !ok {
 		return
 	}
 
@@ -569,20 +577,22 @@ func (a *App) handleDashboardUsage(w http.ResponseWriter, r *http.Request) {
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_usage_failed")
 		return
 	}
-	keys, err := a.keysRepo.List(r.Context(), false)
+	keys, err := a.identity.ListAPIKeys(r.Context(), tenantID)
 	if err != nil {
 		log.Printf("failed to load dashboard keys for usage: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_usage_keys_failed")
 		return
 	}
 
+	// usage rows keep the legacy numeric key handle — map each stored key to
+	// the deterministic handle auth derives for it (auth.LegacyAPIKeyID).
 	nameByID := make(map[int64]string, len(keys))
 	for _, key := range keys {
 		name := strings.TrimSpace(key.Name)
 		if name == "" {
-			name = fmt.Sprintf("API Key #%d", key.ID)
+			name = "API Key " + key.ID
 		}
-		nameByID[key.ID] = name
+		nameByID[auth.LegacyAPIKeyID(tenantID, key.ID)] = name
 	}
 
 	rows := make([]dashboardUsageRow, 0, len(usage))
@@ -603,7 +613,7 @@ func (a *App) handleDashboardUsage(w http.ResponseWriter, r *http.Request) {
 	if len(rows) == 0 {
 		for _, key := range keys {
 			rows = append(rows, dashboardUsageRow{
-				APIKeyID:     key.ID,
+				APIKeyID:     auth.LegacyAPIKeyID(tenantID, key.ID),
 				APIKeyName:   key.Name,
 				TotalTokens:  0,
 				TotalCost:    0,
@@ -628,15 +638,31 @@ func (a *App) handleDashboardUsage(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// dashboardTenantID resolves the tenant for dashboard key/usage reads from
+// the request's authenticated principal. The signed password cookie carries
+// no tenant identity, so password-mode calls get a truthful 401 rather than
+// a fabricated tenant (the session-cookie principal lands with 01-16/01-20).
+func (a *App) dashboardTenantID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if p, ok := auth.PrincipalFromContext(r.Context()); ok && p.TenantID != "" {
+		return p.TenantID, true
+	}
+	WriteUnauthorized(w, "authenticated principal required")
+	return "", false
+}
+
 func (a *App) handleDashboardAPIKeys(w http.ResponseWriter, r *http.Request) {
 	setNoStoreHeaders(w)
-	if a.keysRepo == nil {
+	if a.identity == nil {
 		WriteOpenAIError(w, http.StatusNotImplemented, "API key store not configured", "server_error", "not_configured")
+		return
+	}
+	tenantID, ok := a.dashboardTenantID(w, r)
+	if !ok {
 		return
 	}
 	switch r.Method {
 	case http.MethodGet:
-		a.renderDashboardKeys(w, r.Context(), "")
+		a.renderDashboardKeys(w, r.Context(), tenantID, "")
 	case http.MethodPost:
 		if err := r.ParseForm(); err != nil {
 			WriteOpenAIError(w, http.StatusBadRequest, "invalid form data", "invalid_request_error", "invalid_form")
@@ -645,13 +671,13 @@ func (a *App) handleDashboardAPIKeys(w http.ResponseWriter, r *http.Request) {
 		action := strings.ToLower(strings.TrimSpace(r.FormValue("action")))
 		switch action {
 		case "", "create":
-			a.createDashboardAPIKey(w, r)
+			a.createDashboardAPIKey(w, r, tenantID)
 		case "toggle":
-			a.toggleDashboardAPIKey(w, r)
+			a.toggleDashboardAPIKey(w, r, tenantID)
 		case "delete":
-			a.deleteDashboardAPIKey(w, r)
+			a.deleteDashboardAPIKey(w, r, tenantID)
 		case "regenerate":
-			a.regenerateDashboardAPIKey(w, r)
+			a.regenerateDashboardAPIKey(w, r, tenantID)
 		default:
 			WriteOpenAIError(w, http.StatusBadRequest, "invalid action", "invalid_request_error", "invalid_action")
 		}
@@ -660,123 +686,117 @@ func (a *App) handleDashboardAPIKeys(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (a *App) createDashboardAPIKey(w http.ResponseWriter, r *http.Request) {
+func (a *App) createDashboardAPIKey(w http.ResponseWriter, r *http.Request, tenantID string) {
 	name := strings.TrimSpace(r.FormValue("name"))
 	if name == "" {
-		a.renderDashboardKeys(w, r.Context(), "Name is required")
+		a.renderDashboardKeys(w, r.Context(), tenantID, "Name is required")
 		return
 	}
-	description := strings.TrimSpace(r.FormValue("description"))
 	scopes := parseDashboardScopes(r.FormValue("scopes"))
-	req := &adminAPIKeyCreateRequest{
-		Name:        name,
-		Description: description,
-		Scopes:      scopes,
-		IsActive:    ptrBool(true),
+	principal, _ := auth.PrincipalFromContext(r.Context())
+	req := adminAPIKeyCreateRequest{
+		Name:     name,
+		Scopes:   scopes,
+		IsActive: ptrBool(true),
 	}
-	if err := sanitizeAdminAPIKeyRequest(req, true); err != nil {
-		a.renderDashboardKeys(w, r.Context(), err.Error())
+	if err := sanitizeAdminAPIKeyRequest(&req, true); err != nil {
+		a.renderDashboardKeys(w, r.Context(), tenantID, err.Error())
 		return
 	}
 
+	key, err := a.apiKeyRecordFromAdminRequest(r.Context(), principal, req)
+	if err != nil {
+		a.renderDashboardKeys(w, r.Context(), tenantID, err.Error())
+		return
+	}
 	plaintext, prefix, hash, usedAlgo, err := a.generateKey(a.apiKeyPrefix, a.apiKeyAlgo, a.apiKeyPepper)
 	if err != nil {
 		log.Printf("failed to generate dashboard API key: %v", err)
-		a.renderDashboardKeys(w, r.Context(), "Failed to generate API key")
+		a.renderDashboardKeys(w, r.Context(), tenantID, "Failed to generate API key")
 		return
 	}
-
-	id, err := a.keysRepo.CreateAPIKey(r.Context(), req.Name, plaintext, a.apiKeyAlgo, a.apiKeyPepper, req.Scopes)
-	if err != nil {
+	key.KeyPrefix = prefix
+	key.KeyHash = hash
+	key.KeyHashAlgo = usedAlgo
+	if err := a.identity.CreateAPIKey(r.Context(), tenantID, key); err != nil {
 		log.Printf("failed to create dashboard API key: %v", err)
-		a.renderDashboardKeys(w, r.Context(), "Failed to persist API key")
+		a.renderDashboardKeys(w, r.Context(), tenantID, "Failed to persist API key")
 		return
 	}
 
-	key := sqliteAPIKeyFromAdminRequest(*req, prefix, hash, usedAlgo)
-	key.ID = id
-	if err := a.keysRepo.Update(r.Context(), key); err != nil {
-		log.Printf("failed to update dashboard API key metadata: %v", err)
-		a.renderDashboardKeys(w, r.Context(), "Failed to save key metadata")
-		return
-	}
-	if req.IsActive != nil && *req.IsActive {
-		if err := a.keysRepo.ActivateKey(r.Context(), id); err != nil {
-			log.Printf("failed to activate dashboard API key: %v", err)
-			a.renderDashboardKeys(w, r.Context(), "Failed to activate API key")
-			return
-		}
-	}
-
-	a.renderDashboardKeys(w, r.Context(), "API key created", plaintext)
+	a.renderDashboardKeys(w, r.Context(), tenantID, "API key created", plaintext)
 }
 
-func (a *App) toggleDashboardAPIKey(w http.ResponseWriter, r *http.Request) {
-	id, err := parseDashboardID(r.FormValue("key_id"))
-	if err != nil {
-		a.renderDashboardKeys(w, r.Context(), err.Error())
+func (a *App) toggleDashboardAPIKey(w http.ResponseWriter, r *http.Request, tenantID string) {
+	id := strings.TrimSpace(r.FormValue("key_id"))
+	if id == "" {
+		a.renderDashboardKeys(w, r.Context(), tenantID, "key id is required")
 		return
 	}
-	key, err := a.keysRepo.GetByID(r.Context(), id)
+	key, err := a.identity.GetAPIKey(r.Context(), tenantID, id)
 	if err != nil {
-		a.renderDashboardKeys(w, r.Context(), "API key not found")
+		a.renderDashboardKeys(w, r.Context(), tenantID, "API key not found")
 		return
 	}
 	key.IsActive = !key.IsActive
-	if err := a.keysRepo.Update(r.Context(), key); err != nil {
+	if err := a.identity.UpdateAPIKey(r.Context(), tenantID, key); err != nil {
 		log.Printf("failed to toggle dashboard API key: %v", err)
-		a.renderDashboardKeys(w, r.Context(), "Failed to update key status")
+		a.renderDashboardKeys(w, r.Context(), tenantID, "Failed to update key status")
 		return
 	}
-	a.renderDashboardKeys(w, r.Context(), "API key updated")
+	a.renderDashboardKeys(w, r.Context(), tenantID, "API key updated")
 }
 
-func (a *App) deleteDashboardAPIKey(w http.ResponseWriter, r *http.Request) {
-	id, err := parseDashboardID(r.FormValue("key_id"))
-	if err != nil {
-		a.renderDashboardKeys(w, r.Context(), err.Error())
+func (a *App) deleteDashboardAPIKey(w http.ResponseWriter, r *http.Request, tenantID string) {
+	id := strings.TrimSpace(r.FormValue("key_id"))
+	if id == "" {
+		a.renderDashboardKeys(w, r.Context(), tenantID, "key id is required")
 		return
 	}
-	if err := a.keysRepo.SoftDelete(r.Context(), id); err != nil {
+	if err := a.identity.RevokeAPIKey(r.Context(), tenantID, id, time.Now().UTC()); err != nil {
 		log.Printf("failed to delete dashboard API key: %v", err)
-		a.renderDashboardKeys(w, r.Context(), "Failed to delete API key")
+		a.renderDashboardKeys(w, r.Context(), tenantID, "Failed to delete API key")
 		return
 	}
-	a.renderDashboardKeys(w, r.Context(), "API key deleted")
+	a.renderDashboardKeys(w, r.Context(), tenantID, "API key deleted")
 }
 
-func (a *App) regenerateDashboardAPIKey(w http.ResponseWriter, r *http.Request) {
-	id, err := parseDashboardID(r.FormValue("key_id"))
-	if err != nil {
-		a.renderDashboardKeys(w, r.Context(), err.Error())
+func (a *App) regenerateDashboardAPIKey(w http.ResponseWriter, r *http.Request, tenantID string) {
+	id := strings.TrimSpace(r.FormValue("key_id"))
+	if id == "" {
+		a.renderDashboardKeys(w, r.Context(), tenantID, "key id is required")
 		return
 	}
-	if _, err := a.keysRepo.GetByID(r.Context(), id); err != nil {
-		a.renderDashboardKeys(w, r.Context(), "API key not found")
+	key, err := a.identity.GetAPIKey(r.Context(), tenantID, id)
+	if err != nil {
+		a.renderDashboardKeys(w, r.Context(), tenantID, "API key not found")
 		return
 	}
 
 	plaintext, prefix, hash, usedAlgo, err := a.generateKey(a.apiKeyPrefix, a.apiKeyAlgo, a.apiKeyPepper)
 	if err != nil {
 		log.Printf("failed to regenerate dashboard API key secret: %v", err)
-		a.renderDashboardKeys(w, r.Context(), "Failed to regenerate API key")
+		a.renderDashboardKeys(w, r.Context(), tenantID, "Failed to regenerate API key")
 		return
 	}
-	if err := a.keysRepo.SetSecret(r.Context(), id, prefix, hash, usedAlgo); err != nil {
+	if err := a.identity.SetAPIKeySecret(r.Context(), tenantID, id, prefix, hash, usedAlgo); err != nil {
 		log.Printf("failed to store regenerated dashboard API key secret: %v", err)
-		a.renderDashboardKeys(w, r.Context(), "Failed to persist regenerated secret")
+		a.renderDashboardKeys(w, r.Context(), tenantID, "Failed to persist regenerated secret")
 		return
 	}
-	if err := a.keysRepo.ActivateKey(r.Context(), id); err != nil {
-		log.Printf("failed to activate regenerated dashboard API key: %v", err)
-		a.renderDashboardKeys(w, r.Context(), "Failed to activate API key")
-		return
+	if !key.IsActive {
+		key.IsActive = true
+		if err := a.identity.UpdateAPIKey(r.Context(), tenantID, key); err != nil {
+			log.Printf("failed to activate regenerated dashboard API key: %v", err)
+			a.renderDashboardKeys(w, r.Context(), tenantID, "Failed to activate API key")
+			return
+		}
 	}
-	a.renderDashboardKeys(w, r.Context(), "API key regenerated", plaintext)
+	a.renderDashboardKeys(w, r.Context(), tenantID, "API key regenerated", plaintext)
 }
 
-func (a *App) renderDashboardKeys(w http.ResponseWriter, ctx context.Context, message string, createdKey ...string) {
-	keys, err := a.keysRepo.List(ctx, false)
+func (a *App) renderDashboardKeys(w http.ResponseWriter, ctx context.Context, tenantID string, message string, createdKey ...string) {
+	keys, err := a.identity.ListAPIKeys(ctx, tenantID)
 	if err != nil {
 		log.Printf("failed to load dashboard API keys: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_keys_failed")
@@ -808,12 +828,16 @@ func (a *App) handleDashboardBudgets(w http.ResponseWriter, r *http.Request) {
 		WriteMethodNotAllowed(w)
 		return
 	}
-	if a.keysRepo == nil || a.usageRepo == nil {
+	if a.identity == nil || a.usageRepo == nil {
 		WriteOpenAIError(w, http.StatusNotImplemented, "budget tracking not configured", "server_error", "not_configured")
 		return
 	}
+	tenantID, ok := a.dashboardTenantID(w, r)
+	if !ok {
+		return
+	}
 
-	keys, err := a.keysRepo.List(r.Context(), false)
+	keys, err := a.identity.ListAPIKeys(r.Context(), tenantID)
 	if err != nil {
 		log.Printf("failed to load dashboard budget keys: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_budgets_keys_failed")
@@ -826,48 +850,39 @@ func (a *App) handleDashboardBudgets(w http.ResponseWriter, r *http.Request) {
 	var overCount int
 	var activeKeys int
 
+	// Per-key budget limits are legacy sqlite columns the postgres identity
+	// rows do not carry; billing budgets own them after 01-17. The section
+	// still reports active keys and their lifetime usage from the retained
+	// counters (usage rows keep the legacy numeric key handle).
 	for _, key := range keys {
-		if key.BudgetLimitCents == nil {
-			continue
-		}
-		period := key.BudgetPeriod
-		if period == "" {
-			period = "total"
-		}
-		_, usedMicrocents, err := a.usedForPeriod(r.Context(), key.ID, period, nil, time.Now().UTC())
+		keyID := auth.LegacyAPIKeyID(tenantID, key.ID)
+		_, usedMicrocents, err := a.usedForPeriod(r.Context(), keyID, "total", nil, time.Now().UTC())
 		if err != nil {
-			log.Printf("failed to load budget usage for key %d: %v", key.ID, err)
+			log.Printf("failed to load usage for key %s: %v", key.ID, err)
 			continue
 		}
 
-		limit := *key.BudgetLimitCents
 		usedCents := microcentsToCents(usedMicrocents)
-		pct := percentInt(usedMicrocents, centsToMicrocents(limit))
-		isOver := usedMicrocents >= centsToMicrocents(limit)
 
 		name := strings.TrimSpace(key.Name)
 		if name == "" {
-			name = fmt.Sprintf("API Key #%d", key.ID)
+			name = "API Key " + key.ID
 		}
 
 		rows = append(rows, dashboardBudgetRow{
-			APIKeyID:         key.ID,
+			APIKeyID:         keyID,
 			APIKeyName:       name,
-			BudgetLimitCents: key.BudgetLimitCents,
-			BudgetPeriod:     period,
+			BudgetLimitCents: nil,
+			BudgetPeriod:     "total",
 			UsedCents:        usedCents,
-			UsedPercent:      pct,
+			UsedPercent:      0,
 			UsedDisplay:      formatUSD(usedCents),
-			LimitDisplay:     formatUSD(limit),
+			LimitDisplay:     "—",
 			IsActive:         key.IsActive,
-			IsOverBudget:     isOver,
+			IsOverBudget:     false,
 		})
 
 		totalUsedCents += usedCents
-		totalLimitCents += limit
-		if isOver {
-			overCount++
-		}
 		if key.IsActive {
 			activeKeys++
 		}
@@ -952,18 +967,6 @@ func parseDashboardScopes(raw string) []string {
 		out = append(out, dashboardDefaultScopes...)
 	}
 	return out
-}
-
-func parseDashboardID(raw string) (int64, error) {
-	idRaw := strings.TrimSpace(raw)
-	if idRaw == "" {
-		return 0, fmt.Errorf("key id is required")
-	}
-	id, err := strconv.ParseInt(idRaw, 10, 64)
-	if err != nil || id <= 0 {
-		return 0, fmt.Errorf("invalid API key id")
-	}
-	return id, nil
 }
 
 func ptrBool(v bool) *bool {

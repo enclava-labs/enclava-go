@@ -19,6 +19,7 @@ import (
 	"enclava-go/internal/llm"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
+	"enclava-go/internal/store/postgres"
 	"enclava-go/internal/store/sqlite"
 )
 
@@ -27,7 +28,7 @@ type App struct {
 	provider         llm.Provider
 	providerID       string
 	prober           *llm.Prober
-	keysRepo         *sqlite.APIKeysRepo
+	identity         *postgres.IdentityRepo
 	extractJobs      *sqlite.ExtractJobsRepo
 	extractTemplates *sqlite.ExtractTemplatesRepo
 	extractSettings  *sqlite.ExtractSettingsRepo
@@ -72,7 +73,7 @@ func NewApp(
 	provider llm.Provider,
 	providerID string,
 	prober *llm.Prober,
-	keysRepo *sqlite.APIKeysRepo,
+	identity *postgres.IdentityRepo,
 	extractJobs *sqlite.ExtractJobsRepo,
 	extractTemplates *sqlite.ExtractTemplatesRepo,
 	extractSettings *sqlite.ExtractSettingsRepo,
@@ -100,7 +101,7 @@ func NewApp(
 		provider:         provider,
 		providerID:       providerID,
 		prober:           prober,
-		keysRepo:         keysRepo,
+		identity:         identity,
 		extractJobs:      extractJobs,
 		extractTemplates: extractTemplates,
 		extractSettings:  extractSettings,
@@ -235,10 +236,30 @@ func (a *App) authenticated(scope string, next func(http.ResponseWriter, *http.R
 				return
 			}
 		}
-		principal, err := a.authSvc.Authenticate(r.Context(), apiKey)
+		// Credential resolution order: Bearer/X-API-Key → API key auth; the
+		// dashboard session cookie → session auth (with CSRF on mutations).
+		var principal auth.Principal
+		var err error
+		cookieAuth := false
+		if strings.TrimSpace(apiKey) != "" {
+			principal, err = a.authSvc.Authenticate(r.Context(), apiKey)
+		} else if cookie, cerr := r.Cookie(sessionCookieName); cerr == nil && strings.TrimSpace(cookie.Value) != "" {
+			cookieAuth = true
+			principal, err = a.authSvc.AuthenticateSession(r.Context(), cookie.Value)
+		} else {
+			principal, err = a.authSvc.Authenticate(r.Context(), "")
+		}
 		if err != nil {
 			WriteUnauthorized(w, err.Error())
 			return
+		}
+		if cookieAuth && r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+			// Cookie-authenticated mutations must carry the session's CSRF
+			// token (header preferred, script-readable cookie as fallback).
+			if err := a.authSvc.ValidateCSRF(r.Context(), principal.TenantID, principal.SessionID, csrfFromRequest(r)); err != nil {
+				WriteForbidden(w, "missing or invalid CSRF token")
+				return
+			}
 		}
 		if a.rl != nil {
 			checks := []rateLimitCheck{}
@@ -251,38 +272,77 @@ func (a *App) authenticated(scope string, next func(http.ResponseWriter, *http.R
 			if principal.RateLimitPerDay != nil {
 				checks = append(checks, rateLimitCheck{limit: int64(*principal.RateLimitPerDay), window: 24 * time.Hour})
 			}
-			if !a.enforceRateLimits(w, fmt.Sprintf("api-key:%d", principal.APIKeyID), now, checks) {
+			if !a.enforceRateLimits(w, "credential:"+principal.CredentialID, now, checks) {
 				return
-			}
-		}
-		if len(principal.AllowedEndpoints) > 0 {
-			path := r.URL.Path
-			if _, ok := principal.AllowedEndpoints["*"]; !ok {
-				if !endpointAllowed(principal.AllowedEndpoints, path) {
-					WriteForbidden(w, "endpoint is not allowed for this API key")
-					return
-				}
-			}
-		}
-		if len(principal.AllowedIPs) > 0 {
-			if !sourceIPAllowed(principal.AllowedIPs, "*") {
-				ip := clientIP(r, a.trustProxy)
-				if ip == "" {
-					WriteForbidden(w, "source IP could not be determined")
-					return
-				}
-				if !sourceIPAllowed(principal.AllowedIPs, ip) {
-					WriteForbidden(w, "source IP is not allowed for this API key")
-					return
-				}
 			}
 		}
 		if !auth.HasScope(principal, scope) {
 			WriteForbidden(w, fmt.Sprintf("missing required scope: %s", scope))
 			return
 		}
-		next(w, r.WithContext(auth.WithPrincipal(r.Context(), principal)), principal)
+		a.enforceAllowlists(w, r, principal, next)
 	}
+}
+
+// enforceAllowlists applies the stored endpoint and IP grants at dispatch.
+// Grants carry the decoded {"mode":"all"}→All or {"mode":"list"}→item map
+// shape: All==true is unrestricted; an empty/absent/malformed list denies
+// everything (fail closed — it never "skips the check"). Endpoint grants
+// hold inference endpoint IDs (route families like "chat/completions"),
+// never URL path patterns. Only API-key credentials carry endpoint/IP
+// grants — session-authenticated dashboard requests are scope-gated only.
+func (a *App) enforceAllowlists(w http.ResponseWriter, r *http.Request, principal auth.Principal, next func(http.ResponseWriter, *http.Request, auth.Principal)) {
+	if principal.CredentialKind == auth.CredentialKindAPIKey {
+		if !principal.AllowedEndpointsAll {
+			if len(principal.AllowedEndpoints) == 0 {
+				WriteForbidden(w, "endpoint is not allowed for this API key")
+				return
+			}
+			if id := inferenceEndpointID(r.URL.Path); id != "" && !auth.EndpointAllowed(principal, id) {
+				WriteForbidden(w, "endpoint is not allowed for this API key")
+				return
+			}
+		}
+		if !principal.AllowedIPsAll {
+			ip := clientIP(r, a.trustProxy)
+			if ip == "" {
+				WriteForbidden(w, "source IP could not be determined")
+				return
+			}
+			if !sourceIPAllowed(principal.AllowedIPs, ip) {
+				WriteForbidden(w, "source IP is not allowed for this API key")
+				return
+			}
+		}
+	}
+	next(w, r.WithContext(auth.WithPrincipal(r.Context(), principal)), principal)
+}
+
+// inferenceEndpointID maps an inference route to its endpoint ID — the
+// route family: "/api/v1/responses/resp_1/cancel" and the "/v1" alias both
+// resolve to "responses"; "/api/v1/chat/completions" → "chat/completions".
+// Non-inference paths return "" and are governed by scopes only.
+func inferenceEndpointID(path string) string {
+	var rest string
+	switch {
+	case strings.HasPrefix(path, "/api/v1/"):
+		rest = strings.TrimPrefix(path, "/api/v1/")
+	case strings.HasPrefix(path, "/v1/"):
+		rest = strings.TrimPrefix(path, "/v1/")
+	default:
+		return ""
+	}
+	rest = strings.Trim(rest, "/")
+	if rest == "" {
+		return ""
+	}
+	if strings.HasPrefix(rest, "chat/completions") {
+		return "chat/completions"
+	}
+	if i := strings.Index(rest, "/"); i > 0 {
+		return rest[:i]
+	}
+	return rest
 }
 
 func (a *App) unauthenticatedRateLimitKey(r *http.Request, apiKey string) string {

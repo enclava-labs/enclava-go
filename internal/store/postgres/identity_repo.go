@@ -475,6 +475,20 @@ func (r *IdentityRepo) TouchAPIKeyUsage(ctx context.Context, tenantID, id string
 	return nil
 }
 
+// SetAPIKeySecret rotates the stored secret material without touching the
+// grant columns — the admin regenerate path (not on IdentityRepository;
+// key rotation is an httpx admin concern).
+func (r *IdentityRepo) SetAPIKeySecret(ctx context.Context, tenantID, id, prefix, hash, algo string) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE api_keys SET key_prefix = $3, key_hash = $4, key_hash_algo = $5
+		 WHERE tenant_id = $1::uuid AND id = $2`,
+		tenantID, id, prefix, hash, algo)
+	if err != nil {
+		return fmt.Errorf("set api key secret: %w", err)
+	}
+	return nil
+}
+
 // FindKeyCandidates is a pre-authentication locator: it intentionally scans
 // key_prefix across ALL tenants, bounded at 50 rows. The service verifies the
 // secret, expiry and revocation before trusting the row's tenant_id.

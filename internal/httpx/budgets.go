@@ -17,7 +17,7 @@ func (a *App) EnforceBudget(ctx context.Context, principal auth.Principal) error
 	if principal.IsUnlimited {
 		return nil
 	}
-	if a.keysRepo == nil || a.usageRepo == nil {
+	if a.usageRepo == nil {
 		return nil
 	}
 
@@ -68,11 +68,7 @@ func (a *App) usedForPeriod(ctx context.Context, apiKeyID int64, period string, 
 		lifetime = false
 	}
 	if lifetime {
-		key, err := a.keysRepo.GetByID(ctx, apiKeyID)
-		if err != nil {
-			return 0, 0, err
-		}
-		return key.TotalTokens, key.TotalCostMicrocents, nil
+		return a.usageRepo.KeyTotals(ctx, apiKeyID)
 	}
 	return a.usageRepo.SumSince(ctx, apiKeyID, since)
 }
