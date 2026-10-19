@@ -55,13 +55,8 @@ wait_for_required_keys
 
 export APP_HOST="${APP_HOST:-0.0.0.0}"
 export APP_PORT="${APP_PORT:-8080}"
-export DATABASE_URL="${DATABASE_URL:-/state/app-data/enclava.db}"
+export DATABASE_URL="${DATABASE_URL:-postgres://postgres:postgres@localhost:5432/enclava}"
 export TRUST_PROXY_HEADERS="${TRUST_PROXY_HEADERS:-true}"
-
-db_dir="$(dirname "$DATABASE_URL")"
-if [ -n "$db_dir" ] && [ "$db_dir" != "." ]; then
-	mkdir -p "$db_dir" 2>/dev/null || true
-fi
 
 if ! is_uint "$APP_RESTART_LIMIT"; then
 	echo "ENCLAVA_APP_RESTART_LIMIT must be a non-negative integer" >&2
