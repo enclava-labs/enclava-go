@@ -1,12 +1,6 @@
 package httpx
 
-import (
-	"context"
-	"strings"
-
-	"enclava-go/internal/llm"
-	"enclava-go/internal/store/sqlite"
-)
+import "enclava-go/internal/llm"
 
 func (a *App) Provider() llm.Provider {
 	return a.provider
@@ -26,12 +20,3 @@ func (a *App) ProviderSnapshot() any {
 	return a.prober.Snapshot()
 }
 
-func (a *App) RecordUsage(ctx context.Context, rec sqlite.UsageRecord) {
-	if a.usageRepo == nil {
-		return
-	}
-	if strings.TrimSpace(rec.ProviderID) == "" {
-		rec.ProviderID = a.providerID
-	}
-	_ = a.usageRepo.Record(ctx, rec)
-}

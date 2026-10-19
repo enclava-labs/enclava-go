@@ -73,15 +73,6 @@ type Principal struct {
 	BillingSubjectID   string
 	BillingSubjectKind string
 
-	// Legacy fields retained until 01-35 so existing callers keep compiling;
-	// populated from stored rows. Deleted in one sweep — do not add new uses.
-	APIKeyID          int64
-	Name              string
-	IsUnlimited       bool
-	BudgetLimitTokens *int64
-	BudgetLimitCents  *int64
-	BudgetPeriod      string
-	RawAPIKeyPrefix   string
 }
 
 type contextKey string

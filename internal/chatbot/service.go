@@ -80,17 +80,10 @@ func requireTenant(p auth.Principal) error {
 	return nil
 }
 
-// actorKey is the conversation-owner identity used for resume authorization.
-// It prefers the canonical ActorID and falls back to the legacy API-key id
-// for principals built before ActorID was populated.
+
+// actorKey is the conversation-owner identity.
 func actorKey(p auth.Principal) string {
-	if id := strings.TrimSpace(p.ActorID); id != "" {
-		return id
-	}
-	if p.APIKeyID > 0 {
-		return fmt.Sprintf("apikey:%d", p.APIKeyID)
-	}
-	return ""
+	return strings.TrimSpace(p.ActorID)
 }
 
 func chatbotAllowed(p auth.Principal, bot Instance) bool {
