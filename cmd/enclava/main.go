@@ -217,7 +217,6 @@ func main() {
 		promptSvc,
 		chatbotSvc,
 		connectorSvc,
-		nil, // usageRepo: every route that consumed it is unmounted (removed in 01-36)
 		billingSvc,
 		billingRepo,
 		endpointsRepo,

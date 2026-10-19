@@ -165,7 +165,7 @@ func newResponsesFx(t *testing.T) *responsesFx {
 		t.Fatalf("new inference service: %v", err)
 	}
 	app := NewApp(auth.NewService(repo, ""), nil, "", nil, repo,
-		nil, nil, nil, nil, nil, nil, nil, brepo, erepo,
+		nil, nil, nil, nil, nil, nil, brepo, erepo,
 		"sha256", "", "enc_", nil, nil, 1, false, svc, bindings, GateConfig{},
 		postgres.NewSourceRepo(db), postgres.NewArtifactRepo(db))
 	fx := &responsesFx{db: db, tenant: tenant, app: app, bindings: bindings, brepo: brepo, erepo: erepo, ups: ups,
