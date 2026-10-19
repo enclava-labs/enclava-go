@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"enclava-go/internal/auth"
 )
 
 type Config struct {
@@ -51,6 +53,11 @@ type Config struct {
 	BootstrapAPIKey    string
 	BootstrapEnabled   bool
 	BootstrapMinLength int
+	// SecretBindings are the operator-approved tenant-bound credential
+	// references (SECRET_BINDINGS). Auth owns resolution; config only parses
+	// and validates this trusted runtime configuration — a stored
+	// credential_ref never names an environment variable itself.
+	SecretBindings []auth.SecretBinding
 }
 
 func Load() (Config, error) {
@@ -200,7 +207,73 @@ func Load() (Config, error) {
 		}
 	}
 
+	bindings, err := parseSecretBindings(os.Getenv("SECRET_BINDINGS"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.SecretBindings = bindings
+
 	return cfg, nil
+}
+
+// parseSecretBindings decodes the SECRET_BINDINGS list. Format:
+// ref_id|tenant_id|purpose|origins|env_name entries separated by ';',
+// origins comma-separated. The resolver re-validates everything; the checks
+// here reject structurally malformed entries and reserved names at Load so
+// bad operator configuration fails before dispatch. The error text never
+// includes secret values (there are none in this variable).
+func parseSecretBindings(raw string) ([]auth.SecretBinding, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var out []auth.SecretBinding
+	seen := make(map[string]struct{})
+	for _, entry := range strings.Split(raw, ";") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			return nil, fmt.Errorf("SECRET_BINDINGS contains an empty entry")
+		}
+		fields := strings.Split(entry, "|")
+		if len(fields) != 5 {
+			return nil, fmt.Errorf("SECRET_BINDINGS entry must have the form ref_id|tenant_id|purpose|origins|env_name")
+		}
+		b := auth.SecretBinding{
+			RefID:    strings.TrimSpace(fields[0]),
+			TenantID: strings.TrimSpace(fields[1]),
+			Purpose:  strings.TrimSpace(fields[2]),
+			EnvName:  strings.TrimSpace(fields[4]),
+		}
+		if b.RefID == "" || b.TenantID == "" {
+			return nil, fmt.Errorf("SECRET_BINDINGS entry requires a reference id and tenant id")
+		}
+		switch b.Purpose {
+		case auth.SecretPurposeInference, auth.SecretPurposeConnector,
+			auth.SecretPurposeMCP, auth.SecretPurposeEmbeddings:
+		default:
+			return nil, fmt.Errorf("SECRET_BINDINGS entry has unknown purpose %q", b.Purpose)
+		}
+		if strings.HasPrefix(b.RefID, "env:") {
+			return nil, fmt.Errorf("SECRET_BINDINGS reference ids are opaque; %q is reserved", "env:")
+		}
+		for _, o := range strings.Split(fields[3], ",") {
+			o = strings.TrimSpace(o)
+			if o == "" {
+				return nil, fmt.Errorf("SECRET_BINDINGS entry has an empty origin")
+			}
+			if _, err := auth.CanonicalizeSecretOrigin(o); err != nil {
+				return nil, fmt.Errorf("SECRET_BINDINGS entry has a malformed origin")
+			}
+			b.Origins = append(b.Origins, o)
+		}
+		key := b.TenantID + "\x00" + b.Purpose + "\x00" + b.RefID
+		if _, dup := seen[key]; dup {
+			return nil, fmt.Errorf("SECRET_BINDINGS contains a duplicate binding")
+		}
+		seen[key] = struct{}{}
+		out = append(out, b)
+	}
+	return out, nil
 }
 
 func (c Config) Addr() string {
