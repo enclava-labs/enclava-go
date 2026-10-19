@@ -17,7 +17,6 @@ import (
 	"enclava-go/internal/auth"
 	"enclava-go/internal/chatbot"
 	"enclava-go/internal/llm"
-	"enclava-go/internal/store/sqlite"
 )
 
 func (a *App) handleChatbots(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
@@ -27,19 +26,13 @@ func (a *App) handleChatbots(w http.ResponseWriter, r *http.Request, principal a
 	}
 	switch r.Method {
 	case http.MethodGet:
-		bots, err := a.chatbotSvc.List(r.Context())
+		bots, err := a.chatbotSvc.List(r.Context(), principal)
 		if err != nil {
 			log.Printf("failed to list chatbots: %v", err)
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "chatbots_list_failed")
 			return
 		}
-		visible := make([]sqlite.ChatbotInstance, 0, len(bots))
-		for _, bot := range bots {
-			if chatbotVisible(principal, bot) {
-				visible = append(visible, bot)
-			}
-		}
-		WriteJSON(w, http.StatusOK, map[string]any{"chatbots": visible})
+		WriteJSON(w, http.StatusOK, map[string]any{"chatbots": bots})
 	case http.MethodPost:
 		if !auth.HasScope(principal, "chatbot.manage") {
 			WriteForbidden(w, "missing required scope: chatbot.manage")
@@ -50,7 +43,7 @@ func (a *App) handleChatbots(w http.ResponseWriter, r *http.Request, principal a
 			WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 			return
 		}
-		bot, err := a.chatbotSvc.Create(r.Context(), input)
+		bot, err := a.chatbotSvc.Create(r.Context(), principal, input)
 		if err != nil {
 			WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "chatbot_invalid")
 			return
@@ -73,13 +66,9 @@ func (a *App) handleChatbotByID(w http.ResponseWriter, r *http.Request, principa
 	}
 	switch r.Method {
 	case http.MethodGet:
-		bot, err := a.chatbotSvc.Get(r.Context(), id)
+		bot, err := a.chatbotSvc.Get(r.Context(), principal, id)
 		if err != nil {
 			writeChatbotNotFoundOrError(w, err, "chatbot_fetch_failed")
-			return
-		}
-		if !chatbotVisible(principal, bot) {
-			writeChatbotNotFoundOrError(w, sql.ErrNoRows, "chatbot_fetch_failed")
 			return
 		}
 		WriteJSON(w, http.StatusOK, bot)
@@ -93,7 +82,7 @@ func (a *App) handleChatbotByID(w http.ResponseWriter, r *http.Request, principa
 			WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 			return
 		}
-		bot, err := a.chatbotSvc.Update(r.Context(), id, input)
+		bot, err := a.chatbotSvc.Update(r.Context(), principal, id, input)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				WriteOpenAIError(w, http.StatusNotFound, "chatbot not found", "invalid_request_error", "not_found")
@@ -108,7 +97,7 @@ func (a *App) handleChatbotByID(w http.ResponseWriter, r *http.Request, principa
 			WriteForbidden(w, "missing required scope: chatbot.manage")
 			return
 		}
-		if err := a.chatbotSvc.Delete(r.Context(), id); err != nil {
+		if err := a.chatbotSvc.Delete(r.Context(), principal, id); err != nil {
 			writeChatbotNotFoundOrError(w, err, "chatbot_delete_failed")
 			return
 		}
@@ -137,7 +126,7 @@ func (a *App) handleExternalChatbot(w http.ResponseWriter, r *http.Request, prin
 			WriteMethodNotAllowed(w)
 			return
 		}
-		models, err := a.chatbotSvc.ExternalModels(r.Context(), chatbotAccess(principal), ref)
+		models, err := a.chatbotSvc.ExternalModels(r.Context(), principal, ref)
 		if err != nil {
 			a.writeChatbotCompletionError(w, r.Context(), err)
 			return
@@ -172,7 +161,7 @@ func (a *App) handleExternalChatbotCompletion(w http.ResponseWriter, r *http.Req
 		a.handleExternalChatbotCompletionStream(w, r, principal, ref, requestBytes)
 		return
 	}
-	out, err := a.chatbotSvc.CreateChatCompletion(r.Context(), chatbotAccess(principal), ref, requestBytes)
+	out, err := a.chatbotSvc.CreateChatCompletion(r.Context(), principal, ref, requestBytes)
 	if err != nil {
 		a.writeChatbotCompletionError(w, r.Context(), err)
 		return
@@ -183,7 +172,7 @@ func (a *App) handleExternalChatbotCompletion(w http.ResponseWriter, r *http.Req
 }
 
 func (a *App) handleExternalChatbotCompletionStream(w http.ResponseWriter, r *http.Request, principal auth.Principal, ref string, requestBytes []byte) {
-	prepared, err := a.chatbotSvc.PrepareChatCompletion(r.Context(), chatbotAccess(principal), ref, requestBytes, true)
+	prepared, err := a.chatbotSvc.PrepareChatCompletion(r.Context(), principal, ref, requestBytes, true)
 	if err != nil {
 		a.writeChatbotCompletionError(w, r.Context(), err)
 		return
@@ -192,7 +181,7 @@ func (a *App) handleExternalChatbotCompletionStream(w http.ResponseWriter, r *ht
 	if err != nil {
 		recordCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
 		defer cancel()
-		a.chatbotSvc.RecordFailure(recordCtx, prepared, statusForProviderError(err))
+		a.chatbotSvc.RecordFailure(recordCtx, principal, prepared, statusForProviderError(err))
 		a.WriteProviderError(w, err)
 		return
 	}
@@ -265,7 +254,7 @@ func (a *App) handleExternalChatbotCompletionStream(w http.ResponseWriter, r *ht
 
 	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
 	defer cancel()
-	a.chatbotSvc.RecordCompletion(recordCtx, prepared, assistant.String(), usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, streamStatusCode)
+	a.chatbotSvc.RecordCompletion(recordCtx, principal, prepared, assistant.String(), usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, streamStatusCode)
 }
 
 func (a *App) applyChatbotStreamEvent(eventData []byte, usage *usageParsed, assistant *strings.Builder) {
@@ -329,33 +318,6 @@ func chatbotContentToString(v any) string {
 	}
 }
 
-func chatbotAccess(principal auth.Principal) chatbot.Access {
-	return chatbot.Access{
-		APIKeyID:           principal.APIKeyID,
-		IsAdmin:            auth.HasScope(principal, "platform.admin"),
-		AllowedModels:      principal.AllowedModels,
-		AllowedChatbots:    principal.AllowedChatbots,
-		AllowedAgents:      principal.AllowedAgents,
-		AllowedModelsAll:   principal.AllowedModelsAll,
-		AllowedChatbotsAll: principal.AllowedChatbotsAll,
-		AllowedAgentsAll:   principal.AllowedAgentsAll,
-	}
-}
-
-// chatbotAllowlistOpen reports whether the chatbot allowlist grants
-// unrestricted access — an explicit all-mode grant or a legacy "*" list item,
-// never merely an empty map.
-func chatbotAllowlistOpen(principal auth.Principal) bool {
-	return auth.ChatbotAllowed(principal)
-}
-
-func chatbotVisible(principal auth.Principal, bot sqlite.ChatbotInstance) bool {
-	ids := []string{bot.ID}
-	if externalID := strings.TrimSpace(bot.ExternalID); externalID != "" {
-		ids = append(ids, externalID)
-	}
-	return auth.ChatbotAllowed(principal, ids...)
-}
 
 func (a *App) writeChatbotCompletionError(w http.ResponseWriter, ctx context.Context, err error) {
 	if errors.Is(err, chatbot.ErrCollectionNotFound) {
