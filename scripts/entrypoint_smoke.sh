@@ -36,7 +36,7 @@ chmod 0755 "$app_bin"
 
 env_file="$tmp_dir/env"
 count_file="$tmp_dir/count"
-database_url="$tmp_dir/data/enclava.db"
+database_url="postgres://postgres:postgres@db:5432/enclava"
 
 ENCLAVA_CONFIG_DIR="$config_dir" \
 ENCLAVA_REQUIRED_CONFIG_KEYS="CUSTOM_FLAG" \

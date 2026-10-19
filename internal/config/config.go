@@ -13,6 +13,8 @@ type Config struct {
 	Host                    string
 	Port                    int
 	DatabaseURL             string
+	DataDir                 string
+	SessionTTL              time.Duration
 	ReadTimeout             time.Duration
 	WriteTimeout            time.Duration
 	IdleTimeout             time.Duration
@@ -57,7 +59,9 @@ func Load() (Config, error) {
 	cfg := Config{
 		Host:        getEnv("APP_HOST", "0.0.0.0"),
 		Port:        getEnvInt("APP_PORT", 8080),
-		DatabaseURL: getEnv("DATABASE_URL", "./enclava.db"),
+		DatabaseURL: getEnv("DATABASE_URL", ""),
+		DataDir:     getEnv("ENCLAVA_DATA_DIR", "./data"),
+		SessionTTL:  getEnvDuration("SESSION_TTL", 12*time.Hour),
 		ReadTimeout: getEnvDuration("HTTP_READ_TIMEOUT", 30*time.Second),
 		// Streaming (SSE) can exceed fixed write timeouts; prefer disabling unless you know you don't need streaming.
 		WriteTimeout:            getEnvDuration("HTTP_WRITE_TIMEOUT", 0),
@@ -100,6 +104,15 @@ func Load() (Config, error) {
 	}
 	if cfg.Port <= 0 {
 		return Config{}, fmt.Errorf("APP_PORT must be > 0")
+	}
+	if err := validatePostgresDSN(cfg.DatabaseURL); err != nil {
+		return Config{}, err
+	}
+	if strings.TrimSpace(cfg.DataDir) == "" {
+		return Config{}, fmt.Errorf("ENCLAVA_DATA_DIR must be non-empty")
+	}
+	if cfg.SessionTTL <= 0 {
+		return Config{}, fmt.Errorf("SESSION_TTL must be > 0")
 	}
 	if cfg.MaxUploadSizeMB <= 0 {
 		return Config{}, fmt.Errorf("MAX_UPLOAD_SIZE_MB must be > 0")
@@ -294,4 +307,24 @@ func getEnvBool(key string, fallback bool) bool {
 		return fallback
 	}
 	return parsed
+}
+
+// validatePostgresDSN fails closed on anything that is not a PostgreSQL DSN:
+// only postgres://, postgresql:// or key=value connection strings pass;
+// postgres.Open re-checks the same rule before opening the pool.
+func validatePostgresDSN(dsn string) error {
+	v := strings.TrimSpace(dsn)
+	if v == "" {
+		return fmt.Errorf("DATABASE_URL must be a PostgreSQL DSN (postgres://, postgresql:// or key=value); got empty")
+	}
+	if strings.HasPrefix(v, "postgres://") || strings.HasPrefix(v, "postgresql://") {
+		return nil
+	}
+	if strings.HasPrefix(v, "file:") || strings.HasSuffix(v, ".db") || strings.ContainsAny(v, "/\\") {
+		return fmt.Errorf("DATABASE_URL must be a PostgreSQL DSN (postgres://, postgresql:// or key=value); got %q", dsn)
+	}
+	if !strings.Contains(v, "=") {
+		return fmt.Errorf("DATABASE_URL must be a PostgreSQL DSN (postgres://, postgresql:// or key=value); got %q", dsn)
+	}
+	return nil
 }
