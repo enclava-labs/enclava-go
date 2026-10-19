@@ -19,8 +19,9 @@ import (
 	"enclava-go/internal/billing"
 	extractsvc "enclava-go/internal/extract"
 	"enclava-go/internal/httpx"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
-	"enclava-go/internal/llm"
+	"enclava-go/internal/source"
 	"enclava-go/internal/store/postgres"
 	"enclava-go/internal/testdb"
 )
@@ -55,7 +56,6 @@ func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 		t.Fatalf("authenticate seeded key: %v", err)
 	}
 
-	extractRepo := postgres.NewExtractRepo(db)
 	jobsRepo := postgres.NewJobsRepo(db)
 	artRepo := postgres.NewArtifactRepo(db)
 	root := t.TempDir()
@@ -63,12 +63,10 @@ func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("artifact store: %v", err)
 	}
-	jobsSvc := jobs.NewService(jobsRepo, 10*time.Millisecond)
-	billingSvc := billing.NewService(postgres.NewBillingRepo(db))
-	provider := &extractHandlerProvider{
+	upstream := &extractHandlerUpstream{
 		response: []byte(`{"id":"c","model":"priced-extract","usage":{"prompt_tokens":1000,"completion_tokens":500,"total_tokens":1500},"choices":[{"message":{"content":"{\"total\":12.5}"}}]}`),
 	}
-	extractService := extractsvc.NewService(extractRepo, extractRepo, jobsRepo, jobsSvc, store, billingSvc, provider, 5)
+	extractService, jobsSvc := newExtractService(t, db, tenant, artRepo, jobsRepo, store, upstream, "priced-extract")
 	if err := extractService.UpsertTemplate(ctx, principal, extractsvc.Template{
 		ID: "invoice", Name: "Invoice", SystemPrompt: "Extract invoice data.", UserPrompt: "Return JSON.",
 		DefaultModel: "priced-extract", Enabled: true,
@@ -79,12 +77,12 @@ func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("upsert template: %v", err)
 	}
-	// Seed rates so the attempt's reserve admits.
+	// Seed rates for the vision capability the attempt dispatches under.
 	billingRepo := postgres.NewBillingRepo(db)
 	for _, u := range []billing.UnitKind{billing.UnitInput, billing.UnitOutput} {
 		if err := billingRepo.PutPrice(ctx, tenant, "price_"+string(u), billing.Price{
 			SubjectType: billing.PriceSubjectModel, SubjectID: "priced-extract",
-			Capability: extractsvc.OperationProcess, Unit: u,
+			Capability: inference.CapabilityVision, Unit: u,
 			RateMicros: 10_000, UnitQuantity: 1000, Currency: "USD",
 			EffectiveFrom: time.Now().Add(-time.Hour).UTC(),
 		}, principal.ActorID, time.Now().Add(-time.Hour).UTC()); err != nil {
@@ -94,7 +92,7 @@ func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 
 	app := httpx.NewApp(
 		auth.NewService(identityRepo, ""),
-		provider,
+		nil,
 		"extract-provider",
 		nil, nil, // prober, identity
 		extractService,
@@ -166,7 +164,7 @@ func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 		Scan(&capability, &model, &amount); err != nil {
 		t.Fatalf("query usage record: %v", err)
 	}
-	if capability != extractsvc.OperationProcess || model != "priced-extract" || amount <= 0 {
+	if capability != inference.CapabilityVision || model != "priced-extract" || amount <= 0 {
 		t.Fatalf("unexpected usage: cap=%s model=%s amount=%d", capability, model, amount)
 	}
 	if err := db.SQL.QueryRowContext(ctx,
@@ -205,15 +203,13 @@ func TestHandleJobDetailDeniesForeignAndUnknown(t *testing.T) {
 		t.Fatalf("auth B: %v", err)
 	}
 
-	extractRepo := postgres.NewExtractRepo(db)
 	jobsRepo := postgres.NewJobsRepo(db)
-	store, err := artifacts.NewStore(filepath.Join(t.TempDir(), "durable"), filepath.Join(t.TempDir(), "scratch"), postgres.NewArtifactRepo(db))
+	artRepo := postgres.NewArtifactRepo(db)
+	store, err := artifacts.NewStore(filepath.Join(t.TempDir(), "durable"), filepath.Join(t.TempDir(), "scratch"), artRepo)
 	if err != nil {
 		t.Fatalf("store: %v", err)
 	}
-	svc := extractsvc.NewService(extractRepo, extractRepo, jobsRepo,
-		jobs.NewService(jobsRepo, time.Millisecond), store,
-		billing.NewService(postgres.NewBillingRepo(db)), &extractHandlerProvider{}, 5)
+	svc, _ := newExtractService(t, db, tenant, artRepo, jobsRepo, store, &extractHandlerUpstream{}, "unrestricted-model")
 	if err := svc.UpsertTemplate(ctx, principalA, extractsvc.Template{
 		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u", Enabled: true,
 	}); err != nil {
@@ -238,31 +234,65 @@ func TestHandleJobDetailDeniesForeignAndUnknown(t *testing.T) {
 	}
 }
 
-type extractHandlerProvider struct {
+// extractHandlerUpstream is the deterministic transport behind the real
+// executor the handler tests drive — policy/routing/accounting run through
+// inference.Service, not a stubbed Execute.
+type extractHandlerUpstream struct {
 	response []byte
 }
 
-func (p *extractHandlerProvider) ListModels(ctx context.Context) (llm.ModelsResponse, error) {
-	return llm.ModelsResponse{Object: "list", Data: []llm.Model{{ID: "priced-extract", SupportsVision: true}}}, nil
-}
-
-func (p *extractHandlerProvider) GetModel(ctx context.Context, modelID string) (llm.Model, error) {
-	return llm.Model{ID: modelID}, nil
-}
-
-func (p *extractHandlerProvider) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
+func (p *extractHandlerUpstream) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
 	return p.response, nil
 }
 
-func (p *extractHandlerProvider) CreateChatCompletionStream(ctx context.Context, body []byte) (io.ReadCloser, error) {
+func (p *extractHandlerUpstream) CreateChatCompletionStream(ctx context.Context, body []byte) (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(nil)), nil
 }
 
-func (p *extractHandlerProvider) CreateEmbeddings(ctx context.Context, body []byte) ([]byte, error) {
-	return json.Marshal(map[string]any{
-		"object": "list",
-		"data":   []any{map[string]any{"object": "embedding", "index": 0, "embedding": []float64{0.1}}},
-		"model":  "priced-extract",
-		"usage":  map[string]any{"prompt_tokens": 1, "total_tokens": 1},
-	})
+func (p *extractHandlerUpstream) CreateEmbeddings(ctx context.Context, body []byte) ([]byte, error) {
+	return nil, nil
+}
+
+func (p *extractHandlerUpstream) DoResponsesRequest(ctx context.Context, method, path string, body []byte) ([]byte, error) {
+	return nil, errors.New("unsupported")
+}
+
+func (p *extractHandlerUpstream) DoResponsesStream(ctx context.Context, method, path string, body []byte) (io.ReadCloser, error) {
+	return nil, errors.New("unsupported")
+}
+
+// newExtractService wires the durable stack plus the real executor over the
+// fake upstream and registers a vision-capable endpoint with model bindings.
+func newExtractService(t *testing.T, db *postgres.DB, tenant string, artRepo *postgres.ArtifactRepo,
+	jobsRepo *postgres.JobsRepo, store *artifacts.Store, upstream inference.Upstream, aliases ...string) (*extractsvc.Service, *jobs.Service) {
+	t.Helper()
+	extractRepo := postgres.NewExtractRepo(db)
+	endpoints := postgres.NewEndpointsRepo(db)
+	sources := postgres.NewSourceRepo(db)
+	billingRepo := postgres.NewBillingRepo(db)
+	jobsSvc := jobs.NewService(jobsRepo, 10*time.Millisecond)
+	caps := []string{inference.CapabilityChat, inference.CapabilityVision}
+	for _, a := range aliases {
+		caps = append(caps, inference.ModelCapabilityPrefix+a)
+	}
+	if err := endpoints.Create(context.Background(), inference.Endpoint{
+		ID: "ep-extract", TenantID: tenant, Protocol: "openai_compatible",
+		BaseOrigin: "https://extract.upstream.example", Capabilities: caps, Enabled: true,
+	}); err != nil {
+		t.Fatalf("seed endpoint: %v", err)
+	}
+	exec, err := inference.NewService(inference.Deps{
+		Endpoints:  endpoints,
+		Sources:    sources,
+		Authorizer: source.NewAuthorizer(sources, 0),
+		Billing:    billing.NewService(billingRepo),
+		Artifacts:  artRepo,
+	}, inference.WithTransportFactory(
+		func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {
+			return upstream, nil
+		}))
+	if err != nil {
+		t.Fatalf("executor: %v", err)
+	}
+	return extractsvc.NewService(extractRepo, extractRepo, jobsRepo, jobsSvc, store, exec, endpoints, 5), jobsSvc
 }

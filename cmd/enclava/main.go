@@ -23,8 +23,10 @@ import (
 	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
 	"enclava-go/internal/llm"
+	extractmodule "enclava-go/internal/modules/extract"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
+	"enclava-go/internal/source"
 	"enclava-go/internal/store/postgres"
 )
 
@@ -85,11 +87,7 @@ func main() {
 
 	jobsSvc := jobs.NewService(jobsRepoPG, 0)
 	billingSvc := billing.NewService(billingRepo)
-	if err := ensureEnvEndpoint(ctx, identityRepo, endpointsRepo, runtimeProviderConfig(cfg)); err != nil {
-		log.Fatalf("provider config seed error: %v", err)
-	}
 
-	authSvc := auth.NewService(identityRepo, cfg.APIKeyPepper)
 	provider, err := buildProvider(cfg)
 	if err != nil {
 		log.Fatalf("provider init error: %v", err)
@@ -97,17 +95,61 @@ func main() {
 	prober := llm.NewProber(provider, cfg.ProviderProbeInterval, cfg.ProviderProbeTimeout)
 	go prober.Start(ctx)
 
+	// The env-configured provider is seeded as a canonical endpoint record:
+	// model aliases discovered from the provider, vision capability for
+	// extraction, and a credential_ref backed by the operator bindings only.
+	envBinding, err := ensureEnvEndpoint(ctx, identityRepo, endpointsRepo, cfg, provider)
+	if err != nil {
+		log.Fatalf("provider config seed error: %v", err)
+	}
+
+	// The shared executor is the ONLY priced model-dispatch boundary (INF-02):
+	// extraction attempts, worker jobs and any later inference surface all
+	// resolve policy, reserve, dispatch and settle through it. Secrets resolve
+	// through operator bindings plus the env-key equivalence returned above —
+	// never a stored ref as an env name.
+	secretBindings := cfg.SecretBindings
+	if envBinding != nil {
+		dup := false
+		for _, b := range cfg.SecretBindings {
+			if b.RefID == envBinding.RefID && b.TenantID == envBinding.TenantID &&
+				b.Purpose == envBinding.Purpose {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			secretBindings = append(secretBindings, *envBinding)
+		}
+	}
+	secretResolver, err := auth.NewSecretResolver(secretBindings)
+	if err != nil {
+		log.Fatalf("secret binding error: %v", err)
+	}
+	inferenceSvc, err := inference.NewService(inference.Deps{
+		Endpoints:  endpointsRepo,
+		Sources:    sourceRepo,
+		Authorizer: source.NewAuthorizer(sourceRepo, 0),
+		Billing:    billingSvc,
+		Secrets:    secretResolver,
+		Artifacts:  artifactRepo,
+	})
+	if err != nil {
+		log.Fatalf("inference service init error: %v", err)
+	}
+
+	authSvc := auth.NewService(identityRepo, cfg.APIKeyPepper)
+
 	extractSvc := extract.NewService(
 		extractRepo,
 		extractRepo,
 		jobsRepoPG,
 		jobsSvc,
 		artifactStore,
-		billingSvc,
-		provider,
+		inferenceSvc,
+		endpointsRepo,
 		cfg.MaxUploadSizeMB,
 	)
-
 	// Seed the bootstrap tenant's default extract templates and settings row
 	// through the owned service.
 	bootstrapTenantID, err := identityRepo.GetTenantBySlug(ctx, "bootstrap")
@@ -122,10 +164,11 @@ func main() {
 		log.Fatalf("extract settings seed error: %v", err)
 	}
 
-	// Infrastructure-only runner: no operation handlers are registered until
-	// the executor plans (01-25+) mount them; it exists to drain fenced
-	// claims cleanly at shutdown.
-	jobsRunner := jobs.NewRunner(jobsSvc, artifactStore, map[string]jobs.HandlerFunc{}, jobs.RunnerConfig{})
+	// Worker: the extract job handler dispatches through the shared executor —
+	// leased fenced claims only, no synchronous provider path.
+	jobsRunner := jobs.NewRunner(jobsSvc, artifactStore, map[string]jobs.HandlerFunc{
+		extract.OperationProcess: extractSvc.JobHandler(),
+	}, jobs.RunnerConfig{})
 	runnerCtx, stopRunner := context.WithCancel(context.Background())
 	runnerDone := make(chan struct{})
 	go func() {
@@ -169,6 +212,10 @@ func main() {
 		cfg.TrustProxyHeaders,
 	)
 
+	// The extract module mounts its API routes on the app's mux — every
+	// processing call it makes funnels through the shared executor.
+	extractmodule.New(extractSvc, cfg.MaxUploadSizeMB).Register(app.Mux(), app)
+
 	srv := &http.Server{
 		Addr:              cfg.Addr(),
 		Handler:           app.Handler(),
@@ -202,14 +249,14 @@ func main() {
 
 // runtimeProviderConfig translates the env provider settings into the
 // canonical endpoint record seeded at startup. Assurance claims stay empty —
-// env config never implies verification.
+// env config never implies verification. The vision capability is advertised
+// because extraction payload parts route as vision through the executor.
 func runtimeProviderConfig(cfg config.Config) inference.Endpoint {
 	endpoint := inference.Endpoint{
-		ID:            cfg.Provider,
-		Protocol:      cfg.Provider,
-		Capabilities:  []string{"chat/completions", "embeddings"},
-		CredentialRef: cfg.Provider + "_env",
-		Enabled:       true,
+		ID:           cfg.Provider,
+		Protocol:     cfg.Provider,
+		Capabilities: []string{inference.CapabilityChat, inference.CapabilityEmbeddings, inference.CapabilityVision},
+		Enabled:      true,
 	}
 	switch cfg.Provider {
 	case "privatemode":
@@ -231,29 +278,78 @@ func runtimeProviderConfig(cfg config.Config) inference.Endpoint {
 	return endpoint
 }
 
+// envCredentialName names the operator-owned environment variable that holds
+// the env provider's API key — trusted configuration, never a request or
+// stored credential_ref value.
+func envCredentialName(cfg config.Config) string {
+	switch cfg.Provider {
+	case "privatemode", "openai":
+		return "PRIVATEMODE_API_KEY"
+	case "openai_compatible":
+		if os.Getenv("OPENAI_COMPATIBLE_API_KEY") != "" {
+			return "OPENAI_COMPATIBLE_API_KEY"
+		}
+		return "PRIVATEMODE_API_KEY"
+	case "redpill":
+		return "REDPILL_API_KEY"
+	case "tinfoil":
+		return "TINFOIL_API_KEY"
+	}
+	return ""
+}
+
 // ensureEnvEndpoint create-or-gets the env provider's endpoint row on the
-// bootstrap tenant so transports/executor see a canonical record.
-func ensureEnvEndpoint(ctx context.Context, identity *postgres.IdentityRepo, endpoints *postgres.EndpointsRepo, seed inference.Endpoint) error {
+// bootstrap tenant so transports/executor see a canonical record. Model
+// aliases discovered from the provider become "model:" capability bindings;
+// when the operator set the provider's environment key, an equivalent
+// inference-purpose binding is returned for the resolver (an operator
+// SECRET_BINDINGS entry for the same ref wins instead).
+func ensureEnvEndpoint(ctx context.Context, identity *postgres.IdentityRepo, endpoints *postgres.EndpointsRepo, cfg config.Config, provider llm.Provider) (*auth.SecretBinding, error) {
 	tenantID, err := identity.GetTenantBySlug(ctx, "bootstrap")
 	if err != nil {
 		if !errors.Is(err, auth.ErrNotFound) {
-			return fmt.Errorf("lookup bootstrap tenant: %w", err)
+			return nil, fmt.Errorf("lookup bootstrap tenant: %w", err)
 		}
 		tenantID, err = identity.CreateTenant(ctx, "bootstrap", "Bootstrap")
 		if err != nil {
-			return fmt.Errorf("create bootstrap tenant: %w", err)
+			return nil, fmt.Errorf("create bootstrap tenant: %w", err)
 		}
 	}
+	seed := runtimeProviderConfig(cfg)
 	seed.TenantID = tenantID
+
+	mctx, cancel := context.WithTimeout(ctx, cfg.ProviderProbeTimeout)
+	defer cancel()
+	if models, err := provider.ListModels(mctx); err == nil {
+		for _, m := range models.Data {
+			if strings.TrimSpace(m.ID) != "" {
+				seed.Capabilities = append(seed.Capabilities, inference.ModelCapabilityPrefix+m.ID)
+			}
+		}
+	} else {
+		log.Printf("model discovery for env endpoint failed: %v", err)
+	}
+
+	var binding *auth.SecretBinding
+	refID := cfg.Provider + "_env"
+	if envName := envCredentialName(cfg); envName != "" && os.Getenv(envName) != "" {
+		if origin, err := auth.CanonicalizeSecretOrigin(seed.BaseOrigin); err == nil {
+			seed.CredentialRef = refID
+			binding = &auth.SecretBinding{
+				RefID: refID, TenantID: tenantID, EnvName: envName,
+				Purpose: auth.SecretPurposeInference, Origins: []string{origin},
+			}
+		}
+	}
 	if _, err := endpoints.Get(ctx, tenantID, seed.ID); err == nil {
-		return nil
+		return binding, nil
 	} else if !errors.Is(err, inference.ErrEndpointNotFound) {
-		return fmt.Errorf("lookup env endpoint: %w", err)
+		return nil, fmt.Errorf("lookup env endpoint: %w", err)
 	}
 	if err := endpoints.Create(ctx, seed); err != nil {
-		return fmt.Errorf("seed env endpoint: %w", err)
+		return nil, fmt.Errorf("seed env endpoint: %w", err)
 	}
-	return nil
+	return binding, nil
 }
 
 func buildProvider(cfg config.Config) (llm.Provider, error) {

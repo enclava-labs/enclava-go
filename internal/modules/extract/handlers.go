@@ -1,7 +1,6 @@
 package extractmodule
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,11 +8,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/extract"
 	"enclava-go/internal/httpx"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/llm"
 )
 
@@ -32,15 +31,8 @@ func (h *Handlers) HandleProcess(w http.ResponseWriter, r *http.Request, princip
 		httpx.WriteMethodNotAllowed(w)
 		return
 	}
-	if !h.platform.ProviderReady() {
-		httpx.WriteOpenAIError(w, http.StatusServiceUnavailable, "provider not ready", "server_error", "provider_not_ready")
-		return
-	}
-	if err := h.platform.EnforceBudget(r.Context(), principal); err != nil {
-		h.platform.WriteBudgetError(w, err)
-		return
-	}
-
+	// No provider-readiness or budget gate here: the shared executor resolves
+	// route capability and admits/settles billing for the actual attempt.
 	r.Body = http.MaxBytesReader(w, r.Body, h.maxUploadMB*1024*1024)
 	if err := r.ParseMultipartForm(h.maxUploadMB * 1024 * 1024); err != nil {
 		httpx.WriteOpenAIError(w, http.StatusBadRequest, "invalid multipart form", "invalid_request_error", "invalid_form")
@@ -100,15 +92,11 @@ func (h *Handlers) HandleProcess(w http.ResponseWriter, r *http.Request, princip
 			httpx.WriteOpenAIError(w, http.StatusNotFound, err.Error(), "invalid_request_error", "not_found")
 			return
 		}
-		if errors.Is(err, extract.ErrForbidden) {
+		if errors.Is(err, extract.ErrForbidden) || errors.Is(err, inference.ErrDenied) {
 			httpx.WriteForbidden(w, err.Error())
 			return
 		}
 		lowerErr := strings.ToLower(err.Error())
-		if strings.Contains(lowerErr, "provider chat completion") {
-			httpx.WriteOpenAIError(w, http.StatusBadGateway, "provider request failed", "server_error", "provider_error")
-			return
-		}
 		if strings.Contains(lowerErr, "unsupported") || strings.Contains(lowerErr, "template") {
 			httpx.WriteOpenAIError(w, http.StatusUnprocessableEntity, err.Error(), "invalid_request_error", "extract_failed")
 			return
@@ -116,8 +104,8 @@ func (h *Handlers) HandleProcess(w http.ResponseWriter, r *http.Request, princip
 		httpx.WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "extract_failed")
 		return
 	}
-	// Billing is settled inside the attempt through reserve/settle — no
-	// platform RecordUsage call here.
+	// Billing is settled inside the attempt by the shared executor — no
+	// platform RecordUsage/EnforceBudget call here.
 	httpx.WriteJSON(w, http.StatusOK, result)
 }
 
@@ -301,13 +289,9 @@ func (h *Handlers) HandleModels(w http.ResponseWriter, r *http.Request, principa
 		httpx.WriteMethodNotAllowed(w)
 		return
 	}
-	if !h.platform.ProviderReady() {
-		httpx.WriteOpenAIError(w, http.StatusServiceUnavailable, "provider not ready", "server_error", "provider_not_ready")
-		return
-	}
-	models, err := h.svc.ModelsForExtract(r.Context())
+	models, err := h.svc.ModelsForExtract(r.Context(), principal.TenantID)
 	if err != nil {
-		h.platform.WriteProviderError(w, err)
+		httpx.WriteOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error", "models_list_failed")
 		return
 	}
 	if len(principal.AllowedModels) > 0 {
@@ -367,18 +351,11 @@ func (h *Handlers) HandleHealth(w http.ResponseWriter, r *http.Request, principa
 		httpx.WriteMethodNotAllowed(w)
 		return
 	}
-	if !h.platform.ProviderReady() {
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{
-			"status":   "degraded",
-			"provider": h.platform.ProviderSnapshot(),
-		})
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-	_, err := h.platform.Provider().ListModels(ctx)
-	if err != nil {
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "degraded", "error": err.Error()})
+	// Extraction health is executor-route health: models configured, not a
+	// local provider probe.
+	models, err := h.svc.ModelsForExtract(r.Context(), principal.TenantID)
+	if err != nil || len(models) == 0 {
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "degraded", "error": "no extraction models configured"})
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok"})
