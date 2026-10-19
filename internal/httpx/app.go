@@ -144,34 +144,23 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/livez", a.handleLivez)
 	a.mux.HandleFunc("/readyz", a.handleReadyz)
 
-	a.mux.HandleFunc("/api/v1/models", a.authenticated("models.list", a.handleModels))
-	a.mux.HandleFunc("/api/v1/models/cache/invalidate", a.authenticated("models.list", a.handleModelsCacheInvalidate))
-	a.mux.HandleFunc("/api/v1/models/", a.authenticated("models.list", a.handleModelByID))
-	a.mux.HandleFunc("/api/v1/chat/completions", a.authenticated("chat.completions", a.handleChatCompletions))
-	a.mux.HandleFunc("/api/v1/embeddings", a.authenticated("embeddings.create", a.handleEmbeddings))
-	a.mux.HandleFunc("/api/v1/responses", a.authenticated("responses", a.handleResponses))
-	a.mux.HandleFunc("/api/v1/responses/", a.authenticated("responses", a.handleResponses))
-	a.mux.HandleFunc("/v1/models", a.authenticated("models.list", a.handleModels))
-	a.mux.HandleFunc("/v1/models/", a.authenticated("models.list", a.handleModelByID))
-	a.mux.HandleFunc("/v1/chat/completions", a.authenticated("chat.completions", a.handleChatCompletions))
-	a.mux.HandleFunc("/v1/embeddings", a.authenticated("embeddings.create", a.handleEmbeddings))
-	a.mux.HandleFunc("/v1/responses", a.authenticated("responses", a.handleResponses))
-	a.mux.HandleFunc("/v1/responses/", a.authenticated("responses", a.handleResponses))
-	a.mux.HandleFunc("/api/v1/", a.authenticated("openai.proxy", a.handleOpenAIPassthrough))
-	a.mux.HandleFunc("/v1/", a.authenticated("openai.proxy", a.handleOpenAIPassthrough))
-	a.mux.HandleFunc("/api/v1/attestation/status", a.authenticated("models.list", a.handleAttestationStatus))
-	a.mux.HandleFunc("/api/v1/attestation/verify", a.authenticated("models.list", a.handleAttestationVerify))
+	// 01-22 cutover: every paid path not yet backed by the shared executor is
+	// unmounted — model passthrough listings, chat completions, embeddings,
+	// responses, the openai_passthrough catch-alls and attestation all served
+	// raw provider calls; the extract module mount, chatbot completions, rag
+	// ingest/search and connector sync dispatch are likewise gone. Unmounted
+	// paths 404 (handlers stay compiling for 01-34's removal); the routes that
+	// remain are owned metadata + auth surfaces.
 	a.mux.HandleFunc("/api/v1/providers", a.authenticated("pricing.manage", a.handleProviders))
 	a.mux.HandleFunc("/api/v1/providers/", a.authenticated("pricing.manage", a.handleProviderByID))
 	a.mux.HandleFunc("/api/v1/rag/collections", a.authenticated("rag", a.handleRAGCollections))
 	a.mux.HandleFunc("/api/v1/rag/collections/", a.authenticated("rag", a.handleRAGCollectionByID))
 	a.mux.HandleFunc("/api/v1/rag/documents/", a.authenticated("rag", a.handleRAGDocumentByID))
-	a.mux.HandleFunc("/api/v1/rag/search", a.authenticated("rag", a.handleRAGSearch))
 	a.mux.HandleFunc("/api/v1/prompt-templates", a.authenticated("chatbot", a.handlePromptTemplates))
 	a.mux.HandleFunc("/api/v1/prompt-templates/", a.authenticated("chatbot", a.handlePromptTemplateByID))
 	a.mux.HandleFunc("/api/v1/chatbots", a.authenticated("chatbot", a.handleChatbots))
 	a.mux.HandleFunc("/api/v1/chatbots/", a.authenticated("chatbot", a.handleChatbotByID))
-	a.mux.HandleFunc("/api/v1/chatbot/external/", a.authenticated("chatbot", a.handleExternalChatbot))
+
 	a.mux.HandleFunc("/api/v1/connectors/sources", a.authenticated("connectors.manage", a.handleConnectorSources))
 	a.mux.HandleFunc("/api/v1/connectors/sources/", a.authenticated("connectors.manage", a.handleConnectorSourceByID))
 	a.mux.HandleFunc("/api/v1/connectors/sync-jobs", a.authenticated("connectors.manage", a.handleConnectorSyncJobs))

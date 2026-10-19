@@ -58,19 +58,9 @@ func (a *App) handleConnectorSourceByID(w http.ResponseWriter, r *http.Request, 
 	parts := strings.Split(rest, "/")
 	sourceID := parts[0]
 	if len(parts) > 1 {
-		if len(parts) == 2 && parts[1] == "sync" {
-			if r.Method != http.MethodPost {
-				WriteMethodNotAllowed(w)
-				return
-			}
-			job, err := a.connectorSvc.SyncSource(r.Context(), principal, sourceID)
-			if err != nil {
-				writeConnectorSyncError(w, err, job)
-				return
-			}
-			WriteJSON(w, http.StatusOK, job)
-			return
-		}
+		// 01-22: the sync dispatch sub-route is unmounted — no job producer
+		// is wired to executor-backed handlers yet; POST …/sync 404s until
+		// re-mount.
 		WriteOpenAIError(w, http.StatusNotFound, "connector route not found", "invalid_request_error", "not_found")
 		return
 	}

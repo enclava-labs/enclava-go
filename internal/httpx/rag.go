@@ -4,9 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -63,12 +61,11 @@ func (a *App) handleRAGCollectionByID(w http.ResponseWriter, r *http.Request, pr
 	parts := strings.Split(rest, "/")
 	collectionID := parts[0]
 	if len(parts) > 1 {
-		switch parts[1] {
-		case "documents":
-			if len(parts) == 2 {
-				a.handleRAGCollectionDocuments(w, r, principal, collectionID)
-				return
-			}
+		// 01-22: document ingest is unmounted — the …/documents sub-route
+		// serves metadata GETs only; uploads 404 until executor-backed ingest.
+		if parts[1] == "documents" && len(parts) == 2 && r.Method == http.MethodGet {
+			a.handleRAGCollectionDocuments(w, r, principal, collectionID)
+			return
 		}
 		WriteOpenAIError(w, http.StatusNotFound, "rag route not found", "invalid_request_error", "not_found")
 		return
@@ -123,44 +120,6 @@ func (a *App) handleRAGCollectionDocuments(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		WriteJSON(w, http.StatusOK, map[string]any{"documents": docs, "limit": limit, "offset": offset})
-	case http.MethodPost:
-		if !auth.HasScope(principal, "rag.manage") {
-			WriteForbidden(w, "missing required scope: rag.manage")
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, a.maxUploadMB*1024*1024)
-		if err := r.ParseMultipartForm(a.maxUploadMB * 1024 * 1024); err != nil {
-			WriteOpenAIError(w, http.StatusBadRequest, "invalid multipart form", "invalid_request_error", "invalid_form")
-			return
-		}
-		file, header, err := r.FormFile("file")
-		if err != nil {
-			WriteOpenAIError(w, http.StatusBadRequest, "file is required", "invalid_request_error", "missing_file")
-			return
-		}
-		defer func() { _ = file.Close() }()
-		content, err := io.ReadAll(file)
-		if err != nil {
-			WriteOpenAIError(w, http.StatusBadRequest, "failed to read uploaded file", "invalid_request_error", "invalid_file")
-			return
-		}
-		mimeType := header.Header.Get("Content-Type")
-		if strings.TrimSpace(mimeType) == "" {
-			mimeType = "application/octet-stream"
-		}
-		out, err := a.ragSvc.UploadDocument(r.Context(), principal, collectionID, rag.UploadDocumentInput{
-			FileName:   filepath.Base(header.Filename),
-			MimeType:   mimeType,
-			Bytes:      content,
-			SourceType: strings.TrimSpace(r.FormValue("source_type")),
-			SourceID:   strings.TrimSpace(r.FormValue("source_id")),
-			SourceURI:  strings.TrimSpace(r.FormValue("source_uri")),
-		})
-		if err != nil {
-			a.writeRAGNotFoundOrBadRequest(w, err, "rag_document_upload_failed")
-			return
-		}
-		WriteJSON(w, http.StatusCreated, out)
 	default:
 		WriteMethodNotAllowed(w)
 	}
@@ -179,23 +138,8 @@ func (a *App) handleRAGDocumentByID(w http.ResponseWriter, r *http.Request, prin
 	parts := strings.Split(rest, "/")
 	documentID := parts[0]
 	if len(parts) > 1 {
-		if len(parts) == 2 && parts[1] == "reprocess" {
-			if r.Method != http.MethodPost {
-				WriteMethodNotAllowed(w)
-				return
-			}
-			if !auth.HasScope(principal, "rag.manage") {
-				WriteForbidden(w, "missing required scope: rag.manage")
-				return
-			}
-			out, err := a.ragSvc.ReprocessDocument(r.Context(), principal, documentID)
-			if err != nil {
-				a.writeRAGNotFoundOrBadRequest(w, err, "rag_document_reprocess_failed")
-				return
-			}
-			WriteJSON(w, http.StatusOK, out)
-			return
-		}
+		// 01-22: reprocess dispatch is unmounted — embedding-producing work
+		// returns when executor-backed ingest lands.
 		WriteOpenAIError(w, http.StatusNotFound, "rag route not found", "invalid_request_error", "not_found")
 		return
 	}
