@@ -20,25 +20,77 @@ type OpenAICompatibleAdapter struct {
 	provider     string
 	client       *http.Client
 	streamClient *http.Client
+	cfgErr       error
+	allowPrivate bool
+	maxBody      int64
+	streamIdle   time.Duration
+	streamWall   time.Duration
+	timeout      time.Duration
 }
 
+// NewOpenAICompatibleAdapter builds a provider transport for one approved
+// endpoint origin. Private/cleartext targets are denied unless the caller
+// marks the endpoint explicitly approved via WithAllowPrivateEndpoint.
 func NewOpenAICompatibleAdapter(baseURL, apiKey string, timeout time.Duration) *OpenAICompatibleAdapter {
-	baseURL = strings.TrimSuffix(baseURL, "/")
-	// Streaming client has no timeout: long-running SSE streams must not be killed.
-	// Mitigation: Go's net/http cancels the request when the client disconnects (via r.Context()).
-	// Known limitation: if the upstream hangs without the client disconnecting, the goroutine leaks.
-	streamClient := &http.Client{
-		Timeout: 0,
+	baseURL = strings.TrimSuffix(strings.TrimSpace(baseURL), "/")
+	a := &OpenAICompatibleAdapter{
+		baseURL:    baseURL,
+		apiKey:     apiKey,
+		provider:   "openai_compatible",
+		maxBody:    maxJSONBodyBytes,
+		streamIdle: defaultStreamIdle,
+		streamWall: defaultStreamWall,
 	}
-	return &OpenAICompatibleAdapter{
-		baseURL:  baseURL,
-		apiKey:   apiKey,
-		provider: "openai_compatible",
-		client: &http.Client{
-			Timeout: timeout,
-		},
-		streamClient: streamClient,
+	a.timeout = timeout
+	a.rebuildClients(timeout)
+	return a
+}
+
+func (a *OpenAICompatibleAdapter) rebuildClients(timeout time.Duration) {
+	if timeout == 0 {
+		timeout = a.timeout
 	}
+	a.timeout = timeout
+	u, err := validateEndpointBaseURL(a.baseURL, a.allowPrivate)
+	if err != nil {
+		a.cfgErr = err
+		a.client = &http.Client{}
+		a.streamClient = &http.Client{}
+		return
+	}
+	a.cfgErr = nil
+	origin := originOf(u)
+	jsonTransport := endpointTransport(origin, a.allowPrivate, defaultResponseHeader)
+	streamTransport := endpointTransport(origin, a.allowPrivate, defaultStreamHeader)
+	// Streaming client has no overall Timeout: long-running SSE streams are
+	// bounded by response-header, idle and wall limits on the body instead.
+	a.client = &http.Client{
+		Timeout:       timeout,
+		Transport:     jsonTransport,
+		CheckRedirect: sameOriginRedirectPolicy,
+	}
+	a.streamClient = &http.Client{
+		Timeout:       0,
+		Transport:     streamTransport,
+		CheckRedirect: sameOriginRedirectPolicy,
+	}
+}
+
+// WithAllowPrivateEndpoint marks this endpoint's private/cleartext target as
+// explicitly approved by administrative configuration. A private URL alone is
+// not an access grant: the adapter refuses it until this is set.
+func (a *OpenAICompatibleAdapter) WithAllowPrivateEndpoint() *OpenAICompatibleAdapter {
+	a.allowPrivate = true
+	a.rebuildClients(0)
+	return a
+}
+
+// WithStreamLimits bounds streaming reads: idle is the max gap between reads,
+// wall the max lifetime of one stream. Zero disables a limit.
+func (a *OpenAICompatibleAdapter) WithStreamLimits(idle, wall time.Duration) *OpenAICompatibleAdapter {
+	a.streamIdle = idle
+	a.streamWall = wall
+	return a
 }
 
 func (a *OpenAICompatibleAdapter) WithProviderName(provider string) *OpenAICompatibleAdapter {
@@ -99,16 +151,30 @@ func (a *OpenAICompatibleAdapter) DoResponsesStream(ctx context.Context, method,
 }
 
 func (a *OpenAICompatibleAdapter) DoPassthroughRequest(ctx context.Context, method, path string, body []byte, headers http.Header) (PassthroughResponse, error) {
+	if a.cfgErr != nil {
+		return PassthroughResponse{}, fmt.Errorf("endpoint not approved: %w", a.cfgErr)
+	}
 	client := a.client
-	if passthroughStreamClientSelected(path, headers, body) {
+	streaming := passthroughStreamClientSelected(path, headers, body)
+	if streaming {
 		client = a.streamClient
 	}
-	return doPassthroughHTTP(ctx, client, a.baseURL, a.apiKey, method, path, body, headers)
+	resp, err := doPassthroughHTTP(ctx, client, a.baseURL, a.apiKey, method, path, body, headers)
+	if err != nil {
+		return PassthroughResponse{}, err
+	}
+	if streaming {
+		resp.Body = newBoundedStreamBody(resp.Body, a.streamIdle, a.streamWall)
+	}
+	return resp, nil
 }
 
 func (a *OpenAICompatibleAdapter) doStream(ctx context.Context, method, path string, body []byte) (io.ReadCloser, error) {
+	if a.cfgErr != nil {
+		return nil, fmt.Errorf("endpoint not approved: %w", a.cfgErr)
+	}
 	requestURL := a.baseURL + path
-	req, err := http.NewRequestWithContext(ctx, method, requestURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, requestURL, noRetryBody(body))
 	if err != nil {
 		return nil, fmt.Errorf("build stream request: %w", err)
 	}
@@ -121,22 +187,18 @@ func (a *OpenAICompatibleAdapter) doStream(ctx context.Context, method, path str
 		return nil, fmt.Errorf("upstream chat stream request failed: %w", err)
 	}
 	if resp.StatusCode >= 300 {
-		defer func() {
-			_ = resp.Body.Close()
-		}()
-		upstreamBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+		upstreamBody, _ := readBoundedBody(resp.Body, maxErrorBodyBytes)
 		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: upstreamBody}
 	}
-	return resp.Body, nil
+	return newBoundedStreamBody(resp.Body, a.streamIdle, a.streamWall), nil
 }
 
 func (a *OpenAICompatibleAdapter) doJSON(ctx context.Context, method, path string, body []byte) ([]byte, error) {
-	url := a.baseURL + path
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
+	if a.cfgErr != nil {
+		return nil, fmt.Errorf("endpoint not approved: %w", a.cfgErr)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, url, reader)
+	url := a.baseURL + path
+	req, err := http.NewRequestWithContext(ctx, method, url, noRetryBody(body))
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
@@ -149,13 +211,14 @@ func (a *OpenAICompatibleAdapter) doJSON(ctx context.Context, method, path strin
 	if err != nil {
 		return nil, fmt.Errorf("upstream request failed: %w", err)
 	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
+	limit := a.maxBody
+	if resp.StatusCode >= 300 {
+		limit = maxErrorBodyBytes
+	}
+	respBody, err := readBoundedBody(resp.Body, limit)
 	if err != nil {
-		return nil, fmt.Errorf("read upstream response: %w", err)
+		return nil, err
 	}
 	if resp.StatusCode >= 300 {
 		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: respBody}
@@ -169,11 +232,7 @@ func doPassthroughHTTP(ctx context.Context, client *http.Client, baseURL, apiKey
 	if err != nil {
 		return PassthroughResponse{}, fmt.Errorf("build passthrough request: %w", err)
 	}
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, requestURL.String(), reader)
+	req, err := http.NewRequestWithContext(ctx, method, requestURL.String(), noRetryBody(body))
 	if err != nil {
 		return PassthroughResponse{}, fmt.Errorf("build passthrough request: %w", err)
 	}
