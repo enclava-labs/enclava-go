@@ -6,6 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -210,5 +213,58 @@ func TestCheckedBudgetAdd(t *testing.T) {
 					tt.a, tt.b, got, ok, tt.want, tt.ok)
 			}
 		})
+	}
+}
+func TestDashboardBudgetShowsHeldSettledAndRemaining(t *testing.T) {
+	f := newBudgetFixture(t)
+	ctx := context.Background()
+	keyID := "dashboard-key"
+	subject := billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: keyID}
+	now := time.Now().UTC()
+	if err := f.repo.PutPrice(ctx, f.tenant, "dashboard-price", billing.Price{
+		SubjectType: billing.PriceSubjectModel, SubjectID: "dashboard-model", Capability: "chat",
+		Unit: billing.UnitInput, RateMicros: 1, UnitQuantity: 1, Currency: "USD",
+	}, "tester", now); err != nil {
+		t.Fatalf("put price: %v", err)
+	}
+	if err := f.repo.CreateBudget(ctx, f.tenant, "dashboard-budget", billing.Budget{
+		Name: "dashboard", Subject: subject, Kind: billing.BudgetKindAmount, Period: billing.PeriodMonthly,
+		LimitAmountMicros: 100, Currency: "USD", StartsAt: now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("create budget: %v", err)
+	}
+	principal := keyPrincipal(f.tenant, keyID)
+	principal.CredentialKind = auth.CredentialKindAPIKey
+	principal.CredentialID = keyID
+	service := billing.NewService(f.repo)
+	reservation, err := service.Reserve(ctx, principal, billing.ReserveRequest{
+		SubjectKeys: []billing.Subject{subject}, BillingSubject: subject, Capability: "chat",
+		Model: "dashboard-model", EndpointID: "dashboard-endpoint",
+		Estimate: billing.Usage{InputUnits: 40},
+		Price:    billing.PriceKey{SubjectType: billing.PriceSubjectModel, SubjectID: "dashboard-model"},
+	})
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	render := func() string {
+		req := httptest.NewRequest(http.MethodGet, "/dashboard/partials/budgets", nil)
+		req = req.WithContext(auth.WithPrincipal(req.Context(), principal))
+		rec := httptest.NewRecorder()
+		f.app.handleDashboardBudgets(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("budget dashboard returned %d: %s", rec.Code, rec.Body.String())
+		}
+		return rec.Body.String()
+	}
+	held := render()
+	if !strings.Contains(held, "USD 0.000040") || !strings.Contains(held, "USD 0.000100") || !strings.Contains(held, "USD 0.000060") {
+		t.Fatalf("held liability or remaining allowance not rendered: %s", held)
+	}
+	if _, err := service.Settle(ctx, principal, reservation.ID, billing.Usage{InputUnits: 30}); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	settled := render()
+	if !strings.Contains(settled, "USD 0.000030") || !strings.Contains(settled, "USD 0.000070") {
+		t.Fatalf("settled liability or remaining allowance not rendered: %s", settled)
 	}
 }
