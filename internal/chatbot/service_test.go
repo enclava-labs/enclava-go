@@ -116,7 +116,7 @@ func TestCreateChatCompletionInjectsRAGAndPersistsConversation(t *testing.T) {
 		t.Fatalf("create chatbot: %v", err)
 	}
 
-	out, err := svc.CreateChatCompletion(ctx, Access{APIKeyID: keyID}, "support_bot", []byte(`{
+	out, err := svc.CreateChatCompletion(ctx, Access{APIKeyID: keyID, AllowedModelsAll: true, AllowedChatbotsAll: true, AllowedAgentsAll: true}, "support_bot", []byte(`{
 		"model": "client-model-ignored",
 		"messages": [{"role":"user","content":"What does the launch note say?"}],
 		"metadata": {"variables": {"audience": "operators"}}
@@ -221,7 +221,7 @@ func TestPrepareChatCompletionSupportsStreamingAndRecordCompletion(t *testing.T)
 		t.Fatalf("create chatbot: %v", err)
 	}
 
-	prepared, err := svc.PrepareChatCompletion(ctx, Access{APIKeyID: keyID}, "streaming_bot", []byte(`{
+	prepared, err := svc.PrepareChatCompletion(ctx, Access{APIKeyID: keyID, AllowedModelsAll: true, AllowedChatbotsAll: true, AllowedAgentsAll: true}, "streaming_bot", []byte(`{
 		"model": "ignored-client-model",
 		"stream": false,
 		"messages": [{"role":"user","content":"Stream this answer."}]
@@ -302,7 +302,7 @@ func TestCreateChatCompletionProviderFailureRecordsUsage(t *testing.T) {
 		t.Fatalf("create chatbot: %v", err)
 	}
 
-	_, err = svc.CreateChatCompletion(ctx, Access{APIKeyID: keyID}, "failure_bot", []byte(`{
+	_, err = svc.CreateChatCompletion(ctx, Access{APIKeyID: keyID, AllowedModelsAll: true, AllowedChatbotsAll: true, AllowedAgentsAll: true}, "failure_bot", []byte(`{
 		"messages": [{"role":"user","content":"will fail"}]
 	}`))
 	if err == nil {
@@ -361,8 +361,9 @@ func TestPrepareChatCompletionEnforcesAllowedChatbots(t *testing.T) {
 		t.Fatalf("expected ErrChatbotNotAllowed, got %v", err)
 	}
 	if _, err := svc.PrepareChatCompletion(ctx, Access{
-		APIKeyID:        keyID,
-		AllowedChatbots: map[string]struct{}{bot.ExternalID: {}},
+		APIKeyID:         keyID,
+		AllowedChatbots:  map[string]struct{}{bot.ExternalID: {}},
+		AllowedModelsAll: true,
 	}, "allowed_bot", body, false); err != nil {
 		t.Fatalf("expected external id to be allowed: %v", err)
 	}
@@ -373,8 +374,9 @@ func TestPrepareChatCompletionEnforcesAllowedChatbots(t *testing.T) {
 		t.Fatalf("expected ErrChatbotNotAllowed for disallowed agent, got %v", err)
 	}
 	if _, err := svc.PrepareChatCompletion(ctx, Access{
-		APIKeyID:      keyID,
-		AllowedAgents: map[string]struct{}{bot.ID: {}},
+		APIKeyID:         keyID,
+		AllowedAgents:    map[string]struct{}{bot.ID: {}},
+		AllowedModelsAll: true,
 	}, "allowed_bot", body, false); err != nil {
 		t.Fatalf("expected agent allowlist to accept chatbot id: %v", err)
 	}
@@ -416,7 +418,7 @@ func TestResumeConversationRequiresSameAPIKey(t *testing.T) {
 		t.Fatalf("create chatbot: %v", err)
 	}
 
-	started, err := svc.PrepareChatCompletion(ctx, Access{APIKeyID: keyA}, "resume_bot", resumeBody(t, "", "first"), false)
+	started, err := svc.PrepareChatCompletion(ctx, Access{APIKeyID: keyA, AllowedModelsAll: true, AllowedChatbotsAll: true, AllowedAgentsAll: true}, "resume_bot", resumeBody(t, "", "first"), false)
 	if err != nil {
 		t.Fatalf("start conversation: %v", err)
 	}
@@ -425,7 +427,7 @@ func TestResumeConversationRequiresSameAPIKey(t *testing.T) {
 	}
 	conversationID := started.Conversation.ID
 
-	if _, err := svc.PrepareChatCompletion(ctx, Access{APIKeyID: keyB}, "resume_bot", resumeBody(t, conversationID, "intrude"), false); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := svc.PrepareChatCompletion(ctx, Access{APIKeyID: keyB, AllowedModelsAll: true, AllowedChatbotsAll: true, AllowedAgentsAll: true}, "resume_bot", resumeBody(t, conversationID, "intrude"), false); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("expected sql.ErrNoRows for other key, got %v", err)
 	}
 	messages, err := chatRepo.ListMessages(ctx, conversationID)
@@ -436,7 +438,7 @@ func TestResumeConversationRequiresSameAPIKey(t *testing.T) {
 		t.Fatalf("other key inserted a message: %#v", messages)
 	}
 
-	resumed, err := svc.PrepareChatCompletion(ctx, Access{APIKeyID: keyA}, "resume_bot", resumeBody(t, conversationID, "owner again"), false)
+	resumed, err := svc.PrepareChatCompletion(ctx, Access{APIKeyID: keyA, AllowedModelsAll: true, AllowedChatbotsAll: true, AllowedAgentsAll: true}, "resume_bot", resumeBody(t, conversationID, "owner again"), false)
 	if err != nil {
 		t.Fatalf("owner resume: %v", err)
 	}
@@ -451,7 +453,7 @@ func TestResumeConversationRequiresSameAPIKey(t *testing.T) {
 		t.Fatalf("unexpected messages after owner resume: %#v", messages)
 	}
 
-	if _, err := svc.PrepareChatCompletion(ctx, Access{APIKeyID: adminKey, IsAdmin: true}, "resume_bot", resumeBody(t, conversationID, "admin"), false); err != nil {
+	if _, err := svc.PrepareChatCompletion(ctx, Access{APIKeyID: adminKey, IsAdmin: true, AllowedModelsAll: true, AllowedChatbotsAll: true, AllowedAgentsAll: true}, "resume_bot", resumeBody(t, conversationID, "admin"), false); err != nil {
 		t.Fatalf("admin resume: %v", err)
 	}
 	messages, err = chatRepo.ListMessages(ctx, conversationID)
@@ -470,7 +472,7 @@ func TestResumeConversationRequiresSameAPIKey(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create legacy conversation: %v", err)
 	}
-	if _, err := svc.PrepareChatCompletion(ctx, Access{APIKeyID: keyA}, "resume_bot", resumeBody(t, legacyID, "hidden"), false); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := svc.PrepareChatCompletion(ctx, Access{APIKeyID: keyA, AllowedModelsAll: true, AllowedChatbotsAll: true, AllowedAgentsAll: true}, "resume_bot", resumeBody(t, legacyID, "hidden"), false); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("expected sql.ErrNoRows for nil owner, got %v", err)
 	}
 	legacyMessages, err := chatRepo.ListMessages(ctx, legacyID)
@@ -480,7 +482,7 @@ func TestResumeConversationRequiresSameAPIKey(t *testing.T) {
 	if len(legacyMessages) != 0 {
 		t.Fatalf("nil owner was visible to a non-admin key: %#v", legacyMessages)
 	}
-	if _, err := svc.PrepareChatCompletion(ctx, Access{APIKeyID: adminKey, IsAdmin: true}, "resume_bot", resumeBody(t, legacyID, "admin sees legacy"), false); err != nil {
+	if _, err := svc.PrepareChatCompletion(ctx, Access{APIKeyID: adminKey, IsAdmin: true, AllowedModelsAll: true, AllowedChatbotsAll: true, AllowedAgentsAll: true}, "resume_bot", resumeBody(t, legacyID, "admin sees legacy"), false); err != nil {
 		t.Fatalf("admin resume of nil owner: %v", err)
 	}
 }
@@ -512,7 +514,7 @@ func TestRetrieveRAGUsesBotAttachmentAccess(t *testing.T) {
 		t.Fatalf("create chatbot: %v", err)
 	}
 	body := []byte(`{"messages":[{"role":"user","content":"where is the collection?"}]}`)
-	_, err = svc.PrepareChatCompletion(ctx, Access{APIKeyID: keyID}, "rag_bot", body, false)
+	_, err = svc.PrepareChatCompletion(ctx, Access{APIKeyID: keyID, AllowedModelsAll: true, AllowedChatbotsAll: true, AllowedAgentsAll: true}, "rag_bot", body, false)
 	if !errors.Is(err, ErrCollectionNotFound) {
 		t.Fatalf("expected ErrCollectionNotFound, got %v", err)
 	}
@@ -524,7 +526,7 @@ func TestRetrieveRAGUsesBotAttachmentAccess(t *testing.T) {
 	}
 
 	searcher.err = errors.New("qdrant down http://qdrant.internal/secret-collection")
-	_, err = svc.PrepareChatCompletion(ctx, Access{APIKeyID: keyID}, "rag_bot", body, false)
+	_, err = svc.PrepareChatCompletion(ctx, Access{APIKeyID: keyID, AllowedModelsAll: true, AllowedChatbotsAll: true, AllowedAgentsAll: true}, "rag_bot", body, false)
 	if errors.Is(err, ErrCollectionNotFound) || errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("infrastructure RAG error was rewritten: %v", err)
 	}

@@ -105,7 +105,7 @@ func TestExternalChatbotCompletionHidesServiceErrors(t *testing.T) {
 		t.Fatalf("create plain chatbot: %v", err)
 	}
 	app := &App{chatbotSvc: chatSvc, provider: provider}
-	principal := auth.Principal{APIKeyID: keyID}
+	principal := auth.Principal{APIKeyID: keyID, AllowedModelsAll: true, AllowedChatbotsAll: true}
 
 	valid := `{"messages":[{"role":"user","content":"hello"}]}`
 	stream := `{"stream":true,"messages":[{"role":"user","content":"hello"}]}`
@@ -296,8 +296,8 @@ func TestChatbotAndPromptReadsHonorAllowlist(t *testing.T) {
 	app := &App{chatbotSvc: chatSvc, promptSvc: promptSvc}
 	byExternal := auth.Principal{AllowedChatbots: map[string]struct{}{"allowed_ext": {}}}
 	byInternal := auth.Principal{AllowedChatbots: map[string]struct{}{hiddenBot.ID: {}}}
-	allowAll := auth.Principal{AllowedChatbots: map[string]struct{}{"*": {}}}
-	open := auth.Principal{}
+	allowAll := auth.Principal{AllowedChatbotsAll: true}
+	open := auth.Principal{AllowedChatbotsAll: true}
 
 	if got := listChatbotIDs(t, app, byExternal); !sameIDs(got, []string{allowedBot.ID}) {
 		t.Fatalf("external allowlist chatbots = %#v", got)

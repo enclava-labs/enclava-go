@@ -166,9 +166,11 @@ func TestMigrateImportDryRunAndRealImport(t *testing.T) {
 
 	chatbotSvc := chatbot.NewService(sqlite.NewChatbotRepo(db.SQL), sqlite.NewPromptTemplatesRepo(db.SQL), ragSvc, provider, sqlite.NewUsageRepo(db.SQL))
 	chatOut, err := chatbotSvc.CreateChatCompletion(ctx, chatbot.Access{
-		APIKeyID:        principal.APIKeyID,
-		AllowedModels:   principal.AllowedModels,
-		AllowedChatbots: principal.AllowedChatbots,
+		APIKeyID:           principal.APIKeyID,
+		AllowedModels:      principal.AllowedModels,
+		AllowedChatbots:    principal.AllowedChatbots,
+		AllowedModelsAll:   principal.AllowedModelsAll,
+		AllowedChatbotsAll: principal.AllowedChatbotsAll,
 	}, "migrated_bot", []byte(`{"model":"client-model","messages":[{"role":"user","content":"Use migrated context"}]}`))
 	if err != nil {
 		t.Fatalf("call imported chatbot: %v", err)

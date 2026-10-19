@@ -1,90 +1,66 @@
 package auth
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
-type Principal struct {
-	APIKeyID                int64
-	Name                    string
-	Scopes                  map[string]struct{}
-	AllowedModels           map[string]struct{}
-	AllowedExtractTemplates map[string]struct{}
-	AllowedChatbots         map[string]struct{}
-	AllowedAgents           map[string]struct{}
-	AllowedEndpoints        map[string]struct{}
-	AllowedIPs              map[string]struct{}
-	RateLimitPerMinute      *int
-	RateLimitPerHour        *int
-	RateLimitPerDay         *int
-	IsUnlimited             bool
-	BudgetLimitTokens       *int64
-	BudgetLimitCents        *int64
-	BudgetPeriod            string
-	RawAPIKeyPrefix         string
+// Session is a server-revocable authenticated session record.
+type Session struct {
+	ID        string
+	TenantID  string
+	ActorID   string
+	UserID    string
+	TokenHash string
+	CreatedAt time.Time
+	ExpiresAt time.Time
+	RevokedAt *time.Time
 }
 
-type contextKey string
-
-const principalContextKey contextKey = "principal"
-
-func WithPrincipal(ctx context.Context, principal Principal) context.Context {
-	return context.WithValue(ctx, principalContextKey, principal)
+// Identity is a tenant-scoped user or service-account actor.
+type Identity struct {
+	ID        string
+	TenantID  string
+	ActorID   string
+	Kind      ActorKind
+	CreatedAt time.Time
+	RevokedAt *time.Time
 }
 
-func PrincipalFromContext(ctx context.Context) (Principal, bool) {
-	p, ok := ctx.Value(principalContextKey).(Principal)
-	return p, ok
+// Delegation records that DelegatedByActorID authorized ActorID's authority
+// to be exercised under a derived principal.
+type Delegation struct {
+	ID                 string
+	TenantID           string
+	ActorID            string
+	DelegatedByActorID string
+	CreatedAt          time.Time
+	RevokedAt          *time.Time
 }
 
-func HasScope(p Principal, scope string) bool {
-	if _, ok := p.Scopes["*"]; ok {
-		return true
-	}
-	_, ok := p.Scopes[scope]
-	return ok
+// Tenant-scoped repository seams. APIKeyRepository is intentionally not
+// redeclared here — it stays in service.go until 01-08 moves and reshapes it.
+// The pre-auth session token-hash lookup is the narrow documented exception
+// to tenant scoping; all other reads are tenant-scoped.
+type SessionRepository interface {
+	// FindByTokenHash is the pre-authentication exception: verify the stored
+	// actor, expiry and revocation before accepting the row's tenant.
+	FindByTokenHash(ctx context.Context, tokenHash string) (Session, error)
+	Get(ctx context.Context, tenantID, id string) (Session, error)
+	Create(ctx context.Context, s Session) error
+	Revoke(ctx context.Context, tenantID, id string, at time.Time) error
 }
 
-func ModelAllowed(p Principal, model string) bool {
-	if len(p.AllowedModels) == 0 {
-		return true
-	}
-	_, ok := p.AllowedModels[model]
-	return ok
+type IdentityRepository interface {
+	Get(ctx context.Context, tenantID, actorID string) (Identity, error)
+	List(ctx context.Context, tenantID string) ([]Identity, error)
+	Create(ctx context.Context, identity Identity) error
+	Revoke(ctx context.Context, tenantID, actorID string, at time.Time) error
 }
 
-func ExtractTemplateAllowed(p Principal, templateID string) bool {
-	if len(p.AllowedExtractTemplates) == 0 {
-		return true
-	}
-	_, ok := p.AllowedExtractTemplates[templateID]
-	return ok
-}
-
-func ChatbotAllowed(p Principal, chatbotIDs ...string) bool {
-	if len(p.AllowedChatbots) == 0 {
-		return true
-	}
-	if _, ok := p.AllowedChatbots["*"]; ok {
-		return true
-	}
-	for _, id := range chatbotIDs {
-		if _, ok := p.AllowedChatbots[id]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-func AgentAllowed(p Principal, agentIDs ...string) bool {
-	if len(p.AllowedAgents) == 0 {
-		return true
-	}
-	if _, ok := p.AllowedAgents["*"]; ok {
-		return true
-	}
-	for _, id := range agentIDs {
-		if _, ok := p.AllowedAgents[id]; ok {
-			return true
-		}
-	}
-	return false
+type DelegationRepository interface {
+	Get(ctx context.Context, tenantID, id string) (Delegation, error)
+	ListForActor(ctx context.Context, tenantID, actorID string) ([]Delegation, error)
+	Create(ctx context.Context, d Delegation) error
+	Revoke(ctx context.Context, tenantID, id string, at time.Time) error
 }
