@@ -125,20 +125,19 @@ type dashboardIdentityData struct {
 }
 
 type dashboardBudgetRow struct {
-	APIKeyName   string
-	BudgetLimit  string
-	BudgetPeriod string
-	UsedDisplay  string
-	Remaining    string
-	Units        string
-	Status       string
+	Subject string
+	Window string
+	Limit string
+	Held string
+	Unknown string
+	Settled string
+	Remaining string
 }
 
 type dashboardBudgetsData struct {
-	Rows       []dashboardBudgetRow
-	TotalUsed  string
-	TotalLimit string
+	Rows []dashboardBudgetRow
 }
+
 
 type dashboardExtractData struct {
 	RecentJobs int64
@@ -332,7 +331,6 @@ func (a *App) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var recentExtractJobs int64
-	var totalExtractJobs int64
 	if a.extractSvc != nil {
 		p, ok := auth.PrincipalFromContext(r.Context())
 		if !ok || p.TenantID == "" {
@@ -340,7 +338,7 @@ func (a *App) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		since := time.Now().UTC().Add(-24 * time.Hour)
-		recentExtractJobs, totalExtractJobs, err = a.extractSvc.JobStats(r.Context(), p, since)
+		recentExtractJobs, _, err = a.extractSvc.JobStats(r.Context(), p, since)
 		if err != nil {
 			log.Printf("failed to load dashboard extract job stats: %v", err)
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_stats_extract_failed")
