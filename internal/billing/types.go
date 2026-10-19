@@ -87,13 +87,17 @@ type Subject struct {
 }
 
 // Budget is an enforceable limit. Amount budgets bind a currency and reject
-// incompatible reservations.
+// incompatible reservations. StartsAt/EndsAt bound applicability; Period
+// selects the rolling liability window.
 type Budget struct {
+	ID                string
 	Subject           Subject
 	Kind              string // BudgetKind* const set
 	Period            string // Period* const set
 	LimitAmountMicros int64
 	Currency          string
+	StartsAt          time.Time
+	EndsAt            *time.Time
 }
 
 // Reservation states. Unknown upstream outcomes retain their hold.
@@ -107,6 +111,8 @@ const (
 // Reservation is an atomic pre-attempt hold. LimitAmountMicros is the checked
 // ceiling bound over all units; reserved per-kind unit quantities are kept in
 // Units because token liability cannot be reconstructed from money.
+// Capability/Model/EndpointID record what the hold was priced for so settle
+// writes truthful usage evidence; DispatchedAt gates ReleaseUndispatched.
 type Reservation struct {
 	TenantID          string
 	ID                string
@@ -114,9 +120,35 @@ type Reservation struct {
 	State             string // Reservation* const set
 	Price             PriceSnapshot
 	LimitAmountMicros int64
+	Currency          string
 	Units             map[UnitKind]int64
+	Capability        string
+	Model             string
+	EndpointID        string
+	JobID             string
+	AttemptID         string
+	DispatchedAt      *time.Time
 	CreatedAt         time.Time
 	SettledAt         *time.Time
+}
+
+// UsageRecord is the immutable settlement evidence for a settled reservation
+// — raw per-kind units, the exact amount charged under the snapshot, and the
+// dispatch context recorded at reserve time.
+type UsageRecord struct {
+	TenantID      string
+	ID            string
+	ReservationID string
+	Subject       Subject
+	Capability    string
+	Model         string
+	EndpointID    string
+	Units         map[UnitKind]int64
+	AmountMicros  int64
+	Currency      string
+	Price         PriceSnapshot
+	Outcome       string // completed|unknown|not_dispatched
+	CreatedAt     time.Time
 }
 
 // Usage is raw reported per-kind usage — never clipped. CachedInputUnits is a
@@ -133,8 +165,10 @@ type Usage struct {
 }
 
 var (
-	ErrBudgetExceeded     = errors.New("billing: budget exceeded")
-	ErrPriceMissing       = errors.New("billing: required price missing")
-	ErrCurrencyMismatch   = errors.New("billing: mixed-currency price set")
-	ErrArithmeticOverflow = errors.New("billing: arithmetic overflow")
+	ErrBudgetExceeded      = errors.New("billing: budget exceeded")
+	ErrPriceMissing        = errors.New("billing: required price missing")
+	ErrCurrencyMismatch    = errors.New("billing: mixed-currency price set")
+	ErrArithmeticOverflow  = errors.New("billing: arithmetic overflow")
+	ErrReservationNotFound = errors.New("billing: reservation not found")
+	ErrReservationState    = errors.New("billing: reservation state forbids transition")
 )
