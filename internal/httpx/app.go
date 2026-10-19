@@ -19,7 +19,6 @@ import (
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
 	"enclava-go/internal/store/postgres"
-	"enclava-go/internal/store/sqlite"
 )
 
 type App struct {
@@ -33,8 +32,6 @@ type App struct {
 	promptSvc    *prompts.Service
 	chatbotSvc   *chatbot.Service
 	connectorSvc *connectors.Service
-	// Kept through the final SQLite backend removal in 01-36.
-	usageRepo    *sqlite.UsageRepo
 	billingSvc   *billing.Service
 	billingRepo  *postgres.BillingRepo
 	endpoints    *postgres.EndpointsRepo
@@ -79,7 +76,6 @@ func NewApp(
 	promptSvc *prompts.Service,
 	chatbotSvc *chatbot.Service,
 	connectorSvc *connectors.Service,
-	usageRepo *sqlite.UsageRepo,
 	billingSvc *billing.Service,
 	billingRepo *postgres.BillingRepo,
 	endpoints *postgres.EndpointsRepo,
@@ -108,7 +104,6 @@ func NewApp(
 		promptSvc:    promptSvc,
 		chatbotSvc:   chatbotSvc,
 		connectorSvc: connectorSvc,
-		usageRepo:    usageRepo,
 		billingSvc:   billingSvc,
 		billingRepo:  billingRepo,
 		endpoints:    endpoints,

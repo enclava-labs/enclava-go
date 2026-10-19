@@ -97,7 +97,7 @@ func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 		nil, nil, // prober, identity
 		extractService,
 		nil, nil, nil, nil,
-		nil, nil, nil, nil,
+		nil, nil, nil,
 		"sha256", "", "enc_",
 		nil, nil,
 		5, false, nil, nil, httpx.GateConfig{}, nil, nil,

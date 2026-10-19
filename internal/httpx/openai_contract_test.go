@@ -143,7 +143,7 @@ func newOpenAIContractFixture(t *testing.T) *openaiFx {
 		t.Fatalf("new inference service: %v", err)
 	}
 	authSvc := auth.NewService(repo, "")
-	app := NewApp(authSvc, nil, "", nil, repo, nil, nil, nil, nil, nil, nil, nil, brepo, erepo,
+	app := NewApp(authSvc, nil, "", nil, repo, nil, nil, nil, nil, nil, nil, brepo, erepo,
 		"sha256", "", "enc_", nil, nil, 1, false, svc, postgres.NewResponseBindingsRepo(db), GateConfig{}, srepo, arepo)
 	fx := &openaiFx{t: t, db: db, tenant: tenant, app: app, up: up, brepo: brepo, erepo: erepo}
 	fx.keyID = key
@@ -464,7 +464,7 @@ func TestOfficialSDKInProcessContract(t *testing.T) {
 		t.Fatalf("new inference service: %v", err)
 	}
 	app := NewApp(auth.NewService(postgres.NewIdentityRepo(f.db), ""), nil, "", nil, postgres.NewIdentityRepo(f.db),
-		nil, nil, nil, nil, nil, nil, nil, f.brepo, f.erepo,
+		nil, nil, nil, nil, nil, nil, f.brepo, f.erepo,
 		"sha256", "", "enc_", nil, nil, 1, false, svc, postgres.NewResponseBindingsRepo(f.db), GateConfig{},
 		postgres.NewSourceRepo(f.db), postgres.NewArtifactRepo(f.db))
 	server := httptest.NewServer(app.Handler())
