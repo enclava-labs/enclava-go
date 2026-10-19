@@ -3,32 +3,63 @@ package rag
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"enclava-go/internal/artifacts"
+	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
+	"enclava-go/internal/jobs"
 	"enclava-go/internal/llm"
-	"enclava-go/internal/store/sqlite"
+	"enclava-go/internal/source"
 )
 
+// OperationEmbed is the durable job operation that indexes one immutable
+// object version: parse → chunk → embed → stage chunks + publish generation.
+const OperationEmbed = "rag.embed"
+
+// Repository is the tenant-scoped persistence boundary for rag.Service over
+// the canonical source/object/version/domain schema. Implemented by
+// postgres.RAGRepo. The embedded SourceRepository is the shared authorizer
+// seam; rag additions cover knowledge collections, items, chunk profiles,
+// chunks and index generations.
 type Repository interface {
-	CreateCollection(ctx context.Context, c sqlite.RAGCollection) error
-	ListCollections(ctx context.Context) ([]sqlite.RAGCollection, error)
-	GetCollection(ctx context.Context, id string) (sqlite.RAGCollection, error)
-	UpdateCollection(ctx context.Context, c sqlite.RAGCollection) error
-	DeleteCollection(ctx context.Context, id string) error
-	ListDocuments(ctx context.Context, collectionID string, limit, offset int) ([]sqlite.RAGDocument, error)
-	GetDocument(ctx context.Context, id string) (sqlite.RAGDocument, error)
-	CreateDocument(ctx context.Context, doc sqlite.RAGDocument, blob []byte, chunks []sqlite.RAGDocumentChunk) error
-	ListDocumentsBySource(ctx context.Context, collectionID, sourceType, sourceID string) ([]sqlite.RAGDocument, error)
-	ReplaceSourceDocument(ctx context.Context, doc sqlite.RAGDocument, blob []byte, chunks []sqlite.RAGDocumentChunk, deleteIDs []string) error
-	ReplaceDocumentProcessing(ctx context.Context, doc sqlite.RAGDocument, chunks []sqlite.RAGDocumentChunk) error
-	GetDocumentBlob(ctx context.Context, documentID string) ([]byte, error)
-	ListDocumentChunks(ctx context.Context, documentID string) ([]sqlite.RAGDocumentChunk, error)
-	DeleteDocument(ctx context.Context, id string) error
+	source.SourceRepository
+
+	// Collections.
+	InsertCollection(ctx context.Context, c Collection) error
+	ListCollections(ctx context.Context, tenantID string) ([]Collection, error)
+	GetCollection(ctx context.Context, tenantID, id string) (Collection, error)
+	UpdateCollection(ctx context.Context, c Collection) error
+	DeleteCollection(ctx context.Context, tenantID, id string) error
+	// EnsureChunkProfile returns the immutable chunk_profiles row for
+	// (tenant, profileID, size, overlap), inserting version N+1 when the
+	// (size, overlap) pair changed.
+	EnsureChunkProfile(ctx context.Context, tenantID, profileID string, size, overlap int) (chunkProfileVersionID string, err error)
+
+	// Collection items and document projection (latest version + latest
+	// index generation state).
+	AddCollectionItem(ctx context.Context, tenantID, collectionID, objectID, addedBy string) error
+	RemoveCollectionItem(ctx context.Context, tenantID, collectionID, objectID string) error
+	ListCollectionItems(ctx context.Context, tenantID, collectionID string) ([]string, error)
+	ListDocuments(ctx context.Context, tenantID, collectionID string, limit, offset int) ([]Document, error)
+	GetDocument(ctx context.Context, tenantID, objectID string) (Document, error)
+	DeleteObjectRows(ctx context.Context, tenantID, objectID string) error
+
+	// Index generations + chunks (single transactional publish boundary).
+	// ReplaceVersionChunksAndStage deletes any prior chunk rows for the
+	// version, inserts the new chunk set and upserts the (collection,
+	// object_version, generation) row in 'staging' state — atomically.
+	ReplaceVersionChunksAndStage(ctx context.Context, tenantID, collectionID, objectID, versionID string, seq, generation int64, profileVersionID string, chunks []DocumentChunk) error
+	MarkGenerationState(ctx context.Context, tenantID, collectionID, versionID string, generation int64, state string) error
+	NextGeneration(ctx context.Context, tenantID, collectionID, versionID string) (int64, error)
+	ChunkCountForVersion(ctx context.Context, tenantID, versionID string) (int, error)
+	ListChunks(ctx context.Context, tenantID, objectID, versionID string) ([]DocumentChunk, error)
 }
 
 type VectorStore interface {
@@ -39,27 +70,22 @@ type VectorStore interface {
 	Search(ctx context.Context, collection string, vector []float64, limit int, filter map[string]any) ([]QdrantSearchPoint, error)
 }
 
-type Access struct {
-	APIKeyID int64
-	IsAdmin  bool
-}
-
-// SpendGuard is an optional budget check and usage recorder for embedding calls.
-// A nil guard skips both. apiKeyID 0 is not checked or recorded.
-type SpendGuard interface {
-	Before(ctx context.Context, apiKeyID int64) error
-	RecordEmbedding(ctx context.Context, apiKeyID int64, model string, promptTokens, totalTokens int) error
-}
-
 type Service struct {
 	repo                  Repository
 	vectorStore           VectorStore
 	provider              llm.Provider
 	defaultEmbeddingModel string
-	spendGuard            SpendGuard
+	artifacts             *artifacts.Store
+	jobs                  *jobs.Service
+	billing               *billing.Service
+	authorizer            *source.Authorizer
+	maxUploadMB           int64
 }
 
-func NewService(repo Repository, vectorStore VectorStore, provider llm.Provider, defaultEmbeddingModel string) *Service {
+// NewService builds the ported rag.Service. artifactStore, jobSvc and
+// billingSvc may be nil only in narrow unit tests — durable ingest and
+// priced embeddings require them.
+func NewService(repo Repository, vectorStore VectorStore, provider llm.Provider, defaultEmbeddingModel string, artifactStore *artifacts.Store, jobSvc *jobs.Service, billingSvc *billing.Service) *Service {
 	if strings.TrimSpace(defaultEmbeddingModel) == "" {
 		defaultEmbeddingModel = "nomic-embed-text"
 	}
@@ -68,87 +94,111 @@ func NewService(repo Repository, vectorStore VectorStore, provider llm.Provider,
 		vectorStore:           vectorStore,
 		provider:              provider,
 		defaultEmbeddingModel: defaultEmbeddingModel,
+		artifacts:             artifactStore,
+		jobs:                  jobSvc,
+		billing:               billingSvc,
+		authorizer:            source.NewAuthorizer(repo, 0),
+		maxUploadMB:           512,
 	}
 }
 
-func (s *Service) SetSpendGuard(guard SpendGuard) {
-	s.spendGuard = guard
+func requireTenant(p auth.Principal) error {
+	if strings.TrimSpace(p.TenantID) == "" {
+		return fmt.Errorf("%w: principal tenant is required", source.ErrDenied)
+	}
+	return nil
 }
 
-func (s *Service) CreateCollection(ctx context.Context, access Access, input CreateCollectionInput) (sqlite.RAGCollection, error) {
+// ---------------------------------------------------------------------
+// Collections
+
+func (s *Service) CreateCollection(ctx context.Context, p auth.Principal, input CreateCollectionInput) (Collection, error) {
+	if err := requireTenant(p); err != nil {
+		return Collection{}, err
+	}
 	name := strings.TrimSpace(input.Name)
 	if name == "" {
-		return sqlite.RAGCollection{}, errors.New("name is required")
+		return Collection{}, errors.New("name is required")
 	}
 	chunkSize, chunkOverlap, err := normalizeChunkSettings(input.ChunkSize, input.ChunkOverlap)
 	if err != nil {
-		return sqlite.RAGCollection{}, err
+		return Collection{}, err
 	}
 	embeddingModel := strings.TrimSpace(input.EmbeddingModel)
 	if embeddingModel == "" {
 		embeddingModel = s.defaultEmbeddingModel
 	}
 	id := newID("ragcol")
-	c := sqlite.RAGCollection{
+	profileVersionID, err := s.repo.EnsureChunkProfile(ctx, p.TenantID, "rag-"+id, chunkSize, chunkOverlap)
+	if err != nil {
+		return Collection{}, err
+	}
+	_ = profileVersionID
+	c := Collection{
+		TenantID:         p.TenantID,
 		ID:               id,
 		Name:             name,
 		Description:      strings.TrimSpace(input.Description),
+		OwnerActorID:     p.ActorID,
 		QdrantCollection: "rag_" + safeCollectionName(id),
 		EmbeddingModel:   embeddingModel,
 		ChunkSize:        chunkSize,
 		ChunkOverlap:     chunkOverlap,
 		ACL:              normalizeACL(input.ACL),
+		Audience:         collectionAudience(input.ACL),
 		Metadata:         nonNilMap(input.Metadata),
 		IsActive:         true,
 	}
-	if access.APIKeyID > 0 {
-		owner := access.APIKeyID
-		c.OwnerAPIKeyID = &owner
+	if err := s.repo.InsertCollection(ctx, c); err != nil {
+		return Collection{}, err
 	}
-	if err := s.repo.CreateCollection(ctx, c); err != nil {
-		return sqlite.RAGCollection{}, err
-	}
-	return s.repo.GetCollection(ctx, id)
+	return s.repo.GetCollection(ctx, p.TenantID, id)
 }
 
-func (s *Service) ListCollections(ctx context.Context, access Access) ([]sqlite.RAGCollection, error) {
-	collections, err := s.repo.ListCollections(ctx)
+func (s *Service) ListCollections(ctx context.Context, p auth.Principal) ([]Collection, error) {
+	if err := requireTenant(p); err != nil {
+		return nil, err
+	}
+	collections, err := s.repo.ListCollections(ctx, p.TenantID)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]sqlite.RAGCollection, 0, len(collections))
+	out := make([]Collection, 0, len(collections))
 	for _, c := range collections {
-		if collectionReadable(c, access) {
+		if collectionReadable(c, p) {
 			out = append(out, c)
 		}
 	}
 	return out, nil
 }
 
-func (s *Service) GetCollection(ctx context.Context, access Access, id string) (sqlite.RAGCollection, error) {
-	c, err := s.repo.GetCollection(ctx, id)
-	if err != nil {
-		return sqlite.RAGCollection{}, err
+func (s *Service) GetCollection(ctx context.Context, p auth.Principal, id string) (Collection, error) {
+	if err := requireTenant(p); err != nil {
+		return Collection{}, err
 	}
-	if !collectionReadable(c, access) {
-		return sqlite.RAGCollection{}, sql.ErrNoRows
+	c, err := s.repo.GetCollection(ctx, p.TenantID, strings.TrimSpace(id))
+	if err != nil {
+		return Collection{}, err
+	}
+	if !collectionReadable(c, p) {
+		return Collection{}, source.ErrDenied
 	}
 	return c, nil
 }
 
-func (s *Service) UpdateCollection(ctx context.Context, access Access, id string, input UpdateCollectionInput) (sqlite.RAGCollection, error) {
-	c, err := s.repo.GetCollection(ctx, id)
+func (s *Service) UpdateCollection(ctx context.Context, p auth.Principal, id string, input UpdateCollectionInput) (Collection, error) {
+	c, err := s.GetCollection(ctx, p, id)
 	if err != nil {
-		return sqlite.RAGCollection{}, err
+		return Collection{}, err
 	}
-	if !collectionManageable(c, access) {
-		return sqlite.RAGCollection{}, sql.ErrNoRows
+	if !collectionManageable(c, p) {
+		return Collection{}, source.ErrDenied
 	}
 	if input.Name != nil {
 		c.Name = strings.TrimSpace(*input.Name)
 	}
 	if c.Name == "" {
-		return sqlite.RAGCollection{}, errors.New("name is required")
+		return Collection{}, errors.New("name is required")
 	}
 	if input.Description != nil {
 		c.Description = strings.TrimSpace(*input.Description)
@@ -157,7 +207,7 @@ func (s *Service) UpdateCollection(ctx context.Context, access Access, id string
 		c.EmbeddingModel = strings.TrimSpace(*input.EmbeddingModel)
 	}
 	if c.EmbeddingModel == "" {
-		return sqlite.RAGCollection{}, errors.New("embedding_model is required")
+		return Collection{}, errors.New("embedding_model is required")
 	}
 	if input.ChunkSize != nil || input.ChunkOverlap != nil {
 		chunkSize := c.ChunkSize
@@ -170,13 +220,19 @@ func (s *Service) UpdateCollection(ctx context.Context, access Access, id string
 		}
 		chunkSize, chunkOverlap, err = normalizeChunkSettings(chunkSize, chunkOverlap)
 		if err != nil {
-			return sqlite.RAGCollection{}, err
+			return Collection{}, err
+		}
+		// A profile change creates a new immutable version row; published
+		// evidence is never silently re-chunked under a mutated profile.
+		if _, err := s.repo.EnsureChunkProfile(ctx, p.TenantID, "rag-"+c.ID, chunkSize, chunkOverlap); err != nil {
+			return Collection{}, err
 		}
 		c.ChunkSize = chunkSize
 		c.ChunkOverlap = chunkOverlap
 	}
 	if input.ACL != nil {
 		c.ACL = normalizeACL(input.ACL)
+		c.Audience = collectionAudience(input.ACL)
 	}
 	if input.Metadata != nil {
 		c.Metadata = input.Metadata
@@ -185,131 +241,179 @@ func (s *Service) UpdateCollection(ctx context.Context, access Access, id string
 		c.IsActive = *input.IsActive
 	}
 	if err := s.repo.UpdateCollection(ctx, c); err != nil {
-		return sqlite.RAGCollection{}, err
+		return Collection{}, err
 	}
-	return s.repo.GetCollection(ctx, id)
+	return s.repo.GetCollection(ctx, p.TenantID, id)
 }
 
-func (s *Service) DeleteCollection(ctx context.Context, access Access, id string) error {
-	c, err := s.repo.GetCollection(ctx, id)
+func (s *Service) DeleteCollection(ctx context.Context, p auth.Principal, id string) error {
+	c, err := s.GetCollection(ctx, p, id)
 	if err != nil {
 		return err
 	}
-	if !collectionManageable(c, access) {
-		return sql.ErrNoRows
+	if !collectionManageable(c, p) {
+		return source.ErrDenied
 	}
 	if s.vectorStore != nil {
 		if err := s.vectorStore.DeleteCollection(ctx, c.QdrantCollection); err != nil {
 			return err
 		}
 	}
-	return s.repo.DeleteCollection(ctx, id)
+	return s.repo.DeleteCollection(ctx, p.TenantID, c.ID)
 }
 
-func (s *Service) UploadDocument(ctx context.Context, access Access, collectionID string, input UploadDocumentInput) (UploadDocumentOutput, error) {
-	c, err := s.GetCollection(ctx, access, collectionID)
+// ---------------------------------------------------------------------
+// Documents
+
+func (s *Service) UploadDocument(ctx context.Context, p auth.Principal, collectionID string, input UploadDocumentInput) (UploadDocumentOutput, error) {
+	c, err := s.GetCollection(ctx, p, collectionID)
 	if err != nil {
 		return UploadDocumentOutput{}, err
 	}
-	if !collectionManageable(c, access) {
-		return UploadDocumentOutput{}, sql.ErrNoRows
+	if !collectionManageable(c, p) {
+		return UploadDocumentOutput{}, source.ErrDenied
 	}
-	return s.processNewDocument(ctx, c, input, access.APIKeyID)
+	return s.processNewDocument(ctx, p, c, input)
 }
 
-func (s *Service) ListDocuments(ctx context.Context, access Access, collectionID string, limit, offset int) ([]sqlite.RAGDocument, error) {
-	c, err := s.GetCollection(ctx, access, collectionID)
+func (s *Service) ListDocuments(ctx context.Context, p auth.Principal, collectionID string, limit, offset int) ([]Document, error) {
+	c, err := s.GetCollection(ctx, p, collectionID)
 	if err != nil {
 		return nil, err
 	}
-	return s.repo.ListDocuments(ctx, c.ID, limit, offset)
+	return s.repo.ListDocuments(ctx, p.TenantID, c.ID, limit, offset)
 }
 
-func (s *Service) DownloadDocument(ctx context.Context, access Access, documentID string) (sqlite.RAGDocument, []byte, error) {
-	doc, err := s.repo.GetDocument(ctx, documentID)
+func (s *Service) DownloadDocument(ctx context.Context, p auth.Principal, documentID string) (Document, []byte, error) {
+	doc, err := s.repo.GetDocument(ctx, p.TenantID, documentID)
 	if err != nil {
-		return sqlite.RAGDocument{}, nil, err
+		return Document{}, nil, err
 	}
-	if _, err := s.GetCollection(ctx, access, doc.CollectionID); err != nil {
-		return sqlite.RAGDocument{}, nil, err
-	}
-	blob, err := s.repo.GetDocumentBlob(ctx, doc.ID)
+	obj, err := s.repo.GetObject(ctx, p.TenantID, doc.ID)
 	if err != nil {
-		return sqlite.RAGDocument{}, nil, err
+		return Document{}, nil, err
+	}
+	if err := s.authorizer.CanRead(ctx, p, obj, source.ReadOptions{}); err != nil {
+		return Document{}, nil, err
+	}
+	if s.artifacts == nil {
+		return Document{}, nil, errors.New("artifact store is not configured")
+	}
+	rc, err := s.artifacts.Read(ctx, artifacts.Ref{TenantID: p.TenantID, ID: doc.ArtifactRef, Kind: artifacts.KindOriginal})
+	if err != nil {
+		return Document{}, nil, err
+	}
+	defer func() { _ = rc.Close() }()
+	blob, err := readAll(rc)
+	if err != nil {
+		return Document{}, nil, err
 	}
 	return doc, blob, nil
 }
 
-func (s *Service) DeleteDocument(ctx context.Context, access Access, documentID string) error {
-	doc, err := s.repo.GetDocument(ctx, documentID)
+func (s *Service) DeleteDocument(ctx context.Context, p auth.Principal, documentID string) error {
+	doc, err := s.repo.GetDocument(ctx, p.TenantID, documentID)
 	if err != nil {
 		return err
 	}
-	c, err := s.repo.GetCollection(ctx, doc.CollectionID)
+	c, err := s.repo.GetCollection(ctx, p.TenantID, doc.CollectionID)
 	if err != nil {
 		return err
 	}
-	if !collectionManageable(c, access) {
-		return sql.ErrNoRows
+	if !collectionManageable(c, p) {
+		return source.ErrDenied
 	}
 	if s.vectorStore != nil {
 		if err := s.vectorStore.DeleteDocumentPoints(ctx, c.QdrantCollection, doc.ID); err != nil {
 			return err
 		}
 	}
-	return s.repo.DeleteDocument(ctx, doc.ID)
+	// Tombstone first: reads block immediately; row cleanup follows.
+	if err := s.repo.TombstoneObject(ctx, p.TenantID, doc.ID); err != nil {
+		return err
+	}
+	return s.repo.DeleteObjectRows(ctx, p.TenantID, doc.ID)
 }
 
-func (s *Service) ReprocessDocument(ctx context.Context, access Access, documentID string) (UploadDocumentOutput, error) {
-	doc, blob, err := s.DownloadDocument(ctx, access, documentID)
+func (s *Service) ReprocessDocument(ctx context.Context, p auth.Principal, documentID string) (UploadDocumentOutput, error) {
+	doc, err := s.repo.GetDocument(ctx, p.TenantID, documentID)
 	if err != nil {
 		return UploadDocumentOutput{}, err
 	}
-	c, err := s.repo.GetCollection(ctx, doc.CollectionID)
+	c, err := s.repo.GetCollection(ctx, p.TenantID, doc.CollectionID)
 	if err != nil {
 		return UploadDocumentOutput{}, err
 	}
-	if !collectionManageable(c, access) {
-		return UploadDocumentOutput{}, sql.ErrNoRows
+	if !collectionManageable(c, p) {
+		return UploadDocumentOutput{}, source.ErrDenied
 	}
-	if s.vectorStore != nil {
-		if err := s.vectorStore.DeleteDocumentPoints(ctx, c.QdrantCollection, doc.ID); err != nil {
-			return UploadDocumentOutput{}, err
-		}
-	}
-	prepared, err := s.prepareDocumentContent(ctx, c, &doc, blob, access.APIKeyID)
+	obj, err := s.repo.GetObject(ctx, p.TenantID, doc.ID)
 	if err != nil {
 		return UploadDocumentOutput{}, err
 	}
-	if err := s.storePoints(ctx, c.QdrantCollection, prepared.points); err != nil {
+	if err := s.authorizer.CanRead(ctx, p, obj, source.ReadOptions{}); err != nil {
 		return UploadDocumentOutput{}, err
 	}
-	applyPreparedDocument(&doc, prepared)
-	chunks := prepared.chunks
-	if err := s.repo.ReplaceDocumentProcessing(ctx, doc, chunks); err != nil {
-		return UploadDocumentOutput{}, err
-	}
-	stored, err := s.repo.GetDocument(ctx, doc.ID)
+	// Reprocess re-runs the embed pipeline against the latest immutable
+	// version: the job idempotency key binds (object, seq, generation) so a
+	// replay returns the same job, and a NEW generation row fences a stale
+	// prior attempt from clobbering the fresh index.
+	gen, err := s.repo.NextGeneration(ctx, p.TenantID, c.ID, doc.ObjectVersionID)
 	if err != nil {
 		return UploadDocumentOutput{}, err
 	}
-	return UploadDocumentOutput{Document: stored, Chunks: chunks}, nil
+	if err := s.enqueueEmbed(ctx, p, c, obj.ID, doc.ObjectVersionID, doc.ObservedSeq, gen); err != nil {
+		return UploadDocumentOutput{}, err
+	}
+	return UploadDocumentOutput{Document: doc}, nil
 }
 
-func (s *Service) Search(ctx context.Context, access Access, input SearchInput) ([]SearchResult, error) {
+// Search resolves the caller's authorized object set BEFORE querying Qdrant:
+// the query itself is scoped, never post-filtered only.
+func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInput) ([]SearchResult, error) {
 	query := strings.TrimSpace(input.Query)
 	if query == "" {
 		return nil, errors.New("query is required")
 	}
-	c, err := s.GetCollection(ctx, access, strings.TrimSpace(input.CollectionID))
+	c, err := s.GetCollection(ctx, p, strings.TrimSpace(input.CollectionID))
 	if err != nil {
 		return nil, err
 	}
-	vectors, _, err := createEmbeddings(ctx, s.provider, c.EmbeddingModel, []string{query}, s.spendGuard, access.APIKeyID)
+	objectIDs, err := s.repo.ListCollectionItems(ctx, p.TenantID, c.ID)
 	if err != nil {
 		return nil, err
 	}
-	results, err := s.vectorStore.Search(ctx, c.QdrantCollection, vectors[0], input.Limit, input.Filter)
+	allowedVersions := []string{}
+	for _, oid := range objectIDs {
+		obj, err := s.repo.GetObject(ctx, p.TenantID, oid)
+		if err != nil {
+			continue // deleted/unknown objects deny identically
+		}
+		if err := s.authorizer.CanRead(ctx, p, obj, source.ReadOptions{}); err != nil {
+			continue
+		}
+		doc, err := s.repo.GetDocument(ctx, p.TenantID, oid)
+		if err != nil || doc.Status != DocumentStatusReady || doc.ObjectVersionID == "" {
+			continue
+		}
+		allowedVersions = append(allowedVersions, doc.ObjectVersionID)
+	}
+	if len(allowedVersions) == 0 {
+		return []SearchResult{}, nil
+	}
+	filter := map[string]any{
+		"must": []any{
+			map[string]any{"key": "object_version_id", "match": map[string]any{"any": allowedVersions}},
+		},
+	}
+	if len(input.Filter) > 0 {
+		filter["must"] = append(filter["must"].([]any), input.Filter)
+	}
+	vectors, _, err := s.embedText(ctx, p, c.EmbeddingModel, []string{query}, OperationEmbed+":query")
+	if err != nil {
+		return nil, err
+	}
+	results, err := s.vectorStore.Search(ctx, c.QdrantCollection, vectors[0], input.Limit, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -328,13 +432,19 @@ func (s *Service) Search(ctx context.Context, access Access, input SearchInput) 
 	return out, nil
 }
 
-func (s *Service) processNewDocument(ctx context.Context, c sqlite.RAGCollection, input UploadDocumentInput, apiKeyID int64) (UploadDocumentOutput, error) {
+// ---------------------------------------------------------------------
+// Ingest: durable artifact + object/version row + fenced embed job.
+
+func (s *Service) processNewDocument(ctx context.Context, p auth.Principal, c Collection, input UploadDocumentInput) (UploadDocumentOutput, error) {
 	input.FileName = strings.TrimSpace(filepath.Base(input.FileName))
 	if input.FileName == "." || input.FileName == "" {
 		return UploadDocumentOutput{}, errors.New("file_name is required")
 	}
 	if len(input.Bytes) == 0 {
 		return UploadDocumentOutput{}, errors.New("document is empty")
+	}
+	if s.artifacts == nil || s.jobs == nil {
+		return UploadDocumentOutput{}, errors.New("rag: durable ingest pipeline is not configured")
 	}
 	if strings.TrimSpace(input.MimeType) == "" {
 		input.MimeType = "application/octet-stream"
@@ -344,195 +454,373 @@ func (s *Service) processNewDocument(ctx context.Context, c sqlite.RAGCollection
 		sourceType = "upload"
 	}
 	sourceID := strings.TrimSpace(input.SourceID)
-	var existing []sqlite.RAGDocument
-	if sourceID != "" {
-		var err error
-		existing, err = s.repo.ListDocumentsBySource(ctx, c.ID, sourceType, sourceID)
-		if err != nil {
-			return UploadDocumentOutput{}, err
-		}
-	}
-	doc := sqlite.RAGDocument{
-		ID:           newID("ragdoc"),
-		CollectionID: c.ID,
-		SourceType:   sourceType,
-		SourceID:     sourceID,
-		SourceURI:    strings.TrimSpace(input.SourceURI),
-		FileName:     input.FileName,
-		MimeType:     strings.TrimSpace(input.MimeType),
-		Status:       DocumentStatusProcessing,
-		Metadata:     nonNilMap(input.Metadata),
-	}
-	if len(existing) > 0 {
-		doc.ID = existing[0].ID
-	}
-	failNew := func(cause error) (UploadDocumentOutput, error) {
-		if len(existing) > 0 {
-			return UploadDocumentOutput{}, cause
-		}
-		now := time.Now().UTC()
-		doc.Status = DocumentStatusFailed
-		doc.ErrorMessage = cause.Error()
-		doc.QdrantPointCount = 0
-		doc.ProcessedAt = &now
-		if createErr := s.repo.CreateDocument(ctx, doc, input.Bytes, nil); createErr != nil {
-			return UploadDocumentOutput{}, createErr
-		}
-		return UploadDocumentOutput{}, cause
+	if sourceID == "" {
+		sourceID = newID("upload")
 	}
 
-	prepared, err := s.prepareDocumentContent(ctx, c, &doc, input.Bytes, apiKeyID)
+	// Persist bytes BEFORE the object version row and the embed job exist.
+	w, ref, err := s.artifacts.Begin(ctx, artifacts.Meta{
+		Ref:      artifacts.Ref{TenantID: p.TenantID, Kind: artifacts.KindOriginal},
+		MimeType: input.MimeType,
+	}, 10*time.Minute, s.maxUploadMB*1024*1024)
 	if err != nil {
-		return failNew(err)
+		return UploadDocumentOutput{}, fmt.Errorf("begin document artifact: %w", err)
 	}
-	if len(prepared.points) == 0 || len(prepared.points[0].Vector) == 0 {
-		return failNew(errors.New("provider returned empty embedding"))
+	if _, err := w.Write(input.Bytes); err != nil {
+		_ = w.Abort(ctx)
+		return UploadDocumentOutput{}, fmt.Errorf("write document artifact: %w", err)
 	}
-	if err := s.vectorStore.EnsureCollection(ctx, c.QdrantCollection, len(prepared.points[0].Vector)); err != nil {
-		return failNew(err)
+	if err := w.Finalize(ctx); err != nil {
+		return UploadDocumentOutput{}, fmt.Errorf("finalize document artifact: %w", err)
 	}
-	if len(existing) > 0 {
-		for _, old := range existing {
-			if err := s.vectorStore.DeleteDocumentPoints(ctx, c.QdrantCollection, old.ID); err != nil {
-				return UploadDocumentOutput{}, err
-			}
-		}
-	}
-	if err := s.vectorStore.UpsertPoints(ctx, c.QdrantCollection, prepared.points); err != nil {
-		return failNew(err)
-	}
-	applyPreparedDocument(&doc, prepared)
-	if len(existing) > 0 {
-		deleteIDs := make([]string, 0, len(existing)-1)
-		for _, old := range existing[1:] {
-			deleteIDs = append(deleteIDs, old.ID)
-		}
-		if err := s.repo.ReplaceSourceDocument(ctx, doc, input.Bytes, prepared.chunks, deleteIDs); err != nil {
-			_ = s.vectorStore.DeleteDocumentPoints(ctx, c.QdrantCollection, doc.ID)
-			return UploadDocumentOutput{}, err
-		}
-	} else if err := s.repo.CreateDocument(ctx, doc, input.Bytes, prepared.chunks); err != nil {
-		if sourceID != "" {
-			_ = s.vectorStore.DeleteDocumentPoints(ctx, c.QdrantCollection, doc.ID)
-		}
-		return UploadDocumentOutput{}, err
-	}
-	stored, err := s.repo.GetDocument(ctx, doc.ID)
+	ref = w.Ref()
+
+	// Audience-mode object: the uploader plus the collection's audience can
+	// read; collection manage rights gate mutation.
+	audience := append([]string{p.ActorID}, c.Audience...)
+	obj, err := s.repo.UpsertObject(ctx, source.Object{
+		TenantID:          p.TenantID,
+		ID:                newID("ragdoc"),
+		Kind:              sourceType,
+		NativeID:          sourceID,
+		AuthorizationMode: source.AuthorizationAudience,
+		OwnerActorID:      p.ActorID,
+		Audience:          audience,
+		ObservedSeq:       0,
+	})
 	if err != nil {
 		return UploadDocumentOutput{}, err
 	}
-	return UploadDocumentOutput{Document: stored, Chunks: prepared.chunks}, nil
-}
 
-type preparedDocument struct {
-	chunks   []sqlite.RAGDocumentChunk
-	points   []QdrantPoint
-	textHash string
-}
-
-func (s *Service) prepareDocumentContent(ctx context.Context, c sqlite.RAGCollection, doc *sqlite.RAGDocument, blob []byte, apiKeyID int64) (preparedDocument, error) {
-	text, err := ExtractText(doc.FileName, doc.MimeType, blob)
+	sum := sha256.Sum256(input.Bytes)
+	prov, _ := json.Marshal(map[string]any{
+		"source_uri": strings.TrimSpace(input.SourceURI),
+		"metadata":   nonNilMap(input.Metadata),
+	})
+	ver := source.ObjectVersion{
+		ObjectID:         obj.ID,
+		ObservedSeq:      obj.ObservedSeq + 1,
+		ArtifactRef:      ref.ID,
+		SHA256:           hex.EncodeToString(sum[:]),
+		ByteSize:         int64(len(input.Bytes)),
+		MimeType:         input.MimeType,
+		OriginalFilename: input.FileName,
+		Provenance:       string(prov),
+	}
+	if err := s.repo.InsertObjectVersion(ctx, p.TenantID, ver); err != nil {
+		return UploadDocumentOutput{}, err
+	}
+	if err := s.repo.AddCollectionItem(ctx, p.TenantID, c.ID, obj.ID, p.ActorID); err != nil {
+		return UploadDocumentOutput{}, err
+	}
+	versionID := versionRowID(ver)
+	gen, err := s.repo.NextGeneration(ctx, p.TenantID, c.ID, versionID)
 	if err != nil {
-		return preparedDocument{}, err
+		return UploadDocumentOutput{}, err
+	}
+	if err := s.enqueueEmbed(ctx, p, c, obj.ID, versionID, ver.ObservedSeq, gen); err != nil {
+		return UploadDocumentOutput{}, err
+	}
+	doc, err := s.repo.GetDocument(ctx, p.TenantID, obj.ID)
+	if err != nil {
+		return UploadDocumentOutput{}, err
+	}
+	return UploadDocumentOutput{Document: doc, Chunks: []DocumentChunk{}}, nil
+}
+
+func versionRowID(ver source.ObjectVersion) string {
+	return fmt.Sprintf("%s#%d", ver.ObjectID, ver.ObservedSeq)
+}
+
+// enqueueEmbed stages the generation row and enqueues the fenced embed job.
+// The idempotency key binds (object, observed seq, generation) so replays of
+// the same version resolve to the same job and a reprocess (new generation)
+// is distinct work.
+func (s *Service) enqueueEmbed(ctx context.Context, p auth.Principal, c Collection, objectID, versionID string, seq, generation int64) error {
+	if err := s.repo.ReplaceVersionChunksAndStage(ctx, p.TenantID, c.ID, objectID, versionID, seq, generation, "" /* profile bound at attempt */, nil); err != nil {
+		return err
+	}
+	_, _, err := s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
+		TenantID:       p.TenantID,
+		Operation:      OperationEmbed,
+		IdempotencyKey: fmt.Sprintf("rag.embed:%s:%d:%d", objectID, seq, generation),
+		Subject: jobs.Subject{
+			ObjectID:         objectID,
+			ObservedRevision: seq,
+		},
+		InputRef: versionID,
+		Policy: map[string]any{
+			"collection_id":   c.ID,
+			"object_id":       objectID,
+			"observed_seq":    seq,
+			"generation":      generation,
+			"embedding_model": c.EmbeddingModel,
+			"chunk_size":      c.ChunkSize,
+			"chunk_overlap":   c.ChunkOverlap,
+		},
+	})
+	return err
+}
+
+// JobHandler is the jobs.Runner handler for OperationEmbed. The fenced
+// attempt: load frozen principal → re-check object/version auth →
+// MarkDispatched → embed → stage chunks + publish generation → settle. A
+// stale attempt can never overwrite a newer version's chunks or generation
+// because both the job fence and the generation number must still be the
+// latest.
+func (s *Service) JobHandler() jobs.HandlerFunc {
+	return func(ctx context.Context, claim *jobs.Claim, _ jobs.InputFunc) (string, error) {
+		return s.attemptEmbed(ctx, claim)
+	}
+}
+
+func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, error) {
+	job := claim.Job()
+	var p auth.Principal
+	if err := json.Unmarshal(job.PrincipalSnapshot, &p); err != nil {
+		return "", fmt.Errorf("decode frozen principal: %w", err)
+	}
+	objectID, _ := job.Policy["object_id"].(string)
+	collectionID, _ := job.Policy["collection_id"].(string)
+	seq := int64FromAny(job.Policy["observed_seq"])
+	generation := int64FromAny(job.Policy["generation"])
+
+	obj, err := s.repo.GetObject(ctx, job.TenantID, objectID)
+	if err != nil {
+		return "", err
+	}
+	if obj.DeletedAt != nil || obj.TombstonedAt != nil {
+		return "", errors.New("object deleted")
+	}
+	ver, err := s.repo.GetObjectVersion(ctx, job.TenantID, objectID, seq)
+	if err != nil {
+		return "", err
+	}
+	if err := s.authorizer.CanReadVersion(ctx, p, obj, ver, source.ReadOptions{}); err != nil {
+		return "", err
+	}
+	// Superseded-version fence: a newer version exists → this attempt must
+	// not write index state. Mark its staged generation superseded.
+	latest, err := s.repo.LatestObjectVersion(ctx, job.TenantID, objectID)
+	if err != nil {
+		return "", err
+	}
+	c, err := s.repo.GetCollection(ctx, job.TenantID, collectionID)
+	if err != nil {
+		return "", err
+	}
+	if latest.ObservedSeq != seq {
+		_ = s.repo.MarkGenerationState(ctx, job.TenantID, collectionID, versionRowID(ver), generation, "superseded")
+		return versionRowID(ver), nil // complete: nothing to index
+	}
+
+	rc, err := s.artifacts.Read(ctx, artifacts.Ref{TenantID: job.TenantID, ID: ver.ArtifactRef, Kind: artifacts.KindOriginal})
+	if err != nil {
+		return "", fmt.Errorf("read input artifact: %w", err)
+	}
+	defer func() { _ = rc.Close() }()
+	blob, err := readAll(rc)
+	if err != nil {
+		return "", fmt.Errorf("read artifact bytes: %w", err)
+	}
+	text, err := ExtractText(ver.OriginalFilename, ver.MimeType, blob)
+	if err != nil {
+		return "", err
 	}
 	chunkTexts := ChunkText(text, c.ChunkSize, c.ChunkOverlap)
 	if len(chunkTexts) == 0 {
-		return preparedDocument{}, errors.New("document has no extractable text")
+		return "", errors.New("document has no extractable text")
 	}
-	vectors, _, err := createEmbeddings(ctx, s.provider, c.EmbeddingModel, chunkTexts, s.spendGuard, apiKeyID)
+
+	if err := claim.MarkDispatched(ctx); err != nil {
+		return "", err
+	}
+
+	// Priced embedding attempt: Reserve → provider → Settle; unobserved
+	// outcomes MarkUnknown so liability is never silently dropped.
+	var resID string
+	if s.billing != nil {
+		estimate := billing.Usage{InputUnits: int64(tokenEstimate(text))}
+		res, rerr := s.billing.Reserve(ctx, p, billing.ReserveRequest{
+			Capability: OperationEmbed,
+			Model:      c.EmbeddingModel,
+			JobID:      job.ID,
+			AttemptID:  claim.AttemptID(),
+			Estimate:   estimate,
+			Price:      billing.PriceKey{SubjectType: billing.PriceSubjectModel, SubjectID: c.EmbeddingModel},
+		})
+		if rerr != nil {
+			return "", rerr
+		}
+		resID = res.ID
+	}
+	vectors, usage, err := createEmbeddings(ctx, s.provider, c.EmbeddingModel, chunkTexts)
 	if err != nil {
-		return preparedDocument{}, err
+		if resID != "" {
+			_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, resID)
+		}
+		return "", err
 	}
 	if len(vectors) == 0 || len(vectors[0]) == 0 {
-		return preparedDocument{}, errors.New("provider returned empty embedding")
+		if resID != "" {
+			_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, resID)
+		}
+		return "", errors.New("provider returned empty embedding")
 	}
-	chunks := make([]sqlite.RAGDocumentChunk, 0, len(chunkTexts))
+
+	chunks := make([]DocumentChunk, 0, len(chunkTexts))
 	points := make([]QdrantPoint, 0, len(chunkTexts))
+	var provMeta map[string]any
+	_ = json.Unmarshal([]byte(ver.Provenance), &provMeta)
+	docMetadata := mapFromPayload(provMeta, "metadata")
+	sourceURI := stringFromPayload(provMeta, "source_uri")
 	for i, chunkText := range chunkTexts {
 		chunkID := newID("ragchunk")
-		pointID := newPointID()
-		chunk := sqlite.RAGDocumentChunk{
+		chunks = append(chunks, DocumentChunk{
 			ID:            chunkID,
-			DocumentID:    doc.ID,
+			DocumentID:    obj.ID,
 			CollectionID:  c.ID,
 			ChunkIndex:    i,
 			Content:       chunkText,
 			TokenCount:    tokenEstimate(chunkText),
-			QdrantPointID: pointID,
-			Metadata: map[string]any{
-				"file_name": doc.FileName,
-			},
-		}
-		chunks = append(chunks, chunk)
+			QdrantPointID: chunkID,
+			Metadata:      map[string]any{"file_name": ver.OriginalFilename},
+		})
 		points = append(points, QdrantPoint{
-			ID:     pointID,
+			ID:     chunkID,
 			Vector: vectors[i],
 			Payload: map[string]any{
-				"collection_id": c.ID,
-				"document_id":   doc.ID,
-				"chunk_id":      chunkID,
-				"chunk_index":   i,
-				"content":       chunkText,
-				"file_name":     doc.FileName,
-				"source_type":   doc.SourceType,
-				"source_id":     doc.SourceID,
-				"metadata":      doc.Metadata,
+				"collection_id":     c.ID,
+				"document_id":       obj.ID,
+				"object_version_id": versionRowID(ver),
+				"observed_seq":      seq,
+				"generation":        generation,
+				"chunk_id":          chunkID,
+				"chunk_index":       i,
+				"content":           chunkText,
+				"file_name":         ver.OriginalFilename,
+				"source_type":       obj.Kind,
+				"source_id":         obj.NativeID,
+				"source_uri":        sourceURI,
+				"metadata":          docMetadata,
 			},
 		})
 	}
-	sum := sha256.Sum256([]byte(text))
-	return preparedDocument{
-		chunks:   chunks,
-		points:   points,
-		textHash: hex.EncodeToString(sum[:]),
-	}, nil
-}
 
-func (s *Service) storePoints(ctx context.Context, collection string, points []QdrantPoint) error {
-	if len(points) == 0 || len(points[0].Vector) == 0 {
-		return errors.New("provider returned empty embedding")
+	profileVersionID, err := s.repo.EnsureChunkProfile(ctx, job.TenantID, "rag-"+c.ID, c.ChunkSize, c.ChunkOverlap)
+	if err != nil {
+		return "", err
 	}
-	if err := s.vectorStore.EnsureCollection(ctx, collection, len(points[0].Vector)); err != nil {
-		return err
+	// Stage the generation: chunks + staging row commit atomically BEFORE
+	// any Qdrant write; a crash leaves a staging generation, never a doc
+	// claiming indexed state.
+	if err := s.repo.ReplaceVersionChunksAndStage(ctx, job.TenantID, c.ID, obj.ID, versionRowID(ver), seq, generation, profileVersionID, chunks); err != nil {
+		return "", err
 	}
-	return s.vectorStore.UpsertPoints(ctx, collection, points)
+	if err := s.vectorStore.EnsureCollection(ctx, c.QdrantCollection, len(vectors[0])); err != nil {
+		return "", err
+	}
+	if err := s.vectorStore.UpsertPoints(ctx, c.QdrantCollection, points); err != nil {
+		return "", err
+	}
+	// Publish only after the durable chunks and index writes exist.
+	if err := s.repo.MarkGenerationState(ctx, job.TenantID, c.ID, versionRowID(ver), generation, "published"); err != nil {
+		return "", err
+	}
+	if resID != "" {
+		if _, err := s.billing.Settle(ctx, p, resID, billing.Usage{InputUnits: int64(usage.Usage.PromptTokens), OutputUnits: 0}); err != nil {
+			_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, resID)
+			return "", fmt.Errorf("settle reservation: %w", err)
+		}
+	}
+	return versionRowID(ver), nil
 }
 
-func applyPreparedDocument(doc *sqlite.RAGDocument, prepared preparedDocument) {
-	now := time.Now().UTC()
-	doc.TextHash = prepared.textHash
-	doc.Status = DocumentStatusReady
-	doc.QdrantPointCount = len(prepared.points)
-	doc.ErrorMessage = ""
-	doc.ProcessedAt = &now
+// embedText runs a priced embedding call for ad-hoc query text. Billing is
+// optional (nil-safe) so narrow unit tests can run without a billing repo.
+func (s *Service) embedText(ctx context.Context, p auth.Principal, model string, inputs []string, capability string) ([][]float64, embeddingResponse, error) {
+	if s.billing == nil {
+		return createEmbeddings(ctx, s.provider, model, inputs)
+	}
+	total := int64(0)
+	for _, in := range inputs {
+		total += int64(tokenEstimate(in))
+	}
+	res, err := s.billing.Reserve(ctx, p, billing.ReserveRequest{
+		Capability: capability,
+		Model:      model,
+		Estimate:   billing.Usage{InputUnits: total},
+		Price:      billing.PriceKey{SubjectType: billing.PriceSubjectModel, SubjectID: model},
+	})
+	if err != nil {
+		return nil, embeddingResponse{}, err
+	}
+	vectors, usage, err := createEmbeddings(ctx, s.provider, model, inputs)
+	if err != nil {
+		_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, res.ID)
+		return nil, embeddingResponse{}, err
+	}
+	if _, err := s.billing.Settle(ctx, p, res.ID, billing.Usage{InputUnits: int64(usage.Usage.PromptTokens)}); err != nil {
+		_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, res.ID)
+		return nil, embeddingResponse{}, err
+	}
+	return vectors, usage, nil
 }
 
-func collectionReadable(c sqlite.RAGCollection, access Access) bool {
-	if access.IsAdmin {
+// ---------------------------------------------------------------------
+// Authorization helpers: no Access struct — the principal drives reads and
+// mutations. Admin authority comes from the platform.admin scope, never a
+// forged flag.
+
+func collectionReadable(c Collection, p auth.Principal) bool {
+	if auth.HasScope(p, "platform.admin") {
 		return true
 	}
 	if !c.IsActive {
 		return false
 	}
-	if c.OwnerAPIKeyID != nil && *c.OwnerAPIKeyID == access.APIKeyID {
+	if c.OwnerActorID != "" && c.OwnerActorID == p.ActorID {
 		return true
 	}
-	if boolACL(c.ACL, "public") {
-		return true
-	}
-	for _, id := range int64ListACL(c.ACL, "api_key_ids") {
-		if id == access.APIKeyID {
+	for _, aud := range c.Audience {
+		if aud == "*" || aud == p.ActorID {
 			return true
 		}
 	}
 	return false
 }
 
-func collectionManageable(c sqlite.RAGCollection, access Access) bool {
-	if access.IsAdmin {
+func collectionManageable(c Collection, p auth.Principal) bool {
+	if auth.HasScope(p, "platform.admin") {
 		return true
 	}
-	return c.OwnerAPIKeyID != nil && *c.OwnerAPIKeyID == access.APIKeyID
+	return c.OwnerActorID != "" && c.OwnerActorID == p.ActorID
+}
+
+// collectionAudience maps the wire-stable ACL map onto the stored audience
+// list: "public" grants tenant-wide read ("*"); "audience" entries are actor
+// IDs verbatim.
+func collectionAudience(acl map[string]any) []string {
+	out := []string{}
+	if acl == nil {
+		return out
+	}
+	if boolACL(acl, "public") {
+		out = append(out, "*")
+	}
+	if raw, ok := acl["audience"]; ok {
+		switch vals := raw.(type) {
+		case []string:
+			out = append(out, vals...)
+		case []any:
+			for _, v := range vals {
+				if s, ok := v.(string); ok && s != "" {
+					out = append(out, s)
+				}
+			}
+		}
+	}
+	return out
 }
 
 func normalizeChunkSettings(chunkSize, chunkOverlap int) (int, int, error) {
@@ -558,13 +846,10 @@ func safeCollectionName(id string) string {
 
 func normalizeACL(acl map[string]any) map[string]any {
 	if acl == nil {
-		return map[string]any{"public": false, "api_key_ids": []int64{}}
+		return map[string]any{"public": false, "audience": []string{}}
 	}
 	if _, ok := acl["public"]; !ok {
 		acl["public"] = false
-	}
-	if _, ok := acl["api_key_ids"]; !ok {
-		acl["api_key_ids"] = []int64{}
 	}
 	return acl
 }
@@ -583,44 +868,6 @@ func boolACL(acl map[string]any, key string) bool {
 	}
 	b, ok := v.(bool)
 	return ok && b
-}
-
-func int64ListACL(acl map[string]any, key string) []int64 {
-	raw, ok := acl[key]
-	if !ok {
-		return nil
-	}
-	switch values := raw.(type) {
-	case []int64:
-		return values
-	case []int:
-		out := make([]int64, 0, len(values))
-		for _, v := range values {
-			out = append(out, int64(v))
-		}
-		return out
-	case []float64:
-		out := make([]int64, 0, len(values))
-		for _, v := range values {
-			out = append(out, int64(v))
-		}
-		return out
-	case []any:
-		out := make([]int64, 0, len(values))
-		for _, item := range values {
-			switch v := item.(type) {
-			case float64:
-				out = append(out, int64(v))
-			case int64:
-				out = append(out, v)
-			case int:
-				out = append(out, int64(v))
-			}
-		}
-		return out
-	default:
-		return nil
-	}
 }
 
 func stringFromPayload(payload map[string]any, key string) string {

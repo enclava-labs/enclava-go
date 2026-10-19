@@ -1,18 +1,22 @@
-package rag
+package rag_test
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
-	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"enclava-go/internal/artifacts"
+	"enclava-go/internal/auth"
+	"enclava-go/internal/jobs"
 	"enclava-go/internal/llm"
-	"enclava-go/internal/store/sqlite"
+	"enclava-go/internal/rag"
+	"enclava-go/internal/source"
+	"enclava-go/internal/store/postgres"
+	"enclava-go/internal/testdb"
 )
 
 type fakeEmbeddingProvider struct{}
@@ -46,7 +50,8 @@ func (f fakeEmbeddingProvider) CreateEmbeddings(ctx context.Context, body []byte
 		inputs = append(inputs, v)
 	case []any:
 		for _, item := range v {
-			inputs = append(inputs, item.(string))
+			s, _ := item.(string)
+			inputs = append(inputs, s)
 		}
 	}
 	data := make([]map[string]any, 0, len(inputs))
@@ -64,11 +69,11 @@ func (f fakeEmbeddingProvider) CreateEmbeddings(ctx context.Context, body []byte
 }
 
 type fakeVectorStore struct {
-	points map[string][]QdrantPoint
+	points map[string][]rag.QdrantPoint
 }
 
 func newFakeVectorStore() *fakeVectorStore {
-	return &fakeVectorStore{points: map[string][]QdrantPoint{}}
+	return &fakeVectorStore{points: map[string][]rag.QdrantPoint{}}
 }
 
 func (f *fakeVectorStore) EnsureCollection(ctx context.Context, collection string, vectorSize int) error {
@@ -78,13 +83,13 @@ func (f *fakeVectorStore) EnsureCollection(ctx context.Context, collection strin
 	return nil
 }
 
-func (f *fakeVectorStore) UpsertPoints(ctx context.Context, collection string, points []QdrantPoint) error {
+func (f *fakeVectorStore) UpsertPoints(ctx context.Context, collection string, points []rag.QdrantPoint) error {
 	f.points[collection] = append(f.points[collection], points...)
 	return nil
 }
 
 func (f *fakeVectorStore) DeleteDocumentPoints(ctx context.Context, collection, documentID string) error {
-	kept := []QdrantPoint{}
+	kept := []rag.QdrantPoint{}
 	for _, point := range f.points[collection] {
 		if point.Payload["document_id"] != documentID {
 			kept = append(kept, point)
@@ -99,10 +104,35 @@ func (f *fakeVectorStore) DeleteCollection(ctx context.Context, collection strin
 	return nil
 }
 
-func (f *fakeVectorStore) Search(ctx context.Context, collection string, vector []float64, limit int, filter map[string]any) ([]QdrantSearchPoint, error) {
-	out := []QdrantSearchPoint{}
+// Search honours the authorization-scoped filter the service passes —
+// points for non-authorized version ids never match.
+func (f *fakeVectorStore) Search(ctx context.Context, collection string, vector []float64, limit int, filter map[string]any) ([]rag.QdrantSearchPoint, error) {
+	allowed := map[string]bool{}
+	if filter != nil {
+		if must, ok := filter["must"].([]any); ok {
+			for _, clause := range must {
+				m, ok := clause.(map[string]any)
+				if !ok {
+					continue
+				}
+				if m["key"] == "object_version_id" {
+					if match, ok := m["match"].(map[string]any); ok {
+						if anyList, ok := match["any"].([]string); ok {
+							for _, v := range anyList {
+								allowed[v] = true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	out := []rag.QdrantSearchPoint{}
 	for _, point := range f.points[collection] {
-		out = append(out, QdrantSearchPoint{ID: point.ID, Score: 0.99, Payload: point.Payload})
+		if len(allowed) > 0 && !allowed[point.Payload["object_version_id"].(string)] {
+			continue
+		}
+		out = append(out, rag.QdrantSearchPoint{ID: point.ID, Score: 0.99, Payload: point.Payload})
 		if len(out) == limit {
 			break
 		}
@@ -110,28 +140,100 @@ func (f *fakeVectorStore) Search(ctx context.Context, collection string, vector 
 	return out, nil
 }
 
-func TestServiceUploadSearchAndDelete(t *testing.T) {
-	ctx := context.Background()
-	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "rag.db"))
+type fixture struct {
+	db        *postgres.DB
+	svc       *rag.Service
+	repo      *postgres.RAGRepo
+	jobs      *jobs.Service
+	store     *artifacts.Store
+	vector    *fakeVectorStore
+	tenant    string
+	principal auth.Principal
+}
+
+func newFixture(t *testing.T) *fixture {
+	t.Helper()
+	db := testdb.New(t)
+	tenant := testdb.SeedTenant(t, db, "rag")
+	user := testdb.SeedUser(t, db, tenant, "rag-owner@example.test", nil)
+	jobsRepo := postgres.NewJobsRepo(db)
+	jobsSvc := jobs.NewService(jobsRepo, 0)
+	artifactRepo := postgres.NewArtifactRepo(db)
+	store, err := artifacts.NewStore(t.TempDir(), t.TempDir(), artifactRepo)
 	if err != nil {
-		t.Fatalf("open db: %v", err)
+		t.Fatalf("artifact store: %v", err)
 	}
-	defer func() { _ = db.Close() }()
+	vector := newFakeVectorStore()
+	repo := postgres.NewRAGRepo(db)
+	svc := rag.NewService(repo, vector, fakeEmbeddingProvider{}, "embed-test", store, jobsSvc, nil)
+	p := auth.Principal{
+		TenantID:       tenant,
+		ActorID:        user.ID,
+		ActorKind:      auth.ActorKindUser,
+		UserID:         user.ID,
+		CredentialID:   "key_test",
+		CredentialKind: auth.CredentialKindAPIKey,
+	}
+	return &fixture{db: db, svc: svc, repo: repo, jobs: jobsSvc, store: store, vector: vector, tenant: tenant, principal: p}
+}
 
-	vectorStore := newFakeVectorStore()
-	svc := NewService(sqlite.NewRAGRepo(db.SQL), vectorStore, fakeEmbeddingProvider{}, "embed-test")
-	access := Access{APIKeyID: createTestAPIKey(t, ctx, db)}
-
-	collection, err := svc.CreateCollection(ctx, access, CreateCollectionInput{
+func (f *fixture) collection(t *testing.T) rag.Collection {
+	t.Helper()
+	c, err := f.svc.CreateCollection(context.Background(), f.principal, rag.CreateCollectionInput{
 		Name:         "Docs",
 		ChunkSize:    100,
 		ChunkOverlap: 10,
+		ACL:          map[string]any{"public": true},
 	})
 	if err != nil {
 		t.Fatalf("create collection: %v", err)
 	}
+	return c
+}
 
-	upload, err := svc.UploadDocument(ctx, access, collection.ID, UploadDocumentInput{
+// runNextJob leases the next queued job, invokes the registered embed
+// handler and completes it — the real worker path under the fenced lease.
+func (f *fixture) runNextJob(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	claim, err := f.jobs.Lease(ctx, "test-worker", time.Minute)
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if claim == nil {
+		t.Fatal("no job to lease")
+	}
+	resultRef, err := f.svc.JobHandler()(ctx, claim, nil)
+	if err != nil {
+		_ = claim.Fail(ctx, err, jobs.FailureFatal)
+		t.Fatalf("embed attempt: %v", err)
+	}
+	if _, err := claim.Complete(ctx, resultRef); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+}
+
+func (f *fixture) docStatus(t *testing.T, collectionID, docID string) rag.Document {
+	t.Helper()
+	docs, err := f.svc.ListDocuments(context.Background(), f.principal, collectionID, 100, 0)
+	if err != nil {
+		t.Fatalf("list documents: %v", err)
+	}
+	for _, d := range docs {
+		if d.ID == docID {
+			return d
+		}
+	}
+	t.Fatalf("document %s not listed", docID)
+	return rag.Document{}
+}
+
+func TestServiceUploadIndexSearchDelete(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+
+	upload, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
 		FileName: "note.txt",
 		MimeType: "text/plain",
 		Bytes:    []byte("enclava rag search content for integration testing"),
@@ -139,286 +241,94 @@ func TestServiceUploadSearchAndDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upload document: %v", err)
 	}
-	if upload.Document.Status != DocumentStatusReady {
-		t.Fatalf("expected ready document, got %s", upload.Document.Status)
+	if upload.Document.Status != rag.DocumentStatusProcessing {
+		t.Fatalf("expected processing before the embed job runs, got %s", upload.Document.Status)
 	}
-	if len(upload.Chunks) == 0 {
-		t.Fatalf("expected chunks")
+	f.runNextJob(t)
+	doc := f.docStatus(t, c.ID, upload.Document.ID)
+	if doc.Status != rag.DocumentStatusReady {
+		t.Fatalf("expected ready document after embed, got %s", doc.Status)
 	}
 
-	results, err := svc.Search(ctx, access, SearchInput{CollectionID: collection.ID, Query: "enclava search", Limit: 5})
+	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "enclava search", Limit: 5})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
 	if len(results) == 0 || results[0].DocumentID != upload.Document.ID {
 		t.Fatalf("unexpected search results: %#v", results)
 	}
-
-	if err := svc.DeleteDocument(ctx, access, upload.Document.ID); err != nil {
+	if _, blob, err := f.svc.DownloadDocument(ctx, f.principal, upload.Document.ID); err != nil || string(blob) == "" {
+		t.Fatalf("download: %v", err)
+	}
+	if err := f.svc.DeleteDocument(ctx, f.principal, upload.Document.ID); err != nil {
 		t.Fatalf("delete document: %v", err)
 	}
-	if got := len(vectorStore.points[collection.QdrantCollection]); got != 0 {
+	if got := len(f.vector.points[c.QdrantCollection]); got != 0 {
 		t.Fatalf("expected qdrant points removed, got %d", got)
 	}
 }
 
-func TestServicePrivateCollectionACL(t *testing.T) {
+func TestServiceTenantAndGrantDeny(t *testing.T) {
+	f := newFixture(t)
 	ctx := context.Background()
-	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "rag-acl.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	svc := NewService(sqlite.NewRAGRepo(db.SQL), newFakeVectorStore(), fakeEmbeddingProvider{}, "embed-test")
-	ownerID := createTestAPIKey(t, ctx, db)
-	otherID := createTestAPIKey(t, ctx, db)
-	collection, err := svc.CreateCollection(ctx, Access{APIKeyID: ownerID}, CreateCollectionInput{Name: "Private"})
-	if err != nil {
-		t.Fatalf("create collection: %v", err)
-	}
-	if _, err := svc.GetCollection(ctx, Access{APIKeyID: otherID}, collection.ID); err == nil {
-		t.Fatalf("expected private collection to be hidden from another api key")
-	}
-	if _, err := svc.GetCollection(ctx, Access{APIKeyID: otherID, IsAdmin: true}, collection.ID); err != nil {
-		t.Fatalf("expected admin access: %v", err)
-	}
-}
-
-type batchEmbeddingProvider struct {
-	fakeEmbeddingProvider
-	calls   [][]string
-	badCall int
-}
-
-func (p *batchEmbeddingProvider) CreateEmbeddings(ctx context.Context, body []byte) ([]byte, error) {
-	var payload struct {
-		Input []string `json:"input"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, err
-	}
-	p.calls = append(p.calls, append([]string(nil), payload.Input...))
-	if p.badCall > 0 && len(p.calls) == p.badCall {
-		return []byte(`{"data":[{"index":0,"embedding":[]}],"usage":{"prompt_tokens":1,"total_tokens":1}}`), nil
-	}
-	type item struct {
-		Index int
-		Text  string
-	}
-	items := make([]item, len(payload.Input))
-	for i, text := range payload.Input {
-		items[i] = item{Index: i, Text: text}
-	}
-	for i, j := 0, len(items)-1; i < j; i, j = i+1, j-1 {
-		items[i], items[j] = items[j], items[i]
-	}
-	data := make([]map[string]any, 0, len(items))
-	for _, it := range items {
-		var n int
-		if _, err := fmt.Sscanf(it.Text, "%d", &n); err != nil {
-			n = -1
-		}
-		data = append(data, map[string]any{
-			"index":     it.Index,
-			"embedding": []float64{float64(n), float64(len(it.Text))},
-		})
-	}
-	return json.Marshal(map[string]any{
-		"data": data,
-		"usage": map[string]any{
-			"prompt_tokens": len(payload.Input),
-			"total_tokens":  len(payload.Input) + 7,
-		},
-	})
-}
-
-type countingVectorStore struct {
-	*fakeVectorStore
-	upserts int
-}
-
-func (c *countingVectorStore) UpsertPoints(ctx context.Context, collection string, points []QdrantPoint) error {
-	c.upserts++
-	return c.fakeVectorStore.UpsertPoints(ctx, collection, points)
-}
-
-type recordingSpendGuard struct {
-	failOnBefore int
-	befores      int
-	records      []struct{ prompt, total int }
-}
-
-func (g *recordingSpendGuard) Before(ctx context.Context, apiKeyID int64) error {
-	g.befores++
-	if g.failOnBefore > 0 && g.befores == g.failOnBefore {
-		return errors.New("budget exceeded")
-	}
-	return nil
-}
-
-func (g *recordingSpendGuard) RecordEmbedding(ctx context.Context, apiKeyID int64, model string, promptTokens, totalTokens int) error {
-	if model == "" || apiKeyID == 0 {
-		return errors.New("missing usage identity")
-	}
-	g.records = append(g.records, struct{ prompt, total int }{promptTokens, totalTokens})
-	return nil
-}
-
-func TestEmbeddingBatchesPreserveOrderAndSkipQdrantOnFailure(t *testing.T) {
-	const chunks = 2049
-	const chunkSize = 100
-	text := repeatedNumberChunks(chunks, chunkSize)
-
-	t.Run("two calls preserve order", func(t *testing.T) {
-		ctx := context.Background()
-		svc, vectorStore, provider, guard, collection, access := newBatchService(t, ctx, 0, 0)
-		upload, err := svc.UploadDocument(ctx, access, collection.ID, UploadDocumentInput{
-			FileName: "batch.txt",
-			MimeType: "text/plain",
-			Bytes:    []byte(text),
-		})
-		if err != nil {
-			t.Fatalf("upload: %v", err)
-		}
-		if len(provider.calls) != 2 || len(provider.calls[0]) != maxEmbeddingInputs || len(provider.calls[1]) != 1 {
-			t.Fatalf("calls = %d parts, want 2048 and 1 (%d calls)", callSizes(provider.calls), len(provider.calls))
-		}
-		if provider.calls[0][0] != fmt.Sprintf("%0*d", chunkSize, 0) || provider.calls[1][0] != fmt.Sprintf("%0*d", chunkSize, chunks-1) {
-			t.Fatalf("batch edges = %q and %q", provider.calls[0][0], provider.calls[1][0])
-		}
-		if len(guard.records) != 2 || guard.befores != 2 {
-			t.Fatalf("guard befores=%d records=%v", guard.befores, guard.records)
-		}
-		if guard.records[0].prompt != maxEmbeddingInputs || guard.records[0].total != maxEmbeddingInputs+7 || guard.records[1].prompt != 1 || guard.records[1].total != 8 {
-			t.Fatalf("usage records = %#v", guard.records)
-		}
-		points := vectorStore.points[collection.QdrantCollection]
-		if vectorStore.upserts != 1 || len(points) != chunks || len(upload.Chunks) != chunks {
-			t.Fatalf("upserts=%d points=%d chunks=%d", vectorStore.upserts, len(points), len(upload.Chunks))
-		}
-		for _, point := range points {
-			content, _ := point.Payload["content"].(string)
-			var n int
-			if _, err := fmt.Sscanf(content, "%d", &n); err != nil {
-				t.Fatalf("parse chunk %q: %v", content, err)
-			}
-			if len(point.Vector) != 2 || point.Vector[0] != float64(n) || point.Vector[1] != float64(len(content)) {
-				t.Fatalf("order not preserved for %d: %#v", n, point.Vector)
-			}
-		}
-		before := guard.befores
-		if _, err := svc.Search(ctx, Access{IsAdmin: true}, SearchInput{CollectionID: collection.ID, Query: "0", Limit: 1}); err != nil {
-			t.Fatalf("unbilled search: %v", err)
-		}
-		if guard.befores != before {
-			t.Fatalf("api key 0 checked the guard: %d -> %d", before, guard.befores)
-		}
-	})
-
-	t.Run("bad second batch writes no points", func(t *testing.T) {
-		ctx := context.Background()
-		svc, vectorStore, provider, guard, collection, access := newBatchService(t, ctx, 2, 0)
-		_, err := svc.UploadDocument(ctx, access, collection.ID, UploadDocumentInput{
-			FileName: "batch.txt",
-			MimeType: "text/plain",
-			Bytes:    []byte(text),
-		})
-		if err == nil {
-			t.Fatal("expected bad second batch to fail")
-		}
-		if len(provider.calls) != 2 || vectorStore.upserts != 0 || len(vectorStore.points[collection.QdrantCollection]) != 0 {
-			t.Fatalf("calls=%d upserts=%d points=%d err=%v", len(provider.calls), vectorStore.upserts, len(vectorStore.points[collection.QdrantCollection]), err)
-		}
-		if len(guard.records) != 1 || guard.records[0].prompt != maxEmbeddingInputs {
-			t.Fatalf("earlier batch was not recorded: %#v", guard.records)
-		}
-	})
-
-	t.Run("budget failure skips later provider call", func(t *testing.T) {
-		ctx := context.Background()
-		svc, vectorStore, provider, guard, collection, access := newBatchService(t, ctx, 0, 2)
-		_, err := svc.UploadDocument(ctx, access, collection.ID, UploadDocumentInput{
-			FileName: "batch.txt",
-			MimeType: "text/plain",
-			Bytes:    []byte(text),
-		})
-		if err == nil || !strings.Contains(err.Error(), "budget exceeded") {
-			t.Fatalf("err=%v", err)
-		}
-		if len(provider.calls) != 1 || vectorStore.upserts != 0 || len(guard.records) != 1 {
-			t.Fatalf("calls=%d upserts=%d records=%d", len(provider.calls), vectorStore.upserts, len(guard.records))
-		}
-	})
-}
-
-func newBatchService(t *testing.T, ctx context.Context, badCall, failBefore int) (*Service, *countingVectorStore, *batchEmbeddingProvider, *recordingSpendGuard, sqlite.RAGCollection, Access) {
-	t.Helper()
-	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "rag-batch.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	vectorStore := &countingVectorStore{fakeVectorStore: newFakeVectorStore()}
-	provider := &batchEmbeddingProvider{badCall: badCall}
-	guard := &recordingSpendGuard{failOnBefore: failBefore}
-	svc := NewService(sqlite.NewRAGRepo(db.SQL), vectorStore, provider, "embed-test")
-	svc.SetSpendGuard(guard)
-	access := Access{APIKeyID: createTestAPIKey(t, ctx, db)}
-	collection, err := svc.CreateCollection(ctx, access, CreateCollectionInput{
-		Name:         "Batch",
+	c, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{
+		Name:         "Private",
 		ChunkSize:    100,
-		ChunkOverlap: 0,
+		ChunkOverlap: 10,
+		ACL:          map[string]any{"public": false},
 	})
 	if err != nil {
-		t.Fatalf("create collection: %v", err)
+		t.Fatalf("create private collection: %v", err)
 	}
-	return svc, vectorStore, provider, guard, collection, access
-}
-
-func repeatedNumberChunks(n, size int) string {
-	var b strings.Builder
-	b.Grow(n * size)
-	for i := 0; i < n; i++ {
-		fmt.Fprintf(&b, "%0*d", size, i)
+	upload, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "secret.txt",
+		MimeType: "text/plain",
+		Bytes:    []byte("private doc content phrase"),
+	})
+	if err != nil {
+		t.Fatalf("upload: %v", err)
 	}
-	return b.String()
-}
+	f.runNextJob(t)
 
-func callSizes(calls [][]string) []int {
-	out := make([]int, len(calls))
-	for i, call := range calls {
-		out[i] = len(call)
+	// A second tenant's principal must see nothing — deny, never leak.
+	otherTenant := testdb.SeedTenant(t, f.db, "other")
+	otherUser := testdb.SeedUser(t, f.db, otherTenant, "intruder@example.test", nil)
+	intruder := auth.Principal{TenantID: otherTenant, ActorID: otherUser.ID, ActorKind: auth.ActorKindUser, UserID: otherUser.ID}
+	if _, err := f.svc.GetCollection(ctx, intruder, c.ID); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("expected cross-tenant deny, got %v", err)
 	}
-	return out
+	results, err := f.svc.Search(ctx, intruder, rag.SearchInput{CollectionID: c.ID, Query: "private", Limit: 5})
+	if err == nil && len(results) != 0 {
+		t.Fatalf("expected cross-tenant search to return nothing, got %#v", results)
+	}
+	if _, _, err := f.svc.DownloadDocument(ctx, intruder, upload.Document.ID); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("expected cross-tenant download deny, got %v", err)
+	}
+
+	// Same tenant, non-owner, non-audience: collection hidden, document denied.
+	stranger := testdb.SeedUser(t, f.db, f.tenant, "stranger@example.test", nil)
+	sp := auth.Principal{TenantID: f.tenant, ActorID: stranger.ID, ActorKind: auth.ActorKindUser, UserID: stranger.ID}
+	if _, err := f.svc.GetCollection(ctx, sp, c.ID); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("expected same-tenant deny, got %v", err)
+	}
+	if _, _, err := f.svc.DownloadDocument(ctx, sp, upload.Document.ID); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("expected same-tenant document deny, got %v", err)
+	}
+
+	// platform.admin sees tenant resources through the scope, not a flag.
+	admin := auth.Principal{TenantID: f.tenant, ActorID: "admin_test", ActorKind: auth.ActorKindUser,
+		Scopes: map[string]struct{}{"platform.admin": {}}}
+	if _, err := f.svc.GetCollection(ctx, admin, c.ID); err != nil {
+		t.Fatalf("expected admin read, got %v", err)
+	}
 }
 
-type failReplaceRepo struct {
-	*sqlite.RAGRepo
-}
-
-func (f failReplaceRepo) ReplaceSourceDocument(ctx context.Context, doc sqlite.RAGDocument, blob []byte, chunks []sqlite.RAGDocumentChunk, deleteIDs []string) error {
-	return errors.New("sqlite down")
-}
-
-func TestUploadSourceIDReplacesDocument(t *testing.T) {
+func TestEmbedFenceStaleAttemptCannotClobberNewerVersion(t *testing.T) {
+	f := newFixture(t)
 	ctx := context.Background()
-	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "rag-source.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	defer func() { _ = db.Close() }()
+	c := f.collection(t)
 
-	repo := sqlite.NewRAGRepo(db.SQL)
-	vectorStore := newFakeVectorStore()
-	svc := NewService(repo, vectorStore, fakeEmbeddingProvider{}, "embed-test")
-	access := Access{APIKeyID: createTestAPIKey(t, ctx, db)}
-	collection, err := svc.CreateCollection(ctx, access, CreateCollectionInput{Name: "Sources", ChunkSize: 100, ChunkOverlap: 0})
-	if err != nil {
-		t.Fatalf("create collection: %v", err)
-	}
-
-	versionA, err := svc.UploadDocument(ctx, access, collection.ID, UploadDocumentInput{
+	uploadA, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
 		FileName:   "a.txt",
 		MimeType:   "text/plain",
 		Bytes:      []byte("version-A-unique-text"),
@@ -428,162 +338,65 @@ func TestUploadSourceIDReplacesDocument(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upload A: %v", err)
 	}
-	oldPointIDs := map[string]bool{}
-	for _, chunk := range versionA.Chunks {
-		oldPointIDs[chunk.QdrantPointID] = true
-	}
-	legacyID := "ragdoc_legacy_duplicate"
-	legacyPointID := "legacy-point-a"
-	legacy := versionA.Document
-	legacy.ID = legacyID
-	legacy.FileName = "legacy.txt"
-	if err := repo.CreateDocument(ctx, legacy, []byte("legacy-A-bytes"), []sqlite.RAGDocumentChunk{{
-		ID:            "ragchunk_legacy",
-		DocumentID:    legacyID,
-		CollectionID:  collection.ID,
-		ChunkIndex:    0,
-		Content:       "legacy-A-chunk",
-		TokenCount:    1,
-		QdrantPointID: legacyPointID,
-		Metadata:      map[string]any{},
-	}}); err != nil {
-		t.Fatalf("insert legacy duplicate: %v", err)
-	}
-	vectorStore.points[collection.QdrantCollection] = append(vectorStore.points[collection.QdrantCollection], QdrantPoint{
-		ID:      legacyPointID,
-		Vector:  []float64{1, 1, 1},
-		Payload: map[string]any{"document_id": legacyID, "content": "legacy-A-chunk"},
-	})
-
-	versionB, err := svc.UploadDocument(ctx, access, collection.ID, UploadDocumentInput{
+	// Version B lands before A's job ever runs — A's fenced attempt must
+	// mark its generation superseded and never index stale chunks.
+	uploadB, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
 		FileName:   "b.txt",
 		MimeType:   "text/plain",
 		Bytes:      []byte("version-B-unique-text"),
 		SourceType: "slack",
 		SourceID:   "thread-1",
-		SourceURI:  "https://example.test/b",
 	})
 	if err != nil {
 		t.Fatalf("upload B: %v", err)
 	}
-	if versionB.Document.ID != versionA.Document.ID {
-		t.Fatalf("document id changed from %s to %s", versionA.Document.ID, versionB.Document.ID)
+	if uploadB.Document.ID != uploadA.Document.ID {
+		t.Fatalf("expected stable document identity, got %s vs %s", uploadA.Document.ID, uploadB.Document.ID)
 	}
-	if versionB.Document.FileName != "b.txt" {
-		t.Fatalf("file name = %s", versionB.Document.FileName)
+	f.runNextJob(t) // A's job — must supersede
+	f.runNextJob(t) // B's job — publishes
+	doc := f.docStatus(t, c.ID, uploadA.Document.ID)
+	if doc.Status != rag.DocumentStatusReady {
+		t.Fatalf("expected ready, got %s", doc.Status)
 	}
-	docs, err := repo.ListDocuments(ctx, collection.ID, 100, 0)
-	if err != nil {
-		t.Fatalf("list documents: %v", err)
-	}
-	if len(docs) != 1 || docs[0].ID != versionA.Document.ID {
-		t.Fatalf("documents = %#v", docs)
-	}
-	if _, err := repo.GetDocument(ctx, legacyID); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("legacy document err=%v", err)
-	}
-	chunks, err := repo.ListDocumentChunks(ctx, versionA.Document.ID)
-	if err != nil {
-		t.Fatalf("list chunks: %v", err)
-	}
-	joined := ""
-	for _, chunk := range chunks {
-		joined += chunk.Content
-	}
-	if !strings.Contains(joined, "version-B-unique-text") || strings.Contains(joined, "version-A-unique-text") || strings.Contains(joined, "legacy-A-chunk") {
-		t.Fatalf("chunks = %q", joined)
-	}
-	blob, err := repo.GetDocumentBlob(ctx, versionA.Document.ID)
-	if err != nil {
-		t.Fatalf("blob: %v", err)
-	}
-	if string(blob) != "version-B-unique-text" {
-		t.Fatalf("blob = %q", blob)
-	}
-	for _, point := range vectorStore.points[collection.QdrantCollection] {
-		if oldPointIDs[point.ID] || point.ID == legacyPointID {
-			t.Fatalf("stale point %s remains: %#v", point.ID, point.Payload)
-		}
+	for _, point := range f.vector.points[c.QdrantCollection] {
 		content, _ := point.Payload["content"].(string)
-		if strings.Contains(content, "version-A-unique-text") || strings.Contains(content, "legacy-A-chunk") {
-			t.Fatalf("stale payload %q", content)
-		}
-		if !strings.Contains(content, "version-B-unique-text") {
-			t.Fatalf("point content = %q", content)
+		if strings.Contains(content, "version-A-unique-text") {
+			t.Fatalf("stale attempt published version A content: %q", content)
 		}
 	}
-	if len(vectorStore.points[collection.QdrantCollection]) == 0 {
-		t.Fatal("expected replacement points")
-	}
-
-	first, err := svc.UploadDocument(ctx, access, collection.ID, UploadDocumentInput{
-		FileName: "one.txt",
-		MimeType: "text/plain",
-		Bytes:    []byte("plain upload one"),
-	})
+	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "version-B", Limit: 5})
 	if err != nil {
-		t.Fatalf("empty source upload: %v", err)
+		t.Fatalf("search: %v", err)
 	}
-	second, err := svc.UploadDocument(ctx, access, collection.ID, UploadDocumentInput{
-		FileName: "two.txt",
-		MimeType: "text/plain",
-		Bytes:    []byte("plain upload two"),
-	})
-	if err != nil {
-		t.Fatalf("second empty source upload: %v", err)
-	}
-	if first.Document.ID == second.Document.ID {
-		t.Fatal("empty source id reused a document id")
-	}
-
-	failSvc := NewService(failReplaceRepo{RAGRepo: repo}, vectorStore, fakeEmbeddingProvider{}, "embed-test")
-	beforeFail := append([]QdrantPoint(nil), vectorStore.points[collection.QdrantCollection]...)
-	sawB := false
-	for _, point := range beforeFail {
-		if content, _ := point.Payload["content"].(string); strings.Contains(content, "version-B-unique-text") {
-			sawB = true
-		}
-	}
-	if !sawB {
-		t.Fatal("fixture lost version B points before the failing replace")
-	}
-	_, err = failSvc.UploadDocument(ctx, access, collection.ID, UploadDocumentInput{
-		FileName:   "c.txt",
-		MimeType:   "text/plain",
-		Bytes:      []byte("version-C-unique-text"),
-		SourceType: "slack",
-		SourceID:   "thread-1",
-	})
-	if err == nil || !strings.Contains(err.Error(), "sqlite down") {
-		t.Fatalf("expected sqlite failure, got %v", err)
-	}
-	for _, point := range vectorStore.points[collection.QdrantCollection] {
-		if point.Payload["document_id"] == versionA.Document.ID {
-			t.Fatalf("source points remained after sqlite failure: %#v", point.Payload)
-		}
-		content, _ := point.Payload["content"].(string)
-		if strings.Contains(content, "version-C-unique-text") || strings.Contains(content, "version-B-unique-text") {
-			t.Fatalf("stale source point remained: %q", content)
-		}
-	}
-	kept, err := repo.ListDocumentChunks(ctx, versionA.Document.ID)
-	if err != nil {
-		t.Fatalf("chunks after failed replace: %v", err)
-	}
-	keptText := ""
-	for _, chunk := range kept {
-		keptText += chunk.Content
-	}
-	if !strings.Contains(keptText, "version-B-unique-text") {
-		t.Fatalf("sqlite changed after failed replace: %q", keptText)
+	if len(results) == 0 || !strings.Contains(results[0].Content, "version-B-unique-text") {
+		t.Fatalf("expected version B indexed, got %#v", results)
 	}
 }
 
-func createTestAPIKey(t *testing.T, ctx context.Context, db *sqlite.DB) int64 {
-	t.Helper()
-	id, err := sqlite.NewAPIKeysRepo(db.SQL).CreateAPIKey(ctx, "test", "enc_test_key_"+newID("secret"), "sha256", "", []string{"rag", "rag.manage"})
+func TestReuploadSameSourceIsNewVersionNotDuplicate(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	uploadA, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "v.txt", MimeType: "text/plain", Bytes: []byte("rev-A"), SourceType: "github", SourceID: "github:acme/docs:f.md",
+	})
 	if err != nil {
-		t.Fatalf("create test api key: %v", err)
+		t.Fatalf("upload A: %v", err)
 	}
-	return id
+	f.runNextJob(t)
+	uploadB, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "v.txt", MimeType: "text/plain", Bytes: []byte("rev-B"), SourceType: "github", SourceID: "github:acme/docs:f.md",
+	})
+	if err != nil {
+		t.Fatalf("upload B: %v", err)
+	}
+	f.runNextJob(t)
+	if uploadB.Document.ID != uploadA.Document.ID {
+		t.Fatalf("expected same object identity, got %s vs %s", uploadA.Document.ID, uploadB.Document.ID)
+	}
+	doc := f.docStatus(t, c.ID, uploadB.Document.ID)
+	if doc.ObservedSeq != 2 {
+		t.Fatalf("expected observed_seq 2, got %d", doc.ObservedSeq)
+	}
 }

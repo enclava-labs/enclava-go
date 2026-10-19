@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"enclava-go/internal/source"
@@ -377,15 +378,19 @@ func (r *SourceRepo) InsertObjectVersion(ctx context.Context, tenantID string, v
 		if err != nil {
 			return fmt.Errorf("marshal version restrictions: %w", err)
 		}
+		provenance := ver.Provenance
+		if strings.TrimSpace(provenance) == "" {
+			provenance = "{}"
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO source_object_versions
 			    (tenant_id, id, object_id, observed_seq, artifact_ref, content_sha256,
 			     byte_size, mime_type, original_filename, upstream_revision,
 			     provenance, restrictions)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '{}'::jsonb, $11)`,
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)`,
 			tenantID, versionRowID(ver), ver.ObjectID, ver.ObservedSeq, ver.ArtifactRef,
 			ver.SHA256, ver.ByteSize, ver.MimeType, ver.OriginalFilename,
-			nilIfNilStr(ver.UpstreamRevision), restrictions); err != nil {
+			nilIfNilStr(ver.UpstreamRevision), provenance, restrictions); err != nil {
 			return fmt.Errorf("insert object version: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `
