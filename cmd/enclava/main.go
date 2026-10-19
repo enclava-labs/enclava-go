@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"enclava-go/internal/connectors"
 	"enclava-go/internal/extract"
 	"enclava-go/internal/httpx"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
 	"enclava-go/internal/llm"
 	extractmodule "enclava-go/internal/modules/extract"
@@ -82,7 +84,7 @@ func main() {
 	promptRepo := postgres.NewPromptsRepo(pgDB)
 	chatbotRepo := postgres.NewChatbotRepo(pgDB)
 	billingRepo := postgres.NewBillingRepo(pgDB)
-	providersRepo := sqlite.NewProvidersRepo(db.SQL)
+	endpointsRepo := postgres.NewEndpointsRepo(pgDB)
 
 	// Durable extract stack: postgres domain repo + artifact store + jobs +
 	// billing (CORE-05/JOB-01/JOB-04).
@@ -96,7 +98,7 @@ func main() {
 	jobsSvc := jobs.NewService(jobsRepoPG, 0)
 	billingSvc := billing.NewService(billingRepo)
 
-	if err := providersRepo.EnsureDefault(ctx, runtimeProviderConfig(cfg)); err != nil {
+	if err := ensureEnvEndpoint(ctx, identityRepo, endpointsRepo, runtimeProviderConfig(cfg)); err != nil {
 		log.Fatalf("provider config seed error: %v", err)
 	}
 
@@ -149,7 +151,7 @@ func main() {
 		usageRepo,
 		billingSvc,
 		billingRepo,
-		providersRepo,
+		endpointsRepo,
 		cfg.APIKeyHashAlgo,
 		cfg.APIKeyPepper,
 		cfg.APIKeyPrefix,
@@ -191,39 +193,60 @@ func main() {
 	log.Printf("shutdown complete")
 }
 
-func runtimeProviderConfig(cfg config.Config) sqlite.ProviderConfig {
-	provider := sqlite.ProviderConfig{
+// runtimeProviderConfig translates the env provider settings into the
+// canonical endpoint record seeded at startup. Assurance claims stay empty —
+// env config never implies verification.
+func runtimeProviderConfig(cfg config.Config) inference.Endpoint {
+	endpoint := inference.Endpoint{
 		ID:            cfg.Provider,
-		Type:          cfg.Provider,
-		Name:          cfg.Provider,
+		Protocol:      cfg.Provider,
+		Capabilities:  []string{"chat/completions", "embeddings"},
 		CredentialRef: cfg.Provider + "_env",
-		Config:        map[string]any{},
-		IsEnabled:     true,
-		IsDefault:     true,
+		Enabled:       true,
 	}
 	switch cfg.Provider {
 	case "privatemode":
-		provider.Name = "PrivateMode"
-		provider.BaseURL = cfg.UpstreamOpenAIBaseURL
+		endpoint.BaseOrigin = cfg.UpstreamOpenAIBaseURL
 	case "openai_compatible":
-		provider.Name = "OpenAI Compatible"
-		provider.BaseURL = cfg.OpenAICompatibleBaseURL
+		endpoint.BaseOrigin = cfg.OpenAICompatibleBaseURL
 	case "redpill":
-		provider.Name = "RedPill"
-		provider.BaseURL = cfg.RedPillBaseURL
+		endpoint.BaseOrigin = cfg.RedPillBaseURL
 	case "tinfoil":
-		provider.Name = "Tinfoil"
-		provider.BaseURL = "https://inference.tinfoil.sh/v1"
+		endpoint.BaseOrigin = "https://inference.tinfoil.sh"
 		if cfg.TinfoilEnclave != "" {
-			provider.BaseURL = "https://" + cfg.TinfoilEnclave + "/v1"
-			provider.Config["enclave"] = cfg.TinfoilEnclave
-			provider.Config["repo"] = cfg.TinfoilRepo
+			endpoint.BaseOrigin = "https://" + cfg.TinfoilEnclave
 		}
-		provider.Config["verify_at_start"] = cfg.TinfoilVerifyAtStart
-		provider.Config["verify_per_call"] = cfg.TinfoilVerifyPerCall
-		provider.Config["verify_max_age"] = cfg.TinfoilVerifyMaxAge.String()
 	}
-	return provider
+	// Env-configured private origins (http) must be explicitly authorized.
+	if strings.HasPrefix(strings.ToLower(endpoint.BaseOrigin), "http://") {
+		endpoint.AuthorizedPrivate = true
+	}
+	return endpoint
+}
+
+// ensureEnvEndpoint create-or-gets the env provider's endpoint row on the
+// bootstrap tenant so transports/executor see a canonical record.
+func ensureEnvEndpoint(ctx context.Context, identity *postgres.IdentityRepo, endpoints *postgres.EndpointsRepo, seed inference.Endpoint) error {
+	tenantID, err := identity.GetTenantBySlug(ctx, "bootstrap")
+	if err != nil {
+		if !errors.Is(err, auth.ErrNotFound) {
+			return fmt.Errorf("lookup bootstrap tenant: %w", err)
+		}
+		tenantID, err = identity.CreateTenant(ctx, "bootstrap", "Bootstrap")
+		if err != nil {
+			return fmt.Errorf("create bootstrap tenant: %w", err)
+		}
+	}
+	seed.TenantID = tenantID
+	if _, err := endpoints.Get(ctx, tenantID, seed.ID); err == nil {
+		return nil
+	} else if !errors.Is(err, inference.ErrEndpointNotFound) {
+		return fmt.Errorf("lookup env endpoint: %w", err)
+	}
+	if err := endpoints.Create(ctx, seed); err != nil {
+		return fmt.Errorf("seed env endpoint: %w", err)
+	}
+	return nil
 }
 
 func buildProvider(cfg config.Config) (llm.Provider, error) {
