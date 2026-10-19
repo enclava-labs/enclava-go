@@ -46,6 +46,8 @@ type App struct {
 	trustProxy   bool
 	executor     *inference.Service
 	bindings     *postgres.ResponseBindingsRepo
+	sourceRepo   *postgres.SourceRepo
+	artifactRepo *postgres.ArtifactRepo
 	rl           *RateLimiter
 	gate         *inferenceGate
 	mux          *http.ServeMux
@@ -90,6 +92,8 @@ func NewApp(
 	executor *inference.Service,
 	bindings *postgres.ResponseBindingsRepo,
 	gate GateConfig,
+	sourceRepo *postgres.SourceRepo,
+	artifactRepo *postgres.ArtifactRepo,
 ) *App {
 	a := &App{
 		authSvc:    authSvc,
@@ -118,6 +122,8 @@ func NewApp(
 		executor:     executor,
 		rl:           NewRateLimiter(),
 		gate:         newInferenceGate(gate),
+		sourceRepo:   sourceRepo,
+		artifactRepo: artifactRepo,
 	}
 
 	a.mux = http.NewServeMux()
@@ -161,6 +167,7 @@ func (a *App) registerBaseRoutes() {
 	// remain are owned metadata + auth surfaces.
 	a.mux.HandleFunc("/api/v1/providers", a.authenticated("pricing.manage", a.handleProviders))
 	a.mux.HandleFunc("/api/v1/providers/", a.authenticated("pricing.manage", a.handleProviderByID))
+	a.mux.HandleFunc("/api/v1/processing-restrictions", a.authenticated("pricing.manage", a.handleProcessingRestrictions))
 	a.mux.HandleFunc("/api/v1/rag/collections", a.authenticated("rag", a.handleRAGCollections))
 	a.mux.HandleFunc("/api/v1/rag/collections/", a.authenticated("rag", a.handleRAGCollectionByID))
 	a.mux.HandleFunc("/api/v1/rag/documents/", a.authenticated("rag", a.handleRAGDocumentByID))

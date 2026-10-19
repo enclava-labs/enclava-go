@@ -543,9 +543,21 @@ func transportSignature(e Endpoint) string {
 	return strings.Join(parts, "|")
 }
 
-// resolveCredential resolves the endpoint's credential_ref through the
-// tenant/purpose/origin-bound resolver. An empty ref resolves to no
-// credential; a configured ref that isn't bound denies.
+// CredentialReferences returns safe operator-configured reference IDs for a tenant.
+func (s *Service) CredentialReferences(tenantID string) []auth.SecretRefMeta {
+	if s == nil || s.secrets == nil {
+		return nil
+	}
+	refs := s.secrets.Metadata(tenantID)
+	out := refs[:0]
+	for _, ref := range refs {
+		if ref.Purpose == auth.SecretPurposeInference {
+			out = append(out, ref)
+		}
+	}
+	return out
+}
+
 func (s *Service) resolveCredential(e Endpoint) (string, error) {
 	if e.CredentialRef == "" {
 		return "", nil
