@@ -56,7 +56,7 @@ type staticRAG struct {
 	err error
 }
 
-func (s staticRAG) Search(context.Context, rag.Access, rag.SearchInput) ([]rag.SearchResult, error) {
+func (s staticRAG) Search(context.Context, auth.Principal, rag.SearchInput) ([]rag.SearchResult, error) {
 	return nil, s.err
 }
 

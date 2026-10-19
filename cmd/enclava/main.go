@@ -77,14 +77,12 @@ func main() {
 	extractTemplatesRepo := sqlite.NewExtractTemplatesRepo(db.SQL)
 	extractSettingsRepo := sqlite.NewExtractSettingsRepo(db.SQL)
 	usageRepo := sqlite.NewUsageRepo(db.SQL)
-	ragRepo := sqlite.NewRAGRepo(db.SQL)
 	promptRepo := sqlite.NewPromptTemplatesRepo(db.SQL)
 	chatbotRepo := sqlite.NewChatbotRepo(db.SQL)
 	pricingRepo := sqlite.NewPricingRepo(db.SQL)
 	budgetsRepo := sqlite.NewBudgetsRepo(db.SQL)
 	billingAuditRepo := sqlite.NewBillingAuditRepo(db.SQL)
 	providersRepo := sqlite.NewProvidersRepo(db.SQL)
-	connectorsRepo := sqlite.NewConnectorsRepo(db.SQL)
 
 	// Durable extract stack: postgres domain repo + artifact store + jobs +
 	// billing (CORE-05/JOB-01/JOB-04).
@@ -130,11 +128,12 @@ func main() {
 	}, jobs.RunnerConfig{})
 	_ = jobsRunner
 	qdrantClient := rag.NewQdrantClient(cfg.QdrantURL, cfg.UpstreamTimeout)
-	ragSvc := rag.NewService(ragRepo, qdrantClient, provider, cfg.DefaultEmbeddingModel)
+	ragRepo := postgres.NewRAGRepo(pgDB)
+	sourceRepo := postgres.NewSourceRepo(pgDB)
+	ragSvc := rag.NewService(ragRepo, qdrantClient, provider, cfg.DefaultEmbeddingModel, artifactStore, jobsSvc, billingSvc)
 	promptSvc := prompts.NewService(promptRepo)
 	chatbotSvc := chatbot.NewService(chatbotRepo, promptRepo, ragSvc, provider, usageRepo)
-	connectorSvc := connectors.NewService(connectorsRepo, ragSvc)
-	connectorSvc.StartScheduler(ctx, cfg.ConnectorSyncInterval)
+	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG, ragSvc)
 
 	app := httpx.NewApp(
 		authSvc,
@@ -164,7 +163,6 @@ func main() {
 		cfg.MaxUploadSizeMB,
 		cfg.TrustProxyHeaders,
 	)
-	ragSvc.SetSpendGuard(app)
 
 	extractMod := extractmodule.New(extractSvc, cfg.MaxUploadSizeMB)
 	extractMod.Register(app.Mux(), app)

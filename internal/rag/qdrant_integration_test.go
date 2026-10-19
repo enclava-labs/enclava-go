@@ -9,9 +9,9 @@ import (
 )
 
 func TestQdrantClientIntegration(t *testing.T) {
-	qdrantURL := strings.TrimSpace(os.Getenv("QDRANT_INTEGRATION_URL"))
+	qdrantURL := strings.TrimSpace(os.Getenv("ENCLAVA_TEST_QDRANT_URL"))
 	if qdrantURL == "" {
-		t.Skip("set QDRANT_INTEGRATION_URL to run real Qdrant integration test")
+		t.Fatalf("ENCLAVA_TEST_QDRANT_URL is not set; tests require a real Qdrant")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

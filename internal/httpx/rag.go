@@ -11,7 +11,9 @@ import (
 	"strings"
 
 	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
 	"enclava-go/internal/rag"
+	"enclava-go/internal/source"
 )
 
 func (a *App) handleRAGCollections(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
@@ -21,7 +23,7 @@ func (a *App) handleRAGCollections(w http.ResponseWriter, r *http.Request, princ
 	}
 	switch r.Method {
 	case http.MethodGet:
-		collections, err := a.ragSvc.ListCollections(r.Context(), ragAccess(principal))
+		collections, err := a.ragSvc.ListCollections(r.Context(), principal)
 		if err != nil {
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "rag_collection_list_failed")
 			return
@@ -37,7 +39,7 @@ func (a *App) handleRAGCollections(w http.ResponseWriter, r *http.Request, princ
 			WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 			return
 		}
-		collection, err := a.ragSvc.CreateCollection(r.Context(), ragAccess(principal), input)
+		collection, err := a.ragSvc.CreateCollection(r.Context(), principal, input)
 		if err != nil {
 			WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "rag_collection_invalid")
 			return
@@ -74,7 +76,7 @@ func (a *App) handleRAGCollectionByID(w http.ResponseWriter, r *http.Request, pr
 
 	switch r.Method {
 	case http.MethodGet:
-		collection, err := a.ragSvc.GetCollection(r.Context(), ragAccess(principal), collectionID)
+		collection, err := a.ragSvc.GetCollection(r.Context(), principal, collectionID)
 		if err != nil {
 			writeRAGNotFoundOrError(w, err, "rag_collection_fetch_failed")
 			return
@@ -90,7 +92,7 @@ func (a *App) handleRAGCollectionByID(w http.ResponseWriter, r *http.Request, pr
 			WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 			return
 		}
-		collection, err := a.ragSvc.UpdateCollection(r.Context(), ragAccess(principal), collectionID, input)
+		collection, err := a.ragSvc.UpdateCollection(r.Context(), principal, collectionID, input)
 		if err != nil {
 			a.writeRAGNotFoundOrBadRequest(w, err, "rag_collection_update_failed")
 			return
@@ -101,7 +103,7 @@ func (a *App) handleRAGCollectionByID(w http.ResponseWriter, r *http.Request, pr
 			WriteForbidden(w, "missing required scope: rag.manage")
 			return
 		}
-		if err := a.ragSvc.DeleteCollection(r.Context(), ragAccess(principal), collectionID); err != nil {
+		if err := a.ragSvc.DeleteCollection(r.Context(), principal, collectionID); err != nil {
 			writeRAGNotFoundOrError(w, err, "rag_collection_delete_failed")
 			return
 		}
@@ -115,7 +117,7 @@ func (a *App) handleRAGCollectionDocuments(w http.ResponseWriter, r *http.Reques
 	switch r.Method {
 	case http.MethodGet:
 		limit, offset := paginationFromRequest(r)
-		docs, err := a.ragSvc.ListDocuments(r.Context(), ragAccess(principal), collectionID, limit, offset)
+		docs, err := a.ragSvc.ListDocuments(r.Context(), principal, collectionID, limit, offset)
 		if err != nil {
 			writeRAGNotFoundOrError(w, err, "rag_document_list_failed")
 			return
@@ -146,7 +148,7 @@ func (a *App) handleRAGCollectionDocuments(w http.ResponseWriter, r *http.Reques
 		if strings.TrimSpace(mimeType) == "" {
 			mimeType = "application/octet-stream"
 		}
-		out, err := a.ragSvc.UploadDocument(r.Context(), ragAccess(principal), collectionID, rag.UploadDocumentInput{
+		out, err := a.ragSvc.UploadDocument(r.Context(), principal, collectionID, rag.UploadDocumentInput{
 			FileName:   filepath.Base(header.Filename),
 			MimeType:   mimeType,
 			Bytes:      content,
@@ -186,7 +188,7 @@ func (a *App) handleRAGDocumentByID(w http.ResponseWriter, r *http.Request, prin
 				WriteForbidden(w, "missing required scope: rag.manage")
 				return
 			}
-			out, err := a.ragSvc.ReprocessDocument(r.Context(), ragAccess(principal), documentID)
+			out, err := a.ragSvc.ReprocessDocument(r.Context(), principal, documentID)
 			if err != nil {
 				a.writeRAGNotFoundOrBadRequest(w, err, "rag_document_reprocess_failed")
 				return
@@ -200,7 +202,7 @@ func (a *App) handleRAGDocumentByID(w http.ResponseWriter, r *http.Request, prin
 
 	switch r.Method {
 	case http.MethodGet:
-		doc, blob, err := a.ragSvc.DownloadDocument(r.Context(), ragAccess(principal), documentID)
+		doc, blob, err := a.ragSvc.DownloadDocument(r.Context(), principal, documentID)
 		if err != nil {
 			writeRAGNotFoundOrError(w, err, "rag_document_download_failed")
 			return
@@ -214,7 +216,7 @@ func (a *App) handleRAGDocumentByID(w http.ResponseWriter, r *http.Request, prin
 			WriteForbidden(w, "missing required scope: rag.manage")
 			return
 		}
-		if err := a.ragSvc.DeleteDocument(r.Context(), ragAccess(principal), documentID); err != nil {
+		if err := a.ragSvc.DeleteDocument(r.Context(), principal, documentID); err != nil {
 			writeRAGNotFoundOrError(w, err, "rag_document_delete_failed")
 			return
 		}
@@ -238,19 +240,12 @@ func (a *App) handleRAGSearch(w http.ResponseWriter, r *http.Request, principal 
 		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 		return
 	}
-	results, err := a.ragSvc.Search(r.Context(), ragAccess(principal), input)
+	results, err := a.ragSvc.Search(r.Context(), principal, input)
 	if err != nil {
 		a.writeRAGNotFoundOrBadRequest(w, err, "rag_search_failed")
 		return
 	}
 	WriteJSON(w, http.StatusOK, map[string]any{"results": results})
-}
-
-func ragAccess(principal auth.Principal) rag.Access {
-	return rag.Access{
-		APIKeyID: principal.APIKeyID,
-		IsAdmin:  auth.HasScope(principal, "platform.admin"),
-	}
 }
 
 func paginationFromRequest(r *http.Request) (int, int) {
@@ -270,7 +265,7 @@ func paginationFromRequest(r *http.Request) (int, int) {
 }
 
 func writeRAGNotFoundOrError(w http.ResponseWriter, err error, code string) {
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) || errors.Is(err, source.ErrDenied) {
 		WriteOpenAIError(w, http.StatusNotFound, "not found", "invalid_request_error", "not_found")
 		return
 	}
@@ -279,11 +274,11 @@ func writeRAGNotFoundOrError(w http.ResponseWriter, err error, code string) {
 
 func (a *App) writeRAGNotFoundOrBadRequest(w http.ResponseWriter, err error, code string) {
 	var be budgetExceededError
-	if errors.As(err, &be) {
+	if errors.As(err, &be) || errors.Is(err, billing.ErrBudgetExceeded) {
 		a.WriteBudgetError(w, err)
 		return
 	}
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) || errors.Is(err, source.ErrDenied) {
 		WriteOpenAIError(w, http.StatusNotFound, "not found", "invalid_request_error", "not_found")
 		return
 	}

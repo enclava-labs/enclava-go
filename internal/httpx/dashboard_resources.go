@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"enclava-go/internal/auth"
 	"enclava-go/internal/chatbot"
 	"enclava-go/internal/connectors"
 	"enclava-go/internal/llm"
@@ -44,8 +45,8 @@ type dashboardBillingAuditData struct {
 }
 
 type dashboardRAGData struct {
-	Collections []sqlite.RAGCollection
-	Documents   []sqlite.RAGDocument
+	Collections []rag.Collection
+	Documents   []rag.Document
 	Success     string
 	Error       string
 }
@@ -53,7 +54,7 @@ type dashboardRAGData struct {
 type dashboardChatbotsData struct {
 	Chatbots        []sqlite.ChatbotInstance
 	PromptTemplates []sqlite.PromptTemplate
-	Collections     []sqlite.RAGCollection
+	Collections     []rag.Collection
 	Success         string
 	Error           string
 }
@@ -65,9 +66,9 @@ type dashboardPromptTemplatesData struct {
 }
 
 type dashboardConnectorsData struct {
-	Sources     []sqlite.ConnectorSource
-	Jobs        []sqlite.ConnectorSyncJob
-	Collections []sqlite.RAGCollection
+	Sources     []connectors.Source
+	Jobs        []connectors.SyncJob
+	Collections []rag.Collection
 	Success     string
 	Error       string
 }
@@ -207,20 +208,24 @@ func (a *App) handleDashboardRAG(w http.ResponseWriter, r *http.Request) {
 		WriteOpenAIError(w, http.StatusNotImplemented, "rag is not configured", "server_error", "not_configured")
 		return
 	}
+	p, ok := a.extractPrincipal(w, r)
+	if !ok {
+		return
+	}
 	successMessage := ""
 	errorMessage := ""
 	if r.Method == http.MethodPost {
-		successMessage, errorMessage = a.handleDashboardRAGAction(r)
+		successMessage, errorMessage = a.handleDashboardRAGAction(r, p)
 	}
-	collections, err := a.ragSvc.ListCollections(r.Context(), rag.Access{IsAdmin: true})
+	collections, err := a.ragSvc.ListCollections(r.Context(), p)
 	if err != nil {
 		log.Printf("failed to load dashboard rag collections: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_rag_failed")
 		return
 	}
-	documents := make([]sqlite.RAGDocument, 0)
+	documents := make([]rag.Document, 0)
 	for _, collection := range collections {
-		docs, err := a.ragSvc.ListDocuments(r.Context(), rag.Access{IsAdmin: true}, collection.ID, 100, 0)
+		docs, err := a.ragSvc.ListDocuments(r.Context(), p, collection.ID, 100, 0)
 		if err != nil {
 			log.Printf("failed to load dashboard rag documents collection_id=%s: %v", collection.ID, err)
 			continue
@@ -238,6 +243,10 @@ func (a *App) handleDashboardRAGDocumentDownload(w http.ResponseWriter, r *http.
 		WriteMethodNotAllowed(w)
 		return
 	}
+	p, ok := a.extractPrincipal(w, r)
+	if !ok {
+		return
+	}
 	if a.ragSvc == nil {
 		WriteOpenAIError(w, http.StatusNotImplemented, "rag is not configured", "server_error", "not_configured")
 		return
@@ -249,7 +258,7 @@ func (a *App) handleDashboardRAGDocumentDownload(w http.ResponseWriter, r *http.
 		WriteOpenAIError(w, http.StatusBadRequest, "document id is required", "invalid_request_error", "missing_document")
 		return
 	}
-	doc, blob, err := a.ragSvc.DownloadDocument(r.Context(), rag.Access{IsAdmin: true}, documentID)
+	doc, blob, err := a.ragSvc.DownloadDocument(r.Context(), p, documentID)
 	if err != nil {
 		writeRAGNotFoundOrError(w, err, "dashboard_rag_document_download_failed")
 		return
@@ -285,7 +294,9 @@ func (a *App) handleDashboardChatbots(w http.ResponseWriter, r *http.Request) {
 		data.PromptTemplates, _ = a.promptSvc.List(r.Context())
 	}
 	if a.ragSvc != nil {
-		data.Collections, _ = a.ragSvc.ListCollections(r.Context(), rag.Access{IsAdmin: true})
+		if p, ok := auth.PrincipalFromContext(r.Context()); ok {
+			data.Collections, _ = a.ragSvc.ListCollections(r.Context(), p)
+		}
 	}
 	if err := dashboardTemplates.ExecuteTemplate(w, "partial-chatbots", data); err != nil {
 		log.Printf("failed to render dashboard chatbots: %v", err)
@@ -328,34 +339,36 @@ func (a *App) handleDashboardConnectors(w http.ResponseWriter, r *http.Request) 
 		WriteOpenAIError(w, http.StatusNotImplemented, "connectors are not configured", "server_error", "not_configured")
 		return
 	}
+	p, ok := a.extractPrincipal(w, r)
+	if !ok {
+		return
+	}
 	successMessage := ""
 	errorMessage := ""
 	if r.Method == http.MethodPost {
-		successMessage, errorMessage = a.handleDashboardConnectorAction(r)
+		successMessage, errorMessage = a.handleDashboardConnectorAction(r, p)
 	}
-	sources, err := a.connectorSvc.ListSources(r.Context(), "", 100, 0)
+	sources, err := a.connectorSvc.ListSources(r.Context(), p, "", 100, 0)
 	if err != nil {
 		log.Printf("failed to load dashboard connector sources: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_connectors_failed")
 		return
 	}
-	jobs, err := a.connectorSvc.ListSyncJobs(r.Context(), "", "", 25, 0)
+	jobs, err := a.connectorSvc.ListSyncJobs(r.Context(), p, "", "", 25, 0)
 	if err != nil {
 		log.Printf("failed to load dashboard connector jobs: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_connector_jobs_failed")
 		return
 	}
 	data := dashboardConnectorsData{Sources: sources, Jobs: jobs, Success: successMessage, Error: errorMessage}
-	if a.ragSvc != nil {
-		data.Collections, _ = a.ragSvc.ListCollections(r.Context(), rag.Access{IsAdmin: true})
-	}
+	data.Collections, _ = a.ragSvc.ListCollections(r.Context(), p)
 	if err := dashboardTemplates.ExecuteTemplate(w, "partial-connectors", data); err != nil {
 		log.Printf("failed to render dashboard connectors: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_connectors_render_failed")
 	}
 }
 
-func (a *App) handleDashboardRAGAction(r *http.Request) (string, string) {
+func (a *App) handleDashboardRAGAction(r *http.Request, p auth.Principal) (string, string) {
 	if err := parseDashboardForm(r, a.maxUploadMB); err != nil {
 		return "", "Invalid form data"
 	}
@@ -363,7 +376,7 @@ func (a *App) handleDashboardRAGAction(r *http.Request) (string, string) {
 	case "create_collection":
 		chunkSize := dashboardFormInt(r, "chunk_size", rag.DefaultChunkSize)
 		chunkOverlap := dashboardFormInt(r, "chunk_overlap", rag.DefaultChunkOverlap)
-		if _, err := a.ragSvc.CreateCollection(r.Context(), rag.Access{IsAdmin: true}, rag.CreateCollectionInput{
+		if _, err := a.ragSvc.CreateCollection(r.Context(), p, rag.CreateCollectionInput{
 			Name:           r.FormValue("name"),
 			Description:    r.FormValue("description"),
 			EmbeddingModel: r.FormValue("embedding_model"),
@@ -389,7 +402,7 @@ func (a *App) handleDashboardRAGAction(r *http.Request) (string, string) {
 		if strings.TrimSpace(mimeType) == "" {
 			mimeType = "application/octet-stream"
 		}
-		if _, err := a.ragSvc.UploadDocument(r.Context(), rag.Access{IsAdmin: true}, collectionID, rag.UploadDocumentInput{
+		if _, err := a.ragSvc.UploadDocument(r.Context(), p, collectionID, rag.UploadDocumentInput{
 			FileName: filepath.Base(header.Filename),
 			MimeType: mimeType,
 			Bytes:    content,
@@ -402,7 +415,7 @@ func (a *App) handleDashboardRAGAction(r *http.Request) (string, string) {
 		if documentID == "" {
 			return "", "Document ID is required"
 		}
-		if _, err := a.ragSvc.ReprocessDocument(r.Context(), rag.Access{IsAdmin: true}, documentID); err != nil {
+		if _, err := a.ragSvc.ReprocessDocument(r.Context(), p, documentID); err != nil {
 			return "", err.Error()
 		}
 		return "Document reprocessed", ""
@@ -411,7 +424,7 @@ func (a *App) handleDashboardRAGAction(r *http.Request) (string, string) {
 		if documentID == "" {
 			return "", "Document ID is required"
 		}
-		if err := a.ragSvc.DeleteDocument(r.Context(), rag.Access{IsAdmin: true}, documentID); err != nil {
+		if err := a.ragSvc.DeleteDocument(r.Context(), p, documentID); err != nil {
 			return "", err.Error()
 		}
 		return "Document deleted", ""
@@ -420,7 +433,7 @@ func (a *App) handleDashboardRAGAction(r *http.Request) (string, string) {
 		if collectionID == "" {
 			return "", "Collection ID is required"
 		}
-		if err := a.ragSvc.DeleteCollection(r.Context(), rag.Access{IsAdmin: true}, collectionID); err != nil {
+		if err := a.ragSvc.DeleteCollection(r.Context(), p, collectionID); err != nil {
 			return "", err.Error()
 		}
 		return "RAG collection deleted", ""
@@ -505,7 +518,7 @@ func (a *App) handleDashboardPromptTemplateAction(r *http.Request) (string, stri
 	return "Prompt template created", ""
 }
 
-func (a *App) handleDashboardConnectorAction(r *http.Request) (string, string) {
+func (a *App) handleDashboardConnectorAction(r *http.Request, p auth.Principal) (string, string) {
 	if err := parseDashboardForm(r, a.maxUploadMB); err != nil {
 		return "", "Invalid form data"
 	}
@@ -515,7 +528,7 @@ func (a *App) handleDashboardConnectorAction(r *http.Request) (string, string) {
 		if err != nil {
 			return "", err.Error()
 		}
-		if _, err := a.connectorSvc.CreateSource(r.Context(), connectors.CreateSourceInput{
+		if _, err := a.connectorSvc.CreateSource(r.Context(), p, connectors.CreateSourceInput{
 			Type:               r.FormValue("type"),
 			Name:               r.FormValue("name"),
 			TargetCollectionID: r.FormValue("target_collection_id"),
@@ -527,7 +540,7 @@ func (a *App) handleDashboardConnectorAction(r *http.Request) (string, string) {
 		return "Connector source created", ""
 	case "sync_source":
 		sourceID := strings.TrimSpace(r.FormValue("source_id"))
-		if _, err := a.connectorSvc.SyncSource(r.Context(), connectors.Access{IsAdmin: true}, sourceID); err != nil {
+		if _, err := a.connectorSvc.SyncSource(r.Context(), p, sourceID); err != nil {
 			return "", err.Error()
 		}
 		return "Connector sync started", ""
@@ -537,7 +550,7 @@ func (a *App) handleDashboardConnectorAction(r *http.Request) (string, string) {
 		if sourceID == "" {
 			return "", "Connector source ID is required"
 		}
-		if _, err := a.connectorSvc.UpdateSource(r.Context(), sourceID, connectors.UpdateSourceInput{IsEnabled: &enabled}); err != nil {
+		if _, err := a.connectorSvc.UpdateSource(r.Context(), p, sourceID, connectors.UpdateSourceInput{IsEnabled: &enabled}); err != nil {
 			return "", err.Error()
 		}
 		if enabled {
@@ -549,7 +562,7 @@ func (a *App) handleDashboardConnectorAction(r *http.Request) (string, string) {
 		if sourceID == "" {
 			return "", "Connector source ID is required"
 		}
-		if err := a.connectorSvc.DeleteSource(r.Context(), sourceID); err != nil {
+		if err := a.connectorSvc.DeleteSource(r.Context(), p, sourceID); err != nil {
 			return "", err.Error()
 		}
 		return "Connector source deleted", ""
