@@ -59,6 +59,21 @@ type Config struct {
 	// and validates this trusted runtime configuration — a stored
 	// credential_ref never names an environment variable itself.
 	SecretBindings []auth.SecretBinding
+
+	// Inference admission limits (CON-01): process-local capacity bounds.
+	// They bound this process only — shared tenant/billing admission is
+	// enforced authoritatively in PostgreSQL, so these values never form a
+	// cluster-wide cap; they sum across processes by design.
+	InferenceMaxActive    int   // INFERENCE_MAX_ACTIVE — upstream dispatch slots
+	InferenceMaxQueued    int   // INFERENCE_MAX_QUEUED — execute queue depth
+	InferencePerTenant    int   // INFERENCE_PER_TENANT — active+queued sublimit (0 = none)
+	InferenceManageActive int   // INFERENCE_MANAGE_ACTIVE — lifecycle/cancel pool
+	InferenceManageQueued int   // INFERENCE_MANAGE_QUEUED
+	InferenceFanOutActive int   // INFERENCE_FANOUT_ACTIVE — internal/job fan-out pool
+	InferenceFanOutQueued int   // INFERENCE_FANOUT_QUEUED
+	InferenceMaxInflight  int   // INFERENCE_MAX_INFLIGHT — /v1 requests executing
+	InferenceMaxHTTPQueue int   // INFERENCE_MAX_HTTP_QUEUE — /v1 callers waiting
+	InferenceMaxBodyBytes int64 // INFERENCE_MAX_BODY_BYTES — in-flight request-body bytes
 }
 
 func Load() (Config, error) {
@@ -103,9 +118,36 @@ func Load() (Config, error) {
 		CORSAllowedOrigins:      getEnvList("CORS_ALLOWED_ORIGINS"),
 		TrustProxyHeaders:       getEnvBool("TRUST_PROXY_HEADERS", false),
 		SessionTenantSlug:       strings.TrimSpace(getEnv("SESSION_TENANT_SLUG", "bootstrap")),
+
+		InferenceMaxActive:    getEnvInt("INFERENCE_MAX_ACTIVE", 32),
+		InferenceMaxQueued:    getEnvInt("INFERENCE_MAX_QUEUED", 128),
+		InferencePerTenant:    getEnvInt("INFERENCE_PER_TENANT", 0),
+		InferenceManageActive: getEnvInt("INFERENCE_MANAGE_ACTIVE", 8),
+		InferenceManageQueued: getEnvInt("INFERENCE_MANAGE_QUEUED", 64),
+		InferenceFanOutActive: getEnvInt("INFERENCE_FANOUT_ACTIVE", 8),
+		InferenceFanOutQueued: getEnvInt("INFERENCE_FANOUT_QUEUED", 256),
+		InferenceMaxInflight:  getEnvInt("INFERENCE_MAX_INFLIGHT", 64),
+		InferenceMaxHTTPQueue: getEnvInt("INFERENCE_MAX_HTTP_QUEUE", 128),
+		InferenceMaxBodyBytes: getEnvInt64("INFERENCE_MAX_BODY_BYTES", 256<<20),
 	}
 	if cfg.Provider == "openai" {
 		cfg.Provider = "privatemode"
+	}
+	if cfg.SessionTenantSlug == "" {
+		return Config{}, fmt.Errorf("SESSION_TENANT_SLUG must be non-empty")
+	}
+	// Admission bounds are process-local capacity controls: actives must be
+	// positive (zero would refuse all dispatch), queue/byte/tenant bounds may
+	// be zero to mean "no queue"/"no bound"/"no sublimit" respectively —
+	// but they may never be negative.
+	if cfg.InferenceMaxActive <= 0 || cfg.InferenceManageActive <= 0 ||
+		cfg.InferenceFanOutActive <= 0 || cfg.InferenceMaxInflight <= 0 {
+		return Config{}, fmt.Errorf("INFERENCE_*_ACTIVE and INFERENCE_MAX_INFLIGHT must be > 0")
+	}
+	if cfg.InferenceMaxQueued < 0 || cfg.InferenceManageQueued < 0 ||
+		cfg.InferenceFanOutQueued < 0 || cfg.InferenceMaxHTTPQueue < 0 ||
+		cfg.InferencePerTenant < 0 || cfg.InferenceMaxBodyBytes < 0 {
+		return Config{}, fmt.Errorf("INFERENCE_* queue/byte/tenant limits must be >= 0")
 	}
 	if cfg.Port <= 0 {
 		return Config{}, fmt.Errorf("APP_PORT must be > 0")
@@ -285,6 +327,9 @@ func getEnvInt(key string, fallback int) int {
 	return i
 }
 
+func getEnvInt64(key string, fallback int64) int64 {
+	return int64(getEnvInt(key, int(fallback)))
+}
 func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	v := os.Getenv(key)
 	if v == "" {

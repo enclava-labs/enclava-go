@@ -47,6 +47,7 @@ type App struct {
 	executor     *inference.Service
 	bindings     *postgres.ResponseBindingsRepo
 	rl           *RateLimiter
+	gate         *inferenceGate
 	mux          *http.ServeMux
 }
 
@@ -88,6 +89,7 @@ func NewApp(
 	trustProxy bool,
 	executor *inference.Service,
 	bindings *postgres.ResponseBindingsRepo,
+	gate GateConfig,
 ) *App {
 	a := &App{
 		authSvc:    authSvc,
@@ -115,6 +117,7 @@ func NewApp(
 		trustProxy:   trustProxy,
 		executor:     executor,
 		rl:           NewRateLimiter(),
+		gate:         newInferenceGate(gate),
 	}
 
 	a.mux = http.NewServeMux()
@@ -124,6 +127,7 @@ func NewApp(
 
 func (a *App) Handler() http.Handler {
 	var h http.Handler = a.mux
+	h = a.inferenceAdmissionMiddleware(h)
 	h = http.MaxBytesHandler(h, a.maxRequestBodyBytes())
 	h = recoverMiddleware(h)
 	h = a.corsMiddleware(h)

@@ -68,6 +68,7 @@ type Service struct {
 	newTransport   func(ctx context.Context, e Endpoint, credential string) (Upstream, error)
 	payloadLimit   int64
 	attemptTimeout time.Duration
+	admission      *Admission
 
 	mu         sync.Mutex
 	transports map[string]transportEntry
@@ -98,6 +99,16 @@ func WithAttemptTimeout(d time.Duration) Option {
 	return func(s *Service) { s.attemptTimeout = d }
 }
 
+// WithAdmission overrides the process-local concurrency gate. Tests pass a
+// small AdmissionConfig to observe explicit bounds; nil uses the defaults.
+func WithAdmission(a *Admission) Option {
+	return func(s *Service) {
+		if a != nil {
+			s.admission = a
+		}
+	}
+}
+
 // NewService composes the executor over the authoritative seams.
 func NewService(deps Deps, opts ...Option) (*Service, error) {
 	if deps.Endpoints == nil || deps.Sources == nil || deps.Authorizer == nil || deps.Billing == nil {
@@ -113,6 +124,7 @@ func NewService(deps Deps, opts ...Option) (*Service, error) {
 		secrets:        deps.Secrets,
 		payloadLimit:   maxPayloadBytes,
 		attemptTimeout: defaultAttemptTimeout,
+		admission:      NewAdmission(AdmissionConfig{}),
 		transports:     map[string]transportEntry{},
 	}
 	for _, opt := range opts {
@@ -168,11 +180,25 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 		return nil, err
 	}
 
+	// Admit before reserving: queued attempts never hold a budget hold.
+	// Job-originated (internal fan-out) work draws from its own pool so a
+	// nested or background model call can never deadlock an outer permit
+	// held by the request pool.
+	class := AdmissionExecute
+	if req.JobID != "" {
+		class = AdmissionFanOut
+	}
+	permit, err := s.admission.Acquire(ctx, class, p.TenantID)
+	if err != nil {
+		return nil, err
+	}
+
 	// AttemptID binds the reservation to a durable job_attempts row when the
 	// caller runs inside a job; standalone calls leave it empty and the
 	// reservation id is the attempt identity.
 	res, err := s.reserve(ctx, p, req, endpoint, capability, upstreamModel, req.AttemptID)
 	if err != nil {
+		permit.Release()
 		return nil, err
 	}
 
@@ -181,23 +207,30 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 	// liability is settled or retained — never released or retried.
 	up, err := s.transportFor(ctx, endpoint)
 	if err != nil {
+		permit.Release()
 		s.releaseUndispatched(ctx, p, res.ID)
 		return nil, fmt.Errorf("transport for endpoint: %w", err)
 	}
 	if err := s.billing.MarkDispatched(ctx, p, res.ID); err != nil {
+		permit.Release()
 		return nil, fmt.Errorf("mark dispatched: %w", err)
 	}
-
 	dctx, cancel := context.WithTimeout(ctx, s.attemptTimeout)
 	defer cancel()
 
 	if req.Stream {
-		raw, err := s.dispatchStream(dctx, up, capability, req, body)
+		// Streams bound their own lifetime via idle/wall limits on the body;
+		// the attempt timeout would kill valid held streams on return.
+		raw, err := s.dispatchStream(ctx, up, capability, req, body)
 		if err != nil {
+			permit.Release()
 			s.failAttempt(ctx, p, res, err)
 			return nil, err
 		}
+		// The permit stays held until the stream body actually closes —
+		// headers returning early never frees the active slot.
 		stream := newAccountingStream(raw, func(usageRaw []byte, terminal bool) {
+			defer permit.Release()
 			usage, known := usageFromJSON(usageRaw)
 			if !terminal {
 				known = false
@@ -219,6 +252,7 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 
 	raw, err := s.dispatch(dctx, up, capability, req, body)
 	if err != nil {
+		permit.Release()
 		if isUpstreamError(err) {
 			// A definitive upstream error response settles its (possibly
 			// zero) reported usage honestly.
@@ -239,6 +273,7 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 		}
 		return nil, err
 	}
+	permit.Release()
 	usage, known := usageFromJSON(raw)
 	rec, serr := s.settleReservation(ctx, p, res, usage, known)
 	result := &Result{
@@ -275,8 +310,13 @@ func (s *Service) Manage(ctx context.Context, p auth.Principal, req ManageReques
 	if !auth.EndpointAllowed(p, e.ID) {
 		return nil, fmt.Errorf("%w", ErrDenied)
 	}
+	permit, err := s.admission.Acquire(ctx, AdmissionManage, p.TenantID)
+	if err != nil {
+		return nil, err
+	}
 	up, err := s.transportFor(ctx, e)
 	if err != nil {
+		permit.Release()
 		return nil, fmt.Errorf("transport for endpoint: %w", err)
 	}
 	path := req.Path
@@ -288,11 +328,13 @@ func (s *Service) Manage(ctx context.Context, p auth.Principal, req ManageReques
 		raw, err := up.DoResponsesStream(mctx, req.Method, path, req.Body)
 		if err != nil {
 			cancel()
+			permit.Release()
 			return nil, err
 		}
-		return &ManageResult{EndpointID: e.ID, Body: &cancelOnClose{ReadCloser: raw, done: cancel}}, nil
+		return &ManageResult{EndpointID: e.ID, Body: &cancelOnClose{ReadCloser: raw, done: func() { cancel(); permit.Release() }}}, nil
 	}
 	defer cancel()
+	defer permit.Release()
 	raw, err := up.DoResponsesRequest(mctx, req.Method, path, req.Body)
 	if err != nil {
 		return nil, err

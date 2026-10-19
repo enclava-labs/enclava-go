@@ -102,6 +102,7 @@ type fx struct {
 	brepo         *postgres.BillingRepo
 	upstream      *fakeUpstream
 	svc           *inference.Service
+	admission     *inference.Admission
 	principal     auth.Principal
 	factoryErr    error
 	conversations inference.ConversationStore
@@ -153,7 +154,7 @@ func (f *fx) build(t *testing.T) {
 				return nil, f.factoryErr
 			}
 			return f.upstream, nil
-		}))
+		}), inference.WithAdmission(f.admission))
 	if err != nil {
 		t.Fatalf("new service: %v", err)
 	}
