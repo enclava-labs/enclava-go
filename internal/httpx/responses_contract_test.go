@@ -352,8 +352,11 @@ func TestResponsesChainedFollowUpPinsOrigin(t *testing.T) {
 	if prev, _ := child["previous_response_id"].(string); prev != pub {
 		t.Fatalf("previous_response_id must echo the public parent, got %v", prev)
 	}
-	if strings.Contains(rec.Body.String(), "resp_UP") || strings.Contains(rec.Body.String(), "msg_UP") {
-		t.Fatalf("upstream ids leaked in response: %s", rec.Body.String())
+	// Exact quoted upstream ids: random public ids may legitimately contain "UP".
+	for _, up := range []string{`"resp_UP1"`, `"resp_UP2"`, `"msg_UP1_1"`, `"msg_UP2_1"`, `"cmp_UP1"`} {
+		if strings.Contains(rec.Body.String(), up) {
+			t.Fatalf("upstream id %s leaked in response: %s", up, rec.Body.String())
+		}
 	}
 
 	// Item references resolve through bindings too.

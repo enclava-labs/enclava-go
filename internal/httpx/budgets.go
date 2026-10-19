@@ -16,7 +16,6 @@ import (
 // billing.Price/UsageRecord store int64 micros of a currency unit.
 const microsPerCent int64 = 10_000
 
-
 // billingSubjectOf resolves the principal's billing subject the same way the
 // billing service does at reserve time.
 func billingSubjectOf(p auth.Principal) billing.Subject {
@@ -64,7 +63,6 @@ func checkedBudgetAdd(a, b int64) (int64, bool) {
 	return a + b, true
 }
 
-
 // periodStart mirrors billing.periodStart for the read path.
 func periodStart(period string, now time.Time) time.Time {
 	switch period {
@@ -79,7 +77,6 @@ func periodStart(period string, now time.Time) time.Time {
 		return time.Time{}
 	}
 }
-
 
 func microsToCents(micro int64) int64 {
 	if micro <= 0 {

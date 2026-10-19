@@ -77,8 +77,6 @@ func seedSettledUsage(t *testing.T, f budgetFixture, id string, subject billing.
 	}
 }
 
-
-
 func TestCheckedBudgetAdd(t *testing.T) {
 	for _, tt := range []struct {
 		name string
