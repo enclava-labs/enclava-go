@@ -143,7 +143,7 @@ func (a *App) renderDashboardResourcePage(w http.ResponseWriter, r *http.Request
 		return
 	}
 	data := dashboardResourcePageData{
-		dashboardPageCommon: a.dashboardPageData(activePage, pageTitle),
+		dashboardPageCommon: a.dashboardPageData(r, activePage, pageTitle),
 		Heading:             pageTitle,
 		Description:         description,
 		PartialPath:         partialPath,

@@ -52,6 +52,7 @@
                 type="email"
                 id="link-email"
                 name="email"
+                autocomplete="username"
                 value="{{if .LinkEmail}}{{.LinkEmail}}{{else}}{{.Email}}{{end}}"
                 class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
               >
@@ -62,7 +63,7 @@
                 required
                 type="password"
                 id="link-password"
-                name="password"
+                autocomplete="current-password"
                 class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
               >
             </div>
@@ -83,6 +84,7 @@
               type="email"
               id="email"
               name="email"
+              autocomplete="username"
               value="{{.Email}}"
               class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
             >
@@ -94,6 +96,7 @@
               type="password"
               id="password"
               name="password"
+              autocomplete="current-password"
               class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
             >
           </div>

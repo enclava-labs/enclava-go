@@ -240,7 +240,7 @@ func (s *Service) principalForUser(ctx context.Context, user User) (Principal, e
 			}
 		}
 	}
-	return Principal{
+	p := Principal{
 		TenantID:           user.TenantID,
 		ActorID:            user.ID,
 		ActorKind:          ActorKindUser,
@@ -248,7 +248,19 @@ func (s *Service) principalForUser(ctx context.Context, user User) (Principal, e
 		Scopes:             scopes,
 		BillingSubjectID:   user.ID,
 		BillingSubjectKind: BillingSubjectUser,
-	}, nil
+	}
+	// A user holding platform.admin administers every tenant resource;
+	// item-level allowlists apply to scoped keys and service accounts, not to
+	// the platform administrator's employee session.
+	if _, ok := scopes[ScopePlatformAdmin]; ok {
+		p.AllowedModelsAll = true
+		p.AllowedExtractTemplatesAll = true
+		p.AllowedChatbotsAll = true
+		p.AllowedAgentsAll = true
+		p.AllowedEndpointsAll = true
+		p.AllowedIPsAll = true
+	}
+	return p, nil
 }
 
 func HashForStorage(plaintext, algo, pepper string) (prefix string, hash string, usedAlgo string, err error) {

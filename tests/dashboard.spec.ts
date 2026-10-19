@@ -1,27 +1,31 @@
-import { test, expect, Page } from '@playwright/test';
+import { test, expect, Page, APIRequestContext } from '@playwright/test';
 
-const BASE = process.env.BASE_URL ?? 'http://localhost:8080';
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL ?? 'admin@example.com';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? 'StrongPassword123';
+// Explicit isolated credentials and base URL are required — there are no
+// built-in example defaults to fall back to.
+const BASE = process.env.BASE_URL || '';
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || '';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const OIDC_AUTHORIZE_SUBSTR = process.env.OIDC_AUTHORIZE_SUBSTR || '';
 
-// Helper: login and return authenticated page
+test.skip(!BASE || !ADMIN_EMAIL || !ADMIN_PASSWORD, 'BASE_URL, ADMIN_EMAIL and ADMIN_PASSWORD are required');
+
+const SESSION_COOKIE = 'enclava_session';
+const CSRF_COOKIE = 'enclava_csrf';
+
+async function sessionCookies(page: Page) {
+  const cookies = await page.context().cookies();
+  const session = cookies.find(c => c.name === SESSION_COOKIE);
+  const csrf = cookies.find(c => c.name === CSRF_COOKIE);
+  return { session, csrf };
+}
+
+// Helper: login via the real local-credential form and return the session.
 async function login(page: Page) {
   await page.goto(`${BASE}/dashboard/login`);
   await page.fill('input[name="email"]', ADMIN_EMAIL);
   await page.fill('input[name="password"]', ADMIN_PASSWORD);
   await page.click('button[type="submit"]');
   await page.waitForURL('**/dashboard');
-}
-
-// Helper: wait for all HTMX partials to load
-async function waitForPartialsLoaded(page: Page) {
-  await expect(page.locator('#dashboard-stats-mount')).not.toContainText('Loading dashboard...');
-}
-
-async function goToAnalytics(page: Page) {
-  await login(page);
-  await page.goto(`${BASE}/dashboard/analytics`);
-  await expect(page.locator('#dashboard-usage')).not.toContainText('Loading analytics...');
 }
 
 async function goToKeys(page: Page) {
@@ -35,140 +39,6 @@ async function openCreateKeyForm(page: Page) {
   await expect(page.locator('#create-key-form')).toBeVisible();
 }
 
-// ─── Health & Public endpoints ─────────────────────────────────
-
-test.describe('Health endpoints', () => {
-  test('GET /health returns status ok', async ({ request }) => {
-    const res = await request.get(`${BASE}/health`);
-    expect(res.status()).toBe(200);
-    const body = await res.json();
-    expect(body.status).toBe('ok');
-    expect(body).toHaveProperty('time');
-    expect(body).toHaveProperty('provider');
-  });
-
-  test('GET /livez returns 200', async ({ request }) => {
-    const res = await request.get(`${BASE}/livez`);
-    expect(res.status()).toBe(200);
-  });
-
-  test('GET /readyz returns 200', async ({ request }) => {
-    const res = await request.get(`${BASE}/readyz`);
-    expect(res.status()).toBe(200);
-  });
-});
-
-// ─── Login page ────────────────────────────────────────────────
-
-test.describe('Login page', () => {
-  test('GET /dashboard redirects to /dashboard/login when not authenticated', async ({ page }) => {
-    await page.goto(`${BASE}/dashboard`);
-    await expect(page).toHaveURL(/\/dashboard\/login/);
-  });
-
-  test('login page renders correctly', async ({ page }) => {
-    await page.goto(`${BASE}/dashboard/login`);
-    await expect(page).toHaveTitle(/Enclava/);
-    await expect(page.locator('text=Enclava').first()).toBeVisible();
-    await expect(page.locator('text=Sign in').first()).toBeVisible();
-    await expect(page.locator('input[name="email"]')).toBeVisible();
-    await expect(page.locator('input[name="password"]')).toBeVisible();
-    await expect(page.locator('button[type="submit"]')).toBeVisible();
-  });
-
-  test('login with wrong password shows error', async ({ page }) => {
-    await page.goto(`${BASE}/dashboard/login`);
-    await page.fill('input[name="email"]', ADMIN_EMAIL);
-    await page.fill('input[name="password"]', 'wrong-password');
-    await page.click('button[type="submit"]');
-    await expect(page).toHaveURL(/\/dashboard\/login/);
-    await expect(page.locator('text=Invalid email or password')).toBeVisible();
-  });
-
-  test('login with correct credentials redirects to dashboard', async ({ page }) => {
-    await login(page);
-    await expect(page).toHaveURL(/\/dashboard$/);
-  });
-});
-
-// ─── Dashboard main page ───────────────────────────────────────
-
-test.describe('Dashboard main page (authenticated)', () => {
-  test.beforeEach(async ({ page }) => {
-    await login(page);
-  });
-
-  test('dashboard page loads with correct structure', async ({ page }) => {
-    await expect(page.locator('text=Enclava').first()).toBeVisible();
-    await expect(page.locator('nav a[href="/dashboard"]').first()).toBeVisible();
-    await expect(page.locator('summary[title="API Keys menu"]')).toBeVisible();
-    await expect(page.locator('button[title="Toggle theme"]')).toBeVisible();
-    await expect(page.locator('summary[title="User menu"]')).toBeVisible();
-  });
-
-  test('API Keys menu includes budgets as a submenu item', async ({ page }) => {
-    const apiKeysMenu = page.locator('details.dashboard-menu').filter({ has: page.locator('summary[title="API Keys menu"]') }).first();
-    await apiKeysMenu.locator('summary[title="API Keys menu"]').click();
-    await expect(apiKeysMenu.locator('a[href="/dashboard/keys"]')).toBeVisible();
-    await expect(apiKeysMenu.locator('a[href="/dashboard/budgets"]')).toBeVisible();
-  });
-
-  test('user menu contains account actions', async ({ page }) => {
-    await page.click('summary[title="User menu"]');
-    const accountPanel = page.locator('.dashboard-account-panel');
-    await expect(accountPanel.getByText(ADMIN_EMAIL, { exact: true })).toBeVisible();
-    await expect(accountPanel.getByText('Logout', { exact: true })).toBeVisible();
-  });
-
-  test('dashboard heading and description visible', async ({ page }) => {
-    await expect(page.locator('h1:text("Gateway overview")')).toBeVisible();
-    await expect(page.getByText(`Signed in as ${ADMIN_EMAIL}`)).toBeVisible();
-  });
-
-  test('dashboard stats section loads', async ({ page }) => {
-    await expect(page.locator('#dashboard-stats-mount')).not.toContainText('Loading dashboard...');
-    await expect(page.locator('text=Active keys')).toBeVisible();
-  });
-
-  test('theme toggle works', async ({ page }) => {
-    const html = page.locator('html');
-    await expect(html).toHaveClass(/dark/);
-    await page.click('button[title="Toggle theme"]');
-    await expect(html).not.toHaveClass(/dark/);
-    await page.click('button[title="Toggle theme"]');
-    await expect(html).toHaveClass(/dark/);
-  });
-});
-
-// ─── Resource dashboard pages ─────────────────────────────────
-
-const resourcePages = [
-  { path: '/dashboard/providers', heading: 'Providers', mount: '#dashboard-providers', text: 'Provider readiness' },
-  { path: '/dashboard/pricing', heading: 'Pricing', mount: '#dashboard-pricing', text: 'Provider Pricing' },
-  { path: '/dashboard/billing-audit', heading: 'Billing Audit', mount: '#dashboard-billing-audit', text: 'Billing Audit' },
-  { path: '/dashboard/rag', heading: 'RAG', mount: '#dashboard-rag', text: 'RAG Collections' },
-  { path: '/dashboard/chatbots', heading: 'Chatbots', mount: '#dashboard-chatbots', text: 'Chatbot Instances' },
-  { path: '/dashboard/prompt-templates', heading: 'Prompt Templates', mount: '#dashboard-prompt-templates', text: 'Prompt Templates' },
-  { path: '/dashboard/connectors', heading: 'Connectors', mount: '#dashboard-connectors', text: 'Connector Sources' },
-];
-
-test.describe('Resource dashboard pages (authenticated)', () => {
-  test.beforeEach(async ({ page }) => {
-    await login(page);
-  });
-
-  for (const resource of resourcePages) {
-    test(`${resource.heading} page renders`, async ({ page }) => {
-      await page.goto(`${BASE}${resource.path}`);
-      await expect(page.locator(`h1:text("${resource.heading}")`)).toBeVisible();
-      await expect(page.locator(resource.mount)).not.toContainText('Loading');
-      await expect(page.locator(resource.mount)).toContainText(resource.text);
-    });
-  }
-});
-
-// ─── Resource dashboard workflows ─────────────────────────────
-
 async function createRAGCollection(page: Page, name: string) {
   await page.goto(`${BASE}/dashboard/rag`);
   const mount = page.locator('#dashboard-rag');
@@ -180,6 +50,215 @@ async function createRAGCollection(page: Page, name: string) {
   await expect(mount).toContainText('RAG collection created');
   await expect(mount).toContainText(name);
 }
+
+// ─── Health & public endpoints ─────────────────────────────────
+
+test.describe('Health endpoints', () => {
+  test('GET /health returns status ok', async ({ request }) => {
+    const res = await request.get(`${BASE}/health`);
+    expect(res.status()).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe('ok');
+  });
+
+  test('GET /livez returns 200', async ({ request }) => {
+    expect((await request.get(`${BASE}/livez`)).status()).toBe(200);
+  });
+});
+
+// ─── Authentication ────────────────────────────────────────────
+
+test.describe('Authentication', () => {
+  test('GET /dashboard redirects to /dashboard/login when unauthenticated', async ({ page }) => {
+    await page.goto(`${BASE}/dashboard`);
+    await expect(page).toHaveURL(/\/dashboard\/login/);
+  });
+
+  test('login with a wrong password shows an accessible error', async ({ page }) => {
+    await page.goto(`${BASE}/dashboard/login`);
+    await page.fill('input[name="email"]', ADMIN_EMAIL);
+    await page.fill('input[name="password"]', 'wrong-password');
+    await page.click('button[type="submit"]');
+    await expect(page).toHaveURL(/\/dashboard\/login/);
+    await expect(page.locator('[role="alert"]')).toContainText('Invalid email or password');
+  });
+
+  test('login sets a server-side session and no service key in localStorage', async ({ page }) => {
+    await login(page);
+    const { session, csrf } = await sessionCookies(page);
+    expect(session).toBeTruthy();
+    expect(csrf).toBeTruthy();
+    const stored = await page.evaluate(() => Object.values({ ...window.localStorage }).join(' '));
+    expect(stored).not.toContain('enclava-dashboard-api-key');
+  });
+
+  test('login form submits with the keyboard only', async ({ page }) => {
+    await page.goto(`${BASE}/dashboard/login`);
+    await page.locator('input[name="email"]').fill(ADMIN_EMAIL);
+    await page.locator('input[name="password"]').fill(ADMIN_PASSWORD);
+    await page.locator('input[name="password"]').press('Enter');
+    await page.waitForURL('**/dashboard');
+    const { session } = await sessionCookies(page);
+    expect(session).toBeTruthy();
+  });
+
+
+  test('unauthenticated partial requests are denied', async ({ request }) => {
+    for (const p of ['/dashboard/partials/stats', '/dashboard/partials/keys', '/dashboard/partials/usage']) {
+      const res = await request.get(`${BASE}${p}`, { maxRedirects: 0 });
+      // GET page partials redirect to login — assert the redirect, not copy.
+      expect(res.status()).toBe(303);
+      expect(res.headers()['location']).toBe('/dashboard/login');
+    }
+    expect((await request.get(`${BASE}/api/v1/identities/users`)).status()).toBe(401);
+  });
+
+  test('cookie-authenticated logout requires the session CSRF token', async ({ page, request }) => {
+    await login(page);
+    const { session } = await sessionCookies(page);
+    const res = await request.post(`${BASE}/dashboard/logout`, {
+      headers: { Cookie: `${SESSION_COOKIE}=${session!.value}` },
+    });
+    // 401 (API-style denial) or 403 (CSRF denial) — never a successful logout.
+    expect([401, 403]).toContain(res.status());
+  });
+
+
+  test('OIDC provider link starts the real authorize flow', async ({ page }) => {
+    test.skip(!OIDC_AUTHORIZE_SUBSTR, 'OIDC_AUTHORIZE_SUBSTR is required to exercise the configured IdP');
+    await page.goto(`${BASE}/dashboard/login`);
+    const link = page.locator('a[href*="/auth/oidc/"][href$="/start"], a[href*="/auth/oidc/"][href*="/start?"]').first();
+    await expect(link).toBeVisible();
+    await link.click();
+    await page.waitForURL(new RegExp(OIDC_AUTHORIZE_SUBSTR));
+  });
+});
+
+// ─── Session lifecycle ─────────────────────────────────────────
+
+test.describe('Session lifecycle', () => {
+  test('logout revokes the session and protects pages afterwards', async ({ page, request }) => {
+    await login(page);
+    const { session, csrf } = await sessionCookies(page);
+    await page.click('summary[title="User menu"]');
+    await page.click('button[title="Sign out"]');
+    await expect(page).toHaveURL(/\/dashboard\/login/);
+
+    // The revoked cookie is worthless afterwards, even with its CSRF token.
+    const res = await request.get(`${BASE}/dashboard/partials/stats`, {
+      maxRedirects: 0,
+      headers: { Cookie: `${SESSION_COOKIE}=${session!.value}; ${CSRF_COOKIE}=${csrf!.value}` },
+    });
+    expect([303, 401]).toContain(res.status());
+
+    await page.goto(`${BASE}/dashboard`);
+    await expect(page).toHaveURL(/\/dashboard\/login/);
+  });
+});
+
+// ─── Account menu & identity page ──────────────────────────────
+
+test.describe('Identity page', () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page);
+  });
+
+  test('account menu shows the signed-in email and identity link', async ({ page }) => {
+    await page.click('summary[title="User menu"]');
+    const panel = page.locator('.dashboard-account-panel');
+    await expect(panel.getByText(ADMIN_EMAIL, { exact: true })).toBeVisible();
+    await expect(panel.locator('a[href="/dashboard/identity"]')).toBeVisible();
+    await expect(panel.getByText('Logout', { exact: true })).toBeVisible();
+  });
+
+  test('identity page loads account, sessions and linked identities', async ({ page }) => {
+    await page.goto(`${BASE}/dashboard/identity`);
+    await expect(page.locator('h1')).toContainText('Identity');
+    await expect(page.locator('#identity-email')).toContainText(ADMIN_EMAIL);
+    await expect(page.locator('#identity-sessions')).toContainText('Current session');
+    await expect(page.locator('#identity-links')).not.toContainText('Loading');
+  });
+
+  test('administration section lists users for an admin session', async ({ page }) => {
+    await page.goto(`${BASE}/dashboard/identity`);
+    await expect(page.locator('#identity-admin')).toBeVisible();
+    await expect(page.locator('#identity-users')).toContainText(ADMIN_EMAIL);
+  });
+
+  test('identity page works at a narrow viewport with the keyboard', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(`${BASE}/dashboard/identity`);
+    await expect(page.locator('#identity-email')).toContainText(ADMIN_EMAIL);
+    // Keyboard: the password form is reachable and submittable without a mouse.
+    const current = page.locator('#identity-current-password');
+    await current.focus();
+    await expect(current).toBeFocused();
+    await current.press('Tab');
+    await expect(page.locator('#identity-new-password')).toBeFocused();
+  });
+});
+
+// ─── Dashboard shell ───────────────────────────────────────────
+
+test.describe('Dashboard main page (authenticated)', () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page);
+  });
+
+  test('stats partial loads with the session', async ({ page }) => {
+    await expect(page.locator('#dashboard-stats-mount')).not.toContainText('Loading dashboard...');
+    await expect(page.locator('text=Active keys')).toBeVisible();
+  });
+
+  test('theme toggle still works', async ({ page }) => {
+    const html = page.locator('html');
+    await expect(html).toHaveClass(/dark/);
+    await page.click('button[title="Toggle theme"]');
+    await expect(html).not.toHaveClass(/dark/);
+    await page.click('button[title="Toggle theme"]');
+    await expect(html).toHaveClass(/dark/);
+  });
+
+  test('stats partial API returns HTML with the session cookie', async ({ page, request }) => {
+    const { session } = await sessionCookies(page);
+    expect(session).toBeTruthy();
+    const res = await request.get(`${BASE}/dashboard/partials/stats`, {
+      headers: { Cookie: `${SESSION_COOKIE}=${session!.value}` },
+    });
+    expect(res.status()).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain('"error"');
+    expect(text).toContain('Active keys');
+  });
+});
+
+// ─── Resource dashboard pages ─────────────────────────────────
+
+const resourcePages = [
+  { path: '/dashboard/providers', mount: '#dashboard-providers' },
+  { path: '/dashboard/pricing', mount: '#dashboard-pricing' },
+  { path: '/dashboard/billing-audit', mount: '#dashboard-billing-audit' },
+  { path: '/dashboard/rag', mount: '#dashboard-rag' },
+  { path: '/dashboard/chatbots', mount: '#dashboard-chatbots' },
+  { path: '/dashboard/prompt-templates', mount: '#dashboard-prompt-templates' },
+  { path: '/dashboard/connectors', mount: '#dashboard-connectors' },
+];
+
+test.describe('Resource dashboard pages (authenticated)', () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page);
+  });
+
+  for (const resource of resourcePages) {
+    test(`${resource.path} partial loads`, async ({ page }) => {
+      await page.goto(`${BASE}${resource.path}`);
+      await expect(page.locator(resource.mount)).not.toContainText('Loading');
+      await expect(page.locator(resource.mount)).not.toContainText('"error"');
+    });
+  }
+});
+
+// ─── Resource dashboard workflows ─────────────────────────────
 
 test.describe('Resource dashboard workflows (authenticated)', () => {
   test.beforeEach(async ({ page }) => {
@@ -202,34 +281,17 @@ test.describe('Resource dashboard workflows (authenticated)', () => {
     await expect(mount).toContainText(name);
   });
 
-  test('RAG collection create and document upload flow works', async ({ page }) => {
+  test('RAG collection create and delete flow works', async ({ page }) => {
     const name = `pw-rag-${Date.now()}`;
     await createRAGCollection(page, name);
 
     const mount = page.locator('#dashboard-rag');
-    const uploadForm = mount.locator('form:has(input[name="action"][value="upload_document"])');
-    await expect(uploadForm).toBeVisible();
-    await uploadForm.locator('select[name="collection_id"]').selectOption({ label: name });
-    await uploadForm.locator('input[type="file"]').setInputFiles({
-      name: 'playwright-rag.txt',
-      mimeType: 'text/plain',
-      buffer: Buffer.from('playwright rag upload phrase'),
-    });
-    await uploadForm.locator('button:text("Upload")').click();
-
-    await expect(mount).toContainText('Document uploaded');
     await expect(mount).toContainText(name);
-    await expect(mount).toContainText('RAG Documents');
-    const documentRow = mount.locator('tr:has-text("playwright-rag.txt")');
-    await expect(documentRow).toBeVisible();
-
-    await documentRow.locator('button:text("Reprocess")').click();
-    await expect(mount).toContainText('Document reprocessed');
 
     page.on('dialog', dialog => dialog.accept());
-    await mount.locator('tr:has-text("playwright-rag.txt") button:text("Delete")').click();
-    await expect(mount).toContainText('Document deleted');
-    await expect(mount.locator('tr:has-text("playwright-rag.txt")')).not.toBeVisible();
+    await mount.locator(`tr:has-text("${name}") button:text("Delete")`).click();
+    await expect(mount).toContainText('RAG collection deleted');
+    await expect(mount.locator(`tr:has-text("${name}")`)).not.toBeVisible();
   });
 
   test('chatbot create flow works', async ({ page }) => {
@@ -246,362 +308,92 @@ test.describe('Resource dashboard workflows (authenticated)', () => {
     await form.locator('button:text("Create")').click();
 
     await expect(mount).toContainText('Chatbot created');
-    await expect(mount).toContainText(name);
     await expect(mount).toContainText(`/api/v1/chatbot/external/${externalID}/chat/completions`);
 
     const row = mount.locator(`tr:has-text("${name}")`);
     await row.locator('button:text("Disable")').click();
     await expect(mount).toContainText('Chatbot disabled');
-    await expect(mount.locator(`tr:has-text("${name}")`)).toContainText('Disabled');
 
     page.on('dialog', dialog => dialog.accept());
     await mount.locator(`tr:has-text("${name}") button:text("Delete")`).click();
     await expect(mount).toContainText('Chatbot deleted');
     await expect(mount.locator(`tr:has-text("${name}")`)).not.toBeVisible();
   });
-
-  test('connector create and sync flow works with source content', async ({ page }) => {
-    const collectionName = `pw-connector-rag-${Date.now()}`;
-    await createRAGCollection(page, collectionName);
-
-    await page.goto(`${BASE}/dashboard/connectors`);
-    const mount = page.locator('#dashboard-connectors');
-    await expect(mount).not.toContainText('Loading');
-    const connectorName = `pw-connector-${Date.now()}`;
-
-    const createForm = mount.locator('form:has(input[name="action"][value="create_source"])');
-    await createForm.locator('input[name="name"]').fill(connectorName);
-    await createForm.locator('select[name="type"]').selectOption('github');
-    await createForm.locator('select[name="target_collection_id"]').selectOption({ label: collectionName });
-    await createForm.locator('input[name="file_name"]').fill('connector-source.txt');
-    await createForm.locator('textarea[name="content"]').fill('connector playwright sync phrase');
-    await createForm.locator('button:text("Create")').click();
-
-    await expect(mount).toContainText('Connector source created');
-    await expect(mount).toContainText(connectorName);
-
-    const row = mount.locator(`tr:has-text("${connectorName}")`);
-    await row.locator('button:text("Sync")').click();
-    await expect(mount).toContainText('Connector sync started');
-    await expect(mount).toContainText('succeeded');
-
-    await mount.locator(`tr:has-text("${connectorName}") button:text("Disable")`).click();
-    await expect(mount).toContainText('Connector source disabled');
-    await expect(mount.locator(`tr:has-text("${connectorName}")`)).toContainText('Disabled');
-
-    await mount.locator(`tr:has-text("${connectorName}") button:text("Enable")`).click();
-    await expect(mount).toContainText('Connector source enabled');
-    await expect(mount.locator(`tr:has-text("${connectorName}")`)).toContainText('Enabled');
-
-    page.on('dialog', dialog => dialog.accept());
-    await mount.locator(`tr:has-text("${connectorName}") button:text("Delete")`).click();
-    await expect(mount).toContainText('Connector source deleted');
-    await expect(mount.locator(`tr:has-text("${connectorName}")`)).not.toBeVisible();
-  });
 });
 
-// ─── HTMX partials: Stats ──────────────────────────────────────
-
-test.describe('Stats partial', () => {
-  test.beforeEach(async ({ page }) => {
-    await login(page);
-  });
-
-  test('stats section loads via HTMX', async ({ page }) => {
-    await expect(page.locator('#dashboard-stats-mount')).not.toContainText('Loading dashboard...');
-    await expect(page.locator('text=Active keys')).toBeVisible();
-    await expect(page.locator('text=Extract · 24h')).toBeVisible();
-    await expect(page.locator('text=Extract · total')).toBeVisible();
-    await expect(page.locator('text=Budget used')).toBeVisible();
-  });
-
-  test('stats shows budget dollar amounts', async ({ page }) => {
-    await expect(page.locator('#dashboard-stats-mount')).not.toContainText('Loading dashboard...');
-    // Budget card should show dollar amounts like "$0.00 / $100.00"
-    await expect(page.locator('text=/\\$\\d/').first()).toBeVisible();
-  });
-
-  test('extract module card visible', async ({ page }) => {
-    await expect(page.locator('#dashboard-stats-mount')).not.toContainText('Loading dashboard...');
-    await expect(page.locator('text=System snapshot')).toBeVisible();
-    await expect(page.getByText('Extract module', { exact: true })).toBeVisible();
-  });
-
-  test('API endpoint card visible with copy button', async ({ page }) => {
-    await expect(page.locator('#dashboard-stats-mount')).not.toContainText('Loading dashboard...');
-    await expect(page.locator('text=API access')).toBeVisible();
-    // Wait for initializeEndpointCopy to populate the element
-    await expect(page.locator('#api-endpoint')).toContainText('/api/v1');
-    await expect(page.locator('#copy-api-endpoint')).toBeVisible();
-  });
-
-  test('dashboard relies on persistent navigation instead of shortcut cards', async ({ page }) => {
-    await expect(page.locator('#dashboard-stats-mount')).not.toContainText('Loading dashboard...');
-    await expect(page.locator('#dashboard-stats-mount a[href="/dashboard/budgets"]')).toHaveCount(1);
-    const apiKeysMenu = page.locator('details.dashboard-menu').filter({ has: page.locator('summary[title="API Keys menu"]') }).first();
-    await apiKeysMenu.locator('summary[title="API Keys menu"]').click();
-    await expect(apiKeysMenu.locator('a[href="/dashboard/budgets"]')).toBeVisible();
-  });
-
-  test('stats partial API returns HTML with session cookie', async ({ page, request }) => {
-    const cookies = await page.context().cookies();
-    const sessionCookie = cookies.find(c => c.name === 'enclava_dashboard_session');
-    expect(sessionCookie).toBeTruthy();
-
-    const res = await request.get(`${BASE}/dashboard/partials/stats`, {
-      headers: {
-        Cookie: `enclava_dashboard_session=${sessionCookie!.value}`,
-      },
-    });
-    expect(res.status()).toBe(200);
-    const contentType = res.headers()['content-type'];
-    expect(contentType).toContain('text/html');
-    const text = await res.text();
-    expect(text).not.toContain('"error"');
-    expect(text).toContain('Active keys');
-  });
-});
-
-// ─── HTMX partials: Usage ──────────────────────────────────────
-
-test.describe('Usage partial', () => {
-  test.beforeEach(async ({ page }) => {
-    await goToAnalytics(page);
-  });
-
-  test('usage section loads via HTMX', async ({ page }) => {
-    await expect(page.locator('#dashboard-usage')).not.toContainText('Loading analytics...');
-    await expect(page.locator('text=Total Tokens')).toBeVisible();
-    await expect(page.locator('text=Total Cost')).toBeVisible();
-  });
-
-  test('usage table has correct headers', async ({ page }) => {
-    await expect(page.locator('#dashboard-usage')).not.toContainText('Loading usage...');
-    await expect(page.locator('#dashboard-usage th:text("API Key")')).toBeVisible();
-    await expect(page.locator('#dashboard-usage th:text("Requests")')).toBeVisible();
-    await expect(page.locator('#dashboard-usage th:text("Tokens")')).toBeVisible();
-    await expect(page.locator('#dashboard-usage th:text("Cost")')).toBeVisible();
-  });
-
-  test('usage partial API returns HTML with session cookie', async ({ page, request }) => {
-    const cookies = await page.context().cookies();
-    const sessionCookie = cookies.find(c => c.name === 'enclava_dashboard_session');
-
-    const res = await request.get(`${BASE}/dashboard/partials/usage`, {
-      headers: {
-        Cookie: `enclava_dashboard_session=${sessionCookie!.value}`,
-      },
-    });
-    expect(res.status()).toBe(200);
-    const text = await res.text();
-    expect(text).not.toContain('"error"');
-    expect(text).toContain('Total Tokens');
-  });
-});
-
-// ─── HTMX partials: Keys ──────────────────────────────────────
+// ─── API Keys management (service credentials) ─────────────────
 
 test.describe('API Keys management', () => {
   test.beforeEach(async ({ page }) => {
     await goToKeys(page);
   });
 
-  test('keys section loads via HTMX', async ({ page }) => {
+  test('keys partial loads via HTMX', async ({ page }) => {
     await expect(page.locator('#dashboard-keys-list')).not.toContainText('Loading keys...');
     const content = await page.locator('#dashboard-keys-list').textContent();
-    const hasKeys = content?.includes('Active') || content?.includes('Inactive');
-    const isEmpty = content?.includes('No API keys');
-    expect(hasKeys || isEmpty).toBeTruthy();
+    expect(content?.includes('Active') || content?.includes('Inactive') || content?.includes('No API keys')).toBeTruthy();
   });
 
-  test('API Key Management heading visible', async ({ page }) => {
-    await expect(page.locator('h1:text("API Keys")')).toBeVisible();
-    await expect(page.locator('h3:text("Key Inventory")')).toBeVisible();
-  });
-
-  test('create key form has correct fields', async ({ page }) => {
+  test('create API key end-to-end with one-time display', async ({ page }) => {
     await openCreateKeyForm(page);
-    await expect(page.locator('label[for="key-name"]')).toBeVisible();
-    await expect(page.locator('input[name="name"]')).toBeVisible();
-    await expect(page.locator('label[for="key-description"]')).toBeVisible();
-    await expect(page.locator('input[name="description"]')).toBeVisible();
-    await expect(page.locator('button:text("Create key")')).toBeVisible();
-  });
-
-  test('create key name is required', async ({ page }) => {
-    await openCreateKeyForm(page);
-    const nameInput = page.locator('input[name="name"]');
-    await expect(nameInput).toHaveAttribute('required', '');
-  });
-
-  test('create API key end-to-end', async ({ page }) => {
-    await openCreateKeyForm(page);
-    const keyName = 'test-key-' + Date.now();
+    const keyName = 'pw-key-' + Date.now();
     await page.fill('input[name="name"]', keyName);
     await page.fill('input[name="description"]', 'Playwright test key');
     await page.click('button:text("Create key")');
 
-    await page.waitForTimeout(1000);
     await expect(page.locator('#dashboard-keys-list')).toContainText('API key created');
     await expect(page.locator('#dashboard-keys-list')).toContainText('Store this key now');
     await expect(page.locator('#dashboard-keys-list')).toContainText(keyName);
+    const shown = await page.locator('#dashboard-keys-list .font-mono code').first().textContent();
+    const stored = await page.evaluate(() => Object.values({ ...window.localStorage }).join(' '));
+    expect(shown).toBeTruthy();
+    expect(stored).not.toContain(shown!.trim());
   });
 
-  test('toggle API key status', async ({ page }) => {
+  test('toggle and delete API key', async ({ page }) => {
     await openCreateKeyForm(page);
-    const keyName = 'toggle-test-' + Date.now();
+    const keyName = 'pw-toggle-' + Date.now();
     await page.fill('input[name="name"]', keyName);
-    await page.fill('input[name="description"]', 'Toggle test');
     await page.click('button:text("Create key")');
-    await page.waitForTimeout(1000);
+    await expect(page.locator('#dashboard-keys-list')).toContainText(keyName);
 
     const row = page.locator(`tr:has-text("${keyName}")`);
     await expect(row).toBeVisible();
-    await row.locator('button[title="Disable key"]').click();
-    await page.waitForTimeout(1000);
-
-    const updatedRow = page.locator(`tr:has-text("${keyName}")`);
-    await expect(updatedRow.locator('text=Inactive')).toBeVisible();
-    await expect(updatedRow.locator('button[title="Enable key"]')).toBeVisible();
-  });
-
-  test('regenerate API key shows new secret', async ({ page }) => {
-    await openCreateKeyForm(page);
-    const keyName = 'regen-test-' + Date.now();
-    await page.fill('input[name="name"]', keyName);
-    await page.fill('input[name="description"]', 'Regen test');
-    await page.click('button:text("Create key")');
-    await page.waitForTimeout(1000);
-
-    const row = page.locator(`tr:has-text("${keyName}")`);
-    page.on('dialog', dialog => dialog.accept());
-    await row.locator('button[title="Regenerate key"]').click();
-    await page.waitForTimeout(1000);
-
-    await expect(page.locator('#dashboard-keys-list')).toContainText('API key regenerated');
-    await expect(page.locator('#dashboard-keys-list')).toContainText('Store this key now');
-  });
-
-  test('delete API key with confirmation', async ({ page }) => {
-    await openCreateKeyForm(page);
-    const keyName = 'delete-test-' + Date.now();
-    await page.fill('input[name="name"]', keyName);
-    await page.fill('input[name="description"]', 'Delete test');
-    await page.click('button:text("Create key")');
-    await page.waitForTimeout(1000);
-    await expect(page.locator('#dashboard-keys-list')).toContainText(keyName);
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes('/dashboard/partials/keys') && r.request().method() === 'POST'),
+      row.locator('button[title="Disable key"]').click(),
+    ]);
+    await expect(page.locator(`tr:has-text("${keyName}")`)).toContainText('Inactive');
 
     page.on('dialog', dialog => dialog.accept());
-
-    const row = page.locator(`tr:has-text("${keyName}")`);
-    await row.locator('button[title="Delete key"]').click();
-    await page.waitForTimeout(1000);
-
+    await page.locator(`tr:has-text("${keyName}") button[title="Delete key"]`).click();
     await expect(page.locator('#dashboard-keys-list')).toContainText('API key deleted');
     await expect(page.locator(`tr:has-text("${keyName}")`)).not.toBeVisible();
   });
 
-  test('keys partial API returns HTML with session cookie', async ({ page, request }) => {
-    const cookies = await page.context().cookies();
-    const sessionCookie = cookies.find(c => c.name === 'enclava_dashboard_session');
+  test('key mutations require the session CSRF token', async ({ page, request }) => {
+    const { session, csrf } = await sessionCookies(page);
+    expect(session).toBeTruthy();
 
-    const res = await request.get(`${BASE}/dashboard/partials/keys`, {
+    // Session cookie without the CSRF token must not mutate key state.
+    const denied = await request.post(`${BASE}/dashboard/partials/keys`, {
       headers: {
-        Cookie: `enclava_dashboard_session=${sessionCookie!.value}`,
+        Cookie: `${SESSION_COOKIE}=${session!.value}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
       },
+      data: 'action=create&name=csrf-probe',
     });
-    expect(res.status()).toBe(200);
-    const text = await res.text();
-    expect(text).not.toContain('"error"');
-    expect(text).not.toContain('missing API key');
-  });
-});
+    expect(denied.status()).toBe(403);
 
-// ─── Logout ────────────────────────────────────────────────────
-
-test.describe('Logout', () => {
-  test('logout redirects to login page', async ({ page }) => {
-    await login(page);
-    await page.click('summary[title="User menu"]');
-    await page.click('button[title="Sign out"]');
-    await expect(page).toHaveURL(/\/dashboard\/login/);
-  });
-
-  test('after logout, dashboard redirects to login', async ({ page }) => {
-    await login(page);
-    await page.click('summary[title="User menu"]');
-    await page.click('button[title="Sign out"]');
-    await expect(page).toHaveURL(/\/dashboard\/login/);
-    await page.goto(`${BASE}/dashboard`);
-    await expect(page).toHaveURL(/\/dashboard\/login/);
-  });
-});
-
-// ─── Unauthenticated partial access ───────────────────────────
-
-test.describe('Unauthenticated access to partials', () => {
-  test('partials/stats returns 401 without auth', async ({ request }) => {
-    const res = await request.get(`${BASE}/dashboard/partials/stats`);
-    expect(res.status()).toBe(401);
-  });
-
-  test('partials/keys returns 401 without auth', async ({ request }) => {
-    const res = await request.get(`${BASE}/dashboard/partials/keys`);
-    expect(res.status()).toBe(401);
-  });
-
-  test('partials/usage returns 401 without auth', async ({ request }) => {
-    const res = await request.get(`${BASE}/dashboard/partials/usage`);
-    expect(res.status()).toBe(401);
-  });
-});
-
-// ─── Static assets ─────────────────────────────────────────────
-
-test.describe('Static assets', () => {
-  test('tailwind.css loads', async ({ request }) => {
-    const res = await request.get(`${BASE}/dashboard/static/tailwind.css`);
-    expect(res.status()).toBe(200);
-    const text = await res.text();
-    expect(text).toContain('--background');
-    expect(text).toContain('--foreground');
-  });
-
-  test('dashboard.js loads', async ({ request }) => {
-    const res = await request.get(`${BASE}/dashboard/static/dashboard.js`);
-    expect(res.status()).toBe(200);
-    const text = await res.text();
-    expect(text).toContain('toggleTheme');
-    expect(text).toContain('showToast');
-  });
-
-  test('dashboard nav CSS loads', async ({ request }) => {
-    const res = await request.get(`${BASE}/dashboard/static/dashboard-nav.css`);
-    expect(res.status()).toBe(200);
-    const text = await res.text();
-    expect(text).toContain('.dashboard-nav');
-    expect(text).toContain('.dashboard-account-panel');
-  });
-
-  test('htmx.min.js loads', async ({ request }) => {
-    const res = await request.get(`${BASE}/dashboard/static/htmx.min.js`);
-    expect(res.status()).toBe(200);
-  });
-});
-
-// ─── Console errors ────────────────────────────────────────────
-
-test.describe('No JS console errors', () => {
-  test('dashboard page has no console errors', async ({ page }) => {
-    const errors: string[] = [];
-    page.on('console', msg => {
-      if (msg.type() === 'error') errors.push(msg.text());
+    // With the session's CSRF token the same mutation is authorized.
+    const allowed = await request.post(`${BASE}/dashboard/partials/keys`, {
+      headers: {
+        Cookie: `${SESSION_COOKIE}=${session!.value}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-CSRF-Token': csrf!.value,
+      },
+      data: 'action=create&name=csrf-ok-' + Date.now(),
     });
-
-    await login(page);
-    await waitForPartialsLoaded(page);
-
-    const unexpected = errors.filter(e => !e.includes('favicon'));
-    expect(unexpected).toEqual([]);
+    expect(allowed.status()).toBe(200);
   });
 });

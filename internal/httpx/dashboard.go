@@ -109,7 +109,15 @@ type dashboardPageCommon struct {
 	ActivePage    string
 	PageTitle     string
 	AuthMode      string
+	UserEmail     string
 	DefaultScopes string
+}
+
+// dashboardIdentityData feeds page_identity: the signed-in account plus the
+// OIDC providers an employee can use for sign-in/linking.
+type dashboardIdentityData struct {
+	dashboardPageCommon
+	Providers []auth.OIDCProvider
 }
 
 type dashboardBudgetRow struct {
@@ -187,16 +195,52 @@ func (a *App) registerDashboardRoutes() {
 	a.mux.HandleFunc("/dashboard/chatbots", a.sessionAuth.RequireSession(a.handleDashboardPageChatbots))
 	a.mux.HandleFunc("/dashboard/prompt-templates", a.sessionAuth.RequireSession(a.handleDashboardPagePromptTemplates))
 	a.mux.HandleFunc("/dashboard/connectors", a.sessionAuth.RequireSession(a.handleDashboardPageConnectors))
+	a.mux.HandleFunc("/dashboard/identity", a.sessionAuth.RequireSession(a.handleDashboardPageIdentity))
 	a.mux.HandleFunc("/dashboard", a.sessionAuth.RequireSession(a.handleDashboardPage))
 	a.mux.HandleFunc("/dashboard/", a.sessionAuth.RequireSession(a.handleDashboardPage))
 }
 
-func (a *App) dashboardPageData(activePage, pageTitle string) dashboardPageCommon {
-	return dashboardPageCommon{
+func (a *App) dashboardPageData(r *http.Request, activePage, pageTitle string) dashboardPageCommon {
+	data := dashboardPageCommon{
 		ActivePage:    activePage,
 		PageTitle:     pageTitle,
 		AuthMode:      "session",
 		DefaultScopes: strings.Join(dashboardDefaultScopes, ", "),
+	}
+	// The principal is session-verified; the email renders in the account
+	// menu so the operator sees which employee account holds the session.
+	if principal, ok := auth.PrincipalFromContext(r.Context()); ok && principal.UserID != "" && a.identity != nil {
+		if user, err := a.identity.GetUser(r.Context(), principal.TenantID, principal.UserID); err == nil {
+			data.UserEmail = user.Email
+		}
+	}
+	return data
+}
+
+// handleDashboardPageIdentity serves the account/identity page. The page's
+// sections load through the /api/v1/identities session+CSRF APIs; only the
+// provider list (for link/sign-in buttons) is rendered server-side.
+func (a *App) handleDashboardPageIdentity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	data := dashboardIdentityData{
+		dashboardPageCommon: a.dashboardPageData(r, "identity", "Identity"),
+	}
+	if a.sessionAuth != nil && a.sessionAuth.oidc != nil {
+		if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
+			if providers, err := a.sessionAuth.oidc.EnabledProviders(r.Context(), principal.TenantID); err == nil {
+				data.Providers = providers
+			} else {
+				log.Printf("identity page providers: %v", err)
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := dashboardTemplates.ExecuteTemplate(w, "page-identity", data); err != nil {
+		log.Printf("failed to render identity page: %v", err)
+		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_identity_render_failed")
 	}
 }
 
@@ -206,7 +250,7 @@ func (a *App) handleDashboardPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "page-dashboard", a.dashboardPageData("dashboard", "Dashboard")); err != nil {
+	if err := dashboardTemplates.ExecuteTemplate(w, "page-dashboard", a.dashboardPageData(r, "dashboard", "Dashboard")); err != nil {
 		log.Printf("failed to render dashboard page: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_render_failed")
 	}
@@ -218,7 +262,7 @@ func (a *App) handleDashboardPageKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "page-keys", a.dashboardPageData("keys", "API Keys")); err != nil {
+	if err := dashboardTemplates.ExecuteTemplate(w, "page-keys", a.dashboardPageData(r, "keys", "API Keys")); err != nil {
 		log.Printf("failed to render dashboard keys page: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_keys_page_render_failed")
 	}
@@ -230,7 +274,7 @@ func (a *App) handleDashboardPageAnalytics(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "page-analytics", a.dashboardPageData("analytics", "Analytics")); err != nil {
+	if err := dashboardTemplates.ExecuteTemplate(w, "page-analytics", a.dashboardPageData(r, "analytics", "Analytics")); err != nil {
 		log.Printf("failed to render dashboard analytics page: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_analytics_page_render_failed")
 	}
@@ -242,7 +286,7 @@ func (a *App) handleDashboardPageBudgets(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "page-budgets", a.dashboardPageData("budgets", "Budgets")); err != nil {
+	if err := dashboardTemplates.ExecuteTemplate(w, "page-budgets", a.dashboardPageData(r, "budgets", "Budgets")); err != nil {
 		log.Printf("failed to render dashboard budgets page: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_budgets_page_render_failed")
 	}
@@ -254,7 +298,7 @@ func (a *App) handleDashboardPageExtract(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "page-extract", a.dashboardPageData("extract", "Extract")); err != nil {
+	if err := dashboardTemplates.ExecuteTemplate(w, "page-extract", a.dashboardPageData(r, "extract", "Extract")); err != nil {
 		log.Printf("failed to render dashboard extract page: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_extract_page_render_failed")
 	}
@@ -457,9 +501,9 @@ func (a *App) handleDashboardUsage(w http.ResponseWriter, r *http.Request) {
 }
 
 // dashboardTenantID resolves the tenant for dashboard key/usage reads from
-// the request's authenticated principal. The signed password cookie carries
-// no tenant identity, so password-mode calls get a truthful 401 rather than
-// a fabricated tenant (the session-cookie principal lands with 01-16/01-20).
+// the request's session-verified principal — RequireSession has already
+// placed it on the context, so an absent principal is a truthful 401 rather
+// than a fabricated tenant.
 func (a *App) dashboardTenantID(w http.ResponseWriter, r *http.Request) (string, bool) {
 	if p, ok := auth.PrincipalFromContext(r.Context()); ok && p.TenantID != "" {
 		return p.TenantID, true
@@ -623,6 +667,14 @@ func (a *App) renderDashboardKeys(w http.ResponseWriter, ctx context.Context, te
 	for i := range keys {
 		keys[i] = redactAdminAPIKey(keys[i])
 	}
+	// Revoked keys are deleted from the operator view.
+	live := keys[:0]
+	for _, k := range keys {
+		if k.RevokedAt == nil {
+			live = append(live, k)
+		}
+	}
+	keys = live
 	secret := ""
 	if len(createdKey) > 0 {
 		secret = createdKey[0]
