@@ -32,6 +32,7 @@ type dashboardProvidersData struct {
 	Models      []llm.Model
 	Attestation any
 	Endpoints   []inference.Endpoint
+	CanManage   bool
 	Error       string
 }
 
@@ -162,6 +163,9 @@ func (a *App) handleDashboardProviders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := dashboardProvidersData{}
+	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
+		data.CanManage = auth.HasScope(principal, "pricing.manage")
+	}
 	if a.prober != nil {
 		data.Snapshot = a.prober.Snapshot()
 	}
