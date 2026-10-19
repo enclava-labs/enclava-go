@@ -18,8 +18,8 @@ import (
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/billing"
+	"enclava-go/internal/extract"
 	"enclava-go/internal/store/postgres"
-	"enclava-go/internal/store/sqlite"
 )
 
 //go:embed dashboard/templates/*.tmpl
@@ -134,7 +134,7 @@ type dashboardBudgetsData struct {
 type dashboardExtractData struct {
 	RecentJobs int64
 	TotalJobs  int64
-	Templates  []sqlite.ExtractTemplate
+	Templates  []extract.Template
 }
 
 const dashboardBudgetTotalCents int64 = 10000
@@ -483,18 +483,17 @@ func (a *App) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 
 	var recentExtractJobs int64
 	var totalExtractJobs int64
-	if a.extractJobs != nil {
-		since := time.Now().UTC().Add(-24 * time.Hour)
-		recentExtractJobs, err = a.extractJobs.CountSince(r.Context(), since)
-		if err != nil {
-			log.Printf("failed to load dashboard recent extract jobs: %v", err)
-			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_stats_extract_recent_failed")
+	if a.extractSvc != nil {
+		p, ok := auth.PrincipalFromContext(r.Context())
+		if !ok || p.TenantID == "" {
+			WriteUnauthorized(w, "authenticated principal required")
 			return
 		}
-		totalExtractJobs, err = a.extractJobs.CountAll(r.Context())
+		since := time.Now().UTC().Add(-24 * time.Hour)
+		recentExtractJobs, totalExtractJobs, err = a.extractSvc.JobStats(r.Context(), p, since)
 		if err != nil {
-			log.Printf("failed to load dashboard total extract jobs: %v", err)
-			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_stats_extract_total_failed")
+			log.Printf("failed to load dashboard extract job stats: %v", err)
+			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_stats_extract_failed")
 			return
 		}
 	}
@@ -918,29 +917,24 @@ func (a *App) handleDashboardExtract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var recentJobs int64
-	var totalJobs int64
-	if a.extractJobs != nil {
-		var err error
-		since := time.Now().UTC().Add(-24 * time.Hour)
-		recentJobs, err = a.extractJobs.CountSince(r.Context(), since)
-		if err != nil {
-			log.Printf("failed to load extract recent jobs: %v", err)
-			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_extract_recent_failed")
-			return
-		}
-		totalJobs, err = a.extractJobs.CountAll(r.Context())
-		if err != nil {
-			log.Printf("failed to load extract total jobs: %v", err)
-			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_extract_total_failed")
-			return
-		}
+	p, ok := a.extractPrincipal(w, r)
+	if !ok {
+		return
 	}
 
-	var templates []sqlite.ExtractTemplate
-	if a.extractTemplates != nil {
+	var recentJobs int64
+	var totalJobs int64
+	var templates []extract.Template
+	if a.extractSvc != nil {
 		var err error
-		templates, err = a.extractTemplates.List(r.Context())
+		since := time.Now().UTC().Add(-24 * time.Hour)
+		recentJobs, totalJobs, err = a.extractSvc.JobStats(r.Context(), p, since)
+		if err != nil {
+			log.Printf("failed to load extract job stats: %v", err)
+			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_extract_stats_failed")
+			return
+		}
+		templates, err = a.extractSvc.ListTemplates(r.Context(), p)
 		if err != nil {
 			log.Printf("failed to load extract templates: %v", err)
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_extract_templates_failed")

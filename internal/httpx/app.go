@@ -25,33 +25,30 @@ import (
 )
 
 type App struct {
-	authSvc          *auth.Service
-	provider         llm.Provider
-	providerID       string
-	prober           *llm.Prober
-	identity         *postgres.IdentityRepo
-	extractJobs      *sqlite.ExtractJobsRepo
-	extractTemplates *sqlite.ExtractTemplatesRepo
-	extractSettings  *sqlite.ExtractSettingsRepo
-	extractSvc       *extract.Service
-	ragSvc           *rag.Service
-	promptSvc        *prompts.Service
-	chatbotSvc       *chatbot.Service
-	connectorSvc     *connectors.Service
-	usageRepo        *sqlite.UsageRepo
-	billingSvc       *billing.Service
-	billingRepo      *postgres.BillingRepo
-	endpoints        *postgres.EndpointsRepo
-	apiKeyAlgo       string
-	apiKeyPepper     string
-	apiKeyPrefix     string
-	corsOrigins      []string
-	adminEmail       string
-	adminPassword    string
-	maxUploadMB      int64
-	trustProxy       bool
-	rl               *RateLimiter
-	mux              *http.ServeMux
+	authSvc       *auth.Service
+	provider      llm.Provider
+	providerID    string
+	prober        *llm.Prober
+	identity      *postgres.IdentityRepo
+	extractSvc    *extract.Service
+	ragSvc        *rag.Service
+	promptSvc     *prompts.Service
+	chatbotSvc    *chatbot.Service
+	connectorSvc  *connectors.Service
+	usageRepo     *sqlite.UsageRepo
+	billingSvc    *billing.Service
+	billingRepo   *postgres.BillingRepo
+	endpoints     *postgres.EndpointsRepo
+	apiKeyAlgo    string
+	apiKeyPepper  string
+	apiKeyPrefix  string
+	corsOrigins   []string
+	adminEmail    string
+	adminPassword string
+	maxUploadMB   int64
+	trustProxy    bool
+	rl            *RateLimiter
+	mux           *http.ServeMux
 }
 
 const (
@@ -74,9 +71,6 @@ func NewApp(
 	providerID string,
 	prober *llm.Prober,
 	identity *postgres.IdentityRepo,
-	extractJobs *sqlite.ExtractJobsRepo,
-	extractTemplates *sqlite.ExtractTemplatesRepo,
-	extractSettings *sqlite.ExtractSettingsRepo,
 	extractSvc *extract.Service,
 	ragSvc *rag.Service,
 	promptSvc *prompts.Service,
@@ -96,32 +90,30 @@ func NewApp(
 	trustProxy bool,
 ) *App {
 	a := &App{
-		authSvc:          authSvc,
-		provider:         provider,
-		providerID:       providerID,
-		prober:           prober,
-		identity:         identity,
-		extractJobs:      extractJobs,
-		extractTemplates: extractTemplates,
-		extractSettings:  extractSettings,
-		extractSvc:       extractSvc,
-		ragSvc:           ragSvc,
-		promptSvc:        promptSvc,
-		chatbotSvc:       chatbotSvc,
-		connectorSvc:     connectorSvc,
-		usageRepo:        usageRepo,
-		billingSvc:       billingSvc,
-		billingRepo:      billingRepo,
-		endpoints:        endpoints,
-		apiKeyAlgo:       apiKeyAlgo,
-		apiKeyPepper:     apiKeyPepper,
-		apiKeyPrefix:     apiKeyPrefix,
-		corsOrigins:      corsOrigins,
-		adminEmail:       strings.TrimSpace(adminEmail),
-		adminPassword:    adminPassword,
-		maxUploadMB:      maxUploadMB,
-		trustProxy:       trustProxy,
-		rl:               NewRateLimiter(),
+		authSvc:    authSvc,
+		provider:   provider,
+		providerID: providerID,
+		prober:     prober,
+		identity:   identity,
+
+		extractSvc:    extractSvc,
+		ragSvc:        ragSvc,
+		promptSvc:     promptSvc,
+		chatbotSvc:    chatbotSvc,
+		connectorSvc:  connectorSvc,
+		usageRepo:     usageRepo,
+		billingSvc:    billingSvc,
+		billingRepo:   billingRepo,
+		endpoints:     endpoints,
+		apiKeyAlgo:    apiKeyAlgo,
+		apiKeyPepper:  apiKeyPepper,
+		apiKeyPrefix:  apiKeyPrefix,
+		corsOrigins:   corsOrigins,
+		adminEmail:    strings.TrimSpace(adminEmail),
+		adminPassword: adminPassword,
+		maxUploadMB:   maxUploadMB,
+		trustProxy:    trustProxy,
+		rl:            NewRateLimiter(),
 	}
 
 	a.mux = http.NewServeMux()

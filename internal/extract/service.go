@@ -42,6 +42,7 @@ type JobReader interface {
 	GetOwnedJob(ctx context.Context, tenantID, id, submitterKey string) (jobs.JobRow, error)
 	ListOwnedJobs(ctx context.Context, tenantID, submitterKey string, limit int) ([]jobs.JobRow, error)
 	CountOwnedJobs(ctx context.Context, tenantID, submitterKey string) (int, error)
+	CountOwnedJobsSince(ctx context.Context, tenantID, submitterKey string, since time.Time) (int, error)
 }
 
 // Service owns the extract pipeline: Process persists the upload as a durable
@@ -389,6 +390,21 @@ func (s *Service) ListJobs(ctx context.Context, p auth.Principal, limit, offset 
 		out = append(out, jobView(row))
 	}
 	return out, total, nil
+}
+
+// JobStats returns the caller's recent (submitted at or after `since`) and
+// total non-deleted job counts — the owner-bound pair the dashboard renders.
+func (s *Service) JobStats(ctx context.Context, p auth.Principal, since time.Time) (recent int64, total int64, err error) {
+	key := jobs.SubmitterKey(p)
+	t, err := s.jobRows.CountOwnedJobs(ctx, p.TenantID, key)
+	if err != nil {
+		return 0, 0, err
+	}
+	rec, err := s.jobRows.CountOwnedJobsSince(ctx, p.TenantID, key, since)
+	if err != nil {
+		return 0, 0, err
+	}
+	return int64(rec), int64(t), nil
 }
 
 // GetJob returns the owner-bound job detail; the decoded result artifact is
