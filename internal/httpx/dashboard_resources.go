@@ -16,6 +16,7 @@ import (
 	"enclava-go/internal/llm"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
+	"enclava-go/internal/store/postgres"
 )
 
 type dashboardResourcePageData struct {
@@ -28,11 +29,15 @@ type dashboardResourcePageData struct {
 }
 
 type dashboardProvidersData struct {
-	Snapshot    llm.ReadinessSnapshot
-	Models      []llm.Model
-	Attestation any
-	Endpoints   []inference.Endpoint
-	Error       string
+	Snapshot       llm.ReadinessSnapshot
+	Models         []llm.Model
+	Attestation    any
+	Endpoints      []inference.Endpoint
+	CredentialRefs []auth.SecretRefMeta
+	PriceRows      []postgres.PriceRow
+	CanManage      bool
+	TenantID       string
+	Error          string
 }
 
 // Billing view rows carry the canonical billing types — the sections read
@@ -162,6 +167,13 @@ func (a *App) handleDashboardProviders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := dashboardProvidersData{}
+	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
+		data.TenantID = principal.TenantID
+		data.CanManage = auth.HasScope(principal, "pricing.manage")
+		if a.executor != nil {
+			data.CredentialRefs = a.executor.CredentialReferences(principal.TenantID)
+		}
+	}
 	if a.prober != nil {
 		data.Snapshot = a.prober.Snapshot()
 	}
@@ -188,6 +200,16 @@ func (a *App) handleDashboardProviders(w http.ResponseWriter, r *http.Request) {
 			log.Printf("failed to load dashboard endpoints: %v", err)
 		} else {
 			data.Endpoints = endpoints
+		}
+	}
+	if a.billingRepo != nil && data.TenantID != "" {
+		endpointPrices, endpointErr := a.billingRepo.ListPrices(r.Context(), data.TenantID, "endpoint", "", "", 200, 0)
+		modelPrices, modelErr := a.billingRepo.ListPrices(r.Context(), data.TenantID, "model", "", "", 200, 0)
+		if endpointErr != nil || modelErr != nil {
+			data.Error = "Provider pricing status unavailable"
+			log.Printf("failed to load provider pricing status: endpoint=%v model=%v", endpointErr, modelErr)
+		} else {
+			data.PriceRows = append(endpointPrices, modelPrices...)
 		}
 	}
 	if err := dashboardTemplates.ExecuteTemplate(w, "partial-providers", data); err != nil {

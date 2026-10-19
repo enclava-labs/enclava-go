@@ -235,6 +235,8 @@ func main() {
 			MaxQueued:    cfg.InferenceMaxHTTPQueue,
 			MaxBodyBytes: cfg.InferenceMaxBodyBytes,
 		},
+		sourceRepo,
+		artifactRepo,
 	)
 
 	// The extract module mounts its API routes on the app's mux — every

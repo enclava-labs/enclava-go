@@ -59,7 +59,7 @@ type Conversation struct {
 
 // restrictionSubjectTenant scopes a SourceRestriction row to tenant-wide
 // processing policy; subjectID is the tenant id.
-const restrictionSubjectTenant = "tenant"
+const restrictionSubjectTenant = source.RestrictionTenant
 
 // restrictionSubjectConversation scopes restrictions attached to a retained
 // conversation; subjectID is the conversation id.

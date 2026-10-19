@@ -159,14 +159,15 @@ type AccessSnapshot struct {
 
 // Restriction subjects.
 const (
+	RestrictionTenant     = "tenant"
 	RestrictionConnection = "connection"
 	RestrictionObject     = "object"
 	RestrictionArtifact   = "artifact"
 )
 
 // SourceRestriction is a server-owned processing restriction attached to a
-// connection, object or artifact. Restrictions narrow — never widen — the
-// destinations and capabilities an execution may use.
+// tenant, connection, object or artifact. Restrictions narrow — never widen —
+// the destinations and capabilities an execution may use.
 type SourceRestriction struct {
 	TenantID           string
 	SubjectKind        string // Restriction* const set

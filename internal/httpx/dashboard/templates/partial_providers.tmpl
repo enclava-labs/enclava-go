@@ -1,60 +1,69 @@
 {{define "partial-providers"}}
 <div class="space-y-6">
-  <div class="grid gap-4 md:grid-cols-3">
-    <div class="rounded-lg border bg-card p-5">
-      <p class="text-sm text-muted-foreground">Provider readiness</p>
-      <p class="mt-2 text-2xl font-semibold">{{if .Snapshot.Ready}}Ready{{else}}Not Ready{{end}}</p>
-      <p class="mt-1 text-xs text-muted-foreground">Failures: {{.Snapshot.ConsecutiveFailures}}</p>
-    </div>
-    <div class="rounded-lg border bg-card p-5">
-      <p class="text-sm text-muted-foreground">Models</p>
-      <p class="mt-2 text-2xl font-semibold">{{len .Models}}</p>
-      <p class="mt-1 text-xs text-muted-foreground">Available through the configured provider</p>
-    </div>
-    <div class="rounded-lg border bg-card p-5">
-      <p class="text-sm text-muted-foreground">Attestation</p>
-      {{with .Attestation}}
-      <p class="mt-2 text-2xl font-semibold">{{if .Verified}}Verified{{else}}Unverified{{end}}</p>
-      <p class="mt-1 text-xs text-muted-foreground">{{.Provider}}</p>
-      {{else}}
-      <p class="mt-2 text-2xl font-semibold">Unavailable</p>
-      <p class="mt-1 text-xs text-muted-foreground">Provider does not expose attestation</p>
-      {{end}}
-    </div>
-  </div>
-
-  {{if .Error}}
-  <div class="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700 dark:border-red-900/40 dark:bg-red-950/20 dark:text-red-300">{{.Error}}</div>
-  {{end}}
-
-  <div class="rounded-lg border bg-card overflow-hidden">
-    <div class="border-b px-5 py-4">
-      <h3 class="font-semibold">Provider Models</h3>
-    </div>
-    {{if not .Models}}
-    <div class="p-8 text-center text-sm text-muted-foreground">No models returned by the configured provider.</div>
-    {{else}}
-    <div class="overflow-x-auto">
-      <table class="w-full text-sm">
-        <thead class="bg-muted/50 text-muted-foreground">
-          <tr>
-            <th class="px-4 py-3 text-left font-medium">Model</th>
-            <th class="px-4 py-3 text-left font-medium">Owned By</th>
-            <th class="px-4 py-3 text-left font-medium">Tasks</th>
-          </tr>
-        </thead>
-        <tbody class="divide-y">
-          {{range .Models}}
-          <tr>
-            <td class="px-4 py-3 font-mono">{{.ID}}</td>
-            <td class="px-4 py-3">{{.OwnedBy}}</td>
-            <td class="px-4 py-3">{{range .Tasks}}<span class="mr-2">{{.}}</span>{{end}}</td>
-          </tr>
-          {{end}}
-        </tbody>
-      </table>
-    </div>
+  {{if .Error}}<p role="alert" class="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">{{.Error}}</p>{{end}}
+  <section class="rounded-lg border bg-card p-5" aria-labelledby="endpoint-heading">
+    <h2 id="endpoint-heading" class="font-semibold">Inference endpoints</h2>
+    <p class="mt-1 text-sm text-muted-foreground">Reachable local endpoints are not confidential unless current attestation verifies them.</p>
+    {{if .Endpoints}}
+    <div class="mt-4 overflow-x-auto"><table class="w-full text-sm">
+      <thead><tr><th scope="col" class="p-2 text-left">Endpoint</th><th scope="col" class="p-2 text-left">Origin</th><th scope="col" class="p-2 text-left">Capabilities</th><th scope="col" class="p-2 text-left">Assurance</th><th scope="col" class="p-2 text-left">Credential</th>{{if $.CanManage}}<th scope="col" class="p-2 text-left">Actions</th>{{end}}</tr></thead>
+      <tbody>{{range .Endpoints}}<tr class="border-t">
+        <td class="p-2">{{.ID}} <span class="text-muted-foreground">({{.Protocol}})</span></td>
+        <td class="p-2">{{.BaseOrigin}}</td><td class="p-2">{{range .Capabilities}}{{.}} {{end}}</td>
+        <td class="p-2">{{if .AssuranceVerifiedAt}}Verified {{.AssuranceVerifiedAt}}{{else if .AssuranceMode}}Requires {{.AssuranceMode}} · not verified{{else if .AuthorizedPrivate}}Local/private · not verified{{else}}Unavailable{{end}}</td>
+        <td class="p-2">{{if .CredentialRef}}Configured reference{{else}}None{{end}}</td>
+        {{if $.CanManage}}<td class="p-2"><button type="button" class="provider-edit-endpoint rounded-md border px-2 py-1" data-id="{{.ID}}" data-protocol="{{.Protocol}}" data-origin="{{.BaseOrigin}}" data-capabilities="{{range .Capabilities}}{{.}},{{end}}" data-credential-ref="{{.CredentialRef}}" data-private="{{.AuthorizedPrivate}}" data-assurance-mode="{{.AssuranceMode}}">Edit</button> <button type="button" class="provider-disable-endpoint rounded-md border px-2 py-1" data-id="{{.ID}}" aria-label="Disable endpoint {{.ID}}">Disable</button></td>{{end}}
+      </tr>{{end}}</tbody>
+    </table></div>
+    {{else}}<p class="mt-3 text-sm text-muted-foreground">No configured endpoints.</p>{{end}}
+    <h3 class="mt-4 font-medium">Configured capability prices</h3>
+    {{if .PriceRows}}
+    <ul class="mt-2 space-y-1 text-sm">{{range .PriceRows}}<li>{{.SubjectType}} {{.SubjectID}} · {{.Capability}} · {{.Unit}}: {{.RateMicros}} micro-{{.Currency}} / {{.UnitQuantity}}</li>{{end}}</ul>
+    {{else}}<p class="mt-2 text-sm text-muted-foreground">No configured price records were found; model routes cannot dispatch without required prices.</p>{{end}}
+    {{if .CanManage}}
+    <form id="provider-endpoint-form" class="mt-5 grid gap-3 md:grid-cols-2">
+      <label class="space-y-1 text-sm">Endpoint ID <input name="id" required maxlength="128" class="w-full rounded-md border bg-background px-3 py-2"></label>
+      <label class="space-y-1 text-sm">Protocol <select name="protocol" class="w-full rounded-md border bg-background px-3 py-2"><option value="openai_compatible">OpenAI compatible</option><option value="tinfoil">Tinfoil</option><option value="privatemode">Private Mode</option><option value="redpill">Redpill</option></select></label>
+      <label class="space-y-1 text-sm">Confidential assurance
+        <select name="assurance_mode" class="w-full rounded-md border bg-background px-3 py-2"><option value="">No confidential claim</option><option value="attested">Require provider attestation (Tinfoil)</option></select>
+      </label>
+      <label class="space-y-1 text-sm">Base origin <input name="base_origin" type="url" required placeholder="https://provider.example" class="w-full rounded-md border bg-background px-3 py-2"></label>
+      <label class="space-y-1 text-sm">Capabilities (comma separated) <input name="capabilities" required placeholder="chat/completions,model:acme=upstream" class="w-full rounded-md border bg-background px-3 py-2"></label>
+      <label class="space-y-1 text-sm">Approved credential reference
+        <select name="credential_ref" class="w-full rounded-md border bg-background px-3 py-2"><option value="">No credential</option>{{range .CredentialRefs}}<option value="{{.RefID}}">{{.RefID}}</option>{{end}}</select>
+      </label>
+      <label class="flex items-center gap-2 text-sm"><input name="authorized_private" type="checkbox"> Explicitly permit private/local origin</label>
+      <button type="submit" class="rounded-md border px-4 py-2 text-sm font-medium md:col-span-2">Add endpoint</button>
+      <button id="provider-endpoint-cancel" type="button" hidden class="rounded-md border px-4 py-2 text-sm md:col-span-2">Cancel editing</button>
+      <p id="provider-endpoint-message" role="status" aria-live="polite" class="md:col-span-2 text-sm"></p>
+    </form>
+    <form id="provider-policy-form" data-tenant-id="{{.TenantID}}" class="mt-6 grid gap-3 border-t pt-5 md:grid-cols-2">
+      <h3 class="font-semibold md:col-span-2">Processing restrictions</h3>
+      <p class="text-sm text-muted-foreground md:col-span-2">Saved tenant and source restrictions combine with input restrictions and can never be widened by a request option.</p>
+      <label class="space-y-1 text-sm">Policy subject
+        <select name="subject_kind" class="w-full rounded-md border bg-background px-3 py-2"><option value="tenant">Tenant</option><option value="connection">Source connection</option><option value="object">Input object</option><option value="artifact">Input artifact</option></select>
+      </label>
+      <label class="space-y-1 text-sm">Subject ID <input name="subject_id" value="{{.TenantID}}" required class="w-full rounded-md border bg-background px-3 py-2"></label>
+      <label class="space-y-1 text-sm">Minimum assurance
+        <select name="required_assurance" class="w-full rounded-md border bg-background px-3 py-2"><option value="">No additional minimum</option><option value="standard">Standard</option><option value="high">Confidential / high assurance</option></select>
+      </label>
+      <fieldset class="space-y-1 text-sm"><legend>Deny processing capabilities</legend>
+        <label class="mr-3"><input type="checkbox" name="deny" value="chat/completions"> Chat</label>
+        <label class="mr-3"><input type="checkbox" name="deny" value="embeddings"> Embeddings</label>
+        <label class="mr-3"><input type="checkbox" name="deny" value="vision"> Vision</label>
+        <label class="mr-3"><input type="checkbox" name="deny" value="responses"> Responses</label>
+      </fieldset>
+      <button type="submit" class="rounded-md border px-4 py-2 text-sm font-medium md:col-span-2">Save processing restrictions</button>
+      <p id="provider-policy-message" role="status" aria-live="polite" class="md:col-span-2 text-sm"></p>
+    </form>
     {{end}}
-  </div>
+  </section>
+  <section class="rounded-lg border bg-card p-5">
+    <h2 class="font-semibold">Legacy process health (not endpoint assurance)</h2>
+    <p class="mt-2 text-sm">Transport ready: {{if .Snapshot.Ready}}yes{{else}}no{{end}} · failures: {{.Snapshot.ConsecutiveFailures}}</p>
+    <p class="mt-1 text-sm">Configured provider models: {{len .Models}}; model listing alone does not establish capability, price, or route readiness.</p>
+    {{with .Attestation}}<p class="mt-1 text-sm">Provider attestation: {{if .Verified}}verified{{else}}not verified{{end}}</p>{{else}}<p class="mt-1 text-sm">Attestation unavailable.</p>{{end}}
+  </section>
 </div>
+<script src="/dashboard/static/providers.js" defer></script>
 {{end}}

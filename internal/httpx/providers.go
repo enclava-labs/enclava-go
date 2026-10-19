@@ -20,7 +20,7 @@ type endpointRequest struct {
 	Protocol          string   `json:"protocol,omitempty"`
 	Capabilities      []string `json:"capabilities,omitempty"`
 	BaseOrigin        string   `json:"base_origin,omitempty"`
-	CredentialRef     string   `json:"credential_ref,omitempty"`
+	CredentialRef     *string  `json:"credential_ref,omitempty"`
 	AssuranceMode     *string  `json:"assurance_mode,omitempty"`
 	AssuranceVerified *bool    `json:"assurance_verified,omitempty"`
 	AuthorizedPrivate *bool    `json:"authorized_private,omitempty"`
@@ -195,13 +195,11 @@ func (a *App) handleProviderByID(w http.ResponseWriter, r *http.Request, p auth.
 
 func endpointFromCreateRequest(tenantID string, req endpointRequest) (inference.Endpoint, error) {
 	endpoint := inference.Endpoint{
-		ID:            strings.TrimSpace(req.ID),
-		TenantID:      tenantID,
-		Protocol:      strings.TrimSpace(req.Protocol),
-		Capabilities:  req.Capabilities,
-		BaseOrigin:    strings.TrimSpace(req.BaseOrigin),
-		CredentialRef: strings.TrimSpace(req.CredentialRef),
-		Enabled:       true,
+		ID: strings.TrimSpace(req.ID), TenantID: tenantID, Protocol: strings.TrimSpace(req.Protocol),
+		Capabilities: req.Capabilities, BaseOrigin: strings.TrimSpace(req.BaseOrigin), Enabled: true,
+	}
+	if req.CredentialRef != nil {
+		endpoint.CredentialRef = strings.TrimSpace(*req.CredentialRef)
 	}
 	if endpoint.Capabilities == nil {
 		endpoint.Capabilities = []string{}
@@ -235,8 +233,8 @@ func endpointFromUpdateRequest(existing inference.Endpoint, req endpointRequest)
 	if strings.TrimSpace(req.BaseOrigin) != "" {
 		endpoint.BaseOrigin = strings.TrimSpace(req.BaseOrigin)
 	}
-	if req.CredentialRef != "" {
-		endpoint.CredentialRef = strings.TrimSpace(req.CredentialRef)
+	if req.CredentialRef != nil {
+		endpoint.CredentialRef = strings.TrimSpace(*req.CredentialRef)
 	}
 	if req.AssuranceMode != nil {
 		endpoint.AssuranceMode = strings.TrimSpace(*req.AssuranceMode)
@@ -247,8 +245,28 @@ func endpointFromUpdateRequest(existing inference.Endpoint, req endpointRequest)
 	if req.AssuranceVerified != nil && *req.AssuranceVerified {
 		return inference.Endpoint{}, errInvalidProvider("assurance_verified_at is set by observed verification only")
 	}
+	if endpoint.Protocol != existing.Protocol ||
+		endpoint.BaseOrigin != existing.BaseOrigin ||
+		endpoint.CredentialRef != existing.CredentialRef ||
+		endpoint.AssuranceMode != existing.AssuranceMode ||
+		endpoint.AuthorizedPrivate != existing.AuthorizedPrivate ||
+		!equalCapabilities(endpoint.Capabilities, existing.Capabilities) {
+		endpoint.AssuranceVerifiedAt = nil
+	}
 	endpoint.Enabled = existing.Enabled
 	return validateEndpoint(endpoint)
+}
+
+func equalCapabilities(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func validateEndpoint(e inference.Endpoint) (inference.Endpoint, error) {
