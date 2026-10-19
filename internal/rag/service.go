@@ -13,9 +13,8 @@ import (
 
 	"enclava-go/internal/artifacts"
 	"enclava-go/internal/auth"
-	"enclava-go/internal/billing"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
-	"enclava-go/internal/llm"
 	"enclava-go/internal/source"
 )
 
@@ -70,33 +69,38 @@ type VectorStore interface {
 	Search(ctx context.Context, collection string, vector []float64, limit int, filter map[string]any) ([]QdrantSearchPoint, error)
 }
 
+// Executor is the shared authorized inference boundary every embedding
+// attempt dispatches through; *inference.Service satisfies it.
+type Executor interface {
+	Execute(ctx context.Context, p auth.Principal, req inference.Request) (*inference.Result, error)
+}
+
 type Service struct {
 	repo                  Repository
 	vectorStore           VectorStore
-	provider              llm.Provider
+	executor              Executor
 	defaultEmbeddingModel string
 	artifacts             *artifacts.Store
 	jobs                  *jobs.Service
-	billing               *billing.Service
 	authorizer            *source.Authorizer
 	maxUploadMB           int64
 }
 
-// NewService builds the ported rag.Service. artifactStore, jobSvc and
-// billingSvc may be nil only in narrow unit tests — durable ingest and
-// priced embeddings require them.
-func NewService(repo Repository, vectorStore VectorStore, provider llm.Provider, defaultEmbeddingModel string, artifactStore *artifacts.Store, jobSvc *jobs.Service, billingSvc *billing.Service) *Service {
+// NewService builds the ported rag.Service. artifactStore and jobSvc may be
+// nil only in narrow unit tests — durable ingest and priced embeddings
+// require them; the executor is the single priced dispatch boundary and is
+// required for any embedding operation.
+func NewService(repo Repository, vectorStore VectorStore, executor Executor, defaultEmbeddingModel string, artifactStore *artifacts.Store, jobSvc *jobs.Service) *Service {
 	if strings.TrimSpace(defaultEmbeddingModel) == "" {
 		defaultEmbeddingModel = "nomic-embed-text"
 	}
 	return &Service{
 		repo:                  repo,
 		vectorStore:           vectorStore,
-		provider:              provider,
+		executor:              executor,
 		defaultEmbeddingModel: defaultEmbeddingModel,
 		artifacts:             artifactStore,
 		jobs:                  jobSvc,
-		billing:               billingSvc,
 		authorizer:            source.NewAuthorizer(repo, 0),
 		maxUploadMB:           512,
 	}
@@ -384,6 +388,7 @@ func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInpu
 		return nil, err
 	}
 	allowedVersions := []string{}
+	queryInputs := []source.ObjectRef{}
 	for _, oid := range objectIDs {
 		obj, err := s.repo.GetObject(ctx, p.TenantID, oid)
 		if err != nil {
@@ -397,6 +402,7 @@ func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInpu
 			continue
 		}
 		allowedVersions = append(allowedVersions, doc.ObjectVersionID)
+		queryInputs = append(queryInputs, source.ObjectRef{ObjectID: oid})
 	}
 	if len(allowedVersions) == 0 {
 		return []SearchResult{}, nil
@@ -409,7 +415,7 @@ func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInpu
 	if len(input.Filter) > 0 {
 		filter["must"] = append(filter["must"].([]any), input.Filter)
 	}
-	vectors, _, err := s.embedText(ctx, p, c.EmbeddingModel, []string{query}, OperationEmbed+":query")
+	vectors, err := s.embed(ctx, p, c.EmbeddingModel, []string{query}, embedScope{Inputs: queryInputs})
 	if err != nil {
 		return nil, err
 	}
@@ -636,35 +642,23 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		return "", err
 	}
 
-	// Priced embedding attempt: Reserve → provider → Settle; unobserved
-	// outcomes MarkUnknown so liability is never silently dropped.
-	var resID string
-	if s.billing != nil {
-		estimate := billing.Usage{InputUnits: int64(tokenEstimate(text))}
-		res, rerr := s.billing.Reserve(ctx, p, billing.ReserveRequest{
-			Capability: OperationEmbed,
-			Model:      c.EmbeddingModel,
-			JobID:      job.ID,
-			AttemptID:  claim.AttemptID(),
-			Estimate:   estimate,
-			Price:      billing.PriceKey{SubjectType: billing.PriceSubjectModel, SubjectID: c.EmbeddingModel},
-		})
-		if rerr != nil {
-			return "", rerr
-		}
-		resID = res.ID
-	}
-	vectors, usage, err := createEmbeddings(ctx, s.provider, c.EmbeddingModel, chunkTexts)
+	// Priced embedding attempt: the shared executor resolves current actor
+	// and input restrictions, reserves the immutable rate, dispatches and
+	// settles or retains unknown liability — no direct-provider path.
+	vectors, err := s.embed(ctx, p, c.EmbeddingModel, chunkTexts, embedScope{
+		Inputs: []source.ObjectRef{{TenantID: job.TenantID, ObjectID: objectID, ObservedSeq: seq}},
+		Artifacts: []artifacts.Ref{{
+			TenantID: job.TenantID,
+			ID:       ver.ArtifactRef,
+			Kind:     artifacts.KindOriginal,
+		}},
+		JobID:     job.ID,
+		AttemptID: claim.AttemptID(),
+	})
 	if err != nil {
-		if resID != "" {
-			_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, resID)
-		}
 		return "", err
 	}
 	if len(vectors) == 0 || len(vectors[0]) == 0 {
-		if resID != "" {
-			_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, resID)
-		}
 		return "", errors.New("provider returned empty embedding")
 	}
 
@@ -676,6 +670,9 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	sourceURI := stringFromPayload(provMeta, "source_uri")
 	for i, chunkText := range chunkTexts {
 		chunkID := newID("ragchunk")
+		// The Qdrant point id is a UUID the vector store accepts; the durable
+		// chunk row id stays a payload reference.
+		pointID := newPointID()
 		chunks = append(chunks, DocumentChunk{
 			ID:            chunkID,
 			DocumentID:    obj.ID,
@@ -683,11 +680,11 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 			ChunkIndex:    i,
 			Content:       chunkText,
 			TokenCount:    tokenEstimate(chunkText),
-			QdrantPointID: chunkID,
+			QdrantPointID: pointID,
 			Metadata:      map[string]any{"file_name": ver.OriginalFilename},
 		})
 		points = append(points, QdrantPoint{
-			ID:     chunkID,
+			ID:     pointID,
 			Vector: vectors[i],
 			Payload: map[string]any{
 				"collection_id":     c.ID,
@@ -727,44 +724,16 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	if err := s.repo.MarkGenerationState(ctx, job.TenantID, c.ID, versionRowID(ver), generation, "published"); err != nil {
 		return "", err
 	}
-	if resID != "" {
-		if _, err := s.billing.Settle(ctx, p, resID, billing.Usage{InputUnits: int64(usage.Usage.PromptTokens), OutputUnits: 0}); err != nil {
-			_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, resID)
-			return "", fmt.Errorf("settle reservation: %w", err)
-		}
-	}
 	return versionRowID(ver), nil
 }
 
-// embedText runs a priced embedding call for ad-hoc query text. Billing is
-// optional (nil-safe) so narrow unit tests can run without a billing repo.
-func (s *Service) embedText(ctx context.Context, p auth.Principal, model string, inputs []string, capability string) ([][]float64, embeddingResponse, error) {
-	if s.billing == nil {
-		return createEmbeddings(ctx, s.provider, model, inputs)
+// embed dispatches one bounded embedding attempt through the shared
+// executor; nil-executor tests that never embed stay usable.
+func (s *Service) embed(ctx context.Context, p auth.Principal, model string, inputs []string, scope embedScope) ([][]float64, error) {
+	if s.executor == nil {
+		return nil, errors.New("rag: inference executor is not configured")
 	}
-	total := int64(0)
-	for _, in := range inputs {
-		total += int64(tokenEstimate(in))
-	}
-	res, err := s.billing.Reserve(ctx, p, billing.ReserveRequest{
-		Capability: capability,
-		Model:      model,
-		Estimate:   billing.Usage{InputUnits: total},
-		Price:      billing.PriceKey{SubjectType: billing.PriceSubjectModel, SubjectID: model},
-	})
-	if err != nil {
-		return nil, embeddingResponse{}, err
-	}
-	vectors, usage, err := createEmbeddings(ctx, s.provider, model, inputs)
-	if err != nil {
-		_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, res.ID)
-		return nil, embeddingResponse{}, err
-	}
-	if _, err := s.billing.Settle(ctx, p, res.ID, billing.Usage{InputUnits: int64(usage.Usage.PromptTokens)}); err != nil {
-		_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, res.ID)
-		return nil, embeddingResponse{}, err
-	}
-	return vectors, usage, nil
+	return createEmbeddings(ctx, s.executor, p, model, inputs, scope)
 }
 
 // ---------------------------------------------------------------------
