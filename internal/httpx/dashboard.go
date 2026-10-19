@@ -82,6 +82,7 @@ type dashboardAnalyticsData struct {
 	TotalCostDisplay string
 	CurrencyTotals   []dashboardCurrencyTotal
 	Days             int
+	BySubject        []postgres.UsageGroupSum
 	ByEndpoint       []postgres.UsageGroupSum
 	ByModel          []postgres.UsageGroupSum
 	Rows             []dashboardUsageRow
@@ -125,12 +126,12 @@ type dashboardIdentityData struct {
 }
 
 type dashboardBudgetRow struct {
-	Subject string
-	Window string
-	Limit string
-	Held string
-	Unknown string
-	Settled string
+	Subject   string
+	Window    string
+	Limit     string
+	Held      string
+	Unknown   string
+	Settled   string
 	Remaining string
 }
 
@@ -138,13 +139,11 @@ type dashboardBudgetsData struct {
 	Rows []dashboardBudgetRow
 }
 
-
 type dashboardExtractData struct {
 	RecentJobs int64
 	TotalJobs  int64
 	Templates  []extract.Template
 }
-
 
 func (a *App) registerDashboardRoutes() {
 	a.mux.Handle("/dashboard/static/", http.StripPrefix("/dashboard/static/", http.FileServer(http.FS(dashboardStaticFiles))))
@@ -415,10 +414,10 @@ func (a *App) handleDashboardUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	usage, err := a.billingRepo.UsageBySubject(r.Context(), tenantID, since)
+	bySubject, err := a.billingRepo.UsageBySubject(r.Context(), tenantID, since)
 	if err != nil {
-		log.Printf("failed to load dashboard usage summary: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_usage_failed")
+		log.Printf("failed to load dashboard usage by subject: %v", err)
+		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_usage_subject_failed")
 		return
 	}
 	keys, err := a.identity.ListAPIKeys(r.Context(), tenantID)
@@ -437,8 +436,8 @@ func (a *App) handleDashboardUsage(w http.ResponseWriter, r *http.Request) {
 		nameByID[key.ID] = name
 	}
 
-	rows := make([]dashboardUsageRow, 0, len(usage))
-	for _, item := range usage {
+	rows := make([]dashboardUsageRow, 0, len(bySubject))
+	for _, item := range bySubject {
 		if item.SubjectType != billing.BudgetSubjectAPIKey {
 			continue
 		}
@@ -460,6 +459,7 @@ func (a *App) handleDashboardUsage(w http.ResponseWriter, r *http.Request) {
 		TotalTokens:    totalTokens,
 		CurrencyTotals: currencyTotals,
 		Days:           days,
+		BySubject:      bySubject,
 		ByEndpoint:     byEndpoint,
 		ByModel:        byModel,
 		Rows:           rows,
@@ -675,74 +675,86 @@ func (a *App) handleDashboardBudgets(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-
 	p, ok := auth.PrincipalFromContext(r.Context())
 	if !ok || p.TenantID != tenantID {
 		WriteUnauthorized(w, "authenticated principal required")
 		return
 	}
-	subject := billing.Subject{Type: billing.BudgetSubjectTenant, ID: tenantID}
-	if p.BillingSubjectKind != "" && p.BillingSubjectID != "" {
-		subject = billing.Subject{Type: p.BillingSubjectKind, ID: p.BillingSubjectID}
+	subject := billingSubjectOf(p)
+	subjects := []billing.Subject{subject, {Type: billing.BudgetSubjectTenant, ID: tenantID}}
+	if p.CredentialKind == auth.CredentialKindAPIKey && p.CredentialID != "" {
+		subjects = append(subjects, billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: p.CredentialID})
 	}
-	liabilities, err := a.billingRepo.Liabilities(r.Context(), tenantID, subject, time.Time{})
+	now := time.Now().UTC()
+	budgets, err := a.billingRepo.ListActiveBudgets(r.Context(), tenantID, subjects, now)
 	if err != nil {
-		log.Printf("failed to load dashboard budget liabilities: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_budgets_usage_failed")
+		log.Printf("failed to load dashboard active budgets: %v", err)
+		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_budgets_list_failed")
 		return
 	}
-	type liabilityTotal struct {
-		micros int64
-		units  int64
-	}
-	totals := make(map[string]liabilityTotal)
-	for _, row := range liabilities {
-		total := totals[row.Currency]
-		var ok bool
-		total.micros, ok = checkedBudgetAdd(total.micros, row.AmountMicros)
-		if !ok {
-			total.micros = int64(^uint64(0) >> 1)
+	rows := make([]dashboardBudgetRow, 0, len(budgets))
+	for _, budget := range budgets {
+		usedUnits, usedMicros, err := a.liabilityForBudget(r.Context(), tenantID, budget, now)
+		if err != nil {
+			log.Printf("failed to load dashboard budget liability: %v", err)
+			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_budgets_usage_failed")
+			return
 		}
-		for _, u := range row.Units {
-			total.units, ok = checkedBudgetAdd(total.units, u)
-			if !ok {
-				total.units = int64(^uint64(0) >> 1)
+		from := periodStart(budget.Period, now)
+		if budget.StartsAt.After(from) {
+			from = budget.StartsAt
+		}
+		liabilities, err := a.billingRepo.Liabilities(r.Context(), tenantID, budget.Subject, from)
+		if err != nil {
+			log.Printf("failed to load dashboard budget breakdown: %v", err)
+			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_budgets_usage_failed")
+			return
+		}
+		var held, unknown, settled, heldUnits, unknownUnits, settledUnits int64
+		for _, liability := range liabilities {
+			amount, units := &settled, &settledUnits
+			switch liability.State {
+			case billing.ReservationHeld:
+				amount, units = &held, &heldUnits
+			case billing.ReservationUnknown:
+				amount, units = &unknown, &unknownUnits
+			case billing.ReservationSettled:
+			default:
+				continue
+			}
+			if sum, ok := checkedBudgetAdd(*amount, liability.AmountMicros); ok {
+				*amount = sum
+			} else {
+				*amount = int64(^uint64(0) >> 1)
+			}
+			for _, value := range liability.Units {
+				if sum, ok := checkedBudgetAdd(*units, value); ok {
+					*units = sum
+				} else {
+					*units = int64(^uint64(0) >> 1)
+				}
 			}
 		}
-		totals[row.Currency] = total
-	}
-	currencies := make([]string, 0, len(totals))
-	for currency := range totals {
-		currencies = append(currencies, currency)
-	}
-	sort.Strings(currencies)
-	rows := make([]dashboardBudgetRow, 0, len(currencies))
-	var firstTotal string
-	for _, currency := range currencies {
-		total := totals[currency]
-		used := formatCurrencyMicros(currency, total.micros)
-		if len(currencies) == 1 {
-			firstTotal = used
+		if budget.Kind == billing.BudgetKindTokens {
+			remaining := budget.LimitAmountMicros - usedUnits
+			rows = append(rows, dashboardBudgetRow{
+				Subject: budget.Subject.Type + " " + budget.Subject.ID, Window: budget.Period,
+				Limit: strconv.FormatInt(budget.LimitAmountMicros, 10) + " raw units",
+				Held:  strconv.FormatInt(heldUnits, 10) + " raw units", Unknown: strconv.FormatInt(unknownUnits, 10) + " raw units",
+				Settled: strconv.FormatInt(settledUnits, 10) + " raw units", Remaining: strconv.FormatInt(remaining, 10) + " raw units",
+			})
+		} else {
+			remaining := budget.LimitAmountMicros - usedMicros
+			rows = append(rows, dashboardBudgetRow{
+				Subject: budget.Subject.Type + " " + budget.Subject.ID, Window: budget.Period,
+				Limit: formatCurrencyMicros(budget.Currency, budget.LimitAmountMicros),
+				Held:  formatCurrencyMicros(budget.Currency, held), Unknown: formatCurrencyMicros(budget.Currency, unknown),
+				Settled: formatCurrencyMicros(budget.Currency, settled), Remaining: formatCurrencyMicros(budget.Currency, remaining),
+			})
 		}
-		rows = append(rows, dashboardBudgetRow{
-			APIKeyName: "Current billing subject",
-			BudgetLimit: "Not configured",
-			BudgetPeriod: "all time",
-			UsedDisplay: used,
-			Remaining: "Not configured",
-			Units: strconv.FormatInt(total.units, 10) + " raw units",
-			Status: "Liability returned by billing service",
-		})
 	}
-	if firstTotal == "" {
-		firstTotal = "No recorded liability"
-	}
-	if len(currencies) > 1 {
-		firstTotal = "Multiple currencies; see rows"
-	}
-	view := dashboardBudgetsData{Rows: rows, TotalUsed: firstTotal, TotalLimit: "Limit details unavailable"}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "partial-budgets", view); err != nil {
+	if err := dashboardTemplates.ExecuteTemplate(w, "partial-budgets", dashboardBudgetsData{Rows: rows}); err != nil {
 		log.Printf("failed to render dashboard budgets: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_budgets_render_failed")
 	}

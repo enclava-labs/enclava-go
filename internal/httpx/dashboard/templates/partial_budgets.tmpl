@@ -1,32 +1,24 @@
 {{define "partial-budgets"}}
 <div class="space-y-4">
-  <div class="flex flex-wrap items-center gap-4 text-sm">
-    <p class="text-muted-foreground">Accounted liability: <span class="font-semibold text-foreground">{{.TotalUsed}}</span></p>
-    <p class="text-muted-foreground">Tenant default limit: <span class="font-semibold text-foreground">{{.TotalLimit}}</span></p>
-  </div>
-
   {{if not .Rows}}
-  {{/* Empty state */}}
   <div class="py-16 text-center">
-    <h3 class="text-lg font-semibold">No liability recorded for this billing subject</h3>
-    <p class="text-sm text-muted-foreground mt-1">Limit details are unavailable in this view.</p>
+    <h3 class="text-lg font-semibold">No active budgets</h3>
+    <p class="text-sm text-muted-foreground mt-1">No allowance is configured for this billing subject.</p>
   </div>
   {{else}}
-  {{/* Card grid */}}
   <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
     {{range .Rows}}
-    <div class="rounded-lg border bg-card text-card-foreground shadow-sm flex flex-col">
-      <div class="px-5 py-4 border-b">
-        <span class="font-semibold truncate">Billing subject</span>
-      </div>
+    <section class="rounded-lg border bg-card text-card-foreground shadow-sm">
+      <h2 class="px-5 py-4 border-b font-semibold">{{.Subject}}</h2>
       <div class="px-5 py-4 space-y-2 text-sm">
-        <p>Usage liability: <span class="font-semibold">{{.UsedDisplay}}</span></p>
-        <p>Enforced limit: {{.BudgetLimit}} ({{.BudgetPeriod}})</p>
-        <p>Remaining allowance: {{.Remaining}}</p>
-        <p>Reserved units: {{.Units}}</p>
-        <p class="text-muted-foreground">{{.Status}}</p>
+        <p>Window: <span class="font-semibold">{{.Window}}</span></p>
+        <p>Limit: <span class="font-semibold">{{.Limit}}</span></p>
+        <p>Held: {{.Held}}</p>
+        <p>Unknown: {{.Unknown}}</p>
+        <p>Settled: {{.Settled}}</p>
+        <p>Remaining allowance: <span class="font-semibold">{{.Remaining}}</span></p>
       </div>
-    </div>
+    </section>
     {{end}}
   </div>
   {{end}}

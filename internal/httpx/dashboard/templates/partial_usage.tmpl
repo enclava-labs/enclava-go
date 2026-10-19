@@ -30,6 +30,17 @@
       <p class="text-xs text-muted-foreground mt-2">Settled usage only; see Budgets for held and unknown liability.</p>
     </div>
   </div>
+  <section class="rounded-lg border bg-card text-card-foreground shadow-sm">
+    <div class="p-5 pb-3 border-b"><h4 class="text-sm font-semibold">Usage by billing subject and currency</h4></div>
+    <div class="p-5 pt-3 space-y-3">
+      {{range .BySubject}}
+      <div class="flex items-center justify-between text-sm">
+        <span>{{.SubjectType}} <span class="font-mono">{{.SubjectID}}</span></span>
+        <span>{{.Currency}} {{formatCurrencyMicros .Currency .AmountMicros}} · {{.RequestCount}} requests · {{.TotalUnits}} raw units</span>
+      </div>
+      {{else}}<p class="text-sm text-muted-foreground">No settled usage by subject.</p>{{end}}
+    </div>
+  </section>
 
   <!-- Two-column grid: Endpoint + Model breakdowns -->
   <div class="grid gap-4 md:grid-cols-2">
