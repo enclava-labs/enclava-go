@@ -16,6 +16,29 @@ import (
 	"enclava-go/internal/store/postgres"
 )
 
+// scopeSubsetError denies minting scopes the issuing administrator does not
+// hold. A mode:"all" scope grant stores no items at all (DecodeAllowlist
+// decodes it to the empty set), so listing items never grants scope "*".
+func (a *App) writeScopeSubsetError(w http.ResponseWriter, principal auth.Principal, scopes json.RawMessage) bool {
+	items, _ := auth.DecodeAllowlist(scopes)
+	for s := range items {
+		if !auth.HasScope(principal, s) {
+			WriteForbidden(w, "key scopes must be a subset of the caller's scopes")
+			return false
+		}
+	}
+	return true
+}
+
+// lastAdminKeyExcluded refuses to revoke/deactivate the tenant's last usable
+// platform.admin credential when the target key carries that scope.
+func (a *App) lastAdminKeyExcluded(w http.ResponseWriter, r *http.Request, principal auth.Principal, k auth.APIKeyRecord) bool {
+	if !keyRecordHasScope(k, auth.ScopePlatformAdmin) {
+		return true
+	}
+	return a.lastAdminExcluded(w, r, principal.TenantID, "", map[string]bool{k.ID: true})
+}
+
 // adminAPIKeyCreateRequest is the admin key payload. The allowed_* fields
 // carry grant item lists — for allowed_endpoints the items are INFERENCE
 // ENDPOINT IDs (enforced at dispatch by auth.EndpointAllowed), never URL
@@ -99,6 +122,9 @@ func (a *App) handleAdminAPIKeys(w http.ResponseWriter, r *http.Request, princip
 		record.KeyPrefix = prefix
 		record.KeyHash = hash
 		record.KeyHashAlgo = usedAlgo
+		if !a.writeScopeSubsetError(w, principal, record.Scopes) {
+			return
+		}
 		if err := a.identity.CreateAPIKey(r.Context(), principal.TenantID, record); err != nil {
 			log.Printf("failed to create api key: %v", err)
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "api_key_create_failed")
@@ -192,6 +218,14 @@ func (a *App) handleAdminAPIKeyByID(w http.ResponseWriter, r *http.Request, prin
 			WriteMethodNotAllowed(w)
 			return
 		}
+		delKey, err := a.identity.GetAPIKey(r.Context(), principal.TenantID, id)
+		if err != nil {
+			a.writeKeyFetchError(w, err)
+			return
+		}
+		if !a.lastAdminKeyExcluded(w, r, principal, delKey) {
+			return
+		}
 		if err := a.identity.RevokeAPIKey(r.Context(), principal.TenantID, id, time.Now().UTC()); err != nil {
 			log.Printf("failed to delete api key: %v", err)
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "api_key_delete_failed")
@@ -259,6 +293,12 @@ func (a *App) handleAdminAPIKeyByID(w http.ResponseWriter, r *http.Request, prin
 			return
 		}
 		applyAdminPatch(&key, req)
+		if !a.writeScopeSubsetError(w, principal, key.Scopes) {
+			return
+		}
+		if req.IsActive != nil && !*req.IsActive && !a.lastAdminKeyExcluded(w, r, principal, key) {
+			return
+		}
 		if err := a.identity.UpdateAPIKey(r.Context(), principal.TenantID, key); err != nil {
 			log.Printf("failed to update api key: %v", err)
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "api_key_update_failed")
@@ -272,6 +312,14 @@ func (a *App) handleAdminAPIKeyByID(w http.ResponseWriter, r *http.Request, prin
 		a.recordAPIKeyBillingAudit(r.Context(), "api_key.updated", id, principal, adminBudgetMetadata(updated))
 		WriteJSON(w, http.StatusOK, redactAdminAPIKey(updated))
 	case http.MethodDelete:
+		delKey, err := a.identity.GetAPIKey(r.Context(), principal.TenantID, id)
+		if err != nil {
+			a.writeKeyFetchError(w, err)
+			return
+		}
+		if !a.lastAdminKeyExcluded(w, r, principal, delKey) {
+			return
+		}
 		if err := a.identity.RevokeAPIKey(r.Context(), principal.TenantID, id, time.Now().UTC()); err != nil {
 			log.Printf("failed to delete api key: %v", err)
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "api_key_delete_failed")
@@ -417,7 +465,13 @@ func (a *App) apiKeyRecordFromAdminRequest(ctx context.Context, principal auth.P
 	ownerUserID := strings.TrimSpace(req.OwnerUserID)
 	serviceAccountID := strings.TrimSpace(req.ServiceAccountID)
 	if ownerUserID == "" && serviceAccountID == "" {
-		ownerUserID = principal.UserID
+		// The owner defaults to the calling actor — a user principal owns via
+		// owner_user_id, a service-account principal via service_account_id.
+		if principal.ActorKind == auth.ActorKindServiceAccount {
+			serviceAccountID = principal.ActorID
+		} else {
+			ownerUserID = principal.UserID
+		}
 	}
 	if ownerUserID == "" && serviceAccountID == "" {
 		return auth.APIKeyRecord{}, errors.New("owner_user_id or service_account_id is required")
