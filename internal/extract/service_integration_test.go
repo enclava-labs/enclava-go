@@ -14,38 +14,40 @@ import (
 	"enclava-go/internal/auth"
 	"enclava-go/internal/billing"
 	"enclava-go/internal/extract"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
-	"enclava-go/internal/llm"
+	"enclava-go/internal/source"
 	"enclava-go/internal/store/postgres"
 	"enclava-go/internal/testdb"
 )
 
-type fakeProvider struct {
+// fakeUpstream is the deterministic transport behind the real executor — the
+// tests exercise the actual inference.Service policy/routing/accounting path,
+// not a stubbed Execute.
+type fakeUpstream struct {
 	response  []byte
 	callCount atomic.Int32
 }
 
-func (f *fakeProvider) ListModels(ctx context.Context) (llm.ModelsResponse, error) {
-	return llm.ModelsResponse{Object: "list", Data: []llm.Model{
-		{ID: "priced-extract", SupportsVision: true},
-		{ID: "unpriced-extract", SupportsVision: true},
-	}}, nil
-}
-func (f *fakeProvider) GetModel(ctx context.Context, modelID string) (llm.Model, error) {
-	return llm.Model{ID: modelID}, nil
-}
-func (f *fakeProvider) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
+func (f *fakeUpstream) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
 	f.callCount.Add(1)
 	if f.response != nil {
 		return f.response, nil
 	}
 	return []byte(`{"id":"c","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15},"choices":[{"message":{"content":"{\"total\":1}"}}]}`), nil
 }
-func (f *fakeProvider) CreateChatCompletionStream(ctx context.Context, body []byte) (io.ReadCloser, error) {
+func (f *fakeUpstream) CreateChatCompletionStream(ctx context.Context, body []byte) (io.ReadCloser, error) {
+	f.callCount.Add(1)
 	return io.NopCloser(&emptyReader{}), nil
 }
-func (f *fakeProvider) CreateEmbeddings(ctx context.Context, body []byte) ([]byte, error) {
+func (f *fakeUpstream) CreateEmbeddings(ctx context.Context, body []byte) ([]byte, error) {
 	return nil, nil
+}
+func (f *fakeUpstream) DoResponsesRequest(ctx context.Context, method, path string, body []byte) ([]byte, error) {
+	return nil, errors.New("responses not supported in fixture")
+}
+func (f *fakeUpstream) DoResponsesStream(ctx context.Context, method, path string, body []byte) (io.ReadCloser, error) {
+	return nil, errors.New("responses not supported in fixture")
 }
 
 type emptyReader struct{}
@@ -53,14 +55,18 @@ type emptyReader struct{}
 func (r *emptyReader) Read(p []byte) (int, error) { return 0, io.EOF }
 func (r *emptyReader) Close() error               { return nil }
 
-// fixture wires the full durable stack on a real PostgreSQL schema.
+// fixture wires the full durable stack on a real PostgreSQL schema: jobs,
+// artifacts, billing and the real executor over a fake upstream transport.
 type fixture struct {
 	t         *testing.T
 	db        *postgres.DB
 	svc       *extract.Service
 	jobsSvc   *jobs.Service
 	store     *artifacts.Store
-	provider  *fakeProvider
+	upstream  *fakeUpstream
+	endpoints *postgres.EndpointsRepo
+	sources   *postgres.SourceRepo
+	billing   *postgres.BillingRepo
 	tenant    string
 	principal auth.Principal
 }
@@ -73,15 +79,30 @@ func newFixture(t *testing.T) fixture {
 	repo := postgres.NewExtractRepo(db)
 	jobsRepo := postgres.NewJobsRepo(db)
 	artRepo := postgres.NewArtifactRepo(db)
+	endpoints := postgres.NewEndpointsRepo(db)
+	sources := postgres.NewSourceRepo(db)
+	billingRepo := postgres.NewBillingRepo(db)
 	root := t.TempDir()
 	store, err := artifacts.NewStore(filepath.Join(root, "durable"), filepath.Join(root, "scratch"), artRepo)
 	if err != nil {
 		t.Fatalf("artifact store: %v", err)
 	}
 	jobsSvc := jobs.NewService(jobsRepo, 10*time.Millisecond)
-	billingSvc := billing.NewService(postgres.NewBillingRepo(db))
-	provider := &fakeProvider{}
-	svc := extract.NewService(repo, repo, jobsRepo, jobsSvc, store, billingSvc, provider, 5)
+	upstream := &fakeUpstream{}
+	exec, err := inference.NewService(inference.Deps{
+		Endpoints:  endpoints,
+		Sources:    sources,
+		Authorizer: source.NewAuthorizer(sources, 0),
+		Billing:    billing.NewService(billingRepo),
+		Artifacts:  artRepo,
+	}, inference.WithTransportFactory(
+		func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {
+			return upstream, nil
+		}))
+	if err != nil {
+		t.Fatalf("executor: %v", err)
+	}
+	svc := extract.NewService(repo, repo, jobsRepo, jobsSvc, store, exec, endpoints, 5)
 
 	tenant := testdb.SeedTenant(t, db, "extract-tenant")
 	user := testdb.SeedUser(t, db, tenant, "extract@example.com", nil)
@@ -96,7 +117,26 @@ func newFixture(t *testing.T) fixture {
 	}
 	return fixture{
 		t: t, db: db, svc: svc, jobsSvc: jobsSvc,
-		store: store, provider: provider, tenant: tenant, principal: principal,
+		store: store, upstream: upstream, endpoints: endpoints,
+		sources: sources, billing: billingRepo,
+		tenant: tenant, principal: principal,
+	}
+}
+
+// seedEndpoint registers the vision-capable endpoint with the given model
+// aliases bound as "model:" capabilities.
+func (f fixture) seedEndpoint(t *testing.T, aliases ...string) {
+	t.Helper()
+	caps := []string{inference.CapabilityChat, inference.CapabilityVision}
+	for _, a := range aliases {
+		caps = append(caps, inference.ModelCapabilityPrefix+a)
+	}
+	if err := f.endpoints.Create(context.Background(), inference.Endpoint{
+		ID: "ep-extract", TenantID: f.tenant, Protocol: "openai_compatible",
+		BaseOrigin: "https://extract.upstream.example", Capabilities: caps,
+		Enabled: true,
+	}); err != nil {
+		t.Fatalf("seed endpoint: %v", err)
 	}
 }
 
@@ -107,14 +147,14 @@ func (f fixture) seedTemplate(t *testing.T, tpl extract.Template) {
 	}
 }
 
-// putPrice seeds one rate for (model, capability=extract.process).
+// putPrice seeds one model rate for the vision capability extraction
+// dispatches under.
 func (f fixture) putPrice(t *testing.T, model string, unit billing.UnitKind, rateMicros int64) {
 	t.Helper()
-	repo := postgres.NewBillingRepo(f.db)
-	err := repo.PutPrice(context.Background(), f.tenant, "price_"+model+"_"+string(unit), billing.Price{
+	err := f.billing.PutPrice(context.Background(), f.tenant, "price_"+model+"_"+string(unit), billing.Price{
 		SubjectType:   billing.PriceSubjectModel,
 		SubjectID:     model,
-		Capability:    extract.OperationProcess,
+		Capability:    inference.CapabilityVision,
 		Unit:          unit,
 		RateMicros:    rateMicros,
 		UnitQuantity:  1000,
@@ -231,20 +271,13 @@ func TestProcessPersistsInputArtifactAndJobRow(t *testing.T) {
 func TestProcessRejectsDisallowedModelAndTemplate(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract")
 	f.seedTemplate(t, extract.Template{
 		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u",
 		DefaultModel: "priced-extract", Enabled: true,
 	})
 
-	p := f.principal
-	p.AllowedModelsAll = false
-	p.AllowedModels = map[string]struct{}{"other-model": {}}
-	if _, err := f.svc.Process(ctx, p, extract.ProcessInput{
-		TemplateID: "invoice", FileName: "a.pdf", Bytes: []byte("x"), MimeType: "application/pdf",
-	}); !errors.Is(err, extract.ErrForbidden) {
-		t.Fatalf("disallowed model: %v, want ErrForbidden", err)
-	}
-
+	// A template the key isn't granted denies at enqueue.
 	p2 := f.principal
 	p2.AllowedExtractTemplatesAll = false
 	p2.AllowedExtractTemplates = map[string]struct{}{"other": {}}
@@ -253,11 +286,33 @@ func TestProcessRejectsDisallowedModelAndTemplate(t *testing.T) {
 	}); !errors.Is(err, extract.ErrForbidden) {
 		t.Fatalf("disallowed template: %v, want ErrForbidden", err)
 	}
+
+	// A model outside the key's allowlist enqueues durably but the executor
+	// denies it at the worker attempt — before any upstream dispatch.
+	p := f.principal
+	p.AllowedModelsAll = false
+	p.AllowedModels = map[string]struct{}{"other-model": {}}
+	out, err := f.svc.Process(ctx, p, extract.ProcessInput{
+		TemplateID: "invoice", FileName: "a.pdf", Bytes: []byte("x"), MimeType: "application/pdf",
+	})
+	if err != nil {
+		t.Fatalf("process enqueue: %v", err)
+	}
+	_ = out
+	claim := f.leaseClaim(t)
+	_, aerr := f.svc.JobHandler()(ctx, claim, inputOpener(f, claim))
+	if !errors.Is(aerr, inference.ErrDenied) && !errors.Is(aerr, inference.ErrNoRoute) {
+		t.Fatalf("disallowed model attempt: %v, want ErrDenied/ErrNoRoute", aerr)
+	}
+	if f.upstream.callCount.Load() != 0 {
+		t.Fatalf("upstream dispatched for disallowed model")
+	}
 }
 
 func TestAttemptPricedModelReservesAndSettles(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract", "unpriced-extract")
 	f.putPrice(t, "priced-extract", billing.UnitInput, 1000)
 	f.putPrice(t, "priced-extract", billing.UnitOutput, 2000)
 	f.seedTemplate(t, extract.Template{
@@ -273,7 +328,7 @@ func TestAttemptPricedModelReservesAndSettles(t *testing.T) {
 		t.Fatalf("process: %v", err)
 	}
 	// No provider dispatch without an executor.
-	if f.provider.callCount.Load() != 0 {
+	if f.upstream.callCount.Load() != 0 {
 		t.Fatalf("provider called during Process")
 	}
 
@@ -285,8 +340,8 @@ func TestAttemptPricedModelReservesAndSettles(t *testing.T) {
 	if resultRef == "" {
 		t.Fatal("empty result ref")
 	}
-	if f.provider.callCount.Load() != 1 {
-		t.Fatalf("provider calls=%d, want 1", f.provider.callCount.Load())
+	if f.upstream.callCount.Load() != 1 {
+		t.Fatalf("provider calls=%d, want 1", f.upstream.callCount.Load())
 	}
 
 	// Usage record exists (settled) keyed by the reservation.
@@ -326,6 +381,7 @@ func TestAttemptPricedModelReservesAndSettles(t *testing.T) {
 func TestAttemptUnpricedModelRefusesBeforeProvider(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
+	f.seedEndpoint(t, "unpriced-extract")
 	f.seedTemplate(t, extract.Template{
 		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u",
 		DefaultModel: "unpriced-extract", Enabled: true,
@@ -344,7 +400,7 @@ func TestAttemptUnpricedModelRefusesBeforeProvider(t *testing.T) {
 	if !errors.Is(err, billing.ErrPriceMissing) {
 		t.Fatalf("attempt err=%v, want ErrPriceMissing", err)
 	}
-	if f.provider.callCount.Load() != 0 {
+	if f.upstream.callCount.Load() != 0 {
 		t.Fatalf("provider invoked before price admission")
 	}
 	// No usage row — nothing was charged.
@@ -393,5 +449,49 @@ func TestCrossTenantJobReadsDenyIdentically(t *testing.T) {
 	list, total, err := f.svc.ListJobs(ctx, otherPrincipal, 20, 0)
 	if err != nil || len(list) != 0 || total != 0 {
 		t.Fatalf("other actor list: %d/%d %v", len(list), total, err)
+	}
+}
+
+// A persisted restriction denying the routed capability on the input artifact
+// stops the worker attempt before any model dispatch — destinations can't be
+// widened by the caller.
+func TestAttemptRestrictedInputDeniesBeforeDispatch(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract")
+	f.putPrice(t, "priced-extract", billing.UnitInput, 1000)
+	f.putPrice(t, "priced-extract", billing.UnitOutput, 2000)
+	f.seedTemplate(t, extract.Template{
+		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u",
+		DefaultModel: "priced-extract", Enabled: true,
+	})
+
+	out, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
+		TemplateID: "invoice", FileName: "invoice.pdf", MimeType: "application/pdf",
+		Bytes: []byte("%PDF-1.7 fake"),
+	})
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	job, err := f.jobsSvc.Get(ctx, f.principal, out.JobID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	// Deny the vision capability for this input artifact.
+	if err := f.sources.SetRestriction(ctx, source.SourceRestriction{
+		TenantID:           f.tenant,
+		SubjectKind:        source.RestrictionArtifact,
+		SubjectID:          job.InputRef,
+		DeniedCapabilities: []string{inference.CapabilityVision},
+	}); err != nil {
+		t.Fatalf("set restriction: %v", err)
+	}
+
+	claim := f.leaseClaim(t)
+	if _, err := f.svc.JobHandler()(ctx, claim, inputOpener(f, claim)); !errors.Is(err, inference.ErrDenied) {
+		t.Fatalf("restricted attempt: %v, want ErrDenied", err)
+	}
+	if f.upstream.callCount.Load() != 0 {
+		t.Fatalf("upstream dispatched despite denied capability")
 	}
 }

@@ -323,7 +323,11 @@ func (a *App) handleDashboardExtractModels(w http.ResponseWriter, r *http.Reques
 		WriteJSON(w, http.StatusOK, map[string]any{"models": []any{}})
 		return
 	}
-	models, err := a.extractSvc.ModelsForExtract(r.Context())
+	p, ok := a.extractPrincipal(w, r)
+	if !ok {
+		return
+	}
+	models, err := a.extractSvc.ModelsForExtract(r.Context(), p.TenantID)
 	if err != nil {
 		log.Printf("dashboard: list extract models: %v", err)
 		WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})

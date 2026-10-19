@@ -10,12 +10,14 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"enclava-go/internal/artifacts"
 	"enclava-go/internal/auth"
 	"enclava-go/internal/billing"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
 	"enclava-go/internal/llm"
 )
@@ -47,17 +49,30 @@ type JobReader interface {
 
 // Service owns the extract pipeline: Process persists the upload as a durable
 // input artifact and enqueues an "extract.process" job — it never calls the
-// provider synchronously. JobHandler is the worker-side fenced attempt:
-// reserve → dispatch → provider → result artifact → settle.
+// provider synchronously. JobHandler is the worker-side fenced attempt: the
+// shared inference executor alone resolves policy, reserves, dispatches and
+// settles — this service never reserves or records usage itself.
 type Service struct {
 	templatesRepo TemplatesRepo
 	settingsRepo  SettingsRepo
 	jobRows       JobReader
 	jobs          *jobs.Service
 	artifacts     *artifacts.Store
-	billing       *billing.Service
-	provider      llm.Provider
+	executor      Executor
+	endpoints     EndpointsLister
 	maxUploadMB   int64
+}
+
+// Executor is the shared authorized inference boundary the attempt dispatches
+// through; *inference.Service satisfies it.
+type Executor interface {
+	Execute(ctx context.Context, p auth.Principal, req inference.Request) (*inference.Result, error)
+}
+
+// EndpointsLister exposes the tenant's configured endpoint model bindings for
+// model selection; *postgres.EndpointsRepo satisfies it.
+type EndpointsLister interface {
+	ListCapabilities(ctx context.Context, tenantID, capability string) ([]inference.Endpoint, error)
 }
 
 func NewService(
@@ -66,8 +81,8 @@ func NewService(
 	jobRows JobReader,
 	jobSvc *jobs.Service,
 	artifactStore *artifacts.Store,
-	billingSvc *billing.Service,
-	provider llm.Provider,
+	executor Executor,
+	endpoints EndpointsLister,
 	maxUploadMB int64,
 ) *Service {
 	return &Service{
@@ -76,8 +91,8 @@ func NewService(
 		jobRows:       jobRows,
 		jobs:          jobSvc,
 		artifacts:     artifactStore,
-		billing:       billingSvc,
-		provider:      provider,
+		executor:      executor,
+		endpoints:     endpoints,
 		maxUploadMB:   maxUploadMB,
 	}
 }
@@ -131,10 +146,6 @@ func (s *Service) Process(ctx context.Context, p auth.Principal, input ProcessIn
 	if err != nil {
 		return ProcessOutput{}, err
 	}
-	if !auth.ModelAllowed(p, model) {
-		return ProcessOutput{}, fmt.Errorf("%w: model is not allowed for this credential", ErrForbidden)
-	}
-
 	// Persist the input BEFORE the job row exists — the job's input_ref binds
 	// the finalized artifact version.
 	w, ref, err := s.artifacts.Begin(ctx, artifacts.Meta{
@@ -171,12 +182,13 @@ func (s *Service) Process(ctx context.Context, p auth.Principal, input ProcessIn
 		InputRef:  ref.ID,
 		InputHash: inputHash,
 		Policy: map[string]any{
-			"template_id": template.ID,
-			"model":       model,
-			"file_name":   input.FileName,
-			"mime_type":   input.MimeType,
-			"file_size":   int64(len(input.Bytes)),
-			"context":     input.Context,
+			"template_id":   template.ID,
+			"model":         model,
+			"file_name":     input.FileName,
+			"mime_type":     input.MimeType,
+			"file_size":     int64(len(input.Bytes)),
+			"input_version": int64(ref.Version),
+			"context":       input.Context,
 		},
 	})
 	if err != nil {
@@ -201,19 +213,19 @@ func (s *Service) Process(ctx context.Context, p auth.Principal, input ProcessIn
 	}, nil
 }
 
-// JobHandler is the jobs.Runner handler for OperationProcess. It is
-// code-complete but not dispatched by composition yet — the runner wiring
-// for workers lands with the executor plan; Process only enqueues.
+// JobHandler is the jobs.Runner handler for OperationProcess; composition
+// mounts it so leased extract jobs dispatch through the shared executor.
 func (s *Service) JobHandler() jobs.HandlerFunc {
 	return func(ctx context.Context, claim *jobs.Claim, input jobs.InputFunc) (string, error) {
 		return s.attempt(ctx, claim, input)
 	}
 }
 
-// attempt executes one claimed extract job under the fenced lease:
-// Reserve → MarkDispatched → provider → result artifact → Settle. The
-// initiating principal is read back from the frozen job snapshot and every
-// authorization is re-checked before privileged work.
+// attempt executes one claimed extract job under the fenced lease. The
+// initiating principal is read back from the frozen job snapshot, template
+// and model authorization are re-checked, and the shared executor alone
+// resolves policy, reserves, dispatches and settles — one reservation, one
+// settlement, no module-side billing.
 func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.InputFunc) (string, error) {
 	job := claim.Job()
 
@@ -236,7 +248,9 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 			return "", err
 		}
 	}
-	if !auth.ExtractTemplateAllowed(p, template.ID) || !auth.ModelAllowed(p, model) {
+	// Template allowlist is re-checked here; model/endpoint/restriction
+	// authorization is the executor's job alone.
+	if !auth.ExtractTemplateAllowed(p, template.ID) {
 		return "", ErrForbidden
 	}
 
@@ -252,32 +266,10 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 
 	promptSystem, promptUser := interpolate(template.SystemPrompt, template.UserPrompt, contextMap(job.Policy["context"]))
 
-	// Bounded per-kind estimate: reserve before any provider call. Missing
-	// price refuses dispatch (ErrPriceMissing) — no silent free units.
-	estimate := billing.Usage{
-		InputUnits:  estimateInputTokens(int64(len(inBytes)), promptSystem, promptUser),
-		OutputUnits: maxExtractOutputTokens,
-	}
-	res, err := s.billing.Reserve(ctx, p, billing.ReserveRequest{
-		Capability: OperationProcess,
-		Model:      model,
-		JobID:      job.ID,
-		AttemptID:  claim.AttemptID(),
-		Estimate:   estimate,
-		Price:      billing.PriceKey{SubjectType: billing.PriceSubjectModel, SubjectID: model},
-	})
-	if err != nil {
-		return "", err
-	}
-	releaseHold := func() { _ = s.billing.ReleaseUndispatched(context.WithoutCancel(ctx), p, res.ID) }
-
+	// Job fencing marks dispatch; the executor alone reserves/settles —
+	// a denied or unpriced request fails before any upstream write.
 	if err := claim.MarkDispatched(ctx); err != nil {
-		releaseHold()
 		return "", err
-	}
-	if err := s.billing.MarkDispatched(ctx, p, res.ID); err != nil {
-		releaseHold()
-		return "", fmt.Errorf("mark reservation dispatched: %w", err)
 	}
 
 	inInput := ProcessInput{
@@ -287,17 +279,38 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 		MimeType:   stringValue(job.Policy["mime_type"]),
 		Bytes:      inBytes,
 	}
-	requestBytes, err := json.Marshal(s.buildProviderRequest(model, template, promptSystem, promptUser, inInput))
+	payload, err := json.Marshal(s.buildProviderRequest(model, template, promptSystem, promptUser, inInput))
 	if err != nil {
 		return "", fmt.Errorf("marshal provider request: %w", err)
 	}
 
-	chatRespRaw, err := s.provider.CreateChatCompletion(ctx, requestBytes)
+	inputVersion, _ := job.Policy["input_version"].(float64)
+	res, err := s.executor.Execute(ctx, p, inference.Request{
+		Capability: inference.CapabilityChat,
+		Model:      model,
+		Payload:    payload,
+		Artifacts: []artifacts.Ref{{
+			TenantID: job.TenantID,
+			ID:       job.InputRef,
+			Version:  int(inputVersion),
+		}},
+		Estimate: billing.Usage{
+			InputUnits:  estimateInputTokens(int64(len(inBytes)), promptSystem, promptUser),
+			OutputUnits: maxExtractOutputTokens,
+		},
+		JobID:     job.ID,
+		AttemptID: claim.AttemptID(),
+	})
 	if err != nil {
-		// The upstream call was dispatched; its outcome is unobserved —
-		// retain liability, never silently retry.
-		_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, res.ID)
 		return "", fmt.Errorf("provider chat completion: %w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.SettlementError != nil {
+		return "", fmt.Errorf("settle reservation: %w", res.SettlementError)
+	}
+	chatRespRaw, err := io.ReadAll(res.Body)
+	if err != nil {
+		return "", fmt.Errorf("read provider response: %w", err)
 	}
 
 	parsed, rawContent, usage, parseErr := parseProviderExtraction(chatRespRaw)
@@ -309,6 +322,14 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 	}
 	validationErrors, validationWarnings := s.validateOutput(parsed, template)
 
+	promptUnits, completionUnits := usage.Prompt, usage.Completion
+	if res.Usage != nil {
+		// Settled units are the accounting truth; the parsed provider report
+		// stays in RawResponse for display only.
+		promptUnits = int(res.Usage.Units[billing.UnitInput])
+		completionUnits = int(res.Usage.Units[billing.UnitOutput])
+	}
+
 	resultDoc := ResultView{
 		ID:                   newID("res"),
 		JobID:                job.ID,
@@ -316,9 +337,9 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 		RawResponse:          rawContent,
 		ValidationErrors:     validationErrors,
 		ValidationWarnings:   validationWarnings,
-		PromptTokensUsed:     usage.Prompt,
-		CompletionTokensUsed: usage.Completion,
-		TokensUsed:           usage.Total,
+		PromptTokensUsed:     promptUnits,
+		CompletionTokensUsed: completionUnits,
+		TokensUsed:           promptUnits + completionUnits,
 		CreatedAt:            time.Now().UTC(),
 	}
 	docBytes, err := json.Marshal(resultDoc)
@@ -330,33 +351,17 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 		MimeType: "application/json",
 	}, writeLeaseTTL, int64(len(docBytes))+4096)
 	if err != nil {
-		_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, res.ID)
 		return "", fmt.Errorf("begin result artifact: %w", err)
 	}
 	if _, err := rw.Write(docBytes); err != nil {
 		_ = rw.Abort(ctx)
-		_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, res.ID)
 		return "", fmt.Errorf("write result artifact: %w", err)
 	}
 	if err := rw.Finalize(ctx); err != nil {
-		_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, res.ID)
 		return "", fmt.Errorf("finalize result artifact: %w", err)
 	}
 	rref = rw.Ref()
 
-	usageRecord, err := s.billing.Settle(ctx, p, res.ID, billing.Usage{
-		InputUnits:       int64(usage.Prompt),
-		OutputUnits:      int64(usage.Completion),
-		CachedInputUnits: 0,
-	})
-	if err != nil {
-		// Result bytes exist but settlement failed: retain liability and fail —
-		// a stale retry reserves a fresh hold under the same fenced attempt.
-		_ = s.artifacts.Delete(context.WithoutCancel(ctx), rref)
-		_ = s.billing.MarkUnknown(context.WithoutCancel(ctx), p, res.ID)
-		return "", fmt.Errorf("settle reservation: %w", err)
-	}
-	_ = usageRecord
 	return rref.ID, nil
 }
 
@@ -506,21 +511,33 @@ func (s *Service) UpdateSettings(ctx context.Context, p auth.Principal, in Setti
 	return s.settingsRepo.UpsertSettings(ctx, p.TenantID, in)
 }
 
-func (s *Service) ModelsForExtract(ctx context.Context) ([]llm.Model, error) {
-	modelsResp, err := s.provider.ListModels(ctx)
+// ModelsForExtract lists the model aliases the tenant's enabled
+// vision-capable endpoints actually expose — configuration truth, not an
+// upstream probe. Unknown to the executor means not selectable.
+func (s *Service) ModelsForExtract(ctx context.Context, tenantID string) ([]llm.Model, error) {
+	endpoints, err := s.endpoints.ListCapabilities(ctx, tenantID, inference.CapabilityVision)
 	if err != nil {
 		return nil, err
 	}
-	models := make([]llm.Model, 0, len(modelsResp.Data))
-	for _, m := range modelsResp.Data {
-		if llm.SupportsVisionOrDocument(m) {
-			models = append(models, m)
+	seen := map[string]struct{}{}
+	var models []llm.Model
+	for _, e := range endpoints {
+		for _, cap := range e.Capabilities {
+			binding, ok := strings.CutPrefix(cap, inference.ModelCapabilityPrefix)
+			if !ok {
+				continue
+			}
+			alias, _, _ := strings.Cut(binding, "=")
+			if alias == "" {
+				continue
+			}
+			if _, dup := seen[alias]; !dup {
+				seen[alias] = struct{}{}
+				models = append(models, llm.Model{ID: alias})
+			}
 		}
 	}
-	// Some providers don't populate capability metadata; fall back to all models.
-	if len(models) == 0 {
-		return modelsResp.Data, nil
-	}
+	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
 	return models, nil
 }
 
@@ -556,18 +573,12 @@ func (s *Service) resolveModel(ctx context.Context, tenantID string, t Template)
 	if err == nil && strings.TrimSpace(settings.DefaultModel) != "" {
 		return settings.DefaultModel, nil
 	}
-
-	modelsResp, err := s.provider.ListModels(ctx)
+	models, err := s.ModelsForExtract(ctx, tenantID)
 	if err != nil {
 		return "", fmt.Errorf("list models for fallback: %w", err)
 	}
-	for _, m := range modelsResp.Data {
-		if llm.SupportsVisionOrDocument(m) {
-			return m.ID, nil
-		}
-	}
-	if len(modelsResp.Data) > 0 {
-		return modelsResp.Data[0].ID, nil
+	if len(models) > 0 {
+		return models[0].ID, nil
 	}
 	return "", errors.New("no models available")
 }

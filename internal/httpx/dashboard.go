@@ -166,6 +166,8 @@ func (a *App) registerDashboardRoutes() {
 	a.mux.HandleFunc("/dashboard/partials/extract/reset-defaults", a.sessionAuth.RequireSession(a.handleDashboardExtractResetDefaults))
 	a.mux.HandleFunc("/dashboard/partials/extract/settings", a.sessionAuth.RequireSession(a.handleDashboardExtractSettings))
 	a.mux.HandleFunc("/dashboard/partials/extract/jobs", a.sessionAuth.RequireSession(a.handleDashboardExtractJobs))
+	a.mux.HandleFunc("/dashboard/partials/extract/process", a.sessionAuth.RequireSession(a.handleDashboardExtractProcess))
+	a.mux.HandleFunc("/dashboard/partials/extract/models", a.sessionAuth.RequireSession(a.handleDashboardExtractModels))
 	a.mux.HandleFunc("/dashboard/partials/providers", a.sessionAuth.RequireSession(a.handleDashboardProviders))
 	a.mux.HandleFunc("/dashboard/partials/pricing", a.sessionAuth.RequireSession(a.handleDashboardPricing))
 	a.mux.HandleFunc("/dashboard/partials/billing-audit", a.sessionAuth.RequireSession(a.handleDashboardBillingAudit))
