@@ -21,6 +21,7 @@ import (
 	extractmodule "enclava-go/internal/modules/extract"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
+	"enclava-go/internal/store/postgres"
 	"enclava-go/internal/store/sqlite"
 )
 
@@ -40,7 +41,23 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	db, err := sqlite.Open(ctx, cfg.DatabaseURL)
+	pgDB, err := postgres.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("postgres init error: %v", err)
+	}
+	defer func() {
+		if err := pgDB.Close(); err != nil {
+			log.Printf("postgres close failed: %v", err)
+		}
+	}()
+	identityRepo := postgres.NewIdentityRepo(pgDB)
+
+	// Legacy SQLite store keeps unported services running until their port
+	// plans land (01-22 removes the whole open).
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		log.Fatalf("data dir init error: %v", err)
+	}
+	db, err := sqlite.Open(ctx, cfg.DataDir+"/enclava-legacy.db")
 	if err != nil {
 		log.Fatalf("database init error: %v", err)
 	}
@@ -73,14 +90,11 @@ func main() {
 	if err := promptRepo.EnsureDefaults(ctx, prompts.DefaultTemplates()); err != nil {
 		log.Fatalf("prompt template seed error: %v", err)
 	}
-	if err := apiKeysRepo.EnsureBootstrapKey(ctx, cfg.BootstrapAPIKey, cfg.APIKeyHashAlgo, cfg.APIKeyPepper, cfg.BootstrapMinLength); err != nil {
-		log.Fatalf("bootstrap key init error: %v", err)
-	}
 	if err := providersRepo.EnsureDefault(ctx, runtimeProviderConfig(cfg)); err != nil {
 		log.Fatalf("provider config seed error: %v", err)
 	}
 
-	authSvc := auth.NewService(apiKeysRepo, cfg.APIKeyPepper)
+	authSvc := auth.NewService(identityRepo, cfg.APIKeyPepper)
 	provider, err := buildProvider(cfg)
 	if err != nil {
 		log.Fatalf("provider init error: %v", err)

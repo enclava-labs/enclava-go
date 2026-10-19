@@ -14,7 +14,9 @@ import (
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/llm"
+	"enclava-go/internal/store/postgres"
 	"enclava-go/internal/store/sqlite"
+	"enclava-go/internal/testdb"
 )
 
 type contractProvider struct {
@@ -153,7 +155,7 @@ func (p *contractProvider) DoPassthroughRequest(ctx context.Context, method, pat
 
 func TestOpenAIChatCompletionContractRecordsUsage(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, _, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 
 	body := []byte(`{"model":"contract-model","messages":[{"role":"user","content":"hello"}],"temperature":0}`)
@@ -184,7 +186,7 @@ func TestOpenAIChatCompletionContractRecordsUsage(t *testing.T) {
 
 func TestOpenAIChatCompletionStreamRecordsUsage(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, _, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 	provider.chatStreamBody = "data: {\"model\":\"contract-model\",\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":9,\"total_tokens\":17}}\n\n"
 
@@ -216,7 +218,7 @@ func TestOpenAIChatCompletionStreamRecordsUsage(t *testing.T) {
 
 func TestOpenAIChatCompletionUpstreamErrorPreservedAndRecorded(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, _, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 	provider.chatErr = &llm.UpstreamError{
 		StatusCode: http.StatusTooManyRequests,
@@ -247,7 +249,7 @@ func TestOpenAIChatCompletionUpstreamErrorPreservedAndRecorded(t *testing.T) {
 
 func TestOpenAIEmbeddingsContractRecordsUsage(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, _, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/embeddings", bytes.NewReader([]byte(`{"model":"embed-model","input":"hello"}`)))
@@ -274,7 +276,7 @@ func TestOpenAIEmbeddingsContractRecordsUsage(t *testing.T) {
 
 func TestOpenAIV1AliasRoutes(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, _, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 
 	for _, tc := range []struct {
@@ -326,18 +328,9 @@ func TestOpenAIV1AliasRoutes(t *testing.T) {
 
 func TestEndpointRestrictionsTreatOpenAIAliasesAsEquivalent(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, ident, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
-	keysRepo := sqlite.NewAPIKeysRepo(db.SQL)
-	keyID := apiKeyIDForSecret(t, ctx, db, apiKey)
-	key, err := keysRepo.GetByID(ctx, keyID)
-	if err != nil {
-		t.Fatalf("get key: %v", err)
-	}
-	key.AllowedEndpoints = []string{"/api/v1/chat/completions", "/v1/embeddings"}
-	if err := keysRepo.Update(ctx, key); err != nil {
-		t.Fatalf("update key endpoints: %v", err)
-	}
+	updateStoredKey(t, ctx, ident, "allowed_endpoints", listGrantJSON("/api/v1/chat/completions", "/v1/embeddings"))
 
 	chatReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"contract-model","messages":[]}`))
 	chatReq.Header.Set("Authorization", "Bearer "+apiKey)
@@ -371,7 +364,7 @@ func TestEndpointRestrictionsTreatOpenAIAliasesAsEquivalent(t *testing.T) {
 
 func TestOpenAIGenericPassthroughProxiesAdditionalRouteFamilies(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, _, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 
 	jsonBody := []byte(`{"model":"contract-model","input":"check this"}`)
@@ -540,7 +533,7 @@ func TestOpenAIProxyEndpointRejectsTraversal(t *testing.T) {
 
 func TestOpenAIPassthroughRecordsTrailingJSONUsageBeyondCaptureLimit(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, _, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 
 	padding := strings.Repeat("a", maxSSEEventBytes)
@@ -576,7 +569,7 @@ func TestOpenAIPassthroughRecordsTrailingJSONUsageBeyondCaptureLimit(t *testing.
 
 func TestOpenAIPassthroughRecordsFinalSSEUsageBeyondCaptureLimit(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, _, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 
 	event := "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"
@@ -614,18 +607,9 @@ func TestOpenAIPassthroughRecordsFinalSSEUsageBeyondCaptureLimit(t *testing.T) {
 
 func TestOpenAIGenericPassthroughRequiresProxyScope(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, ident, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
-	keysRepo := sqlite.NewAPIKeysRepo(db.SQL)
-	keyID := apiKeyIDForSecret(t, ctx, db, apiKey)
-	key, err := keysRepo.GetByID(ctx, keyID)
-	if err != nil {
-		t.Fatalf("get key: %v", err)
-	}
-	key.Scopes = []string{"models.list", "chat.completions", "embeddings.create", "responses"}
-	if err := keysRepo.Update(ctx, key); err != nil {
-		t.Fatalf("update key scopes: %v", err)
-	}
+	updateStoredKey(t, ctx, ident, "scopes", listGrantJSON("models.list", "chat.completions", "embeddings.create", "responses"))
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/moderations", strings.NewReader(`{"model":"contract-model","input":"hello"}`))
 	req.Header.Set("Authorization", "Bearer "+apiKey)
@@ -644,18 +628,9 @@ func TestOpenAIGenericPassthroughRequiresProxyScope(t *testing.T) {
 
 func TestOpenAIGenericPassthroughAppliesModelRestrictions(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, ident, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
-	keysRepo := sqlite.NewAPIKeysRepo(db.SQL)
-	keyID := apiKeyIDForSecret(t, ctx, db, apiKey)
-	key, err := keysRepo.GetByID(ctx, keyID)
-	if err != nil {
-		t.Fatalf("get key: %v", err)
-	}
-	key.AllowedModels = []string{"contract-model"}
-	if err := keysRepo.Update(ctx, key); err != nil {
-		t.Fatalf("update key models: %v", err)
-	}
+	updateStoredKey(t, ctx, ident, "allowed_models", listGrantJSON("contract-model"))
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", strings.NewReader("model=blocked-model&file=fake"))
 	req.Header.Set("Authorization", "Bearer "+apiKey)
@@ -674,7 +649,7 @@ func TestOpenAIGenericPassthroughAppliesModelRestrictions(t *testing.T) {
 
 func TestResponsesAPIContractRecordsUsage(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, _, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 
 	body := []byte(`{"model":"contract-model","input":"hello","metadata":{"trace":"abc"}}`)
@@ -705,7 +680,7 @@ func TestResponsesAPIContractRecordsUsage(t *testing.T) {
 
 func TestResponsesAPIStreamsAndRecordsUsage(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, _, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 
 	body := []byte(`{"model":"contract-model","input":"hello","stream":true}`)
@@ -736,7 +711,7 @@ func TestResponsesAPIStreamsAndRecordsUsage(t *testing.T) {
 
 func TestResponsesAPIProxiesDocumentedSubroutes(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, _, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 
 	cases := []struct {
@@ -774,7 +749,7 @@ func TestResponsesAPIProxiesDocumentedSubroutes(t *testing.T) {
 
 func TestResponsesBudgetAppliesOnlyToCreate(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, ident, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 
 	cancelBody := []byte(`{"model":"contract-model"}`)
@@ -797,7 +772,7 @@ func TestResponsesBudgetAppliesOnlyToCreate(t *testing.T) {
 		t.Fatalf("cancel must not insert a usage row, got %d", usageCount)
 	}
 
-	keyID := apiKeyIDForSecret(t, ctx, db, apiKey)
+	keyID := apiKeyIDForSecret(t, ctx, ident, apiKey)
 	limitTokens := int64(0)
 	if err := sqlite.NewBudgetsRepo(db.SQL).Upsert(ctx, sqlite.Budget{
 		ID:          "contract_responses_budget",
@@ -844,7 +819,7 @@ func TestResponsesBudgetAppliesOnlyToCreate(t *testing.T) {
 
 func TestResponsesAPIFallsBackToGenericPassthroughForUnknownSubroutes(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, _, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 
 	body := []byte(`{"model":"contract-model","metadata":{"trace":"yes"}}`)
@@ -871,10 +846,10 @@ func TestResponsesAPIFallsBackToGenericPassthroughForUnknownSubroutes(t *testing
 
 func TestOpenAIChatCompletionBudgetExceededBeforeProviderCall(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, ident, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 
-	keyID := apiKeyIDForSecret(t, ctx, db, apiKey)
+	keyID := apiKeyIDForSecret(t, ctx, ident, apiKey)
 	limitTokens := int64(0)
 	if err := sqlite.NewBudgetsRepo(db.SQL).Upsert(ctx, sqlite.Budget{
 		ID:          "contract_budget",
@@ -912,20 +887,11 @@ func TestOpenAIChatCompletionBudgetExceededBeforeProviderCall(t *testing.T) {
 
 func TestOpenAIAPIKeyAllowedIPsSupportsCIDRAndTrustedProxy(t *testing.T) {
 	ctx := context.Background()
-	db, apiKey, app, provider := newOpenAIContractApp(t, ctx)
+	db, ident, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 	app.trustProxy = true
 
-	keysRepo := sqlite.NewAPIKeysRepo(db.SQL)
-	keyID := apiKeyIDForSecret(t, ctx, db, apiKey)
-	key, err := keysRepo.GetByID(ctx, keyID)
-	if err != nil {
-		t.Fatalf("get api key: %v", err)
-	}
-	key.AllowedIPs = []string{"198.51.100.0/24"}
-	if err := keysRepo.Update(ctx, key); err != nil {
-		t.Fatalf("update allowed ips: %v", err)
-	}
+	updateStoredKey(t, ctx, ident, "allowed_ips", listGrantJSON("198.51.100.0/24"))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/models", nil)
 	req.RemoteAddr = "203.0.113.10:4567"
@@ -955,38 +921,59 @@ func TestOpenAIAPIKeyAllowedIPsSupportsCIDRAndTrustedProxy(t *testing.T) {
 	}
 }
 
-func newOpenAIContractApp(t *testing.T, ctx context.Context) (*sqlite.DB, string, *App, *contractProvider) {
+// contractIdentity carries the real-PostgreSQL identity rows the app
+// authenticates against (testdb fixture), alongside the sqlite db that
+// still backs unported stores.
+type contractIdentity struct {
+	db     *postgres.DB
+	repo   *postgres.IdentityRepo
+	tenant string
+	keyID  string
+}
+
+func newOpenAIContractApp(t *testing.T, ctx context.Context) (*sqlite.DB, contractIdentity, string, *App, *contractProvider) {
 	t.Helper()
 	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "openai-contract.db"))
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
-	keysRepo := sqlite.NewAPIKeysRepo(db.SQL)
-	apiKey := "enc_test_contract_secret_1234567890"
-	keyID, err := keysRepo.CreateAPIKey(ctx, "contract", apiKey, "sha256", "", []string{"models.list", "chat.completions", "embeddings.create", "responses", "openai.proxy"})
+	// Authentication resolves against an isolated PostgreSQL identity store.
+	pgdb := testdb.New(t)
+	tenant := testdb.SeedTenant(t, pgdb, "contract")
+	user := testdb.SeedUser(t, pgdb, tenant, "contract@example.com", nil)
+	apiKey, keyRec := testdb.SeedAPIKey(t, pgdb, tenant, testdb.SeedKeySpec{
+		Name:        "contract",
+		OwnerUserID: user.ID,
+		Scopes:      []string{"models.list", "chat.completions", "embeddings.create", "responses", "openai.proxy"},
+	})
+	ident := contractIdentity{
+		db:     pgdb,
+		repo:   postgres.NewIdentityRepo(pgdb),
+		tenant: tenant,
+		keyID:  keyRec.ID,
+	}
+	// Legacy numeric handle: unported sqlite stores (usage_records, budgets)
+	// still FK-reference api_keys.id, so mirror the deterministic
+	// principal.APIKeyID the service derives for this stored credential.
+	seeded, err := auth.NewService(ident.repo, "").Authenticate(ctx, apiKey)
 	if err != nil {
-		t.Fatalf("create api key: %v", err)
+		t.Fatalf("authenticate seeded key: %v", err)
 	}
-	if err := keysRepo.ActivateKey(ctx, keyID); err != nil {
-		t.Fatalf("activate api key: %v", err)
+	if _, err := db.SQL.ExecContext(ctx,
+		`INSERT INTO api_keys (id, name, key_prefix, key_hash, is_active) VALUES (?, 'contract', '', '', 1)`,
+		seeded.APIKeyID); err != nil {
+		t.Fatalf("mirror legacy key row: %v", err)
 	}
-	key, err := keysRepo.GetByID(ctx, keyID)
-	if err != nil {
-		t.Fatalf("get api key: %v", err)
-	}
-	key.IsUnlimited = false
-	if err := keysRepo.Update(ctx, key); err != nil {
-		t.Fatalf("mark api key budget-bound: %v", err)
-	}
+
 	provider := &contractProvider{
 		models: llm.ModelsResponse{Object: "list", Data: []llm.Model{{ID: "contract-model"}, {ID: "embed-model", Tasks: []string{"embeddings"}}}},
 	}
 	app := NewApp(
-		auth.NewService(keysRepo, ""),
+		auth.NewService(ident.repo, ""),
 		provider,
 		"contract-provider",
 		nil,
-		keysRepo,
+		sqlite.NewAPIKeysRepo(db.SQL),
 		nil,
 		nil,
 		nil,
@@ -1009,14 +996,52 @@ func newOpenAIContractApp(t *testing.T, ctx context.Context) (*sqlite.DB, string
 		5,
 		false,
 	)
-	return db, apiKey, app, provider
+	return db, ident, apiKey, app, provider
 }
 
-func apiKeyIDForSecret(t *testing.T, ctx context.Context, db *sqlite.DB, apiKey string) int64 {
+// apiKeyIDForSecret resolves the deterministic legacy numeric handle the
+// auth service derives for the stored credential (Principal.APIKeyID).
+func apiKeyIDForSecret(t *testing.T, ctx context.Context, ident contractIdentity, apiKey string) int64 {
 	t.Helper()
-	principal, err := auth.NewService(sqlite.NewAPIKeysRepo(db.SQL), "").Authenticate(ctx, apiKey)
+	principal, err := auth.NewService(ident.repo, "").Authenticate(ctx, apiKey)
 	if err != nil {
 		t.Fatalf("authenticate key: %v", err)
 	}
 	return principal.APIKeyID
+}
+
+// updateStoredKey mutates a stored grant column on the seeded PostgreSQL
+// key row, exercising the real persistence path.
+func updateStoredKey(t *testing.T, ctx context.Context, ident contractIdentity, column string, grant json.RawMessage) {
+	t.Helper()
+	rec, err := ident.repo.GetAPIKey(ctx, ident.tenant, ident.keyID)
+	if err != nil {
+		t.Fatalf("get key: %v", err)
+	}
+	switch column {
+	case "allowed_models":
+		rec.AllowedModels = grant
+	case "allowed_endpoints":
+		rec.AllowedEndpoints = grant
+	case "allowed_ips":
+		rec.AllowedIPs = grant
+	case "scopes":
+		rec.Scopes = grant
+	default:
+		t.Fatalf("unknown allowlist column %q", column)
+	}
+	if err := ident.repo.UpdateAPIKey(ctx, ident.tenant, rec); err != nil {
+		t.Fatalf("update key: %v", err)
+	}
+}
+
+func listGrantJSON(items ...string) json.RawMessage {
+	raw, err := json.Marshal(struct {
+		Mode  string   `json:"mode"`
+		Items []string `json:"items"`
+	}{Mode: "list", Items: items})
+	if err != nil {
+		panic(err)
+	}
+	return raw
 }

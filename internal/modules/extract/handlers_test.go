@@ -17,7 +17,9 @@ import (
 	extractsvc "enclava-go/internal/extract"
 	"enclava-go/internal/httpx"
 	"enclava-go/internal/llm"
+	"enclava-go/internal/store/postgres"
 	"enclava-go/internal/store/sqlite"
+	"enclava-go/internal/testdb"
 )
 
 func TestExtractTemplateIDFromRequestAcceptsLegacyAliases(t *testing.T) {
@@ -49,14 +51,27 @@ func TestHandleProcessRecordsPricedExtractUsage(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	apiKey := "enc_test_extract_usage_secret"
+	// Authentication resolves against an isolated PostgreSQL identity store.
+	pgdb := testdb.New(t)
+	tenant := testdb.SeedTenant(t, pgdb, "extract-usage")
+	user := testdb.SeedUser(t, pgdb, tenant, "extract@example.com", nil)
+	apiKey, _ := testdb.SeedAPIKey(t, pgdb, tenant, testdb.SeedKeySpec{
+		Name:        "extract-usage",
+		OwnerUserID: user.ID,
+		Scopes:      []string{"extract"},
+	})
 	keysRepo := sqlite.NewAPIKeysRepo(db.SQL)
-	keyID, err := keysRepo.CreateAPIKey(ctx, "extract-usage", apiKey, "sha256", "", []string{"extract"})
+	identityRepo := postgres.NewIdentityRepo(pgdb)
+	// Mirror the deterministic legacy numeric handle: usage_records still
+	// FK-references sqlite api_keys.id until those stores are ported.
+	seeded, err := auth.NewService(identityRepo, "").Authenticate(ctx, apiKey)
 	if err != nil {
-		t.Fatalf("create api key: %v", err)
+		t.Fatalf("authenticate seeded key: %v", err)
 	}
-	if err := keysRepo.ActivateKey(ctx, keyID); err != nil {
-		t.Fatalf("activate api key: %v", err)
+	if _, err := db.SQL.ExecContext(ctx,
+		`INSERT INTO api_keys (id, name, key_prefix, key_hash, is_active) VALUES (?, 'extract-usage', '', '', 1)`,
+		seeded.APIKeyID); err != nil {
+		t.Fatalf("mirror legacy key row: %v", err)
 	}
 
 	templatesRepo := sqlite.NewExtractTemplatesRepo(db.SQL)
@@ -103,7 +118,7 @@ func TestHandleProcessRecordsPricedExtractUsage(t *testing.T) {
 		5,
 	)
 	app := httpx.NewApp(
-		auth.NewService(keysRepo, ""),
+		auth.NewService(identityRepo, ""),
 		provider,
 		"extract-provider",
 		nil,
@@ -131,7 +146,7 @@ func TestHandleProcessRecordsPricedExtractUsage(t *testing.T) {
 		false,
 	)
 	handlers := NewHandlers(extractService, 5, app)
-	principal, err := auth.NewService(keysRepo, "").Authenticate(ctx, apiKey)
+	principal, err := auth.NewService(identityRepo, "").Authenticate(ctx, apiKey)
 	if err != nil {
 		t.Fatalf("authenticate key: %v", err)
 	}
@@ -167,7 +182,7 @@ func TestHandleProcessRecordsPricedExtractUsage(t *testing.T) {
 		SELECT endpoint, model, provider_id, prompt_tokens, completion_tokens, total_tokens, cost_cents
 		FROM usage_records
 		WHERE api_key_id = ?
-	`, keyID).Scan(&endpoint, &model, &providerID, &promptTokens, &completionTokens, &totalTokens, &costCents); err != nil {
+	`, principal.APIKeyID).Scan(&endpoint, &model, &providerID, &promptTokens, &completionTokens, &totalTokens, &costCents); err != nil {
 		t.Fatalf("query usage record: %v", err)
 	}
 	if endpoint != "/api/v1/extract/process" || model != "priced-extract" || providerID != "extract-provider" {
