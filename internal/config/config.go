@@ -49,10 +49,11 @@ type Config struct {
 	// Dashboard login runs on server sessions only — there is no
 	// ADMIN_EMAIL/ADMIN_PASSWORD path; the `enclava bootstrap` CLI is the
 	// first-login story (AUTH-01/AUTH-03).
-	TrustProxyHeaders  bool
-	BootstrapAPIKey    string
-	BootstrapEnabled   bool
-	BootstrapMinLength int
+	TrustProxyHeaders bool
+	// SessionTenantSlug is the tenant the dashboard session login resolves
+	// against (SESSION_TENANT_SLUG); the serve path seeds the "bootstrap"
+	// slug and `enclava bootstrap --tenant <slug>` targets it.
+	SessionTenantSlug string
 	// SecretBindings are the operator-approved tenant-bound credential
 	// references (SECRET_BINDINGS). Auth owns resolution; config only parses
 	// and validates this trusted runtime configuration — a stored
@@ -101,9 +102,7 @@ func Load() (Config, error) {
 		APIKeyPrefix:            getEnv("API_KEY_PREFIX", "enc_"),
 		CORSAllowedOrigins:      getEnvList("CORS_ALLOWED_ORIGINS"),
 		TrustProxyHeaders:       getEnvBool("TRUST_PROXY_HEADERS", false),
-		BootstrapAPIKey:         getEnv("BOOTSTRAP_API_KEY", ""),
-		BootstrapEnabled:        getEnvBool("BOOTSTRAP_ENABLED", false),
-		BootstrapMinLength:      getEnvInt("BOOTSTRAP_API_KEY_MIN_LENGTH", 48),
+		SessionTenantSlug:       strings.TrimSpace(getEnv("SESSION_TENANT_SLUG", "bootstrap")),
 	}
 	if cfg.Provider == "openai" {
 		cfg.Provider = "privatemode"
@@ -154,26 +153,8 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("API_KEY_PREFIX must be non-empty")
 	}
 
-	if cfg.BootstrapAPIKey != "" {
-		cfg.BootstrapAPIKey = strings.TrimSpace(cfg.BootstrapAPIKey)
-		if cfg.BootstrapAPIKey == "" {
-			return Config{}, fmt.Errorf("BOOTSTRAP_API_KEY must not be blank")
-		}
-		if !cfg.BootstrapEnabled {
-			return Config{}, fmt.Errorf("BOOTSTRAP_API_KEY is set but BOOTSTRAP_ENABLED=false; set BOOTSTRAP_ENABLED=true to use bootstrap seeding")
-		}
-		if cfg.BootstrapMinLength <= 0 {
-			return Config{}, fmt.Errorf("BOOTSTRAP_API_KEY_MIN_LENGTH must be > 0")
-		}
-		if err := validateBootstrapAPIKey(cfg.BootstrapAPIKey, cfg.BootstrapMinLength); err != nil {
-			return Config{}, err
-		}
-	} else if cfg.BootstrapEnabled {
-		return Config{}, fmt.Errorf("BOOTSTRAP_ENABLED=true requires BOOTSTRAP_API_KEY")
-	}
-
-	if cfg.BootstrapMinLength < 24 && cfg.BootstrapAPIKey != "" {
-		return Config{}, fmt.Errorf("BOOTSTRAP_API_KEY_MIN_LENGTH must be at least 24")
+	if cfg.SessionTenantSlug == "" {
+		return Config{}, fmt.Errorf("SESSION_TENANT_SLUG must be non-empty")
 	}
 	if cfg.Provider != "privatemode" && cfg.Provider != "tinfoil" && cfg.Provider != "openai_compatible" && cfg.Provider != "redpill" {
 		return Config{}, fmt.Errorf("INFERENCE_PROVIDER must be one of: privatemode, tinfoil, openai_compatible, redpill")
@@ -332,34 +313,6 @@ func getEnvList(key string) []string {
 		out = append(out, part)
 	}
 	return out
-}
-
-func validateBootstrapAPIKey(value string, minLength int) error {
-	normalized := strings.ToLower(strings.TrimSpace(value))
-	switch normalized {
-	case "",
-		"enc_demo_replace_me",
-		"demo",
-		"change_me",
-		"changeme",
-		"bootstrap",
-		"default",
-		"password",
-		"test",
-		"abc123",
-		"abc123456":
-		return fmt.Errorf("BOOTSTRAP_API_KEY uses a forbidden placeholder value")
-	}
-
-	if len(value) < minLength {
-		return fmt.Errorf("BOOTSTRAP_API_KEY must be at least %d characters", minLength)
-	}
-
-	if strings.ContainsAny(value, " \t\r\n") {
-		return fmt.Errorf("BOOTSTRAP_API_KEY must not contain whitespace")
-	}
-
-	return nil
 }
 
 func getEnvBool(key string, fallback bool) bool {

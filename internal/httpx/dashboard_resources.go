@@ -3,10 +3,8 @@ package httpx
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -472,38 +470,6 @@ func (a *App) handleDashboardRAGAction(r *http.Request, p auth.Principal) (strin
 			return "", err.Error()
 		}
 		return "RAG collection created", ""
-	case "upload_document":
-		collectionID := strings.TrimSpace(r.FormValue("collection_id"))
-		file, header, err := r.FormFile("file")
-		if err != nil {
-			return "", "File is required"
-		}
-		defer func() { _ = file.Close() }()
-		content, err := io.ReadAll(file)
-		if err != nil {
-			return "", "Failed to read uploaded file"
-		}
-		mimeType := header.Header.Get("Content-Type")
-		if strings.TrimSpace(mimeType) == "" {
-			mimeType = "application/octet-stream"
-		}
-		if _, err := a.ragSvc.UploadDocument(r.Context(), p, collectionID, rag.UploadDocumentInput{
-			FileName: filepath.Base(header.Filename),
-			MimeType: mimeType,
-			Bytes:    content,
-		}); err != nil {
-			return "", err.Error()
-		}
-		return "Document uploaded", ""
-	case "reprocess_document":
-		documentID := strings.TrimSpace(r.FormValue("document_id"))
-		if documentID == "" {
-			return "", "Document ID is required"
-		}
-		if _, err := a.ragSvc.ReprocessDocument(r.Context(), p, documentID); err != nil {
-			return "", err.Error()
-		}
-		return "Document reprocessed", ""
 	case "delete_document":
 		documentID := strings.TrimSpace(r.FormValue("document_id"))
 		if documentID == "" {
@@ -623,12 +589,6 @@ func (a *App) handleDashboardConnectorAction(r *http.Request, p auth.Principal) 
 			return "", err.Error()
 		}
 		return "Connector source created", ""
-	case "sync_source":
-		sourceID := strings.TrimSpace(r.FormValue("source_id"))
-		if _, err := a.connectorSvc.SyncSource(r.Context(), p, sourceID); err != nil {
-			return "", err.Error()
-		}
-		return "Connector sync started", ""
 	case "set_source_enabled":
 		sourceID := strings.TrimSpace(r.FormValue("source_id"))
 		enabled := strings.TrimSpace(r.FormValue("enabled")) == "true"

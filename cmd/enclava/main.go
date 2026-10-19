@@ -23,17 +23,15 @@ import (
 	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
 	"enclava-go/internal/llm"
-	extractmodule "enclava-go/internal/modules/extract"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
 	"enclava-go/internal/store/postgres"
-	"enclava-go/internal/store/sqlite"
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "migrate-import" {
-		if err := runMigrateImport(context.Background(), os.Args[2:]); err != nil {
-			log.Fatalf("migrate-import error: %v", err)
+	if len(os.Args) > 1 && os.Args[1] == "bootstrap" {
+		if err := runBootstrap(context.Background(), os.Args[2:]); err != nil {
+			log.Fatalf("bootstrap error: %v", err)
 		}
 		return
 	}
@@ -46,6 +44,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// CORE-02/CORE-05: the ONLY database open is PostgreSQL — there is no
+	// SQLite path anywhere in the composition root.
 	pgDB, err := postgres.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("postgres init error: %v", err)
@@ -55,41 +55,34 @@ func main() {
 			log.Printf("postgres close failed: %v", err)
 		}
 	}()
-	identityRepo := postgres.NewIdentityRepo(pgDB)
 
-	// Legacy SQLite store keeps unported services running until their port
-	// plans land (01-22 removes the whole open).
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		log.Fatalf("data dir init error: %v", err)
 	}
-	db, err := sqlite.Open(ctx, cfg.DataDir+"/enclava-legacy.db")
-	if err != nil {
-		log.Fatalf("database init error: %v", err)
-	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			log.Printf("database close failed: %v", err)
-		}
-	}()
 
-	// The legacy sqlite API keys repo is gone — key admin runs on the
-	// postgres IdentityRepo; bootstrap key seeding is replaced by the 01-22
-	// bootstrap CLI.
-	usageRepo := sqlite.NewUsageRepo(db.SQL)
+	identityRepo := postgres.NewIdentityRepo(pgDB)
 	promptRepo := postgres.NewPromptsRepo(pgDB)
 	chatbotRepo := postgres.NewChatbotRepo(pgDB)
 	billingRepo := postgres.NewBillingRepo(pgDB)
 	endpointsRepo := postgres.NewEndpointsRepo(pgDB)
-
-	// Durable extract stack: postgres domain repo + artifact store + jobs +
-	// billing (CORE-05/JOB-01/JOB-04).
 	extractRepo := postgres.NewExtractRepo(pgDB)
 	jobsRepoPG := postgres.NewJobsRepo(pgDB)
 	artifactRepo := postgres.NewArtifactRepo(pgDB)
-	artifactStore, err := artifacts.NewStore(cfg.DataDir, cfg.DataDir+"/scratch", artifactRepo)
+	ragRepo := postgres.NewRAGRepo(pgDB)
+	sourceRepo := postgres.NewSourceRepo(pgDB)
+
+	// Durable artifacts under <data>/artifacts, scratch under <data>/scratch —
+	// sibling roots, since the store rejects nested disjoint roots.
+	artifactStore, err := artifacts.NewStore(cfg.DataDir+"/artifacts", cfg.DataDir+"/scratch", artifactRepo)
 	if err != nil {
 		log.Fatalf("artifact store init error: %v", err)
 	}
+	// D-10: reconcile crash leftovers before serving; a reconcile failure
+	// fails startup rather than serving over a suspect durable root.
+	if err := artifactStore.Reconcile(ctx); err != nil {
+		log.Fatalf("artifact reconcile error: %v", err)
+	}
+
 	jobsSvc := jobs.NewService(jobsRepoPG, 0)
 	billingSvc := billing.NewService(billingRepo)
 	if err := ensureEnvEndpoint(ctx, identityRepo, endpointsRepo, runtimeProviderConfig(cfg)); err != nil {
@@ -116,7 +109,7 @@ func main() {
 	)
 
 	// Seed the bootstrap tenant's default extract templates and settings row
-	// through the owned service (the legacy sqlite seeding is gone).
+	// through the owned service.
 	bootstrapTenantID, err := identityRepo.GetTenantBySlug(ctx, "bootstrap")
 	if err != nil {
 		log.Fatalf("bootstrap tenant lookup error: %v", err)
@@ -128,23 +121,29 @@ func main() {
 	if _, err := extractSvc.GetSettings(ctx, bootstrapPrincipal); err != nil {
 		log.Fatalf("extract settings seed error: %v", err)
 	}
-	// The runner carries the extract.process handler registration; the
-	// worker loop itself starts with the executor plan (01-25).
-	jobsRunner := jobs.NewRunner(jobsSvc, artifactStore, map[string]jobs.HandlerFunc{
-		extract.OperationProcess: extractSvc.JobHandler(),
-	}, jobs.RunnerConfig{})
-	_ = jobsRunner
+
+	// Infrastructure-only runner: no operation handlers are registered until
+	// the executor plans (01-25+) mount them; it exists to drain fenced
+	// claims cleanly at shutdown.
+	jobsRunner := jobs.NewRunner(jobsSvc, artifactStore, map[string]jobs.HandlerFunc{}, jobs.RunnerConfig{})
+	runnerCtx, stopRunner := context.WithCancel(context.Background())
+	runnerDone := make(chan struct{})
+	go func() {
+		defer close(runnerDone)
+		if err := jobsRunner.Run(runnerCtx); err != nil {
+			log.Printf("jobs runner error: %v", err)
+		}
+	}()
+
 	qdrantClient := rag.NewQdrantClient(cfg.QdrantURL, cfg.UpstreamTimeout)
-	ragRepo := postgres.NewRAGRepo(pgDB)
-	sourceRepo := postgres.NewSourceRepo(pgDB)
 	ragSvc := rag.NewService(ragRepo, qdrantClient, provider, cfg.DefaultEmbeddingModel, artifactStore, jobsSvc, billingSvc)
-	chatbotSvc := chatbot.NewService(chatbotRepo, promptRepo, ragSvc, provider, legacyUsageRecorder{repo: usageRepo})
+	chatbotSvc := chatbot.NewService(chatbotRepo, promptRepo, ragSvc, provider, nil)
 	promptSvc := prompts.NewService(promptRepo, chatbotSvc)
 	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG, ragSvc)
 
 	// Browser dashboard login runs on the server-session handlers from 01-12;
-	// the bootstrap slug resolves per request so `enclava bootstrap` order is free.
-	sessionAuth := httpx.NewSessionAuth(authSvc, auth.NewOIDCService(identityRepo, auth.EnvSecretResolver), cfg.SessionTTL, httpx.DashboardTemplates(), "bootstrap")
+	// the configured slug resolves per request so `enclava bootstrap` order is free.
+	sessionAuth := httpx.NewSessionAuth(authSvc, auth.NewOIDCService(identityRepo, auth.EnvSecretResolver), cfg.SessionTTL, httpx.DashboardTemplates(), cfg.SessionTenantSlug)
 
 	app := httpx.NewApp(
 		authSvc,
@@ -157,7 +156,7 @@ func main() {
 		promptSvc,
 		chatbotSvc,
 		connectorSvc,
-		usageRepo,
+		nil, // usageRepo: every route that consumed it is unmounted (removed in 01-36)
 		billingSvc,
 		billingRepo,
 		endpointsRepo,
@@ -169,9 +168,6 @@ func main() {
 		cfg.MaxUploadSizeMB,
 		cfg.TrustProxyHeaders,
 	)
-
-	extractMod := extractmodule.New(extractSvc, cfg.MaxUploadSizeMB)
-	extractMod.Register(app.Mux(), app)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr(),
@@ -190,6 +186,9 @@ func main() {
 	}()
 
 	<-ctx.Done()
+	// Drain order: runner first (releases fenced leases / requeues), then HTTP.
+	stopRunner()
+	<-runnerDone
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -300,29 +299,4 @@ func buildProvider(cfg config.Config) (llm.Provider, error) {
 	default:
 		return nil, fmt.Errorf("unsupported INFERENCE_PROVIDER %q", cfg.Provider)
 	}
-}
-
-// legacyUsageRecorder bridges the chatbot completion usage records to the
-// legacy sqlite usage stats repo until the billing port (01-17) replaces
-// observability writes. Keyed attribution still flows through APIKeyID.
-type legacyUsageRecorder struct {
-	repo *sqlite.UsageRepo
-}
-
-func (r legacyUsageRecorder) Record(ctx context.Context, rec chatbot.UsageRecord) error {
-	if r.repo == nil || rec.APIKeyID <= 0 {
-		return nil
-	}
-	return r.repo.Record(ctx, sqlite.UsageRecord{
-		ID:               rec.ID,
-		APIKeyID:         rec.APIKeyID,
-		Endpoint:         rec.Endpoint,
-		Model:            rec.Model,
-		ChatbotID:        rec.ChatbotID,
-		ProviderID:       rec.ProviderID,
-		PromptTokens:     rec.PromptTokens,
-		CompletionTokens: rec.CompletionTokens,
-		TotalTokens:      rec.TotalTokens,
-		StatusCode:       rec.StatusCode,
-	})
 }
