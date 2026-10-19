@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -52,8 +53,9 @@ func (r *APIKeysRepo) FindCandidatesByPrefix(ctx context.Context, prefix string)
 		var rlHour sql.NullInt64
 		var rlDay sql.NullInt64
 
+		var legacyID int64
 		if err := rows.Scan(
-			&rec.ID,
+			&legacyID,
 			&rec.Name,
 			&rec.KeyPrefix,
 			&rec.KeyHash,
@@ -78,14 +80,18 @@ func (r *APIKeysRepo) FindCandidatesByPrefix(ctx context.Context, prefix string)
 			return nil, fmt.Errorf("scan api key candidate: %w", err)
 		}
 
+		rec.ID = fmt.Sprintf("%d", legacyID)
 		rec.IsActive = isActive == 1
-		rec.Scopes = unmarshalStringList(scopesRaw)
-		rec.AllowedModels = unmarshalStringList(modelsRaw)
-		rec.AllowedExtractTemplates = unmarshalStringList(templatesRaw)
-		rec.AllowedChatbots = unmarshalStringList(chatbotsRaw)
-		rec.AllowedAgents = unmarshalStringList(agentsRaw)
-		rec.AllowedEndpoints = unmarshalStringList(endpointsRaw)
-		rec.AllowedIPs = unmarshalStringList(allowedIPsRaw)
+		// Legacy columns store string lists; map onto the canonical
+		// mode/list grant documents (empty or "*" list → mode:all, matching
+		// the old unrestricted storage contract until this store is ported).
+		rec.Scopes = legacyGrant(unmarshalStringList(scopesRaw))
+		rec.AllowedModels = legacyGrant(unmarshalStringList(modelsRaw))
+		rec.AllowedTemplates = legacyGrant(unmarshalStringList(templatesRaw))
+		rec.AllowedChatbots = legacyGrant(unmarshalStringList(chatbotsRaw))
+		rec.AllowedAgents = legacyGrant(unmarshalStringList(agentsRaw))
+		rec.AllowedEndpoints = legacyGrant(unmarshalStringList(endpointsRaw))
+		rec.AllowedIPs = legacyGrant(unmarshalStringList(allowedIPsRaw))
 		if rlMin.Valid {
 			v := int(rlMin.Int64)
 			rec.RateLimitPerMinute = &v
@@ -120,6 +126,28 @@ func (r *APIKeysRepo) FindCandidatesByPrefix(ctx context.Context, prefix string)
 	}
 
 	return out, nil
+}
+
+// legacyGrant maps a legacy stored string list to a canonical grant
+// document: empty list or a "*" item is the old unrestricted contract →
+// {"mode":"all"}; otherwise an explicit {"mode":"list"} row.
+func legacyGrant(values []string) json.RawMessage {
+	for _, v := range values {
+		if v == "*" {
+			return json.RawMessage(`{"mode":"all"}`)
+		}
+	}
+	if len(values) == 0 {
+		return json.RawMessage(`{"mode":"all"}`)
+	}
+	raw, err := json.Marshal(struct {
+		Mode  string   `json:"mode"`
+		Items []string `json:"items"`
+	}{Mode: "list", Items: values})
+	if err != nil {
+		return json.RawMessage(`{"mode":"list","items":[]}`)
+	}
+	return raw
 }
 
 func (r *APIKeysRepo) TouchUsage(ctx context.Context, id int64) error {
