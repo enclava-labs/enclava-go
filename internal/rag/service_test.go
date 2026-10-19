@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -11,33 +12,39 @@ import (
 
 	"enclava-go/internal/artifacts"
 	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
-	"enclava-go/internal/llm"
 	"enclava-go/internal/rag"
 	"enclava-go/internal/source"
 	"enclava-go/internal/store/postgres"
 	"enclava-go/internal/testdb"
 )
 
-type fakeEmbeddingProvider struct{}
-
-func (f fakeEmbeddingProvider) ListModels(ctx context.Context) (llm.ModelsResponse, error) {
-	return llm.ModelsResponse{}, nil
+// fakeEmbeddingUpstream is the deterministic executor transport answering
+// embeddings requests — real policy/pricing run inside inference.Service.
+type fakeEmbeddingUpstream struct {
+	calls int
 }
 
-func (f fakeEmbeddingProvider) GetModel(ctx context.Context, modelID string) (llm.Model, error) {
-	return llm.Model{}, nil
+func (f *fakeEmbeddingUpstream) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
+	return nil, errors.New("unexpected chat call")
 }
 
-func (f fakeEmbeddingProvider) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
-	return nil, nil
+func (f *fakeEmbeddingUpstream) CreateChatCompletionStream(ctx context.Context, body []byte) (io.ReadCloser, error) {
+	return nil, errors.New("unexpected chat stream call")
 }
 
-func (f fakeEmbeddingProvider) CreateChatCompletionStream(ctx context.Context, body []byte) (io.ReadCloser, error) {
-	return nil, nil
+func (f *fakeEmbeddingUpstream) DoResponsesRequest(ctx context.Context, method, path string, body []byte) ([]byte, error) {
+	return nil, errors.New("unexpected responses call")
 }
 
-func (f fakeEmbeddingProvider) CreateEmbeddings(ctx context.Context, body []byte) ([]byte, error) {
+func (f *fakeEmbeddingUpstream) DoResponsesStream(ctx context.Context, method, path string, body []byte) (io.ReadCloser, error) {
+	return nil, errors.New("unexpected responses stream call")
+}
+
+func (f *fakeEmbeddingUpstream) CreateEmbeddings(ctx context.Context, body []byte) ([]byte, error) {
+	f.calls++
 	var payload struct {
 		Input any `json:"input"`
 	}
@@ -67,6 +74,49 @@ func (f fakeEmbeddingProvider) CreateEmbeddings(ctx context.Context, body []byte
 		"usage":  map[string]any{"prompt_tokens": len(inputs), "total_tokens": len(inputs)},
 	})
 }
+
+// newExecutor composes the real shared executor over postgres seams with the
+// fake transport, plus the embeddings endpoint binding and price the
+// attempt must resolve through.
+func newExecutor(t *testing.T, db *postgres.DB, tenant string, upstream inference.Upstream) *inference.Service {
+	t.Helper()
+	ctx := context.Background()
+	endpoints := postgres.NewEndpointsRepo(db)
+	sources := postgres.NewSourceRepo(db)
+	billingRepo := postgres.NewBillingRepo(db)
+	if err := endpoints.Create(ctx, inference.Endpoint{
+		ID:           "ep-embed",
+		TenantID:     tenant,
+		Protocol:     "openai_compatible",
+		BaseOrigin:   "https://embed.upstream.example",
+		Capabilities: []string{inference.CapabilityEmbeddings, "model:embed-test"},
+		Enabled:      true,
+	}); err != nil {
+		t.Fatalf("create endpoint: %v", err)
+	}
+	if err := billingRepo.PutPrice(ctx, tenant, fmt.Sprintf("p-embed-%s", newTestID()), billing.Price{
+		SubjectType: billing.PriceSubjectEndpoint, SubjectID: "ep-embed",
+		Capability: inference.CapabilityEmbeddings, Unit: billing.UnitInput,
+		RateMicros: 1, UnitQuantity: 1, Currency: "USD",
+	}, "tester", time.Now().UTC().Add(-time.Minute)); err != nil {
+		t.Fatalf("put price: %v", err)
+	}
+	svc, err := inference.NewService(inference.Deps{
+		Endpoints:  endpoints,
+		Sources:    sources,
+		Authorizer: source.NewAuthorizer(sources, 0),
+		Billing:    billing.NewService(billingRepo),
+		Artifacts:  postgres.NewArtifactRepo(db),
+	}, inference.WithTransportFactory(func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {
+		return upstream, nil
+	}))
+	if err != nil {
+		t.Fatalf("new inference service: %v", err)
+	}
+	return svc
+}
+
+func newTestID() string { return fmt.Sprintf("t%d", time.Now().UnixNano()) }
 
 type fakeVectorStore struct {
 	points map[string][]rag.QdrantPoint
@@ -165,14 +215,16 @@ func newFixture(t *testing.T) *fixture {
 	}
 	vector := newFakeVectorStore()
 	repo := postgres.NewRAGRepo(db)
-	svc := rag.NewService(repo, vector, fakeEmbeddingProvider{}, "embed-test", store, jobsSvc, nil)
+	svc := rag.NewService(repo, vector, newExecutor(t, db, tenant, &fakeEmbeddingUpstream{}), "embed-test", store, jobsSvc)
 	p := auth.Principal{
-		TenantID:       tenant,
-		ActorID:        user.ID,
-		ActorKind:      auth.ActorKindUser,
-		UserID:         user.ID,
-		CredentialID:   "key_test",
-		CredentialKind: auth.CredentialKindAPIKey,
+		TenantID:            tenant,
+		ActorID:             user.ID,
+		ActorKind:           auth.ActorKindUser,
+		UserID:              user.ID,
+		CredentialID:        "key_test",
+		CredentialKind:      auth.CredentialKindAPIKey,
+		AllowedModelsAll:    true,
+		AllowedEndpointsAll: true,
 	}
 	return &fixture{db: db, svc: svc, repo: repo, jobs: jobsSvc, store: store, vector: vector, tenant: tenant, principal: p}
 }

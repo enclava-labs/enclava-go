@@ -3,6 +3,7 @@ package connectors
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -10,32 +11,37 @@ import (
 
 	"enclava-go/internal/artifacts"
 	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
-	"enclava-go/internal/llm"
 	"enclava-go/internal/rag"
+	"enclava-go/internal/source"
 	"enclava-go/internal/store/postgres"
 	"enclava-go/internal/testdb"
 )
 
-type connectorEmbeddingProvider struct{}
+// connectorEmbeddingUpstream is the deterministic executor transport for the
+// connector → rag ingest path; policy and pricing run inside the real
+// shared executor, never a provider stub.
+type connectorEmbeddingUpstream struct{}
 
-func (p connectorEmbeddingProvider) ListModels(ctx context.Context) (llm.ModelsResponse, error) {
-	return llm.ModelsResponse{}, nil
+func (p connectorEmbeddingUpstream) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
+	return nil, errors.New("unexpected chat call")
 }
 
-func (p connectorEmbeddingProvider) GetModel(ctx context.Context, modelID string) (llm.Model, error) {
-	return llm.Model{}, nil
+func (p connectorEmbeddingUpstream) CreateChatCompletionStream(ctx context.Context, body []byte) (io.ReadCloser, error) {
+	return nil, errors.New("unexpected chat stream call")
 }
 
-func (p connectorEmbeddingProvider) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
-	return nil, nil
+func (p connectorEmbeddingUpstream) DoResponsesRequest(ctx context.Context, method, path string, body []byte) ([]byte, error) {
+	return nil, errors.New("unexpected responses call")
 }
 
-func (p connectorEmbeddingProvider) CreateChatCompletionStream(ctx context.Context, body []byte) (io.ReadCloser, error) {
-	return nil, nil
+func (p connectorEmbeddingUpstream) DoResponsesStream(ctx context.Context, method, path string, body []byte) (io.ReadCloser, error) {
+	return nil, errors.New("unexpected responses stream call")
 }
 
-func (p connectorEmbeddingProvider) CreateEmbeddings(ctx context.Context, body []byte) ([]byte, error) {
+func (p connectorEmbeddingUpstream) CreateEmbeddings(ctx context.Context, body []byte) ([]byte, error) {
 	var payload struct {
 		Input any `json:"input"`
 	}
@@ -64,6 +70,47 @@ func (p connectorEmbeddingProvider) CreateEmbeddings(ctx context.Context, body [
 		"data":   data,
 		"usage":  map[string]any{"prompt_tokens": len(inputs), "total_tokens": len(inputs)},
 	})
+}
+
+// newConnectorExecutor composes the real shared executor with the seeded
+// embeddings endpoint binding and input-unit price the ingest attempt must
+// resolve through.
+func newConnectorExecutor(t *testing.T, db *postgres.DB, tenant string) *inference.Service {
+	t.Helper()
+	ctx := context.Background()
+	endpoints := postgres.NewEndpointsRepo(db)
+	sources := postgres.NewSourceRepo(db)
+	billingRepo := postgres.NewBillingRepo(db)
+	if err := endpoints.Create(ctx, inference.Endpoint{
+		ID:           "ep-embed",
+		TenantID:     tenant,
+		Protocol:     "openai_compatible",
+		BaseOrigin:   "https://embed.upstream.example",
+		Capabilities: []string{inference.CapabilityEmbeddings, "model:embed-test"},
+		Enabled:      true,
+	}); err != nil {
+		t.Fatalf("create endpoint: %v", err)
+	}
+	if err := billingRepo.PutPrice(ctx, tenant, "p-embed-input", billing.Price{
+		SubjectType: billing.PriceSubjectEndpoint, SubjectID: "ep-embed",
+		Capability: inference.CapabilityEmbeddings, Unit: billing.UnitInput,
+		RateMicros: 1, UnitQuantity: 1, Currency: "USD",
+	}, "tester", time.Now().UTC().Add(-time.Minute)); err != nil {
+		t.Fatalf("put price: %v", err)
+	}
+	svc, err := inference.NewService(inference.Deps{
+		Endpoints:  endpoints,
+		Sources:    sources,
+		Authorizer: source.NewAuthorizer(sources, 0),
+		Billing:    billing.NewService(billingRepo),
+		Artifacts:  postgres.NewArtifactRepo(db),
+	}, inference.WithTransportFactory(func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {
+		return connectorEmbeddingUpstream{}, nil
+	}))
+	if err != nil {
+		t.Fatalf("new inference service: %v", err)
+	}
+	return svc
 }
 
 type connectorVectorStore struct {
@@ -119,7 +166,8 @@ func TestConnectorSyncIndexesDocumentsIntoSearchableRAG(t *testing.T) {
 	tenant := testdb.SeedTenant(t, db, "conn-rag")
 	user := testdb.SeedUser(t, db, tenant, "conn-rag@example.test", nil)
 	p := auth.Principal{TenantID: tenant, ActorID: user.ID, ActorKind: auth.ActorKindUser, UserID: user.ID,
-		CredentialID: "key_test", CredentialKind: auth.CredentialKindAPIKey}
+		CredentialID: "key_test", CredentialKind: auth.CredentialKindAPIKey,
+		AllowedModelsAll: true, AllowedEndpointsAll: true}
 
 	jobsRepo := postgres.NewJobsRepo(db)
 	jobsSvc := jobs.NewService(jobsRepo, 0)
@@ -127,7 +175,7 @@ func TestConnectorSyncIndexesDocumentsIntoSearchableRAG(t *testing.T) {
 	if err != nil {
 		t.Fatalf("artifact store: %v", err)
 	}
-	ragSvc := rag.NewService(postgres.NewRAGRepo(db), newConnectorVectorStore(), connectorEmbeddingProvider{}, "embed-test", artifactStore, jobsSvc, nil)
+	ragSvc := rag.NewService(postgres.NewRAGRepo(db), newConnectorVectorStore(), newConnectorExecutor(t, db, tenant), "embed-test", artifactStore, jobsSvc)
 	collection, err := ragSvc.CreateCollection(ctx, p, rag.CreateCollectionInput{
 		Name:         "Connector Search",
 		ChunkSize:    100,

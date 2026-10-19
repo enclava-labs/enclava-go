@@ -164,10 +164,14 @@ func main() {
 		log.Fatalf("extract settings seed error: %v", err)
 	}
 
-	// Worker: the extract job handler dispatches through the shared executor —
-	// leased fenced claims only, no synchronous provider path.
+	qdrantClient := rag.NewQdrantClient(cfg.QdrantURL, cfg.UpstreamTimeout)
+	ragSvc := rag.NewService(ragRepo, qdrantClient, inferenceSvc, cfg.DefaultEmbeddingModel, artifactStore, jobsSvc)
+
+	// Worker: extract and embed job handlers dispatch through the shared
+	// executor — leased fenced claims only, no synchronous provider path.
 	jobsRunner := jobs.NewRunner(jobsSvc, artifactStore, map[string]jobs.HandlerFunc{
 		extract.OperationProcess: extractSvc.JobHandler(),
+		rag.OperationEmbed:       ragSvc.JobHandler(),
 	}, jobs.RunnerConfig{})
 	runnerCtx, stopRunner := context.WithCancel(context.Background())
 	runnerDone := make(chan struct{})
@@ -178,8 +182,6 @@ func main() {
 		}
 	}()
 
-	qdrantClient := rag.NewQdrantClient(cfg.QdrantURL, cfg.UpstreamTimeout)
-	ragSvc := rag.NewService(ragRepo, qdrantClient, provider, cfg.DefaultEmbeddingModel, artifactStore, jobsSvc, billingSvc)
 	chatbotSvc := chatbot.NewService(chatbotRepo, promptRepo, ragSvc, provider, nil)
 	promptSvc := prompts.NewService(promptRepo, chatbotSvc)
 	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG, ragSvc)

@@ -6,10 +6,21 @@ import (
 	"fmt"
 	"io"
 
-	"enclava-go/internal/llm"
+	"enclava-go/internal/artifacts"
+	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
+	"enclava-go/internal/inference"
+	"enclava-go/internal/source"
 )
 
-const maxEmbeddingInputs = 2048
+// maxEmbeddingInputs caps batch size by item count; maxEmbeddingBatchUnits
+// caps the summed estimate so one batch always sits inside the routed
+// embeddings operation bound — a route-level limit is enforced by the
+// executor, never assumed from a fixed item count.
+const (
+	maxEmbeddingInputs     = 2048
+	maxEmbeddingBatchUnits = 1 << 20
+)
 
 type embeddingResponse struct {
 	Data []struct {
@@ -22,79 +33,105 @@ type embeddingResponse struct {
 	} `json:"usage"`
 }
 
-// createEmbeddings batches embedding calls over maxEmbeddingInputs. Budget
-// admission and usage settlement live in the caller (billing.Reserve →
-// provider → billing.Settle) — never in a spend guard with an APIKeyID-zero
-// bypass.
-func createEmbeddings(ctx context.Context, provider llm.Provider, model string, inputs []string) ([][]float64, embeddingResponse, error) {
+// embedScope is the authorization/accounting context shared by every batch
+// of one embedding attempt: the same initiating or delegated principal,
+// immutable input references and durable job linkage.
+type embedScope struct {
+	Inputs    []source.ObjectRef
+	Artifacts []artifacts.Ref
+	JobID     string
+	AttemptID string
+}
+
+// createEmbeddings batches embedding calls through the shared executor —
+// policy resolution, pricing, dispatch and settlement all live inside
+// inference.Service.Execute; there is no direct-provider or key-zero path.
+func createEmbeddings(ctx context.Context, executor Executor, p auth.Principal, model string, inputs []string, scope embedScope) ([][]float64, error) {
 	vectors := make([][]float64, len(inputs))
-	var summed embeddingResponse
 	var dim int
-	for offset := 0; offset < len(inputs); offset += maxEmbeddingInputs {
-		end := offset + maxEmbeddingInputs
-		if end > len(inputs) {
-			end = len(inputs)
+	for offset := 0; offset < len(inputs); {
+		// Bound each batch by both item count and summed unit estimate.
+		units := int64(0)
+		end := offset
+		for end < len(inputs) && end-offset < maxEmbeddingInputs {
+			u := int64(tokenEstimate(inputs[end]))
+			if units+u > maxEmbeddingBatchUnits && end > offset {
+				break
+			}
+			units += u
+			end++
 		}
-		batch := inputs[offset:end]
-		batchVectors, resp, err := createEmbeddingBatch(ctx, provider, model, batch)
+		batchVectors, err := createEmbeddingBatch(ctx, executor, p, model, inputs[offset:end], units, scope)
 		if err != nil {
-			return nil, embeddingResponse{}, err
+			return nil, err
 		}
 		for i, vec := range batchVectors {
 			if dim == 0 {
 				dim = len(vec)
 			} else if len(vec) != dim {
-				return nil, embeddingResponse{}, fmt.Errorf("embedding dimension mismatch: got %d, want %d", len(vec), dim)
+				return nil, fmt.Errorf("embedding dimension mismatch: got %d, want %d", len(vec), dim)
 			}
 			vectors[offset+i] = vec
 		}
-		summed.Usage.PromptTokens += resp.Usage.PromptTokens
-		summed.Usage.TotalTokens += resp.Usage.TotalTokens
+		offset = end
 	}
-	return vectors, summed, nil
+	return vectors, nil
 }
 
-func createEmbeddingBatch(ctx context.Context, provider llm.Provider, model string, inputs []string) ([][]float64, embeddingResponse, error) {
-	payload := map[string]any{
-		"model": model,
-		"input": inputs,
-	}
-	body, err := json.Marshal(payload)
+func createEmbeddingBatch(ctx context.Context, executor Executor, p auth.Principal, model string, inputs []string, estimate int64, scope embedScope) ([][]float64, error) {
+	payload, err := json.Marshal(map[string]any{"input": inputs})
 	if err != nil {
-		return nil, embeddingResponse{}, fmt.Errorf("marshal embeddings request: %w", err)
+		return nil, fmt.Errorf("marshal embeddings request: %w", err)
 	}
-	respBody, err := provider.CreateEmbeddings(ctx, body)
+	res, err := executor.Execute(ctx, p, inference.Request{
+		Capability: inference.CapabilityEmbeddings,
+		Model:      model,
+		Payload:    payload,
+		Inputs:     scope.Inputs,
+		Artifacts:  scope.Artifacts,
+		Estimate:   billing.Usage{InputUnits: estimate},
+		JobID:      scope.JobID,
+		AttemptID:  scope.AttemptID,
+	})
 	if err != nil {
-		return nil, embeddingResponse{}, fmt.Errorf("provider embeddings: %w", err)
+		return nil, fmt.Errorf("provider embeddings: %w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.SettlementError != nil {
+		return nil, fmt.Errorf("settle reservation: %w", res.SettlementError)
+	}
+	respBody, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read embeddings response: %w", err)
 	}
 	var resp embeddingResponse
 	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return nil, embeddingResponse{}, fmt.Errorf("decode embeddings response: %w", err)
+		return nil, fmt.Errorf("decode embeddings response: %w", err)
 	}
 	if len(resp.Data) != len(inputs) {
-		return nil, embeddingResponse{}, fmt.Errorf("embedding count mismatch: got %d, want %d", len(resp.Data), len(inputs))
+		return nil, fmt.Errorf("embedding count mismatch: got %d, want %d", len(resp.Data), len(inputs))
 	}
 	vectors := make([][]float64, len(inputs))
 	seen := make([]bool, len(inputs))
 	for _, item := range resp.Data {
 		if item.Index < 0 || item.Index >= len(vectors) {
-			return nil, embeddingResponse{}, fmt.Errorf("embedding response has invalid index %d", item.Index)
+			return nil, fmt.Errorf("embedding response has invalid index %d", item.Index)
 		}
 		if seen[item.Index] {
-			return nil, embeddingResponse{}, fmt.Errorf("embedding response has duplicate index %d", item.Index)
+			return nil, fmt.Errorf("embedding response has duplicate index %d", item.Index)
 		}
 		if len(item.Embedding) == 0 {
-			return nil, embeddingResponse{}, fmt.Errorf("embedding response has empty vector at index %d", item.Index)
+			return nil, fmt.Errorf("embedding response has empty vector at index %d", item.Index)
 		}
 		seen[item.Index] = true
 		vectors[item.Index] = item.Embedding
 	}
 	for i, ok := range seen {
 		if !ok {
-			return nil, embeddingResponse{}, fmt.Errorf("embedding response missing index %d", i)
+			return nil, fmt.Errorf("embedding response missing index %d", i)
 		}
 	}
-	return vectors, resp, nil
+	return vectors, nil
 }
 
 func readAll(r io.Reader) ([]byte, error) {
