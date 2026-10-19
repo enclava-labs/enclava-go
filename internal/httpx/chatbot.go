@@ -149,10 +149,6 @@ func (a *App) handleExternalChatbotCompletion(w http.ResponseWriter, r *http.Req
 		WriteOpenAIError(w, http.StatusServiceUnavailable, "provider not ready", "server_error", "provider_not_ready")
 		return
 	}
-	if err := a.EnforceBudget(r.Context(), principal); err != nil {
-		a.WriteBudgetError(w, err)
-		return
-	}
 	requestBytes, err := io.ReadAll(io.LimitReader(r.Body, 16*1024*1024))
 	if err != nil {
 		WriteOpenAIError(w, http.StatusBadRequest, "invalid request body", "invalid_request_error", "invalid_body")

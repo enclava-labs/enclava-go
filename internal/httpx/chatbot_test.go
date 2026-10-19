@@ -92,7 +92,6 @@ func openChatPrincipal(tenantID string) auth.Principal {
 		TenantID:           tenantID,
 		ActorID:            "http_key_actor",
 		ActorKind:          auth.ActorKindServiceAccount,
-		APIKeyID:           42,
 		AllowedModelsAll:   true,
 		AllowedChatbotsAll: true,
 	}

@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"net/http"
 	"strings"
 	"time"
@@ -49,9 +48,6 @@ type APIKeyRecord struct {
 	LastUsedAt         *time.Time
 	CreatedAt          time.Time
 
-	// Legacy fields retained on the record only so the retained sqlite
-	// producer keeps compiling until its port (Principal populates them for
-	// postgres rows as nil/zero — the columns do not exist there).
 	IsUnlimited       bool
 	BudgetLimitTokens *int64
 	BudgetLimitCents  *int64
@@ -140,15 +136,6 @@ func (s *Service) principalFromKey(ctx context.Context, key APIKeyRecord) (Princ
 		TenantID:        tenantID,
 		CredentialID:    key.ID,
 		CredentialKind:  CredentialKindAPIKey,
-		Name:            key.Name,
-		RawAPIKeyPrefix: key.KeyPrefix,
-		// Legacy numeric id: deterministic handle derived from the stored
-		// credential row so unported callers keep working until 01-35.
-		APIKeyID:          LegacyAPIKeyID(tenantID, key.ID),
-		IsUnlimited:       key.IsUnlimited,
-		BudgetLimitTokens: key.BudgetLimitTokens,
-		BudgetLimitCents:  key.BudgetLimitCents,
-		BudgetPeriod:      key.BudgetPeriod,
 
 		RateLimitPerMinute: key.RateLimitPerMinute,
 		RateLimitPerHour:   key.RateLimitPerHour,
@@ -200,13 +187,6 @@ func (s *Service) principalFromKey(ctx context.Context, key APIKeyRecord) (Princ
 	return principal, nil
 }
 
-// LegacyAPIKeyID derives the retained numeric APIKeyID legacy field from the
-// stored credential identity. Deterministic per row; retired with the field.
-func LegacyAPIKeyID(tenantID, keyID string) int64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(tenantID + "/" + keyID))
-	return int64(h.Sum64() & 0x7fffffffffffffff)
-}
 
 // AuthenticatePassword verifies a local account's bcrypt password and returns
 // the user's principal (password auth precedes session issuance).

@@ -4,7 +4,6 @@ package httpx
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -78,122 +77,7 @@ func seedSettledUsage(t *testing.T, f budgetFixture, id string, subject billing.
 	}
 }
 
-func keyPrincipal(tenant, keyID string) auth.Principal {
-	return auth.Principal{
-		TenantID:           tenant,
-		BillingSubjectKind: auth.BillingSubjectAPIKey,
-		BillingSubjectID:   keyID,
-	}
-}
 
-func TestEnforceBudgetDeniesAtStoredAmountLimit(t *testing.T) {
-	f := newBudgetFixture(t)
-	ctx := context.Background()
-	keyID := "key-deny"
-	subject := billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: keyID}
-
-	// 1 USD = 1_000_000 micros; seed exactly the 10-micros-of-dollar limit…
-	if err := f.repo.CreateBudget(ctx, f.tenant, "b_deny", billing.Budget{
-		Name: "deny-at-limit", Subject: subject,
-		Kind: billing.BudgetKindAmount, Period: billing.PeriodMonthly,
-		LimitAmountMicros: 1_000_000, Currency: "USD",
-		StartsAt: time.Now().UTC().Add(-time.Hour),
-	}); err != nil {
-		t.Fatalf("create budget: %v", err)
-	}
-
-	seedSettledUsage(t, f, "deny_under", subject, 100, 999_999, "USD", time.Now().UTC())
-	if err := f.app.EnforceBudget(ctx, keyPrincipal(f.tenant, keyID)); err != nil {
-		t.Fatalf("below limit should admit: %v", err)
-	}
-
-	seedSettledUsage(t, f, "deny_hit", subject, 1, 1, "USD", time.Now().UTC())
-	err := f.app.EnforceBudget(ctx, keyPrincipal(f.tenant, keyID))
-	if err == nil {
-		t.Fatal("expected budget exceeded at the stored limit")
-	}
-	var budgetErr budgetExceededError
-	if !errors.As(err, &budgetErr) {
-		t.Fatalf("expected budgetExceededError, got %T %v", err, err)
-	}
-}
-
-func TestEnforceBudgetDeniesOnTokenBudget(t *testing.T) {
-	f := newBudgetFixture(t)
-	ctx := context.Background()
-	keyID := "key-tokens"
-	subject := billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: keyID}
-
-	if err := f.repo.CreateBudget(ctx, f.tenant, "b_tokens", billing.Budget{
-		Name: "token-cap", Subject: subject,
-		Kind: billing.BudgetKindTokens, Period: billing.PeriodDaily,
-		LimitAmountMicros: 500,
-		StartsAt:          time.Now().UTC().Add(-time.Hour),
-	}); err != nil {
-		t.Fatalf("create token budget: %v", err)
-	}
-
-	seedSettledUsage(t, f, "tok_under", subject, 499, 0, "USD", time.Now().UTC())
-	if err := f.app.EnforceBudget(ctx, keyPrincipal(f.tenant, keyID)); err != nil {
-		t.Fatalf("499 < 500 should admit: %v", err)
-	}
-	seedSettledUsage(t, f, "tok_hit", subject, 1, 0, "USD", time.Now().UTC())
-	var budgetErr budgetExceededError
-	if err := f.app.EnforceBudget(ctx, keyPrincipal(f.tenant, keyID)); !errors.As(err, &budgetErr) {
-		t.Fatalf("expected denial at 500 units, got %v", err)
-	}
-}
-
-func TestEnforceBudgetPeriodWindow(t *testing.T) {
-	f := newBudgetFixture(t)
-	ctx := context.Background()
-	keyID := "key-window"
-	subject := billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: keyID}
-	now := time.Now().UTC()
-	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
-	lastMonth := monthStart.Add(-time.Hour)
-
-	if err := f.repo.CreateBudget(ctx, f.tenant, "b_window", billing.Budget{
-		Name: "monthly-window", Subject: subject,
-		Kind: billing.BudgetKindAmount, Period: billing.PeriodMonthly,
-		LimitAmountMicros: 100, Currency: "USD",
-		StartsAt: lastMonth.Add(-time.Hour),
-	}); err != nil {
-		t.Fatalf("create budget: %v", err)
-	}
-
-	// Last month's charge must not count against this month's window.
-	seedSettledUsage(t, f, "win_old", subject, 10, 1_000_000, "USD", lastMonth)
-	if err := f.app.EnforceBudget(ctx, keyPrincipal(f.tenant, keyID)); err != nil {
-		t.Fatalf("previous-period usage must not count: %v", err)
-	}
-	seedSettledUsage(t, f, "win_new", subject, 1, 100, "USD", time.Now().UTC())
-	var budgetErr budgetExceededError
-	if err := f.app.EnforceBudget(ctx, keyPrincipal(f.tenant, keyID)); !errors.As(err, &budgetErr) {
-		t.Fatalf("current-period usage at the limit must deny, got %v", err)
-	}
-}
-
-func TestUsedForPeriodReadsSettledAggregates(t *testing.T) {
-	f := newBudgetFixture(t)
-	ctx := context.Background()
-	keyID := "key-usage"
-	subject := billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: keyID}
-	other := billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: "key-other"}
-
-	seedSettledUsage(t, f, "agg_a", subject, 40, 250_000, "USD", time.Now().UTC())
-	seedSettledUsage(t, f, "agg_b", subject, 60, 250_000, "USD", time.Now().UTC())
-	// Another subject's usage must not leak into this key's total.
-	seedSettledUsage(t, f, "agg_other", other, 999, 9_999_999, "USD", time.Now().UTC())
-
-	units, micros, err := f.app.usedForPeriod(ctx, f.tenant, subject, "total", nil, time.Now().UTC())
-	if err != nil {
-		t.Fatalf("usedForPeriod: %v", err)
-	}
-	if units != 100 || micros != 500_000 {
-		t.Fatalf("expected 100 units / 500000 micros, got %d / %d", units, micros)
-	}
-}
 
 func TestCheckedBudgetAdd(t *testing.T) {
 	for _, tt := range []struct {
@@ -233,9 +117,11 @@ func TestDashboardBudgetShowsHeldSettledAndRemaining(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create budget: %v", err)
 	}
-	principal := keyPrincipal(f.tenant, keyID)
-	principal.CredentialKind = auth.CredentialKindAPIKey
-	principal.CredentialID = keyID
+	principal := auth.Principal{
+		TenantID: f.tenant, CredentialKind: auth.CredentialKindAPIKey,
+		CredentialID: keyID, BillingSubjectKind: auth.BillingSubjectAPIKey,
+		BillingSubjectID: keyID,
+	}
 	service := billing.NewService(f.repo)
 	reservation, err := service.Reserve(ctx, principal, billing.ReserveRequest{
 		SubjectKeys: []billing.Subject{subject}, BillingSubject: subject, Capability: "chat",

@@ -33,6 +33,7 @@ type App struct {
 	promptSvc    *prompts.Service
 	chatbotSvc   *chatbot.Service
 	connectorSvc *connectors.Service
+	// Kept through the final SQLite backend removal in 01-36.
 	usageRepo    *sqlite.UsageRepo
 	billingSvc   *billing.Service
 	billingRepo  *postgres.BillingRepo

@@ -166,7 +166,6 @@ func openPrincipal(tenantID string) auth.Principal {
 		TenantID:            tenantID,
 		ActorID:             "key_actor_1",
 		ActorKind:           auth.ActorKindServiceAccount,
-		APIKeyID:            7,
 		AllowedModelsAll:    true,
 		AllowedChatbotsAll:  true,
 		AllowedAgentsAll:    true,
@@ -477,7 +476,7 @@ func TestPrepareChatCompletionEnforcesAllowedChatbots(t *testing.T) {
 		t.Fatalf("create chatbot: %v", err)
 	}
 	body := []byte(`{"messages":[{"role":"user","content":"hello"}]}`)
-	base := auth.Principal{TenantID: f.tenantA, ActorID: "key_actor", APIKeyID: 9}
+	base := auth.Principal{TenantID: f.tenantA, ActorID: "key_actor"}
 
 	restricted := base
 	restricted.AllowedChatbots = map[string]struct{}{"other_bot": {}}
@@ -515,7 +514,6 @@ func TestResumeConversationRequiresOwnerOrAdmin(t *testing.T) {
 	owner := openPrincipal(f.tenantA)
 	other := openPrincipal(f.tenantA)
 	other.ActorID = "key_actor_2"
-	other.APIKeyID = 8
 	admin := adminPrincipal(f.tenantA)
 
 	if _, err := f.svc.Create(ctx, owner, chatbot.CreateChatbotInput{
