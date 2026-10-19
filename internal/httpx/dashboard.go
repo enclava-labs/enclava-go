@@ -82,8 +82,13 @@ type dashboardKeysData struct {
 }
 
 type dashboardLoginData struct {
-	Email string
-	Error string
+	Email            string
+	Error            string
+	ReturnTo         string
+	Providers        []auth.OIDCProvider
+	LinkToken        string
+	LinkProviderName string
+	LinkEmail        string
 }
 
 type dashboardStatsData struct {

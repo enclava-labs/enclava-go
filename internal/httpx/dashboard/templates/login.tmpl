@@ -35,7 +35,47 @@
         </div>
         {{end}}
 
+        {{if .LinkToken}}
+        <div class="rounded-lg border bg-muted/50 p-4 mb-4">
+          <h2 class="text-sm font-semibold">Link your {{.LinkProviderName}} account</h2>
+          <p class="text-sm text-muted-foreground mt-1">
+            Sign-in with {{.LinkProviderName}}{{if .LinkEmail}} as {{.LinkEmail}}{{end}}
+            is not connected to an Enclava account yet. Enter the account's credentials to link it.
+          </p>
+          <form method="post" action="/auth/oidc/link" class="space-y-4 mt-4" autocomplete="off">
+            <input type="hidden" name="link_token" value="{{.LinkToken}}">
+            <input type="hidden" name="return_to" value="{{.ReturnTo}}">
+            <div class="space-y-2">
+              <label for="link-email" class="text-sm font-medium leading-none">Email</label>
+              <input
+                required
+                type="email"
+                id="link-email"
+                name="email"
+                value="{{if .LinkEmail}}{{.LinkEmail}}{{else}}{{.Email}}{{end}}"
+                class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              >
+            </div>
+            <div class="space-y-2">
+              <label for="link-password" class="text-sm font-medium leading-none">Password</label>
+              <input
+                required
+                type="password"
+                id="link-password"
+                name="password"
+                class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              >
+            </div>
+            <div class="pt-2">
+              <button type="submit" class="inline-flex w-full items-center justify-center rounded-md text-sm font-medium bg-primary text-primary-foreground hover:bg-primary/90 h-10 px-4">
+                Link account and sign in
+              </button>
+            </div>
+          </form>
+        </div>
+        {{else}}
         <form method="post" action="/dashboard/login" class="space-y-4" autocomplete="off">
+          <input type="hidden" name="return_to" value="{{.ReturnTo}}">
           <div class="space-y-2">
             <label for="email" class="text-sm font-medium leading-none">Email</label>
             <input
@@ -63,6 +103,25 @@
             </button>
           </div>
         </form>
+        {{if .Providers}}
+        <div class="relative my-6">
+          <div class="absolute inset-0 flex items-center"><span class="w-full border-t"></span></div>
+          <div class="relative flex justify-center text-xs uppercase">
+            <span class="bg-card px-2 text-muted-foreground">or continue with</span>
+          </div>
+        </div>
+        <div class="space-y-2">
+          {{range .Providers}}
+          <a
+            href="/auth/oidc/{{.ID}}/start{{if $.ReturnTo}}?return_to={{$.ReturnTo}}{{end}}"
+            class="inline-flex w-full items-center justify-center rounded-md text-sm font-medium border border-input bg-background hover:bg-accent hover:text-accent-foreground h-10 px-4"
+          >
+            Sign in with {{.Name}}
+          </a>
+          {{end}}
+        </div>
+        {{end}}
+        {{end}}
       </div>
 
       <p class="text-center text-sm text-muted-foreground mt-6">
