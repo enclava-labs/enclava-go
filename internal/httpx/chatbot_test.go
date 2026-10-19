@@ -15,6 +15,7 @@ import (
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/chatbot"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/llm"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
@@ -22,6 +23,25 @@ import (
 	"enclava-go/internal/testdb"
 )
 
+// stubExecutor stands in for the shared executor — the HTTP layer never
+// calls a provider directly, so completions exercise the chatbot.Executor
+// seam.
+type stubExecutor struct {
+	result *inference.Result
+	err    error
+}
+
+func (s *stubExecutor) Execute(ctx context.Context, p auth.Principal, req inference.Request) (*inference.Result, error) {
+	return s.result, s.err
+}
+
+// streamResult builds an executor result wrapping a fixed SSE body.
+func streamResult(body string) *inference.Result {
+	return &inference.Result{Body: io.NopCloser(strings.NewReader(body))}
+}
+
+// completionProvider stubs the raw provider used by non-assistant routes
+// (passthrough, models, embeddings); assistant paths never see it.
 type completionProvider struct {
 	err error
 }
@@ -86,10 +106,9 @@ func TestExternalChatbotCompletionHidesServiceErrors(t *testing.T) {
 	promptRepo := postgres.NewPromptsRepo(db)
 
 	const secret = "supersecret-qdrant-dsn"
-	provider := &completionProvider{err: errors.New("sql: " + secret + " no such table")}
 	chatSvc := chatbot.NewService(postgres.NewChatbotRepo(db), promptRepo, staticRAG{
 		err: errors.New("qdrant search failed at " + secret),
-	}, provider, nil)
+	}, &stubExecutor{err: errors.New("sql: " + secret + " no such table")})
 	p := openChatPrincipal(tenantID)
 	if _, err := chatSvc.Create(ctx, p, chatbot.CreateChatbotInput{
 		Name:             "RAG Bot",
@@ -106,8 +125,7 @@ func TestExternalChatbotCompletionHidesServiceErrors(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create plain chatbot: %v", err)
 	}
-	app := &App{chatbotSvc: chatSvc, provider: provider}
-
+	app := &App{chatbotSvc: chatSvc}
 	valid := `{"messages":[{"role":"user","content":"hello"}]}`
 	stream := `{"stream":true,"messages":[{"role":"user","content":"hello"}]}`
 	assertCompletionStatus(t, app, p, "rag_http_bot", valid, http.StatusInternalServerError, secret)
@@ -118,6 +136,33 @@ func TestExternalChatbotCompletionHidesServiceErrors(t *testing.T) {
 	malformed := postChatbotCompletion(t, app, p, "plain_http_bot", "{")
 	if !strings.Contains(malformed.Body.String(), "invalid JSON") {
 		t.Fatalf("malformed body status %d, body %s", malformed.Code, malformed.Body.String())
+	}
+}
+
+func TestExternalChatbotCompletionStreamUsesExecutor(t *testing.T) {
+	ctx := context.Background()
+	db := testdb.New(t)
+	tenantID := testdb.SeedTenant(t, db, "chatbot-stream")
+	promptRepo := postgres.NewPromptsRepo(db)
+	exec := &stubExecutor{result: streamResult(
+		"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n")}
+	chatSvc := chatbot.NewService(postgres.NewChatbotRepo(db), promptRepo, nil, exec)
+	p := openChatPrincipal(tenantID)
+	if _, err := chatSvc.Create(ctx, p, chatbot.CreateChatbotInput{
+		Name:       "Stream Bot",
+		Model:      "chat-test-model",
+		ExternalID: "stream_http_bot",
+	}); err != nil {
+		t.Fatalf("create stream chatbot: %v", err)
+	}
+	app := &App{chatbotSvc: chatSvc}
+	rec := postChatbotCompletion(t, app, p, "stream_http_bot",
+		`{"stream":true,"messages":[{"role":"user","content":"hello"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stream status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "data: {\"choices\"") {
+		t.Fatalf("stream body missing SSE data: %s", rec.Body.String())
 	}
 }
 
@@ -255,7 +300,7 @@ func TestChatbotAndPromptReadsHonorAllowlist(t *testing.T) {
 	tenantID := testdb.SeedTenant(t, db, "chatbot-reads")
 
 	promptRepo := postgres.NewPromptsRepo(db)
-	chatSvc := chatbot.NewService(postgres.NewChatbotRepo(db), promptRepo, nil, &completionProvider{}, nil)
+	chatSvc := chatbot.NewService(postgres.NewChatbotRepo(db), promptRepo, nil, nil)
 	promptSvc := prompts.NewService(promptRepo, chatSvc)
 	open := openChatPrincipal(tenantID)
 

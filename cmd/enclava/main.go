@@ -127,12 +127,13 @@ func main() {
 		log.Fatalf("secret binding error: %v", err)
 	}
 	inferenceSvc, err := inference.NewService(inference.Deps{
-		Endpoints:  endpointsRepo,
-		Sources:    sourceRepo,
-		Authorizer: source.NewAuthorizer(sourceRepo, 0),
-		Billing:    billingSvc,
-		Secrets:    secretResolver,
-		Artifacts:  artifactRepo,
+		Endpoints:     endpointsRepo,
+		Sources:       sourceRepo,
+		Authorizer:    source.NewAuthorizer(sourceRepo, 0),
+		Billing:       billingSvc,
+		Secrets:       secretResolver,
+		Artifacts:     artifactRepo,
+		Conversations: postgres.NewChatbotConversationStore(chatbotRepo),
 	})
 	if err != nil {
 		log.Fatalf("inference service init error: %v", err)
@@ -182,7 +183,7 @@ func main() {
 		}
 	}()
 
-	chatbotSvc := chatbot.NewService(chatbotRepo, promptRepo, ragSvc, provider, nil)
+	chatbotSvc := chatbot.NewService(chatbotRepo, promptRepo, ragSvc, inferenceSvc)
 	promptSvc := prompts.NewService(promptRepo, chatbotSvc)
 	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG, ragSvc)
 
