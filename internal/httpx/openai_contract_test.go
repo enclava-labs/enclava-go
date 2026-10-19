@@ -11,8 +11,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
 	"enclava-go/internal/llm"
 	"enclava-go/internal/store/postgres"
 	"enclava-go/internal/store/sqlite"
@@ -774,18 +776,15 @@ func TestResponsesBudgetAppliesOnlyToCreate(t *testing.T) {
 		t.Fatalf("cancel must not insert a usage row, got %d", usageCount)
 	}
 
-	keyID := apiKeyIDForSecret(t, ctx, ident, apiKey)
-	limitTokens := int64(0)
-	if err := sqlite.NewBudgetsRepo(db.SQL).Upsert(ctx, sqlite.Budget{
-		ID:          "contract_responses_budget",
-		Name:        "zero token budget",
-		SubjectType: "api_key",
-		APIKeyID:    &keyID,
-		LimitTokens: &limitTokens,
-		Period:      "total",
-		IsActive:    true,
+	if err := postgres.NewBillingRepo(ident.db).CreateBudget(ctx, ident.tenant, "contract_responses_budget", billing.Budget{
+		Name:              "zero token budget",
+		Subject:           billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: ident.keyID},
+		Kind:              billing.BudgetKindTokens,
+		Period:            billing.PeriodMonthly,
+		LimitAmountMicros: 0,
+		StartsAt:          time.Now().UTC().Add(-time.Hour),
 	}); err != nil {
-		t.Fatalf("upsert budget: %v", err)
+		t.Fatalf("create budget: %v", err)
 	}
 
 	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/responses", bytes.NewReader([]byte(`{"model":"contract-model","input":"hello"}`)))
@@ -851,18 +850,15 @@ func TestOpenAIChatCompletionBudgetExceededBeforeProviderCall(t *testing.T) {
 	db, ident, apiKey, app, provider := newOpenAIContractApp(t, ctx)
 	defer func() { _ = db.Close() }()
 
-	keyID := apiKeyIDForSecret(t, ctx, ident, apiKey)
-	limitTokens := int64(0)
-	if err := sqlite.NewBudgetsRepo(db.SQL).Upsert(ctx, sqlite.Budget{
-		ID:          "contract_budget",
-		Name:        "zero token budget",
-		SubjectType: "api_key",
-		APIKeyID:    &keyID,
-		LimitTokens: &limitTokens,
-		Period:      "total",
-		IsActive:    true,
+	if err := postgres.NewBillingRepo(ident.db).CreateBudget(ctx, ident.tenant, "contract_budget", billing.Budget{
+		Name:              "zero token budget",
+		Subject:           billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: ident.keyID},
+		Kind:              billing.BudgetKindTokens,
+		Period:            billing.PeriodMonthly,
+		LimitAmountMicros: 0,
+		StartsAt:          time.Now().UTC().Add(-time.Hour),
 	}); err != nil {
-		t.Fatalf("upsert budget: %v", err)
+		t.Fatalf("create budget: %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/completions", bytes.NewReader([]byte(`{"model":"contract-model","messages":[]}`)))
@@ -986,8 +982,7 @@ func newOpenAIContractApp(t *testing.T, ctx context.Context) (*sqlite.DB, contra
 		nil,
 		sqlite.NewUsageRepo(db.SQL),
 		nil,
-		sqlite.NewBudgetsRepo(db.SQL),
-		nil,
+		postgres.NewBillingRepo(pgdb),
 		nil,
 		"sha256",
 		"",

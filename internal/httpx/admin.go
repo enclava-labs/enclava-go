@@ -8,12 +8,12 @@ import (
 	"errors"
 	"log"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
 	"enclava-go/internal/auth"
-	"enclava-go/internal/store/sqlite"
+	"enclava-go/internal/billing"
+	"enclava-go/internal/store/postgres"
 )
 
 // adminAPIKeyCreateRequest is the admin key payload. The allowed_* fields
@@ -111,7 +111,7 @@ func (a *App) handleAdminAPIKeys(w http.ResponseWriter, r *http.Request, princip
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "api_key_fetch_failed")
 			return
 		}
-		a.recordAPIKeyBillingAudit(r.Context(), "api_key.created", auth.LegacyAPIKeyID(principal.TenantID, record.ID), principal, adminBudgetMetadata(created))
+		a.recordAPIKeyBillingAudit(r.Context(), "api_key.created", record.ID, principal, adminBudgetMetadata(created))
 		created = redactAdminAPIKey(created)
 		WriteJSON(w, http.StatusCreated, adminAPIKeyCreateResponse{
 			APIKey:    created,
@@ -176,7 +176,7 @@ func (a *App) handleAdminAPIKeyByID(w http.ResponseWriter, r *http.Request, prin
 			a.writeKeyFetchError(w, err)
 			return
 		}
-		a.recordAPIKeyBillingAudit(r.Context(), "api_key.secret_regenerated", auth.LegacyAPIKeyID(principal.TenantID, id), principal, nil)
+		a.recordAPIKeyBillingAudit(r.Context(), "api_key.secret_regenerated", id, principal, nil)
 		key = redactAdminAPIKey(key)
 		WriteJSON(w, http.StatusOK, adminAPIKeyCreateResponse{APIKey: key, SecretKey: plaintext})
 		return
@@ -197,7 +197,7 @@ func (a *App) handleAdminAPIKeyByID(w http.ResponseWriter, r *http.Request, prin
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "api_key_delete_failed")
 			return
 		}
-		a.recordAPIKeyBillingAudit(r.Context(), "api_key.deleted", auth.LegacyAPIKeyID(principal.TenantID, id), principal, nil)
+		a.recordAPIKeyBillingAudit(r.Context(), "api_key.deleted", id, principal, nil)
 		WriteJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
 		return
 	}
@@ -224,7 +224,7 @@ func (a *App) handleAdminAPIKeyByID(w http.ResponseWriter, r *http.Request, prin
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "api_key_restore_failed")
 			return
 		}
-		a.recordAPIKeyBillingAudit(r.Context(), "api_key.restored", auth.LegacyAPIKeyID(principal.TenantID, id), principal, nil)
+		a.recordAPIKeyBillingAudit(r.Context(), "api_key.restored", id, principal, nil)
 		WriteJSON(w, http.StatusOK, map[string]any{"restored": true, "id": id})
 		return
 	}
@@ -269,7 +269,7 @@ func (a *App) handleAdminAPIKeyByID(w http.ResponseWriter, r *http.Request, prin
 			a.writeKeyFetchError(w, err)
 			return
 		}
-		a.recordAPIKeyBillingAudit(r.Context(), "api_key.updated", auth.LegacyAPIKeyID(principal.TenantID, id), principal, adminBudgetMetadata(updated))
+		a.recordAPIKeyBillingAudit(r.Context(), "api_key.updated", id, principal, adminBudgetMetadata(updated))
 		WriteJSON(w, http.StatusOK, redactAdminAPIKey(updated))
 	case http.MethodDelete:
 		if err := a.identity.RevokeAPIKey(r.Context(), principal.TenantID, id, time.Now().UTC()); err != nil {
@@ -277,7 +277,7 @@ func (a *App) handleAdminAPIKeyByID(w http.ResponseWriter, r *http.Request, prin
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "api_key_delete_failed")
 			return
 		}
-		a.recordAPIKeyBillingAudit(r.Context(), "api_key.deleted", auth.LegacyAPIKeyID(principal.TenantID, id), principal, nil)
+		a.recordAPIKeyBillingAudit(r.Context(), "api_key.deleted", id, principal, nil)
 		WriteJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
 	default:
 		WriteMethodNotAllowed(w)
@@ -295,9 +295,9 @@ func (a *App) writeKeyFetchError(w http.ResponseWriter, err error) {
 	WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "api_key_fetch_failed")
 }
 
-func (a *App) handleAdminUsageSummary(w http.ResponseWriter, r *http.Request, _ auth.Principal) {
+func (a *App) handleAdminUsageSummary(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
 	setNoStoreHeaders(w)
-	if a.identity == nil || a.usageRepo == nil {
+	if a.billingRepo == nil {
 		WriteOpenAIError(w, http.StatusNotImplemented, "usage tracking not configured", "server_error", "not_configured")
 		return
 	}
@@ -306,20 +306,20 @@ func (a *App) handleAdminUsageSummary(w http.ResponseWriter, r *http.Request, _ 
 		return
 	}
 	since := time.Now().UTC().AddDate(0, 0, -30)
-	usage, err := a.usageRepo.SumAll(r.Context(), since)
+	usage, err := a.billingRepo.UsageBySubject(r.Context(), principal.TenantID, since)
 	if err != nil {
 		log.Printf("failed to fetch usage summary: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "usage_summary_failed")
 		return
 	}
-	var totalTokens int64
+	var totalUnits int64
 	for _, u := range usage {
-		totalTokens += u.TotalTokens
+		totalUnits += u.TotalUnits
 	}
 	WriteJSON(w, http.StatusOK, map[string]any{
-		"usage":        usage,
-		"total_tokens": totalTokens,
-		"period_days":  30,
+		"usage":       usage,
+		"total_units": totalUnits,
+		"period_days": 30,
 	})
 }
 
@@ -512,25 +512,23 @@ func applyAdminPatch(k *auth.APIKeyRecord, req adminAPIKeyCreateRequest) {
 	}
 }
 
-func (a *App) recordAPIKeyBillingAudit(ctx context.Context, action string, apiKeyID int64, actor auth.Principal, metadata map[string]any) {
-	if a.billingAuditRepo == nil || apiKeyID <= 0 {
+func (a *App) recordAPIKeyBillingAudit(ctx context.Context, action, keyID string, actor auth.Principal, metadata map[string]any) {
+	if a.billingRepo == nil || actor.TenantID == "" || keyID == "" {
 		return
 	}
-	subjectID := strconv.FormatInt(apiKeyID, 10)
 	if metadata == nil {
 		metadata = map[string]any{}
 	}
-	if err := a.billingAuditRepo.Create(ctx, sqlite.BillingAuditLog{
+	if err := a.billingRepo.CreateBillingAudit(ctx, actor.TenantID, postgres.BillingAuditRow{
 		ID:          NewID("billaudit"),
-		APIKeyID:    &apiKeyID,
-		SubjectType: "api_key",
-		SubjectID:   subjectID,
+		SubjectType: billing.BudgetSubjectAPIKey,
+		SubjectID:   keyID,
 		Action:      action,
-		ActorType:   "api_key",
-		ActorID:     strconv.FormatInt(actor.APIKeyID, 10),
-		Metadata:    metadata,
+		ActorType:   string(actor.ActorKind),
+		ActorID:     actor.ActorID,
+		Detail:      metadata,
 	}); err != nil {
-		log.Printf("failed to write billing audit event %s for api key %d: %v", action, apiKeyID, err)
+		log.Printf("failed to write billing audit event %s for api key %s: %v", action, keyID, err)
 	}
 }
 

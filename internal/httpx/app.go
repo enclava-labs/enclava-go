@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
 	"enclava-go/internal/chatbot"
 	"enclava-go/internal/connectors"
 	"enclava-go/internal/extract"
@@ -38,9 +39,8 @@ type App struct {
 	chatbotSvc       *chatbot.Service
 	connectorSvc     *connectors.Service
 	usageRepo        *sqlite.UsageRepo
-	pricingRepo      *sqlite.PricingRepo
-	budgetsRepo      *sqlite.BudgetsRepo
-	billingAuditRepo *sqlite.BillingAuditRepo
+	billingSvc       *billing.Service
+	billingRepo      *postgres.BillingRepo
 	providersRepo    *sqlite.ProvidersRepo
 	apiKeyAlgo       string
 	apiKeyPepper     string
@@ -83,9 +83,8 @@ func NewApp(
 	chatbotSvc *chatbot.Service,
 	connectorSvc *connectors.Service,
 	usageRepo *sqlite.UsageRepo,
-	pricingRepo *sqlite.PricingRepo,
-	budgetsRepo *sqlite.BudgetsRepo,
-	billingAuditRepo *sqlite.BillingAuditRepo,
+	billingSvc *billing.Service,
+	billingRepo *postgres.BillingRepo,
 	providersRepo *sqlite.ProvidersRepo,
 	apiKeyAlgo string,
 	apiKeyPepper string,
@@ -111,9 +110,8 @@ func NewApp(
 		chatbotSvc:       chatbotSvc,
 		connectorSvc:     connectorSvc,
 		usageRepo:        usageRepo,
-		pricingRepo:      pricingRepo,
-		budgetsRepo:      budgetsRepo,
-		billingAuditRepo: billingAuditRepo,
+		billingSvc:       billingSvc,
+		billingRepo:      billingRepo,
 		providersRepo:    providersRepo,
 		apiKeyAlgo:       apiKeyAlgo,
 		apiKeyPepper:     apiKeyPepper,

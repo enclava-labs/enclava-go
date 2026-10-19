@@ -35,41 +35,39 @@ type dashboardProvidersData struct {
 	Error       string
 }
 
-// Legacy billing/pricing view rows — the billing repo itself ports in 01-17;
-// these stay wire-identical to the sqlite rows until then.
+// Billing view rows carry the canonical billing types — the sections read
+// billing_prices/billing_price_audit/billing_audit via a.billingRepo.
 type dashboardProviderPricing struct {
-	ID                       int64
-	ProviderID               string
-	ModelID                  string
-	Currency                 string
-	InputTokenCentsPer1K     float64
-	OutputTokenCentsPer1K    float64
-	EmbeddingTokenCentsPer1K float64
-	EffectiveAt              time.Time
-	CreatedAt                time.Time
+	ID            string
+	SubjectType   string
+	SubjectID     string
+	Capability    string
+	Unit          string
+	RateMicros    int64
+	UnitQuantity  int64
+	Currency      string
+	EffectiveFrom time.Time
+	CreatedAt     time.Time
 }
 
 type dashboardPricingAudit struct {
-	ID                string
-	ProviderPricingID *int64
-	Action            string
-	ActorType         string
-	ActorID           string
-	Before            map[string]any
-	After             map[string]any
-	CreatedAt         time.Time
+	ID        string
+	PriceID   string
+	Action    string
+	ActorType string
+	ActorID   string
+	Detail    map[string]any
+	CreatedAt time.Time
 }
 
 type dashboardBillingAudit struct {
 	ID          string
-	APIKeyID    *int64
 	SubjectType string
 	SubjectID   string
 	Action      string
 	ActorType   string
 	ActorID     string
-	AmountCents *int64
-	Metadata    map[string]any
+	Detail      map[string]any
 	CreatedAt   time.Time
 }
 
@@ -194,17 +192,21 @@ func (a *App) handleDashboardPricing(w http.ResponseWriter, r *http.Request) {
 		WriteMethodNotAllowed(w)
 		return
 	}
-	if a.pricingRepo == nil {
+	if a.billingRepo == nil {
 		WriteOpenAIError(w, http.StatusNotImplemented, "pricing is not configured", "server_error", "not_configured")
 		return
 	}
-	pricing, err := a.pricingRepo.List(r.Context(), "", "", 100, 0)
+	tenantID, ok := a.dashboardTenantID(w, r)
+	if !ok {
+		return
+	}
+	pricing, err := a.billingRepo.ListPrices(r.Context(), tenantID, "", "", "", 100, 0)
 	if err != nil {
 		log.Printf("failed to load dashboard pricing: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_pricing_failed")
 		return
 	}
-	audit, err := a.pricingRepo.ListPricingAudit(r.Context(), 20, 0)
+	audit, err := a.billingRepo.ListPriceAudit(r.Context(), tenantID, 20, 0)
 	if err != nil {
 		log.Printf("failed to load dashboard pricing audit: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_pricing_audit_failed")
@@ -213,16 +215,17 @@ func (a *App) handleDashboardPricing(w http.ResponseWriter, r *http.Request) {
 	pricingView := make([]dashboardProviderPricing, 0, len(pricing))
 	for _, row := range pricing {
 		pricingView = append(pricingView, dashboardProviderPricing{
-			ID: row.ID, ProviderID: row.ProviderID, ModelID: row.ModelID, Currency: row.Currency,
-			InputTokenCentsPer1K: row.InputTokenCentsPer1K, OutputTokenCentsPer1K: row.OutputTokenCentsPer1K,
-			EmbeddingTokenCentsPer1K: row.EmbeddingTokenCentsPer1K, EffectiveAt: row.EffectiveAt, CreatedAt: row.CreatedAt,
+			ID: row.ID, SubjectType: row.SubjectType, SubjectID: row.SubjectID,
+			Capability: row.Capability, Unit: string(row.Unit), RateMicros: row.RateMicros,
+			UnitQuantity: row.UnitQuantity, Currency: row.Currency,
+			EffectiveFrom: row.EffectiveFrom, CreatedAt: row.CreatedAt,
 		})
 	}
 	auditView := make([]dashboardPricingAudit, 0, len(audit))
 	for _, row := range audit {
 		auditView = append(auditView, dashboardPricingAudit{
-			ID: row.ID, ProviderPricingID: row.ProviderPricingID, Action: row.Action,
-			ActorType: row.ActorType, ActorID: row.ActorID, Before: row.Before, After: row.After, CreatedAt: row.CreatedAt,
+			ID: row.ID, PriceID: row.PriceID, Action: row.Action,
+			ActorType: row.ActorType, ActorID: row.ActorID, Detail: row.Detail, CreatedAt: row.CreatedAt,
 		})
 	}
 	if err := dashboardTemplates.ExecuteTemplate(w, "partial-pricing", dashboardPricingData{Pricing: pricingView, Audit: auditView}); err != nil {
@@ -236,11 +239,15 @@ func (a *App) handleDashboardBillingAudit(w http.ResponseWriter, r *http.Request
 		WriteMethodNotAllowed(w)
 		return
 	}
-	if a.billingAuditRepo == nil {
+	if a.billingRepo == nil {
 		WriteOpenAIError(w, http.StatusNotImplemented, "billing audit is not configured", "server_error", "not_configured")
 		return
 	}
-	audit, err := a.billingAuditRepo.List(r.Context(), nil, "", 100, 0)
+	tenantID, ok := a.dashboardTenantID(w, r)
+	if !ok {
+		return
+	}
+	audit, err := a.billingRepo.ListBillingAudit(r.Context(), tenantID, "", "", 100, 0)
 	if err != nil {
 		log.Printf("failed to load dashboard billing audit: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_billing_audit_failed")
@@ -249,9 +256,9 @@ func (a *App) handleDashboardBillingAudit(w http.ResponseWriter, r *http.Request
 	auditView := make([]dashboardBillingAudit, 0, len(audit))
 	for _, row := range audit {
 		auditView = append(auditView, dashboardBillingAudit{
-			ID: row.ID, APIKeyID: row.APIKeyID, SubjectType: row.SubjectType, SubjectID: row.SubjectID,
+			ID: row.ID, SubjectType: row.SubjectType, SubjectID: row.SubjectID,
 			Action: row.Action, ActorType: row.ActorType, ActorID: row.ActorID,
-			AmountCents: row.AmountCents, Metadata: row.Metadata, CreatedAt: row.CreatedAt,
+			Detail: row.Detail, CreatedAt: row.CreatedAt,
 		})
 	}
 	if err := dashboardTemplates.ExecuteTemplate(w, "partial-billing-audit", dashboardBillingAuditData{Audit: auditView}); err != nil {

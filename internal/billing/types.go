@@ -98,6 +98,8 @@ type Budget struct {
 	Currency          string
 	StartsAt          time.Time
 	EndsAt            *time.Time
+
+	Name string
 }
 
 // Reservation states. Unknown upstream outcomes retain their hold.

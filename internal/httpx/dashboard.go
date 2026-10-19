@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
+	"enclava-go/internal/store/postgres"
 	"enclava-go/internal/store/sqlite"
 )
 
@@ -57,7 +59,7 @@ var dashboardDefaultScopes = []string{
 }
 
 type dashboardUsageRow struct {
-	APIKeyID     int64
+	APIKeyID     string
 	APIKeyName   string
 	TotalTokens  int64
 	TotalCost    int64
@@ -70,8 +72,8 @@ type dashboardAnalyticsData struct {
 	TotalTokens      int64
 	TotalCostDisplay string
 	Days             int
-	ByEndpoint       []sqlite.UsageByEndpoint
-	ByModel          []sqlite.UsageByModel
+	ByEndpoint       []postgres.UsageGroupSum
+	ByModel          []postgres.UsageGroupSum
 	Rows             []dashboardUsageRow
 }
 
@@ -109,7 +111,7 @@ type dashboardPageCommon struct {
 }
 
 type dashboardBudgetRow struct {
-	APIKeyID         int64
+	APIKeyID         string
 	APIKeyName       string
 	BudgetLimitCents *int64
 	BudgetPeriod     string
@@ -498,15 +500,15 @@ func (a *App) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var usedBudgetCents int64
-	if a.usageRepo != nil {
-		usage, err := a.usageRepo.SumAll(r.Context(), time.Now().UTC().AddDate(0, 0, -30))
+	if a.billingRepo != nil {
+		totals, err := a.billingRepo.UsageTotals(r.Context(), tenantID, time.Now().UTC().AddDate(0, 0, -30))
 		if err != nil {
 			log.Printf("failed to load dashboard stats usage: %v", err)
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_stats_usage_failed")
 			return
 		}
-		for _, item := range usage {
-			usedBudgetCents += item.TotalCostCents
+		for _, item := range totals {
+			usedBudgetCents += microsToCents(item.AmountMicros)
 		}
 	}
 
@@ -530,7 +532,7 @@ func (a *App) handleDashboardUsage(w http.ResponseWriter, r *http.Request) {
 		WriteMethodNotAllowed(w)
 		return
 	}
-	if a.identity == nil || a.usageRepo == nil {
+	if a.identity == nil || a.billingRepo == nil {
 		WriteOpenAIError(w, http.StatusNotImplemented, "usage tracking not configured", "server_error", "not_configured")
 		return
 	}
@@ -550,28 +552,34 @@ func (a *App) handleDashboardUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	since := time.Now().UTC().AddDate(0, 0, -days)
 
-	totalRequests, totalTokens, totalCostCents, err := a.usageRepo.SumTotal(r.Context(), since)
+	totals, err := a.billingRepo.UsageTotals(r.Context(), tenantID, since)
 	if err != nil {
 		log.Printf("failed to load dashboard usage totals: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_usage_totals_failed")
 		return
 	}
+	var totalRequests, totalTokens, totalCostCents int64
+	for _, t := range totals {
+		totalRequests += t.RequestCount
+		totalTokens += t.TotalUnits
+		totalCostCents += microsToCents(t.AmountMicros)
+	}
 
-	byEndpoint, err := a.usageRepo.SumByEndpoint(r.Context(), since)
+	byEndpoint, err := a.billingRepo.UsageByEndpoint(r.Context(), tenantID, since)
 	if err != nil {
 		log.Printf("failed to load dashboard usage by endpoint: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_usage_endpoint_failed")
 		return
 	}
 
-	byModel, err := a.usageRepo.SumByModel(r.Context(), since)
+	byModel, err := a.billingRepo.UsageByModel(r.Context(), tenantID, since)
 	if err != nil {
 		log.Printf("failed to load dashboard usage by model: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_usage_model_failed")
 		return
 	}
 
-	usage, err := a.usageRepo.SumAll(r.Context(), since)
+	usage, err := a.billingRepo.UsageBySubject(r.Context(), tenantID, since)
 	if err != nil {
 		log.Printf("failed to load dashboard usage summary: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_usage_failed")
@@ -584,25 +592,28 @@ func (a *App) handleDashboardUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// usage rows keep the legacy numeric key handle — map each stored key to
-	// the deterministic handle auth derives for it (auth.LegacyAPIKeyID).
-	nameByID := make(map[int64]string, len(keys))
+	// usage_records.subject_id carries the stored key UUID for api_key
+	// subjects — names map directly.
+	nameByID := make(map[string]string, len(keys))
 	for _, key := range keys {
 		name := strings.TrimSpace(key.Name)
 		if name == "" {
 			name = "API Key " + key.ID
 		}
-		nameByID[auth.LegacyAPIKeyID(tenantID, key.ID)] = name
+		nameByID[key.ID] = name
 	}
 
 	rows := make([]dashboardUsageRow, 0, len(usage))
 	for _, item := range usage {
+		if item.SubjectType != billing.BudgetSubjectAPIKey {
+			continue
+		}
+		costCents := microsToCents(item.AmountMicros)
 		rows = append(rows, dashboardUsageRow{
-			APIKeyID:     item.APIKeyID,
-			APIKeyName:   nameByID[item.APIKeyID],
-			TotalTokens:  item.TotalTokens,
-			TotalCost:    item.TotalCostCents,
-			CostDisplay:  formatUSD(item.TotalCostCents),
+			APIKeyID:     item.SubjectID,
+			APIKeyName:   nameByID[item.SubjectID],
+			TotalTokens:  item.TotalUnits,
+			TotalCost:    costCents,
 			RequestCount: item.RequestCount,
 		})
 	}
@@ -613,7 +624,7 @@ func (a *App) handleDashboardUsage(w http.ResponseWriter, r *http.Request) {
 	if len(rows) == 0 {
 		for _, key := range keys {
 			rows = append(rows, dashboardUsageRow{
-				APIKeyID:     auth.LegacyAPIKeyID(tenantID, key.ID),
+				APIKeyID:     key.ID,
 				APIKeyName:   key.Name,
 				TotalTokens:  0,
 				TotalCost:    0,
@@ -828,7 +839,7 @@ func (a *App) handleDashboardBudgets(w http.ResponseWriter, r *http.Request) {
 		WriteMethodNotAllowed(w)
 		return
 	}
-	if a.identity == nil || a.usageRepo == nil {
+	if a.identity == nil || a.billingRepo == nil {
 		WriteOpenAIError(w, http.StatusNotImplemented, "budget tracking not configured", "server_error", "not_configured")
 		return
 	}
@@ -850,19 +861,18 @@ func (a *App) handleDashboardBudgets(w http.ResponseWriter, r *http.Request) {
 	var overCount int
 	var activeKeys int
 
-	// Per-key budget limits are legacy sqlite columns the postgres identity
-	// rows do not carry; billing budgets own them after 01-17. The section
-	// still reports active keys and their lifetime usage from the retained
-	// counters (usage rows keep the legacy numeric key handle).
+	// Per-key budget limits moved to stored billing budgets; the section
+	// reports active keys with lifetime settled usage from billing
+	// usage_records keyed by the stored key UUID.
 	for _, key := range keys {
-		keyID := auth.LegacyAPIKeyID(tenantID, key.ID)
-		_, usedMicrocents, err := a.usedForPeriod(r.Context(), keyID, "total", nil, time.Now().UTC())
+		subject := billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: key.ID}
+		_, usedMicros, err := a.usedForPeriod(r.Context(), tenantID, subject, "total", nil, time.Now().UTC())
 		if err != nil {
 			log.Printf("failed to load usage for key %s: %v", key.ID, err)
 			continue
 		}
 
-		usedCents := microcentsToCents(usedMicrocents)
+		usedCents := microsToCents(usedMicros)
 
 		name := strings.TrimSpace(key.Name)
 		if name == "" {
@@ -870,7 +880,7 @@ func (a *App) handleDashboardBudgets(w http.ResponseWriter, r *http.Request) {
 		}
 
 		rows = append(rows, dashboardBudgetRow{
-			APIKeyID:         keyID,
+			APIKeyID:         key.ID,
 			APIKeyName:       name,
 			BudgetLimitCents: nil,
 			BudgetPeriod:     "total",

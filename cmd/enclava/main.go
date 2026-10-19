@@ -81,9 +81,7 @@ func main() {
 	usageRepo := sqlite.NewUsageRepo(db.SQL)
 	promptRepo := postgres.NewPromptsRepo(pgDB)
 	chatbotRepo := postgres.NewChatbotRepo(pgDB)
-	pricingRepo := sqlite.NewPricingRepo(db.SQL)
-	budgetsRepo := sqlite.NewBudgetsRepo(db.SQL)
-	billingAuditRepo := sqlite.NewBillingAuditRepo(db.SQL)
+	billingRepo := postgres.NewBillingRepo(pgDB)
 	providersRepo := sqlite.NewProvidersRepo(db.SQL)
 
 	// Durable extract stack: postgres domain repo + artifact store + jobs +
@@ -96,7 +94,7 @@ func main() {
 		log.Fatalf("artifact store init error: %v", err)
 	}
 	jobsSvc := jobs.NewService(jobsRepoPG, 0)
-	billingSvc := billing.NewService(postgres.NewBillingRepo(pgDB))
+	billingSvc := billing.NewService(billingRepo)
 
 	if err := providersRepo.EnsureDefault(ctx, runtimeProviderConfig(cfg)); err != nil {
 		log.Fatalf("provider config seed error: %v", err)
@@ -149,9 +147,8 @@ func main() {
 		chatbotSvc,
 		connectorSvc,
 		usageRepo,
-		pricingRepo,
-		budgetsRepo,
-		billingAuditRepo,
+		billingSvc,
+		billingRepo,
 		providersRepo,
 		cfg.APIKeyHashAlgo,
 		cfg.APIKeyPepper,
