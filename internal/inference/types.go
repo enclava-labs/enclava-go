@@ -146,6 +146,38 @@ type Result struct {
 	SettlementError error
 }
 
+// ManageRequest is one unpriced lifecycle follow-up on a retained upstream
+// resource (retrieve, cancel, delete, input_items, stream-resume). It never
+// reserves or settles: management operations must stay available when the
+// ordinary inference budget is exhausted, and they must never be retried or
+// replayed onto another endpoint.
+type ManageRequest struct {
+	// EndpointID is the binding-resolved origin endpoint — the only
+	// destination the follow-up may reach.
+	EndpointID string
+
+	// Method/Path/Query select the upstream operation under /responses/.
+	// Path carries the bound upstream ID; Query is a pre-validated
+	// server-built query string (already-resolved cursors only).
+	Method string
+	Path   string
+	Query  string
+
+	// Body is a bounded request body for POST-style management calls.
+	Body []byte
+
+	// Stream asks for the streaming variant (GET ?stream=true resumes).
+	Stream bool
+}
+
+// ManageResult is the relayed outcome of one management call.
+type ManageResult struct {
+	// EndpointID is the endpoint record actually dispatched.
+	EndpointID string
+	// Body is the bounded upstream payload or stream; caller must Close.
+	Body io.ReadCloser
+}
+
 var (
 	// ErrDenied is the single public outcome for authorization failures —
 	// unknown references, cross-tenant targets, actor/model/endpoint

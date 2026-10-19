@@ -12,9 +12,11 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/llm"
+	"enclava-go/internal/store/sqlite"
 )
 
 const openAIProxyScope = "openai.proxy"
@@ -382,4 +384,61 @@ func (w flushWriter) Write(p []byte) (int, error) {
 	n, err := w.w.Write(p)
 	w.flusher.Flush()
 	return n, err
+}
+
+// Passthrough-only helpers kept here pending 01-34's removal of this file:
+// the Responses handler no longer shares them.
+
+func openAIV1EndpointPath(path string) (string, bool) {
+	switch {
+	case strings.HasPrefix(path, "/api/v1/"):
+		return strings.TrimPrefix(path, "/api/v1"), true
+	case path == "/api/v1":
+		return "", true
+	case strings.HasPrefix(path, "/v1/"):
+		return strings.TrimPrefix(path, "/v1"), true
+	case path == "/v1":
+		return "", true
+	default:
+		return "", false
+	}
+}
+
+func statusForProviderError(err error) int {
+	var upstreamErr *llm.UpstreamError
+	if err != nil && strings.Contains(err.Error(), "context deadline exceeded") {
+		return http.StatusGatewayTimeout
+	}
+	if err != nil && strings.Contains(err.Error(), "context canceled") {
+		return 499
+	}
+	if err != nil && errors.As(err, &upstreamErr) && upstreamErr.StatusCode > 0 {
+		return upstreamErr.StatusCode
+	}
+	return http.StatusBadGateway
+}
+
+func (a *App) recordParsedUsage(ctx context.Context, principal auth.Principal, endpoint, model string, usage usageParsed, statusCode int) {
+	if a.usageRepo == nil {
+		return
+	}
+	if usage.Model == "" {
+		usage.Model = model
+	}
+	if usage.TotalTokens == 0 {
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	a.RecordUsage(recordCtx, sqlite.UsageRecord{
+		ID:               NewID("usage"),
+		APIKeyID:         principal.APIKeyID,
+		Endpoint:         endpoint,
+		Model:            usage.Model,
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+		TotalTokens:      usage.TotalTokens,
+		CostCents:        0,
+		StatusCode:       statusCode,
+	})
 }

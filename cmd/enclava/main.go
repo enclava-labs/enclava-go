@@ -71,6 +71,7 @@ func main() {
 	jobsRepoPG := postgres.NewJobsRepo(pgDB)
 	artifactRepo := postgres.NewArtifactRepo(pgDB)
 	ragRepo := postgres.NewRAGRepo(pgDB)
+	bindingsRepo := postgres.NewResponseBindingsRepo(pgDB)
 	sourceRepo := postgres.NewSourceRepo(pgDB)
 
 	// Durable artifacts under <data>/artifacts, scratch under <data>/scratch —
@@ -214,6 +215,7 @@ func main() {
 		cfg.MaxUploadSizeMB,
 		cfg.TrustProxyHeaders,
 		inferenceSvc,
+		bindingsRepo,
 	)
 
 	// The extract module mounts its API routes on the app's mux — every
@@ -259,7 +261,7 @@ func runtimeProviderConfig(cfg config.Config) inference.Endpoint {
 	endpoint := inference.Endpoint{
 		ID:           cfg.Provider,
 		Protocol:     cfg.Provider,
-		Capabilities: []string{inference.CapabilityChat, inference.CapabilityEmbeddings, inference.CapabilityVision},
+		Capabilities: []string{inference.CapabilityChat, inference.CapabilityEmbeddings, inference.CapabilityVision, inference.CapabilityResponses, inference.CapabilityCompact},
 		Enabled:      true,
 	}
 	switch cfg.Provider {

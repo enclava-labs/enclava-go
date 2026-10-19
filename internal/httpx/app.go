@@ -45,6 +45,7 @@ type App struct {
 	maxUploadMB  int64
 	trustProxy   bool
 	executor     *inference.Service
+	bindings     *postgres.ResponseBindingsRepo
 	rl           *RateLimiter
 	mux          *http.ServeMux
 }
@@ -86,6 +87,7 @@ func NewApp(
 	maxUploadMB int64,
 	trustProxy bool,
 	executor *inference.Service,
+	bindings *postgres.ResponseBindingsRepo,
 ) *App {
 	a := &App{
 		authSvc:    authSvc,
@@ -109,6 +111,7 @@ func NewApp(
 		corsOrigins:  corsOrigins,
 		sessionAuth:  sessionAuth,
 		maxUploadMB:  maxUploadMB,
+		bindings:     bindings,
 		trustProxy:   trustProxy,
 		executor:     executor,
 		rl:           NewRateLimiter(),
@@ -170,6 +173,11 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/v1/models/", a.authenticated("models.list", a.handleModelByID))
 	a.mux.HandleFunc("/v1/chat/completions", a.authenticated("chat.completions", a.handleChatCompletions))
 	a.mux.HandleFunc("/v1/embeddings", a.authenticated("embeddings.create", a.handleEmbeddings))
+	// 01-30: the selected Responses lifecycle — create/stream, retrieve,
+	// delete, cancel, input items, input-token count and compact — runs
+	// through the shared executor over owner/endpoint-bound public IDs.
+	a.mux.HandleFunc("/v1/responses", a.authenticated("responses", a.handleResponses))
+	a.mux.HandleFunc("/v1/responses/", a.authenticated("responses", a.handleResponses))
 
 	a.mux.HandleFunc("/api/v1/connectors/sources/", a.authenticated("connectors.manage", a.handleConnectorSourceByID))
 	a.mux.HandleFunc("/api/v1/connectors/sync-jobs", a.authenticated("connectors.manage", a.handleConnectorSyncJobs))
