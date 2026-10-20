@@ -112,21 +112,86 @@ func TestSDKStreamErrorPreservesAccountingDisposition(t *testing.T) {
 
 func TestConfidentialSDKUnsupportedCapabilities(t *testing.T) {
 	p := &ConfidentialSDK{}
-	if !p.Supports("chat/completions") || !p.Supports("embeddings") || p.Supports("responses") {
+	if !p.Supports("chat/completions") || !p.Supports("embeddings") ||
+		!p.Supports("responses") || !p.Supports("responses/compact") {
 		t.Fatal("capability support declaration is incorrect")
 	}
 	// Embeddings now go through the SDK; a nil client only fails at call time.
 	if _, err := p.CreateEmbeddings(context.Background(), nil); err == nil {
 		t.Fatal("embeddings on a nil-client transport must fail")
 	}
-	if _, err := p.DoResponsesRequest(context.Background(), "POST", "/responses", nil); err == nil {
-		t.Fatal("responses unexpectedly supported")
+	if _, err := p.DoResponsesRequest(context.Background(), "POST", "/responses/invalid/operation", nil); err == nil {
+		t.Fatal("unknown Responses management operation unexpectedly supported")
 	}
 	if _, err := p.CreateChatCompletionStream(context.Background(), nil); err == nil {
 		t.Fatal("chat streaming unexpectedly supported")
 	}
 	if _, err := p.DoResponsesStream(context.Background(), "POST", "/responses", nil); err == nil {
 		t.Fatal("responses streaming unexpectedly supported")
+	}
+}
+func TestConfidentialSDKResponseManageRequestRouting(t *testing.T) {
+	for _, tc := range []struct {
+		method, path, body, op, responseID string
+	}{
+		{"GET", "/responses/resp_provider", "", "retrieve", "resp_provider"},
+		{"GET", "/responses/resp_provider/input_items?after=item_provider&limit=10&ignored=leak", "", "list_input_items", "resp_provider"},
+		{"POST", "/responses/resp_provider/cancel", "", "cancel", "resp_provider"},
+		{"DELETE", "/responses/resp_provider", "", "delete", "resp_provider"},
+		{"POST", "/responses/input_tokens", `{"input":"text"}`, "input_tokens", ""},
+		{"POST", "/responses/compact", `{"model":"m"}`, "compact", ""},
+	} {
+		got, err := responseManageRequest(tc.method, tc.path, []byte(tc.body), "provider-a")
+		if err != nil {
+			t.Fatalf("%s %s: %v", tc.method, tc.path, err)
+		}
+		if got["op"] != tc.op || got["provider"] != "provider-a" || got["provider_response_id"] != tc.responseID {
+			t.Fatalf("%s %s: request identity = %#v", tc.method, tc.path, got)
+		}
+		params, ok := got["params"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s %s: params = %#v", tc.method, tc.path, got["params"])
+		}
+		if tc.op == "list_input_items" {
+			if params["after"] != "item_provider" || params["limit"] != "10" {
+				t.Fatalf("list params = %#v", params)
+			}
+			if _, ok := params["ignored"]; ok {
+				t.Fatalf("unrecognized query reached SDK: %#v", params)
+			}
+		}
+		if tc.op == "input_tokens" && params["input"] != "text" {
+			t.Fatalf("body params = %#v", params)
+		}
+	}
+}
+
+func TestConfidentialSDKResponseManageRejectsCreateAndUnknownRoutes(t *testing.T) {
+	for _, tc := range []struct{ method, path string }{
+		{"POST", "/responses"},
+		{"GET", "/responses"},
+		{"GET", "/responses/resp/id"},
+		{"POST", "/responses/resp_provider/delete"},
+	} {
+		if _, err := responseManageRequest(tc.method, tc.path, nil, "provider-a"); err == nil {
+			t.Fatalf("%s %s unexpectedly supported", tc.method, tc.path)
+		}
+	}
+}
+
+func TestConfidentialSDKResponseManageRequiresVerifiedVerdict(t *testing.T) {
+	if _, err := responseManageResult(map[string]any{
+		"verdict":  map[string]any{"status": "demo"},
+		"response": map[string]any{"id": "resp_demo"},
+	}); err == nil {
+		t.Fatal("demo/unverified response was accepted")
+	}
+	raw, err := responseManageResult(map[string]any{
+		"verdict":  map[string]any{"status": "verified"},
+		"response": map[string]any{"id": "resp_provider"},
+	})
+	if err != nil || string(raw) != `{"id":"resp_provider"}` {
+		t.Fatalf("verified response = %s, error %v", raw, err)
 	}
 }
 

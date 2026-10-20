@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	ci "github.com/enclava-labs/confidential-inference-sdk/bindings/go"
@@ -62,7 +64,8 @@ func sdkClientConfig(path, provider, key string) ([]byte, error) {
 func (p *ConfidentialSDK) Close() error { return p.client.Close() }
 
 func (p *ConfidentialSDK) Supports(capability string) bool {
-	return capability == "chat/completions" || capability == "vision" || capability == "embeddings"
+	return capability == "chat/completions" || capability == "vision" ||
+		capability == "embeddings" || capability == "responses" || capability == "responses/compact"
 }
 
 func (p *ConfidentialSDK) VerifyAttestation(ctx context.Context) (AttestationStatus, error) {
@@ -326,9 +329,111 @@ func (p *ConfidentialSDK) writeChatCompletionStream(ctx context.Context, stream 
 		event = next
 	}
 }
-func (p *ConfidentialSDK) DoResponsesRequest(context.Context, string, string, []byte) ([]byte, error) {
-	return nil, errors.New("unsupported capability")
+func (p *ConfidentialSDK) DoResponsesRequest(ctx context.Context, method, path string, body []byte) ([]byte, error) {
+	if method == "POST" && path == "/responses" {
+		return p.execute(ctx, body, func(req any, timeout time.Duration) (map[string]any, error) {
+			return p.client.CreateResponse(req, timeout)
+		})
+	}
+	req, err := responseManageRequest(method, path, body, p.provider)
+	if err != nil {
+		return nil, err
+	}
+	timeout := time.Duration(0)
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = time.Until(deadline)
+		if timeout <= 0 {
+			return nil, ctx.Err()
+		}
+	}
+	result, err := p.client.ResponseManage(req, timeout)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, sdkOperationError(err)
+	}
+	return responseManageResult(result)
 }
+
+func responseManageResult(result map[string]any) ([]byte, error) {
+	verdict, ok := result["verdict"].(map[string]any)
+	if !ok || verdict["status"] != "verified" {
+		return nil, errors.New("confidential SDK verdict not verified after execution")
+	}
+	response, ok := result["response"]
+	if !ok {
+		return nil, errors.New("confidential SDK response missing after execution")
+	}
+	return json.Marshal(response)
+}
+
+func responseManageRequest(method, path string, body []byte, provider string) (map[string]any, error) {
+	u, err := url.ParseRequestURI(path)
+	if err != nil {
+		return nil, errors.New("unsupported capability")
+	}
+	parts := strings.Split(strings.TrimPrefix(u.Path, "/responses"), "/")
+	if u.Path != "/responses" && !strings.HasPrefix(u.Path, "/responses/") {
+		return nil, errors.New("unsupported capability")
+	}
+	op, responseID := "", ""
+	switch {
+	case u.Path == "/responses" && method == "POST":
+		return nil, errors.New("unsupported capability")
+	case u.Path == "/responses/input_tokens" && method == "POST":
+		op = "input_tokens"
+	case u.Path == "/responses/compact" && method == "POST":
+		op = "compact"
+	case len(parts) == 2 && parts[0] == "" && parts[1] != "":
+		responseID = parts[1]
+		switch method {
+		case "GET":
+			op = "retrieve"
+		case "DELETE":
+			op = "delete"
+		}
+	case len(parts) == 3 && parts[0] == "" && parts[1] != "":
+		responseID = parts[1]
+		switch {
+		case parts[2] == "input_items" && method == "GET":
+			op = "list_input_items"
+		case parts[2] == "cancel" && method == "POST":
+			op = "cancel"
+		}
+	}
+	if op == "" {
+		return nil, errors.New("unsupported capability")
+	}
+	params := map[string]any{}
+	switch op {
+	case "retrieve":
+		for _, key := range []string{"starting_after"} {
+			if values, ok := u.Query()[key]; ok && len(values) == 1 {
+				params[key] = values[0]
+			}
+		}
+	case "list_input_items":
+		for _, key := range []string{"limit", "order", "after", "before"} {
+			if values, ok := u.Query()[key]; ok && len(values) == 1 {
+				params[key] = values[0]
+			}
+		}
+	}
+	if len(body) != 0 {
+		var bodyParams map[string]any
+		if err := json.Unmarshal(body, &bodyParams); err != nil {
+			return nil, err
+		}
+		for key, value := range bodyParams {
+			params[key] = value
+		}
+	}
+	return map[string]any{
+		"op": op, "provider": provider, "provider_response_id": responseID, "params": params,
+	}, nil
+}
+
 func (p *ConfidentialSDK) DoResponsesStream(context.Context, string, string, []byte) (io.ReadCloser, error) {
 	return nil, errors.New("unsupported capability")
 }

@@ -930,3 +930,54 @@ func TestExecuteConfidentialSDKOfflineDemoEmbeddings(t *testing.T) {
 		t.Fatalf("SDK embeddings assurance not stamped: endpoint=%+v err=%v", stored, err)
 	}
 }
+
+func TestExecuteConfidentialSDKOfflineDemoResponsesLifecycle(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("CONFIDENTIAL_INFERENCE_FFI_LIBRARY")) == "" {
+		t.Fatal("CONFIDENTIAL_INFERENCE_FFI_LIBRARY is required for this integration test")
+	}
+	f := newFx(t)
+	e := inference.Endpoint{
+		ID: "ep-sdk-responses", TenantID: f.tenant, Protocol: "confidential_sdk", SDKProvider: "demo",
+		BaseOrigin:   "https://demo.example",
+		Capabilities: []string{inference.CapabilityResponses, "model:gpt-oss-120b=gpt-oss-120b"},
+		Enabled:      true,
+	}
+	if err := f.endpoint.Create(f.ctx, e); err != nil {
+		t.Fatalf("create SDK endpoint: %v", err)
+	}
+	f.priceFor(t, e.ID, inference.CapabilityResponses, billing.UnitInput, 1, 1)
+	f.priceFor(t, e.ID, inference.CapabilityResponses, billing.UnitOutput, 1, 1)
+	svc, err := inference.NewService(inference.Deps{
+		Endpoints: f.endpoint, Sources: f.sources, Authorizer: source.NewAuthorizer(f.sources, time.Hour),
+		Billing: f.billing, Artifacts: f.artifact,
+	})
+	if err != nil {
+		t.Fatalf("new SDK inference service: %v", err)
+	}
+	defer svc.Close()
+	result, err := svc.Execute(f.ctx, f.principal, inference.Request{
+		Capability: inference.CapabilityResponses, Model: "gpt-oss-120b",
+		Payload:  []byte(`{"model":"gpt-oss-120b","input":"hello"}`),
+		Estimate: billing.Usage{InputUnits: 100, OutputUnits: 50},
+	})
+	if err != nil {
+		t.Fatalf("SDK Responses create: %v", err)
+	}
+	defer result.Body.Close()
+	raw, err := io.ReadAll(result.Body)
+	if err != nil || !strings.Contains(string(raw), `"object":"response"`) {
+		t.Fatalf("SDK Responses create did not return a response object: %s err=%v", raw, err)
+	}
+	if result.ReservationID == "" {
+		t.Fatal("SDK Responses create bypassed the priced executor")
+	}
+	manage, err := svc.Manage(f.ctx, f.principal, inference.ManageRequest{
+		EndpointID: e.ID, Method: "GET", Path: "/responses/resp_demo",
+	})
+	if manage != nil {
+		_ = manage.Body.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "provider_response_manage_failed") {
+		t.Fatalf("demo Responses follow-up must fail closed, got %v", err)
+	}
+}

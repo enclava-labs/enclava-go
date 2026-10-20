@@ -26,9 +26,9 @@ Only `/v1` selected operations are mounted. `/api/v1` inference aliases and arbi
 | `/v1/chat/completions` | POST | `chat.completions` | Shared-executor chat; streaming depends on the selected endpoint. |
 | `/v1/embeddings` | POST | `embeddings.create` | Shared-executor embedding operation. |
 | `/v1/responses` | POST | `responses` | Create, including streaming when supported. |
-| `/v1/responses/{response_id}` | GET, DELETE | `responses` | Owner/tenant-bound retrieval and deletion. |
-| `/v1/responses/{response_id}/cancel` | POST | `responses` | Cancellation remains available independently of ordinary inference budget. |
-| `/v1/responses/{response_id}/input_items` | GET | `responses` | Bound to the locally owned response reference. |
+| `/v1/responses/{response_id}` | GET, DELETE | `responses` | Owner/tenant-bound retrieval and deletion; confidential SDK follow-ups dispatch with the bound provider response ID. |
+| `/v1/responses/{response_id}/cancel` | POST | `responses` | Cancellation remains available independently of ordinary inference budget; confidential SDK dispatch uses the bound provider response ID. |
+| `/v1/responses/{response_id}/input_items` | GET | `responses` | Bound to the locally owned response reference; confidential SDK dispatch uses the bound provider response ID. |
 | `/v1/responses/input_tokens`, `/v1/responses/compact` | POST | `responses` | Require the selected endpoint to support the operation. |
 
 ## Platform and feature APIs
