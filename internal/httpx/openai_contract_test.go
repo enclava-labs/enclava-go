@@ -324,6 +324,62 @@ func TestChatStreamRelaysToolCallDeltas(t *testing.T) {
 		t.Fatal("upstream stream body not closed after relay")
 	}
 }
+func TestChatStreamSettlesOnlyTerminalUsageOnce(t *testing.T) {
+	f := newOpenAIContractFixture(t)
+	f.up.streamBody = "data: {\"id\":\"chatcmpl_123456\",\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n" +
+		"data: {\"id\":\"chatcmpl_123456\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n" +
+		"data: [DONE]\n\n"
+	rec := f.do(t, http.MethodPost, "/v1/chat/completions",
+		`{"model":"gpt-fast","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "data: [DONE]") {
+		t.Fatalf("stream terminal relay: %d %s", rec.Code, rec.Body.String())
+	}
+	var reservationID string
+	if err := f.db.SQL.QueryRowContext(context.Background(),
+		`SELECT reservation_id FROM usage_records WHERE tenant_id = $1::uuid`, f.tenant).Scan(&reservationID); err != nil {
+		t.Fatal(err)
+	}
+	res, err := f.brepo.GetReservation(context.Background(), f.tenant, reservationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.State != billing.ReservationSettled {
+		t.Fatalf("terminal stream reservation state = %s", res.State)
+	}
+	usage, err := f.brepo.GetUsageRecord(context.Background(), f.tenant, reservationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.Units[billing.UnitInput] != 5 || usage.Units[billing.UnitOutput] != 2 {
+		t.Fatalf("terminal usage not settled exactly: %+v", usage.Units)
+	}
+	var settlements int
+	if err := f.db.SQL.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM usage_records WHERE tenant_id = $1::uuid AND reservation_id = $2`, f.tenant, reservationID).Scan(&settlements); err != nil {
+		t.Fatal(err)
+	}
+	if settlements != 1 {
+		t.Fatalf("usage records = %d, want exactly one", settlements)
+	}
+}
+
+func TestChatStreamWithoutTerminalUsageRetainsLiability(t *testing.T) {
+	f := newOpenAIContractFixture(t)
+	f.up.streamBody = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"
+	rec := f.do(t, http.MethodPost, "/v1/chat/completions",
+		`{"model":"gpt-fast","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stream: %d %s", rec.Code, rec.Body.String())
+	}
+	var state string
+	if err := f.db.SQL.QueryRowContext(context.Background(),
+		`SELECT state FROM reservations WHERE tenant_id = $1::uuid ORDER BY created_at DESC LIMIT 1`, f.tenant).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != billing.ReservationUnknown {
+		t.Fatalf("stream without terminal usage state = %s, want unknown", state)
+	}
+}
 
 func TestChatDeniedModelDeniedBeforeDispatch(t *testing.T) {
 	f := newOpenAIContractFixture(t)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -84,6 +85,31 @@ func TestSDKOperationErrorAccountingMapping(t *testing.T) {
 	}
 }
 
+func TestSDKStreamErrorPreservesAccountingDisposition(t *testing.T) {
+	err := sdkOperationError(sdkStreamEventError(map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"code": "provider_rejected", "message": "rate limited",
+			"dispatch": ci.DispatchRejected, "http_status": float64(429),
+		},
+	}))
+	var upstream *UpstreamError
+	if !errors.As(err, &upstream) || upstream.StatusCode != 429 || upstream.Message != "rate limited" {
+		t.Fatalf("stream provider rejection not preserved: %v", err)
+	}
+
+	err = sdkOperationError(sdkStreamEventError(map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"code": "stream_failed", "message": "outcome unknown",
+			"dispatch": ci.DispatchUnknown,
+		},
+	}))
+	if errors.As(err, &upstream) {
+		t.Fatalf("ambiguous stream outcome must remain unsettled: %v", err)
+	}
+}
+
 func TestConfidentialSDKUnsupportedCapabilities(t *testing.T) {
 	p := &ConfidentialSDK{}
 	if !p.Supports("chat/completions") || !p.Supports("embeddings") || p.Supports("responses") {
@@ -101,5 +127,18 @@ func TestConfidentialSDKUnsupportedCapabilities(t *testing.T) {
 	}
 	if _, err := p.DoResponsesStream(context.Background(), "POST", "/responses", nil); err == nil {
 		t.Fatal("responses streaming unexpectedly supported")
+	}
+}
+
+func TestCancellableStreamReaderCloseCancelsContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	stream := &cancellableStreamReader{PipeReader: reader, cancel: cancel}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("context error = %v, want canceled", ctx.Err())
 	}
 }

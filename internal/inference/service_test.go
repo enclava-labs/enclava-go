@@ -830,6 +830,59 @@ func TestExecuteConfidentialSDKOfflineDemo(t *testing.T) {
 	}
 }
 
+func TestExecuteConfidentialSDKStreamFailsClosedForE2EERoute(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("CONFIDENTIAL_INFERENCE_FFI_LIBRARY")) == "" {
+		t.Fatal("CONFIDENTIAL_INFERENCE_FFI_LIBRARY is required for this integration test")
+	}
+	f := newFx(t)
+	e := inference.Endpoint{
+		ID: "ep-sdk-stream", TenantID: f.tenant, Protocol: "confidential_sdk", SDKProvider: "demo",
+		BaseOrigin:   "https://demo.example",
+		Capabilities: []string{inference.CapabilityChat, "model:gpt-oss-120b=gpt-oss-120b"},
+		Enabled:      true,
+	}
+	if err := f.endpoint.Create(f.ctx, e); err != nil {
+		t.Fatalf("create SDK endpoint: %v", err)
+	}
+	f.priceFor(t, e.ID, inference.CapabilityChat, billing.UnitInput, 1, 1)
+	f.priceFor(t, e.ID, inference.CapabilityChat, billing.UnitOutput, 1, 1)
+	svc, err := inference.NewService(inference.Deps{
+		Endpoints: f.endpoint, Sources: f.sources, Authorizer: source.NewAuthorizer(f.sources, time.Hour),
+		Billing: f.billing, Artifacts: f.artifact,
+	})
+	if err != nil {
+		t.Fatalf("new SDK inference service: %v", err)
+	}
+	defer svc.Close()
+	before := f.reservationCount(t)
+	_, err = svc.Execute(f.ctx, f.principal, inference.Request{
+		Capability: inference.CapabilityChat, Model: "gpt-oss-120b", Stream: true,
+		Payload:  []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+		Estimate: billing.Usage{InputUnits: 100, OutputUnits: 50},
+	})
+	if err == nil || !strings.Contains(err.Error(), "streaming_not_supported") {
+		t.Fatalf("E2EE SDK stream must fail closed, got %v", err)
+	}
+	if got := f.reservationCount(t); got != before+1 {
+		t.Fatalf("stream denial reservations = %d, want one attempt", got-before)
+	}
+	var state string
+	if err := f.db.SQL.QueryRowContext(f.ctx,
+		`SELECT state FROM reservations WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1`, f.tenant).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != billing.ReservationReleased && state != billing.ReservationUnknown {
+		t.Fatalf("E2EE stream denial state = %s, want released pre-dispatch or unknown after dispatch", state)
+	}
+	var settlements int
+	if err := f.db.SQL.QueryRowContext(f.ctx,
+		`SELECT count(*) FROM usage_records WHERE tenant_id = $1`, f.tenant).Scan(&settlements); err != nil {
+		t.Fatal(err)
+	}
+	if settlements != 0 {
+		t.Fatalf("fail-closed stream recorded %d settlements, want none", settlements)
+	}
+}
 func TestExecuteConfidentialSDKOfflineDemoEmbeddings(t *testing.T) {
 	if strings.TrimSpace(os.Getenv("CONFIDENTIAL_INFERENCE_FFI_LIBRARY")) == "" {
 		t.Fatal("CONFIDENTIAL_INFERENCE_FFI_LIBRARY is required for this integration test")

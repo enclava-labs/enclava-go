@@ -146,8 +146,185 @@ func sdkOperationError(err error) error {
 	return fmt.Errorf("confidential SDK: %w", err)
 }
 
-func (p *ConfidentialSDK) CreateChatCompletionStream(context.Context, []byte) (io.ReadCloser, error) {
-	return nil, errors.New("unsupported capability")
+func (p *ConfidentialSDK) CreateChatCompletionStream(ctx context.Context, body []byte) (io.ReadCloser, error) {
+	var req any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stream, err := p.client.StartStream(req)
+	if err != nil {
+		return nil, sdkOperationError(err)
+	}
+	first, err := nextSDKStreamEvent(ctx, stream)
+	if err != nil {
+		closeSDKStream(stream)
+		return nil, sdkOperationError(err)
+	}
+	if first["type"] != "verdict" {
+		closeSDKStream(stream)
+		return nil, sdkOperationError(sdkStreamEventError(first))
+	}
+	verdict, ok := first["verdict"].(map[string]any)
+	if !ok || verdict["status"] != "verified" {
+		closeSDKStream(stream)
+		return nil, errors.New("confidential SDK stream verdict not verified")
+	}
+	streamCtx, cancel := context.WithCancel(ctx)
+	reader, writer := io.Pipe()
+	go func() {
+		defer cancel()
+		p.writeChatCompletionStream(streamCtx, stream, first, writer)
+	}()
+	return &cancellableStreamReader{PipeReader: reader, cancel: cancel}, nil
+}
+
+func nextSDKStreamEvent(ctx context.Context, stream *ci.Stream) (map[string]any, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			stream.Cancel()
+			return nil, err
+		}
+		event, err := stream.Next(250 * time.Millisecond)
+		if err != nil || event != nil {
+			return event, err
+		}
+	}
+}
+
+type cancellableStreamReader struct {
+	*io.PipeReader
+	cancel context.CancelFunc
+}
+
+func (r *cancellableStreamReader) Close() error {
+	r.cancel()
+	return r.PipeReader.Close()
+}
+
+// closeSDKStream waits for Next to observe cancellation before freeing the
+// handle; the SDK returns StatusBusy rather than freeing an in-flight stream.
+func closeSDKStream(stream *ci.Stream) {
+	stream.Cancel()
+	for {
+		event, err := stream.Next(250 * time.Millisecond)
+		if err != nil {
+			break
+		}
+		if event == nil {
+			continue
+		}
+		switch event["type"] {
+		case "done", "cancelled", "closed", "error":
+			_ = stream.Close()
+			return
+		}
+	}
+	_ = stream.Close()
+}
+
+func sdkStreamEventError(event map[string]any) error {
+	detail, _ := event["error"].(map[string]any)
+	if detail == nil {
+		return errors.New("confidential SDK stream failed")
+	}
+	message, _ := detail["message"].(string)
+	if message == "" {
+		message = "confidential SDK stream failed"
+	}
+	code, _ := detail["code"].(string)
+	if code == "" {
+		code = "stream_failed"
+	}
+	dispatch, _ := detail["dispatch"].(string)
+	status := 0
+	if value, ok := detail["http_status"].(float64); ok {
+		status = int(value)
+	}
+	return &ci.Error{
+		Status: ci.StatusOperationFailed, Code: code, Message: message,
+		Dispatch: dispatch, HTTPStatus: status,
+	}
+}
+
+func (p *ConfidentialSDK) writeChatCompletionStream(ctx context.Context, stream *ci.Stream, first map[string]any, writer *io.PipeWriter) {
+	defer closeSDKStream(stream)
+	var responseID, model string
+	var created any
+	seenUsage := false
+	writeEvent := func(value any) error {
+		data, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(writer, "data: %s\n\n", data)
+		return err
+	}
+	for event := first; event != nil; {
+		switch event["type"] {
+		case "chunk":
+			chunk, ok := event["chunk"].(map[string]any)
+			if !ok {
+				_ = writer.CloseWithError(errors.New("confidential SDK stream chunk missing"))
+				return
+			}
+			if id, ok := chunk["id"].(string); ok {
+				responseID = id
+			}
+			if name, ok := chunk["model"].(string); ok {
+				model = name
+			}
+			if value, ok := chunk["created"]; ok {
+				created = value
+			}
+			seenUsage = seenUsage || chunk["usage"] != nil
+			if err := writeEvent(chunk); err != nil {
+				_ = writer.CloseWithError(err)
+				return
+			}
+		case "usage":
+			if !seenUsage {
+				final := map[string]any{
+					"object": "chat.completion.chunk", "choices": []any{}, "usage": event["usage"],
+				}
+				if responseID != "" {
+					final["id"] = responseID
+				}
+				if model != "" {
+					final["model"] = model
+				}
+				if created != nil {
+					final["created"] = created
+				}
+				if err := writeEvent(final); err != nil {
+					_ = writer.CloseWithError(err)
+					return
+				}
+				seenUsage = true
+			}
+		case "done":
+			if _, err := io.WriteString(writer, "data: [DONE]\n\n"); err != nil {
+				_ = writer.CloseWithError(err)
+			} else {
+				_ = writer.Close()
+			}
+			return
+		case "error":
+			_ = writer.CloseWithError(sdkOperationError(sdkStreamEventError(event)))
+			return
+		case "cancelled", "closed":
+			_ = writer.CloseWithError(errors.New("confidential SDK stream ended without terminal usage"))
+			return
+		}
+		next, err := nextSDKStreamEvent(ctx, stream)
+		if err != nil {
+			_ = writer.CloseWithError(sdkOperationError(err))
+			return
+		}
+		event = next
+	}
 }
 func (p *ConfidentialSDK) DoResponsesRequest(context.Context, string, string, []byte) ([]byte, error) {
 	return nil, errors.New("unsupported capability")
