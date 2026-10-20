@@ -153,6 +153,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("inference service init error: %v", err)
 	}
+	defer func() {
+		if err := inferenceSvc.Close(); err != nil {
+			log.Printf("inference close failed: %v", err)
+		}
+	}()
 
 	authSvc := auth.NewService(identityRepo, cfg.APIKeyPepper)
 

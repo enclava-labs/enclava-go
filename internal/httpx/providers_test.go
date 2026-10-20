@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -44,6 +45,22 @@ func TestEndpointUpdateInvalidatesAssuranceOnConfigChanges(t *testing.T) {
 	}
 }
 
+func TestConfidentialSDKEndpointRequiresSDKProvider(t *testing.T) {
+	_, err := endpointFromCreateRequest("tenant-a", endpointRequest{
+		ID: "endpoint-a", Protocol: "confidential_sdk", BaseOrigin: "https://provider.example",
+	})
+	if err == nil || !strings.Contains(err.Error(), "sdk_provider is required") {
+		t.Fatalf("expected missing sdk_provider validation error, got %v", err)
+	}
+
+	endpoint, err := endpointFromCreateRequest("tenant-a", endpointRequest{
+		ID: "endpoint-a", Protocol: "confidential_sdk", SDKProvider: "provider-a",
+		BaseOrigin: "https://provider.example",
+	})
+	if err != nil || endpoint.SDKProvider != "provider-a" {
+		t.Fatalf("valid confidential SDK endpoint rejected: endpoint=%+v err=%v", endpoint, err)
+	}
+}
 func TestEndpointCreateRejectsCallerClaimedVerification(t *testing.T) {
 	verified := true
 	_, err := endpointFromCreateRequest("tenant-a", endpointRequest{

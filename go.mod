@@ -4,6 +4,7 @@ go 1.26.4
 
 require (
 	github.com/coreos/go-oidc/v3 v3.17.0
+	github.com/enclava-labs/confidential-inference-sdk/bindings/go v0.0.0
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/openai/openai-go/v3 v3.39.0
 	github.com/tinfoilsh/tinfoil-go v0.13.1
@@ -11,6 +12,8 @@ require (
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sync v0.21.0
 )
+
+replace github.com/enclava-labs/confidential-inference-sdk/bindings/go => ../enclava-proxy-sdk/confidential-inference-sdk/bindings/go
 
 require (
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
@@ -20,6 +23,7 @@ require (
 	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467 // indirect
 	github.com/digitorus/pkcs7 v0.0.0-20250730155240-ffadbf3f398c // indirect
 	github.com/digitorus/timestamp v0.0.0-20250524132541-c45532741eea // indirect
+	github.com/ebitengine/purego v0.11.2 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect

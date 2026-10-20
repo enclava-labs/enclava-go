@@ -28,7 +28,7 @@ func NewEndpointsRepo(db *DB) *EndpointsRepo {
 
 var _ inference.EndpointRepository = (*EndpointsRepo)(nil)
 
-const endpointCols = `id, protocol, base_origin, credential_ref,
+const endpointCols = `id, protocol, sdk_provider, base_origin, credential_ref,
 	capabilities::text, assurance_mode, assurance_verified_at,
 	authorized_private, enabled`
 
@@ -36,7 +36,7 @@ func scanEndpoint(row rowScanner, tenantID string) (inference.Endpoint, error) {
 	var e inference.Endpoint
 	var caps string
 	var verified sql.NullTime
-	err := row.Scan(&e.ID, &e.Protocol, &e.BaseOrigin, &e.CredentialRef,
+	err := row.Scan(&e.ID, &e.Protocol, &e.SDKProvider, &e.BaseOrigin, &e.CredentialRef,
 		&caps, &e.AssuranceMode, &verified, &e.AuthorizedPrivate, &e.Enabled)
 	if err != nil {
 		return inference.Endpoint{}, err
@@ -135,10 +135,10 @@ func (r *EndpointsRepo) Create(ctx context.Context, e inference.Endpoint) error 
 	}
 	_, err = r.db.ExecContext(ctx, `
 		INSERT INTO inference_endpoints
-			(tenant_id, id, protocol, base_origin, credential_ref, capabilities,
+			(tenant_id, id, protocol, sdk_provider, base_origin, credential_ref, capabilities,
 			 assurance_mode, assurance_verified_at, authorized_private, enabled)
-		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-		e.TenantID, e.ID, e.Protocol, e.BaseOrigin, e.CredentialRef,
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		e.TenantID, e.ID, e.Protocol, e.SDKProvider, e.BaseOrigin, e.CredentialRef,
 		string(caps), e.AssuranceMode, e.AssuranceVerifiedAt,
 		e.AuthorizedPrivate, e.Enabled)
 	if err != nil {
@@ -159,11 +159,11 @@ func (r *EndpointsRepo) Update(ctx context.Context, e inference.Endpoint) error 
 	}
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE inference_endpoints SET
-			protocol = $3, base_origin = $4, credential_ref = $5,
-			capabilities = $6, assurance_mode = $7, assurance_verified_at = $8,
-			authorized_private = $9, enabled = $10, updated_at = now()
+			protocol = $3, sdk_provider = $4, base_origin = $5, credential_ref = $6,
+			capabilities = $7, assurance_mode = $8, assurance_verified_at = $9,
+			authorized_private = $10, enabled = $11, updated_at = now()
 		WHERE tenant_id = $1::uuid AND id = $2`,
-		e.TenantID, e.ID, e.Protocol, e.BaseOrigin, e.CredentialRef,
+		e.TenantID, e.ID, e.Protocol, e.SDKProvider, e.BaseOrigin, e.CredentialRef,
 		string(caps), e.AssuranceMode, e.AssuranceVerifiedAt,
 		e.AuthorizedPrivate, e.Enabled)
 	if err != nil {

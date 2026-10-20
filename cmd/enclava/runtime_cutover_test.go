@@ -18,7 +18,10 @@ func TestApplicationRuntimeCutover(t *testing.T) {
 		t.Fatalf("go list dependencies: %v", err)
 	}
 	for _, dep := range strings.Split(string(out), "\n") {
-		if strings.Contains(dep, "python") || strings.Contains(dep, "node") || strings.Contains(dep, "cgo") {
+		// purego ships a package named fakecgo for runtime support; it is not
+		// the cgo toolchain or a native runtime dependency.
+		if strings.Contains(dep, "python") || strings.Contains(dep, "node") ||
+			(strings.Contains(dep, "cgo") && dep != "github.com/ebitengine/purego/internal/fakecgo") {
 			t.Errorf("unexpected non-Go runtime dependency %q", dep)
 		}
 	}

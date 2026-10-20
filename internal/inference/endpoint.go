@@ -21,6 +21,7 @@ type Endpoint struct {
 	ID                  string
 	TenantID            string
 	Protocol            string
+	SDKProvider         string
 	Capabilities        []string
 	BaseOrigin          string
 	CredentialRef       string // server-approved, bound to tenant+purpose+origin

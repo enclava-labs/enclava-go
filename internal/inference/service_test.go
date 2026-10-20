@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -746,5 +747,54 @@ func TestRealAdapterEndToEnd(t *testing.T) {
 	}
 	if f.reservationState(t, res.ReservationID) != billing.ReservationSettled {
 		t.Fatal("reservation not settled after real dispatch")
+	}
+}
+
+func TestExecuteConfidentialSDKOfflineDemo(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("CONFIDENTIAL_INFERENCE_FFI_LIBRARY")) == "" {
+		t.Fatal("CONFIDENTIAL_INFERENCE_FFI_LIBRARY is required for this integration test")
+	}
+	f := newFx(t)
+	e := inference.Endpoint{
+		ID: "ep-sdk", TenantID: f.tenant, Protocol: "confidential_sdk", SDKProvider: "demo",
+		BaseOrigin:   "https://demo.example",
+		Capabilities: []string{inference.CapabilityChat, "model:gpt-oss-120b=gpt-oss-120b"},
+		Enabled:      true,
+	}
+	if err := f.endpoint.Create(f.ctx, e); err != nil {
+		t.Fatalf("create SDK endpoint: %v", err)
+	}
+	f.priceFor(t, e.ID, inference.CapabilityChat, billing.UnitInput, 1, 1)
+	f.priceFor(t, e.ID, inference.CapabilityChat, billing.UnitOutput, 1, 1)
+	svc, err := inference.NewService(inference.Deps{
+		Endpoints: f.endpoint, Sources: f.sources, Authorizer: source.NewAuthorizer(f.sources, time.Hour),
+		Billing: f.billing, Artifacts: f.artifact,
+	})
+	if err != nil {
+		t.Fatalf("new SDK inference service: %v", err)
+	}
+	defer svc.Close()
+	result, err := svc.Execute(f.ctx, f.principal, inference.Request{
+		Capability: inference.CapabilityChat, Model: "gpt-oss-120b",
+		Payload:  []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+		Estimate: billing.Usage{InputUnits: 100, OutputUnits: 50},
+	})
+	if err != nil {
+		t.Fatalf("SDK execute: %v", err)
+	}
+	defer result.Body.Close()
+	body, err := io.ReadAll(result.Body)
+	if err != nil {
+		t.Fatalf("read SDK response: %v", err)
+	}
+	if !strings.Contains(string(body), `"choices"`) || !strings.Contains(string(body), `"usage"`) {
+		t.Fatalf("SDK response is not OpenAI-shaped: %s", body)
+	}
+	if result.Usage == nil || f.reservationState(t, result.ReservationID) != billing.ReservationSettled {
+		t.Fatalf("SDK request did not settle usage: %+v", result.Usage)
+	}
+	stored, err := f.endpoint.Get(f.ctx, f.tenant, e.ID)
+	if err != nil || stored.AssuranceVerifiedAt == nil {
+		t.Fatalf("SDK verified assurance was not stamped: endpoint=%+v err=%v", stored, err)
 	}
 }

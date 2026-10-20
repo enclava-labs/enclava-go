@@ -8,18 +8,19 @@ package inference
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
+	"enclava-go/internal/llm"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-
-	"enclava-go/internal/auth"
-	"enclava-go/internal/billing"
-	"enclava-go/internal/llm"
 )
 
 // Billing is the reservation/settlement seam consumed by the executor;
@@ -134,6 +135,20 @@ func NewService(deps Deps, opts ...Option) (*Service, error) {
 		s.newTransport = s.defaultTransport
 	}
 	return s, nil
+}
+
+func (s *Service) Close() error {
+	s.mu.Lock()
+	entries := s.transports
+	s.transports = make(map[string]transportEntry)
+	s.mu.Unlock()
+	var errs []error
+	for _, ent := range entries {
+		if closer, ok := ent.up.(interface{ Close() error }); ok {
+			errs = append(errs, closer.Close())
+		}
+	}
+	return errors.Join(errs...)
 }
 
 const (
@@ -274,6 +289,9 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 		return nil, err
 	}
 	permit.Release()
+	if endpoint.Protocol == "confidential_sdk" {
+		s.stampVerification(ctx, endpoint)
+	}
 	usage, known := usageFromJSON(raw)
 	rec, serr := s.settleReservation(ctx, p, res, usage, known)
 	result := &Result{
@@ -437,8 +455,10 @@ func (s *Service) reserve(ctx context.Context, p auth.Principal, req Request, en
 	return s.billing.Reserve(ctx, p, base)
 }
 
-// dispatch sends the bounded body for non-streaming requests.
 func (s *Service) dispatch(ctx context.Context, up Upstream, capability string, req Request, body []byte) ([]byte, error) {
+	if unsupported, ok := up.(interface{ Supports(string) bool }); ok && !unsupported.Supports(capability) {
+		return nil, ErrUnsupportedCapability
+	}
 	switch capability {
 	case CapabilityChat, CapabilityVision:
 		return up.CreateChatCompletion(ctx, body)
@@ -454,6 +474,9 @@ func (s *Service) dispatch(ctx context.Context, up Upstream, capability string, 
 
 // dispatchStream opens the streaming variant of the bounded request.
 func (s *Service) dispatchStream(ctx context.Context, up Upstream, capability string, req Request, body []byte) (io.ReadCloser, error) {
+	if unsupported, ok := up.(interface{ Supports(string) bool }); ok && !unsupported.Supports(capability) {
+		return nil, ErrUnsupportedCapability
+	}
 	switch capability {
 	case CapabilityChat, CapabilityVision:
 		return up.CreateChatCompletionStream(ctx, body)
@@ -486,17 +509,25 @@ func responsesTarget(capability string, req Request) (string, string) {
 // approved endpoint revision, never per request.
 func (s *Service) transportFor(ctx context.Context, e Endpoint) (Upstream, error) {
 	sig := transportSignature(e)
+	if e.Protocol == "confidential_sdk" {
+		path := os.Getenv("CONFIDENTIAL_SDK_CONFIG")
+		config, err := os.ReadFile(path)
+		if path != "" && err != nil {
+			return nil, fmt.Errorf("read confidential SDK config: %w", err)
+		}
+		sig += "|" + fmt.Sprintf("%x", sha256.Sum256(config))
+	}
+	credential, err := s.resolveCredential(e)
+	if err != nil {
+		return nil, err
+	}
+	sig += "|" + fmt.Sprintf("%x", sha256.Sum256([]byte(credential)))
 	key := e.TenantID + "\x00" + e.ID
 	s.mu.Lock()
 	ent, ok := s.transports[key]
 	s.mu.Unlock()
 	if ok && ent.signature == sig {
 		return ent.up, nil
-	}
-
-	credential, err := s.resolveCredential(e)
-	if err != nil {
-		return nil, err
 	}
 	up, err := s.newTransport(ctx, e, credential)
 	if err != nil {
@@ -520,8 +551,14 @@ func (s *Service) transportFor(ctx context.Context, e Endpoint) (Upstream, error
 	}
 
 	s.mu.Lock()
+	old, replaced := s.transports[key]
 	s.transports[key] = transportEntry{signature: sig, up: up}
 	s.mu.Unlock()
+	if replaced {
+		if closer, ok := old.up.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+	}
 	return up, nil
 }
 
@@ -530,7 +567,7 @@ func (s *Service) transportFor(ctx context.Context, e Endpoint) (Upstream, error
 // credentials or origin.
 func transportSignature(e Endpoint) string {
 	parts := []string{
-		e.Protocol, e.BaseOrigin, e.CredentialRef,
+		e.Protocol, e.SDKProvider, e.BaseOrigin, e.CredentialRef,
 		fmt.Sprintf("%v", e.AuthorizedPrivate),
 		e.AssuranceMode,
 	}
@@ -593,6 +630,8 @@ func (s *Service) defaultTransport(ctx context.Context, e Endpoint, credential s
 	case "tinfoil":
 		host := strings.TrimPrefix(strings.TrimPrefix(e.BaseOrigin, "https://"), "http://")
 		return llm.NewTinfoilProvider(credential, host, "", s.attemptTimeout, false, false, 5*time.Minute)
+	case "confidential_sdk":
+		return llm.NewConfidentialSDK(os.Getenv("CONFIDENTIAL_SDK_CONFIG"), e.SDKProvider, e.BaseOrigin, credential)
 	default:
 		return nil, fmt.Errorf("%w: protocol %q", ErrUnsupportedCapability, e.Protocol)
 	}

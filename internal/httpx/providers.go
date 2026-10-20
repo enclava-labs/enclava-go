@@ -18,6 +18,7 @@ import (
 type endpointRequest struct {
 	ID                string   `json:"id,omitempty"`
 	Protocol          string   `json:"protocol,omitempty"`
+	SDKProvider       string   `json:"sdk_provider,omitempty"`
 	Capabilities      []string `json:"capabilities,omitempty"`
 	BaseOrigin        string   `json:"base_origin,omitempty"`
 	CredentialRef     *string  `json:"credential_ref,omitempty"`
@@ -195,7 +196,7 @@ func (a *App) handleProviderByID(w http.ResponseWriter, r *http.Request, p auth.
 
 func endpointFromCreateRequest(tenantID string, req endpointRequest) (inference.Endpoint, error) {
 	endpoint := inference.Endpoint{
-		ID: strings.TrimSpace(req.ID), TenantID: tenantID, Protocol: strings.TrimSpace(req.Protocol),
+		ID: strings.TrimSpace(req.ID), TenantID: tenantID, Protocol: strings.TrimSpace(req.Protocol), SDKProvider: strings.TrimSpace(req.SDKProvider),
 		Capabilities: req.Capabilities, BaseOrigin: strings.TrimSpace(req.BaseOrigin), Enabled: true,
 	}
 	if req.CredentialRef != nil {
@@ -227,6 +228,9 @@ func endpointFromUpdateRequest(existing inference.Endpoint, req endpointRequest)
 	if strings.TrimSpace(req.Protocol) != "" {
 		endpoint.Protocol = strings.TrimSpace(req.Protocol)
 	}
+	if strings.TrimSpace(req.SDKProvider) != "" {
+		endpoint.SDKProvider = strings.TrimSpace(req.SDKProvider)
+	}
 	if req.Capabilities != nil {
 		endpoint.Capabilities = req.Capabilities
 	}
@@ -246,6 +250,7 @@ func endpointFromUpdateRequest(existing inference.Endpoint, req endpointRequest)
 		return inference.Endpoint{}, errInvalidProvider("assurance_verified_at is set by observed verification only")
 	}
 	if endpoint.Protocol != existing.Protocol ||
+		endpoint.SDKProvider != existing.SDKProvider ||
 		endpoint.BaseOrigin != existing.BaseOrigin ||
 		endpoint.CredentialRef != existing.CredentialRef ||
 		endpoint.AssuranceMode != existing.AssuranceMode ||
@@ -280,7 +285,10 @@ func validateEndpoint(e inference.Endpoint) (inference.Endpoint, error) {
 		return inference.Endpoint{}, errInvalidProvider("protocol is required")
 	}
 	if !knownProviderType(e.Protocol) {
-		return inference.Endpoint{}, errInvalidProvider("protocol must be one of: tinfoil, privatemode, openai_compatible, redpill")
+		return inference.Endpoint{}, errInvalidProvider("protocol must be one of: tinfoil, privatemode, openai_compatible, redpill, confidential_sdk")
+	}
+	if e.Protocol == "confidential_sdk" && strings.TrimSpace(e.SDKProvider) == "" {
+		return inference.Endpoint{}, errInvalidProvider("sdk_provider is required for confidential_sdk")
 	}
 	u, err := url.Parse(strings.TrimSpace(e.BaseOrigin))
 	if err != nil || u.Host == "" {
@@ -303,7 +311,7 @@ func validateEndpoint(e inference.Endpoint) (inference.Endpoint, error) {
 
 func knownProviderType(providerType string) bool {
 	switch strings.ToLower(strings.TrimSpace(providerType)) {
-	case "tinfoil", "privatemode", "openai_compatible", "redpill":
+	case "tinfoil", "privatemode", "openai_compatible", "redpill", "confidential_sdk":
 		return true
 	default:
 		return false
