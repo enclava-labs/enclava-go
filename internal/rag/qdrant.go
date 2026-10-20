@@ -17,9 +17,15 @@ type QdrantClient struct {
 	client  *http.Client
 }
 
+type SparseVector struct {
+	Indices []uint32  `json:"indices"`
+	Values  []float32 `json:"values"`
+}
+
 type QdrantPoint struct {
 	ID      string         `json:"id"`
-	Vector  []float64      `json:"vector"`
+	Vector  []float64      `json:"-"`
+	Sparse  SparseVector   `json:"-"`
 	Payload map[string]any `json:"payload"`
 }
 
@@ -52,10 +58,8 @@ func (c *QdrantClient) EnsureCollection(ctx context.Context, collection string, 
 	}
 
 	body, err := json.Marshal(map[string]any{
-		"vectors": map[string]any{
-			"size":     vectorSize,
-			"distance": "Cosine",
-		},
+		"vectors":        map[string]any{"dense": map[string]any{"size": vectorSize, "distance": "Cosine"}},
+		"sparse_vectors": map[string]any{"text": map[string]any{}},
 	})
 	if err != nil {
 		return err
@@ -71,7 +75,23 @@ func (c *QdrantClient) EnsureCollection(ctx context.Context, collection string, 
 }
 
 func (c *QdrantClient) UpsertPoints(ctx context.Context, collection string, points []QdrantPoint) error {
-	body, err := json.Marshal(map[string]any{"points": points})
+	hasSparse, namedDense, err := c.collectionVectors(ctx, collection)
+	if err != nil {
+		return err
+	}
+	wirePoints := make([]map[string]any, 0, len(points))
+	for _, point := range points {
+		var vectors any = point.Vector
+		if namedDense {
+			named := map[string]any{"dense": point.Vector}
+			if hasSparse {
+				named["text"] = point.Sparse
+			}
+			vectors = named
+		}
+		wirePoints = append(wirePoints, map[string]any{"id": point.ID, "vector": vectors, "payload": point.Payload})
+	}
+	body, err := json.Marshal(map[string]any{"points": wirePoints})
 	if err != nil {
 		return err
 	}
@@ -124,22 +144,48 @@ type QdrantSearchPoint struct {
 }
 
 func (c *QdrantClient) Search(ctx context.Context, collection string, vector []float64, limit int, filter map[string]any) ([]QdrantSearchPoint, error) {
+	return c.SearchHybrid(ctx, collection, vector, SparseVector{}, limit, filter)
+}
+
+func (c *QdrantClient) SearchHybrid(ctx context.Context, collection string, vector []float64, sparse SparseVector, limit int, filter map[string]any) ([]QdrantSearchPoint, error) {
+	hasSparse, namedDense, err := c.collectionVectors(ctx, collection)
+	if err != nil {
+		return nil, err
+	}
+	hasSparse = hasSparse && len(sparse.Indices) > 0
+	return c.search(ctx, collection, vector, sparse, limit, filter, hasSparse, namedDense)
+}
+
+func (c *QdrantClient) search(ctx context.Context, collection string, vector []float64, sparse SparseVector, limit int, filter map[string]any, hasSparse, namedDense bool) ([]QdrantSearchPoint, error) {
 	if limit <= 0 {
 		limit = 5
 	}
-	payload := map[string]any{
-		"vector":       vector,
-		"limit":        limit,
-		"with_payload": true,
-	}
-	if len(filter) > 0 {
-		payload["filter"] = filter
+	var payload map[string]any
+	path := "/collections/" + url.PathEscape(collection) + "/points/search"
+	if hasSparse {
+		prefetch := []map[string]any{
+			{"query": vector, "using": "dense", "limit": limit, "filter": filter},
+			{"query": sparse, "using": "text", "limit": limit, "filter": filter},
+		}
+		payload = map[string]any{"prefetch": prefetch, "query": map[string]any{"fusion": "rrf"}, "limit": limit, "with_payload": true}
+		path = "/collections/" + url.PathEscape(collection) + "/points/query"
+	} else if namedDense {
+		payload = map[string]any{"query": vector, "using": "dense", "limit": limit, "with_payload": true}
+		if len(filter) > 0 {
+			payload["filter"] = filter
+		}
+		path = "/collections/" + url.PathEscape(collection) + "/points/query"
+	} else {
+		payload = map[string]any{"vector": vector, "limit": limit, "with_payload": true}
+		if len(filter) > 0 {
+			payload["filter"] = filter
+		}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
-	status, resp, err := c.do(ctx, http.MethodPost, "/collections/"+url.PathEscape(collection)+"/points/search", body)
+	status, resp, err := c.do(ctx, http.MethodPost, path, body)
 	if err != nil {
 		return nil, err
 	}
@@ -147,13 +193,55 @@ func (c *QdrantClient) Search(ctx context.Context, collection string, vector []f
 		return nil, fmt.Errorf("qdrant search failed: status=%d body=%s", status, string(resp))
 	}
 	var envelope struct {
-		Result []QdrantSearchPoint `json:"result"`
-		Status string              `json:"status"`
+		Result json.RawMessage `json:"result"`
+		Status string          `json:"status"`
 	}
 	if err := json.Unmarshal(resp, &envelope); err != nil {
 		return nil, fmt.Errorf("decode qdrant search response: %w", err)
 	}
-	return envelope.Result, nil
+	var points []QdrantSearchPoint
+	if len(envelope.Result) > 0 && envelope.Result[0] == '[' {
+		err = json.Unmarshal(envelope.Result, &points)
+	} else {
+		var queryResult struct {
+			Points []QdrantSearchPoint `json:"points"`
+		}
+		err = json.Unmarshal(envelope.Result, &queryResult)
+		points = queryResult.Points
+	}
+	if err != nil {
+		return nil, fmt.Errorf("decode qdrant search results: %w", err)
+	}
+	return points, nil
+}
+
+func (c *QdrantClient) collectionVectors(ctx context.Context, collection string) (hasSparse, namedDense bool, err error) {
+	status, resp, err := c.do(ctx, http.MethodGet, "/collections/"+url.PathEscape(collection), nil)
+	if err != nil {
+		return false, false, err
+	}
+	if status >= 300 {
+		return false, false, fmt.Errorf("qdrant collection schema failed: status=%d body=%s", status, string(resp))
+	}
+	var envelope struct {
+		Result struct {
+			Config struct {
+				Params struct {
+					Vectors       json.RawMessage            `json:"vectors"`
+					SparseVectors map[string]json.RawMessage `json:"sparse_vectors"`
+				} `json:"params"`
+			} `json:"config"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(resp, &envelope); err != nil {
+		return false, false, fmt.Errorf("decode qdrant collection schema: %w", err)
+	}
+	var named map[string]json.RawMessage
+	if err := json.Unmarshal(envelope.Result.Config.Params.Vectors, &named); err == nil {
+		_, namedDense = named["dense"]
+	}
+	_, hasSparse = envelope.Result.Config.Params.SparseVectors["text"]
+	return hasSparse, namedDense, nil
 }
 
 func (c *QdrantClient) do(ctx context.Context, method, path string, body []byte) (int, []byte, error) {

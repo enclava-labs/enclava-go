@@ -66,7 +66,7 @@ type VectorStore interface {
 	UpsertPoints(ctx context.Context, collection string, points []QdrantPoint) error
 	DeleteDocumentPoints(ctx context.Context, collection, documentID string) error
 	DeleteCollection(ctx context.Context, collection string) error
-	Search(ctx context.Context, collection string, vector []float64, limit int, filter map[string]any) ([]QdrantSearchPoint, error)
+	SearchHybrid(ctx context.Context, collection string, vector []float64, sparse SparseVector, limit int, filter map[string]any) ([]QdrantSearchPoint, error)
 }
 
 // Executor is the shared authorized inference boundary every embedding
@@ -419,23 +419,89 @@ func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInpu
 	if err != nil {
 		return nil, err
 	}
-	results, err := s.vectorStore.Search(ctx, c.QdrantCollection, vectors[0], input.Limit, filter)
+	results, err := s.vectorStore.SearchHybrid(ctx, c.QdrantCollection, vectors[0], sparseVector(query), input.Limit, filter)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]SearchResult, 0, len(results))
-	for _, result := range results {
-		payload := result.Payload
-		out = append(out, SearchResult{
-			DocumentID: stringFromPayload(payload, "document_id"),
-			ChunkID:    stringFromPayload(payload, "chunk_id"),
-			Score:      result.Score,
-			Content:    stringFromPayload(payload, "content"),
-			FileName:   stringFromPayload(payload, "file_name"),
-			Metadata:   mapFromPayload(payload, "metadata"),
-		})
+	return mergeSearchSections(results, input.Limit), nil
+}
+
+func mergeSearchSections(points []QdrantSearchPoint, limit int) []SearchResult {
+	if limit <= 0 {
+		limit = 5
 	}
-	return out, nil
+	out := make([]SearchResult, 0, len(points))
+	for _, point := range points {
+		p := point.Payload
+		docID := stringFromPayload(p, "document_id")
+		index := intFromPayload(p["chunk_index"])
+		content := stringFromPayload(p, "content")
+		merged := false
+		for i := range out {
+			if out[i].DocumentID != docID {
+				continue
+			}
+			switch {
+			case index == out[i].ChunkEnd+1:
+				out[i].Content += content
+				out[i].ChunkEnd = index
+				merged = true
+			case index == out[i].ChunkStart-1:
+				out[i].Content = content + out[i].Content
+				out[i].ChunkStart = index
+				merged = true
+			}
+			if merged {
+				break
+			}
+		}
+		if merged {
+			continue
+		}
+		if len(out) < limit {
+			out = append(out, SearchResult{
+				DocumentID: docID,
+				ChunkID:    stringFromPayload(p, "chunk_id"),
+				ChunkStart: index,
+				ChunkEnd:   index,
+				Score:      point.Score,
+				Content:    content,
+				SourceURI:  stringFromPayload(p, "source_uri"),
+				FileName:   stringFromPayload(p, "file_name"),
+				Metadata:   mapFromPayload(p, "metadata"),
+			})
+		}
+	}
+	for i := range out {
+		for j := i + 1; j < len(out); {
+			if out[i].DocumentID != out[j].DocumentID || (out[i].ChunkEnd+1 != out[j].ChunkStart && out[j].ChunkEnd+1 != out[i].ChunkStart) {
+				j++
+				continue
+			}
+			if out[j].ChunkStart < out[i].ChunkStart {
+				out[i].Content = out[j].Content + out[i].Content
+				out[i].ChunkStart = out[j].ChunkStart
+			} else {
+				out[i].Content += out[j].Content
+				out[i].ChunkEnd = out[j].ChunkEnd
+			}
+			out = append(out[:j], out[j+1:]...)
+		}
+	}
+	return out
+}
+
+func intFromPayload(value any) int {
+	switch n := value.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	default:
+		return 0
+	}
 }
 
 // ---------------------------------------------------------------------
@@ -686,6 +752,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		points = append(points, QdrantPoint{
 			ID:     pointID,
 			Vector: vectors[i],
+			Sparse: sparseVector(chunkText),
 			Payload: map[string]any{
 				"collection_id":     c.ID,
 				"document_id":       obj.ID,

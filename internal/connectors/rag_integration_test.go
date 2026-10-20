@@ -156,7 +156,7 @@ func (s *connectorVectorStore) DeleteCollection(ctx context.Context, collection 
 	return nil
 }
 
-func (s *connectorVectorStore) Search(ctx context.Context, collection string, vector []float64, limit int, filter map[string]any) ([]rag.QdrantSearchPoint, error) {
+func (s *connectorVectorStore) SearchHybrid(ctx context.Context, collection string, vector []float64, sparse rag.SparseVector, limit int, filter map[string]any) ([]rag.QdrantSearchPoint, error) {
 	out := []rag.QdrantSearchPoint{}
 	for _, point := range s.points[collection] {
 		out = append(out, rag.QdrantSearchPoint{ID: point.ID, Score: 0.99, Payload: point.Payload})

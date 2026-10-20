@@ -187,12 +187,14 @@ func main() {
 
 	qdrantClient := rag.NewQdrantClient(cfg.QdrantURL, cfg.UpstreamTimeout)
 	ragSvc := rag.NewService(ragRepo, qdrantClient, inferenceSvc, cfg.DefaultEmbeddingModel, artifactStore, jobsSvc)
+	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG, ragSvc)
 
 	// Worker: extract and embed job handlers dispatch through the shared
 	// executor — leased fenced claims only, no synchronous provider path.
 	jobsRunner := jobs.NewRunner(jobsSvc, artifactStore, map[string]jobs.HandlerFunc{
 		extract.OperationProcess: extractSvc.JobHandler(),
 		rag.OperationEmbed:       ragSvc.JobHandler(),
+		connectors.OperationSync: connectorSvc.JobHandler(),
 	}, jobs.RunnerConfig{})
 	runnerCtx, stopRunner := context.WithCancel(context.Background())
 	runnerDone := make(chan struct{})
@@ -205,7 +207,6 @@ func main() {
 
 	chatbotSvc := chatbot.NewService(chatbotRepo, promptRepo, ragSvc, inferenceSvc)
 	promptSvc := prompts.NewService(promptRepo, chatbotSvc)
-	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG, ragSvc)
 
 	// Browser dashboard login runs on the server-session handlers from 01-12;
 	// the configured slug resolves per request so `enclava bootstrap` order is free.

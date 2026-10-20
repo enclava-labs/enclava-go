@@ -61,6 +61,10 @@ func (a *App) handleRAGCollectionByID(w http.ResponseWriter, r *http.Request, pr
 	parts := strings.Split(rest, "/")
 	collectionID := parts[0]
 	if len(parts) > 1 {
+		if parts[1] == "search" && len(parts) == 2 {
+			a.handleRAGSearch(w, r, principal, collectionID)
+			return
+		}
 		// 01-22: document ingest is unmounted — the …/documents sub-route
 		// serves metadata GETs only; uploads 404 until executor-backed ingest.
 		if parts[1] == "documents" && len(parts) == 2 && r.Method == http.MethodGet {
@@ -170,7 +174,7 @@ func (a *App) handleRAGDocumentByID(w http.ResponseWriter, r *http.Request, prin
 	}
 }
 
-func (a *App) handleRAGSearch(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
+func (a *App) handleRAGSearch(w http.ResponseWriter, r *http.Request, principal auth.Principal, collectionID string) {
 	if a.ragSvc == nil {
 		WriteOpenAIError(w, http.StatusNotImplemented, "rag is not configured", "server_error", "not_configured")
 		return
@@ -184,6 +188,7 @@ func (a *App) handleRAGSearch(w http.ResponseWriter, r *http.Request, principal 
 		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 		return
 	}
+	input.CollectionID = collectionID
 	results, err := a.ragSvc.Search(r.Context(), principal, input)
 	if err != nil {
 		a.writeRAGNotFoundOrBadRequest(w, err, "rag_search_failed")

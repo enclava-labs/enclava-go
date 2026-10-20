@@ -1,10 +1,15 @@
 package rag_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -40,13 +45,13 @@ func TestQdrantClientIntegration(t *testing.T) {
 	client := rag.NewQdrantClient(qdrantURL, 5*time.Second)
 	collection := "rag_integration_" + ragSafeName()
 	defer func() { _ = client.DeleteCollection(context.Background(), collection) }()
-
 	if err := client.EnsureCollection(ctx, collection, 3); err != nil {
 		t.Fatalf("ensure collection: %v", err)
 	}
 	if err := client.UpsertPoints(ctx, collection, []rag.QdrantPoint{{
 		ID:     ragPointID(),
 		Vector: []float64{0.1, 0.2, 0.3},
+		Sparse: integrationSparse("qdrant integration content"),
 		Payload: map[string]any{
 			"document_id": "doc_qdrant_integration",
 			"chunk_id":    "chunk_qdrant_integration",
@@ -72,6 +77,87 @@ func TestQdrantClientIntegration(t *testing.T) {
 	if len(results) != 0 {
 		t.Fatalf("expected deleted document points to disappear, got %#v", results)
 	}
+}
+
+func TestQdrantHybridAndLegacyIntegration(t *testing.T) {
+	baseURL := envOrFatal(t, "QDRANT_INTEGRATION_URL")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client := rag.NewQdrantClient(baseURL, 5*time.Second)
+	collection := "rag_hybrid_" + ragSafeName()
+	defer func() { _ = client.DeleteCollection(context.Background(), collection) }()
+	if err := client.EnsureCollection(ctx, collection, 2); err != nil {
+		t.Fatalf("ensure hybrid collection: %v", err)
+	}
+	targetID, otherID := ragPointID(), ragPointID()
+	if err := client.UpsertPoints(ctx, collection, []rag.QdrantPoint{
+		{ID: targetID, Vector: []float64{1, 0}, Sparse: integrationSparse("orchid meadow"), Payload: map[string]any{"document_id": "orchid", "tenant_id": "tenant-a"}},
+		{ID: otherID, Vector: []float64{0, 1}, Sparse: integrationSparse("quartz harbor"), Payload: map[string]any{"document_id": "quartz", "tenant_id": "tenant-b"}},
+	}); err != nil {
+		t.Fatalf("upsert hybrid points: %v", err)
+	}
+	filter := map[string]any{"must": []any{map[string]any{"key": "tenant_id", "match": map[string]any{"value": "tenant-a"}}}}
+	for _, tc := range []struct {
+		name   string
+		vector []float64
+		sparse rag.SparseVector
+	}{
+		{"sparse-only terms", []float64{0, 1}, integrationSparse("orchid meadow")},
+		{"dense-only terms", []float64{1, 0}, integrationSparse("unrelated")},
+		{"both", []float64{1, 0}, integrationSparse("orchid meadow")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			results, err := client.SearchHybrid(ctx, collection, tc.vector, tc.sparse, 2, filter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(results) != 1 || results[0].ID != targetID {
+				t.Fatalf("expected authorized orchid point, got %#v", results)
+			}
+		})
+	}
+	legacy := "rag_legacy_" + ragSafeName()
+	defer func() { _ = client.DeleteCollection(context.Background(), legacy) }()
+	create, _ := json.Marshal(map[string]any{"vectors": map[string]any{"size": 2, "distance": "Cosine"}})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, baseURL+"/collections/"+legacy, bytes.NewReader(create))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		t.Fatalf("create legacy collection: %s", resp.Status)
+	}
+	legacyID := ragPointID()
+	if err := client.UpsertPoints(ctx, legacy, []rag.QdrantPoint{{ID: legacyID, Vector: []float64{1, 0}, Payload: map[string]any{"document_id": "legacy"}}}); err != nil {
+		t.Fatalf("upsert legacy point: %v", err)
+	}
+	results, err := client.SearchHybrid(ctx, legacy, []float64{1, 0}, integrationSparse("legacy words"), 1, nil)
+	if err != nil {
+		t.Fatalf("search legacy collection: %v", err)
+	}
+	if len(results) != 1 || results[0].ID != legacyID {
+		t.Fatalf("unexpected legacy search results: %#v", results)
+	}
+}
+
+func integrationSparse(text string) rag.SparseVector {
+	indices := make([]uint32, 0)
+	for _, token := range strings.Fields(text) {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(token))
+		indices = append(indices, h.Sum32())
+	}
+	sort.Slice(indices, func(i, j int) bool { return indices[i] < indices[j] })
+	values := make([]float32, len(indices))
+	for i := range values {
+		values[i] = 1
+	}
+	return rag.SparseVector{Indices: indices, Values: values}
 }
 
 // TestEmbeddingExecutorIntegration indexes a small text fixture end-to-end:

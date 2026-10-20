@@ -163,7 +163,7 @@ func (f *fakeVectorStore) DeleteCollection(ctx context.Context, collection strin
 
 // Search honours the authorization-scoped filter the service passes —
 // points for non-authorized version ids never match.
-func (f *fakeVectorStore) Search(ctx context.Context, collection string, vector []float64, limit int, filter map[string]any) ([]rag.QdrantSearchPoint, error) {
+func (f *fakeVectorStore) SearchHybrid(ctx context.Context, collection string, vector []float64, sparse rag.SparseVector, limit int, filter map[string]any) ([]rag.QdrantSearchPoint, error) {
 	allowed := map[string]bool{}
 	if filter != nil {
 		if must, ok := filter["must"].([]any); ok {
