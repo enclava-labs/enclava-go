@@ -21,6 +21,22 @@ func NewConfidentialSDK(path, provider, origin, key string) (*ConfidentialSDK, e
 	if provider == "" {
 		return nil, errors.New("SDK provider id is required")
 	}
+	b, err := sdkClientConfig(path, provider, key)
+	if err != nil {
+		return nil, err
+	}
+	client, err := ci.NewClient(b)
+	if err != nil {
+		return nil, err
+	}
+	return &ConfidentialSDK{client: client, provider: provider}, nil
+}
+
+// sdkClientConfig loads the shared operator trust config and attaches only the
+// endpoint's tenant-resolved credential. api_keys in the shared file (e.g. env
+// references) are dropped: they would be an ambient credential every tenant's
+// endpoint could use.
+func sdkClientConfig(path, provider, key string) ([]byte, error) {
 	cfg := map[string]any{}
 	if path != "" {
 		b, err := os.ReadFile(path)
@@ -34,24 +50,13 @@ func NewConfidentialSDK(path, provider, origin, key string) (*ConfidentialSDK, e
 			return nil, errors.New("confidential SDK config must be a JSON object")
 		}
 	}
+	delete(cfg, "api_keys")
+	delete(cfg, "allow_inline_api_keys")
 	if key != "" {
 		cfg["allow_inline_api_keys"] = true
-		keys, ok := cfg["api_keys"].(map[string]any)
-		if !ok {
-			keys = map[string]any{}
-		}
-		keys[provider] = map[string]any{"inline": key}
-		cfg["api_keys"] = keys
+		cfg["api_keys"] = map[string]any{provider: map[string]any{"inline": key}}
 	}
-	b, err := json.Marshal(cfg)
-	if err != nil {
-		return nil, err
-	}
-	client, err := ci.NewClient(b)
-	if err != nil {
-		return nil, err
-	}
-	return &ConfidentialSDK{client: client, provider: provider}, nil
+	return json.Marshal(cfg)
 }
 
 func (p *ConfidentialSDK) Close() error { return p.client.Close() }
