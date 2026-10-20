@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -34,14 +35,45 @@ func NewConfidentialSDK(path, provider, origin, key string) (*ConfidentialSDK, e
 	return &ConfidentialSDK{client: client, provider: provider}, nil
 }
 
-// sdkClientConfig loads the shared operator trust config and attaches only the
-// endpoint's tenant-resolved credential. api_keys in the shared file (e.g. env
+// ConfidentialSDKConfigFile resolves the operator trust config for one SDK
+// provider. path may name a single config file used for every provider, or a
+// directory holding one <provider>.json per provider — the form that lets
+// endpoints for different providers, each with its own operator-signed
+// artifacts and policy, run in one process. An empty path stays empty (the
+// bundled demo config).
+func ConfidentialSDKConfigFile(path, provider string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("stat confidential SDK config: %w", err)
+	}
+	if !info.IsDir() {
+		return path, nil
+	}
+	if provider == "" || provider == ".." || provider != filepath.Base(provider) {
+		return "", fmt.Errorf("invalid SDK provider id %q for config directory", provider)
+	}
+	file := filepath.Join(path, provider+".json")
+	if _, err := os.Stat(file); err != nil {
+		return "", fmt.Errorf("confidential SDK config for provider %q: %w", provider, err)
+	}
+	return file, nil
+}
+
+// sdkClientConfig loads the provider's operator trust config and attaches only
+// the endpoint's tenant-resolved credential. api_keys in the file (e.g. env
 // references) are dropped: they would be an ambient credential every tenant's
 // endpoint could use.
 func sdkClientConfig(path, provider, key string) ([]byte, error) {
+	file, err := ConfidentialSDKConfigFile(path, provider)
+	if err != nil {
+		return nil, err
+	}
 	cfg := map[string]any{}
-	if path != "" {
-		b, err := os.ReadFile(path)
+	if file != "" {
+		b, err := os.ReadFile(file)
 		if err != nil {
 			return nil, fmt.Errorf("read confidential SDK config: %w", err)
 		}

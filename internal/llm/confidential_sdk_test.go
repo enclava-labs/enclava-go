@@ -61,6 +61,72 @@ func TestConfidentialSDKConfigUsesOnlyTenantResolvedCredential(t *testing.T) {
 	}
 }
 
+func TestConfidentialSDKConfigFileResolvesPerProvider(t *testing.T) {
+	dir := t.TempDir()
+	tinfoil := filepath.Join(dir, "tinfoil.json")
+	if err := os.WriteFile(tinfoil, []byte(`{"demo_provider":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	single := filepath.Join(dir, "single.json")
+	if err := os.WriteFile(single, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		path, provider, want string
+		wantErr              bool
+	}{
+		{"", "tinfoil", "", false},
+		{single, "tinfoil", single, false},
+		{single, "chutes", single, false},
+		{dir, "tinfoil", tinfoil, false},
+		{dir, "chutes", "", true},
+		{dir, "../escape", "", true},
+		{dir, "..", "", true},
+		{filepath.Join(dir, "missing.json"), "tinfoil", "", true},
+	} {
+		got, err := ConfidentialSDKConfigFile(tc.path, tc.provider)
+		if tc.wantErr != (err != nil) || got != tc.want {
+			t.Fatalf("ConfidentialSDKConfigFile(%q, %q) = %q, %v; want %q, err=%v", tc.path, tc.provider, got, err, tc.want, tc.wantErr)
+		}
+	}
+}
+
+// A config directory gives each provider its own operator trust config, so
+// endpoints for different providers run in one process.
+func TestConfidentialSDKConfigDirectoryLoadsProviderFile(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("chutes.json", `{"demo_provider":true}`)
+	write("tinfoil.json", `{"demo_provider":false}`)
+
+	load := func(provider string) map[string]any {
+		b, err := sdkClientConfig(dir, provider, "tenant-key")
+		if err != nil {
+			t.Fatalf("sdkClientConfig(%s): %v", provider, err)
+		}
+		var cfg map[string]any
+		if err := json.Unmarshal(b, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+	if got := load("chutes")["demo_provider"]; got != true {
+		t.Fatalf("chutes config demo_provider = %v, want its own file (true)", got)
+	}
+	tinfoil := load("tinfoil")
+	if got := tinfoil["demo_provider"]; got != false {
+		t.Fatalf("tinfoil config demo_provider = %v, want its own file (false)", got)
+	}
+	if keys := tinfoil["api_keys"].(map[string]any); len(keys) != 1 || keys["tinfoil"] == nil {
+		t.Fatalf("tinfoil credential must attach under its own provider: %v", keys)
+	}
+}
+
 // Only a definitive provider rejection may settle as an upstream response;
 // anything that might have executed must stay a plain error so the executor
 // retains liability instead of settling it as free.

@@ -518,12 +518,17 @@ func responsesTarget(capability string, req Request) (string, string) {
 func (s *Service) transportFor(ctx context.Context, e Endpoint) (Upstream, error) {
 	sig := transportSignature(e)
 	if e.Protocol == "confidential_sdk" {
-		path := os.Getenv("CONFIDENTIAL_SDK_CONFIG")
-		config, err := os.ReadFile(path)
-		if path != "" && err != nil {
-			return nil, fmt.Errorf("read confidential SDK config: %w", err)
+		file, err := llm.ConfidentialSDKConfigFile(os.Getenv("CONFIDENTIAL_SDK_CONFIG"), e.SDKProvider)
+		if err != nil {
+			return nil, err
 		}
-		sig += "|" + fmt.Sprintf("%x", sha256.Sum256(config))
+		if file != "" {
+			config, err := os.ReadFile(file)
+			if err != nil {
+				return nil, fmt.Errorf("read confidential SDK config: %w", err)
+			}
+			sig += "|" + fmt.Sprintf("%x", sha256.Sum256(config))
+		}
 	}
 	credential, err := s.resolveCredential(e)
 	if err != nil {
