@@ -1,6 +1,10 @@
 package rag
 
-import "time"
+import (
+	"time"
+
+	"enclava-go/internal/source"
+)
 
 const (
 	DocumentStatusProcessing = "processing"
@@ -69,6 +73,10 @@ type DocumentChunk struct {
 	Content       string         `json:"content"`
 	TokenCount    int            `json:"token_count"`
 	QdrantPointID string         `json:"qdrant_point_id,omitempty"`
+	ByteStart     int            `json:"byte_start,omitempty"`
+	ByteEnd       int            `json:"byte_end,omitempty"`
+	SpanRefs      []source.Span  `json:"span_refs,omitempty"`
+	HeaderPath    string         `json:"header_path,omitempty"`
 	Metadata      map[string]any `json:"metadata,omitempty"`
 	CreatedAt     time.Time      `json:"created_at"`
 }
@@ -120,6 +128,7 @@ type SearchResult struct {
 	Content    string         `json:"content"`
 	SourceURI  string         `json:"source_uri,omitempty"`
 	FileName   string         `json:"file_name,omitempty"`
+	HeaderPath string         `json:"header_path,omitempty"`
 	Metadata   map[string]any `json:"metadata,omitempty"`
 }
 

@@ -139,13 +139,28 @@ func TestRAGRepoDocumentProjectionAndGenerations(t *testing.T) {
 		doc.SourceURI != "file:///a.txt" || doc.Metadata["k"] != "v" {
 		t.Fatalf("document projection mismatch: %#v", doc)
 	}
+	parsed := source.Document{
+		Ref: source.ObjectRef{TenantID: tenant, ObjectID: obj.ID, ObservedSeq: 1},
+		Blocks: []source.Block{
+			{ID: "blk_1", Ordinal: 0, Kind: "heading", Text: "Title", ByteStart: 0, ByteEnd: 5, Locator: source.Locator{HeadingLevel: 1}},
+			{ID: "blk_2", Ordinal: 1, Kind: "paragraph", ParentID: "blk_1", Text: "hello", ByteStart: 6, ByteEnd: 11},
+		},
+	}
+	if err := repo.SaveParsedDocument(ctx, "rag-structured-v1", parsed); err != nil {
+		t.Fatalf("save parsed document: %v", err)
+	}
+	var blocks int
+	if err := db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM blocks WHERE tenant_id = $1`, tenant).Scan(&blocks); err != nil || blocks != 2 {
+		t.Fatalf("parsed blocks = %d, %v", blocks, err)
+	}
 	gen, err := repo.NextGeneration(ctx, tenant, "ragcol_1", doc.ObjectVersionID)
 	if err != nil || gen != 1 {
 		t.Fatalf("next generation = %d, %v", gen, err)
 	}
 	chunks := []rag.DocumentChunk{{
 		ID: "chk_1", DocumentID: obj.ID, CollectionID: "ragcol_1",
-		ChunkIndex: 0, Content: "hello", TokenCount: 1,
+		ChunkIndex: 0, Content: "hello", TokenCount: 1, ByteStart: 6, ByteEnd: 11,
+		SpanRefs: []source.Span{{Ref: parsed.Ref, BlockID: "blk_2", ByteStart: 0, ByteEnd: 5}},
 	}}
 	if err := repo.ReplaceVersionChunksAndStage(ctx, tenant, "ragcol_1", obj.ID, doc.ObjectVersionID, 1, gen, "", chunks); err == nil {
 		t.Fatal("expected chunk insert to fail without a bound profile")
@@ -159,6 +174,11 @@ func TestRAGRepoDocumentProjectionAndGenerations(t *testing.T) {
 	}
 	if n, err := repo.ChunkCountForVersion(ctx, tenant, doc.ObjectVersionID); err != nil || n != 1 {
 		t.Fatalf("chunk count = %d, %v", n, err)
+	}
+	roundTrip, err := repo.ListChunks(ctx, tenant, obj.ID, doc.ObjectVersionID)
+	if err != nil || len(roundTrip) != 1 || roundTrip[0].ByteStart != 6 || roundTrip[0].ByteEnd != 11 ||
+		len(roundTrip[0].SpanRefs) != 1 || roundTrip[0].SpanRefs[0].BlockID != "blk_2" {
+		t.Fatalf("chunk spans roundtrip: %#v, %v", roundTrip, err)
 	}
 	if err := repo.MarkGenerationState(ctx, tenant, "ragcol_1", doc.ObjectVersionID, gen, "published"); err != nil {
 		t.Fatalf("publish generation: %v", err)

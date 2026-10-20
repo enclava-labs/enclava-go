@@ -284,6 +284,34 @@ func TestEmbeddingExecutorIntegration(t *testing.T) {
 	if len(results) == 0 || results[0].DocumentID != upload.Document.ID {
 		t.Fatalf("unexpected live results: %#v", results)
 	}
+	markdown, err := svc.UploadDocument(ctx, p, c.ID, rag.UploadDocumentInput{
+		FileName: "sections.md", MimeType: "text/markdown",
+		Bytes: []byte("# Doc\n\n## Section\n\nsectioncite unique marker"),
+	})
+	if err != nil {
+		t.Fatalf("upload markdown: %v", err)
+	}
+	claim, err = jobsSvc.Lease(ctx, "live-worker", time.Minute)
+	if err != nil || claim == nil {
+		t.Fatalf("lease markdown embed job: claim=%v err=%v", claim, err)
+	}
+	resultRef, err = svc.JobHandler()(ctx, claim, nil)
+	if err != nil {
+		_ = claim.Fail(ctx, err, jobs.FailureFatal)
+		t.Fatalf("markdown embed attempt: %v", err)
+	}
+	if _, err := claim.Complete(ctx, resultRef); err != nil {
+		t.Fatalf("complete markdown embed job: %v", err)
+	}
+	citations, err := svc.Search(ctx, p, rag.SearchInput{
+		CollectionID: c.ID, Query: "sectioncite unique marker", Limit: 5,
+	})
+	if err != nil {
+		t.Fatalf("search markdown section: %v", err)
+	}
+	if len(citations) == 0 || citations[0].DocumentID != markdown.Document.ID || citations[0].HeaderPath != "Doc › Section" {
+		t.Fatalf("markdown search citation lacks section path: %#v", citations)
+	}
 }
 
 func ragPointID() string {

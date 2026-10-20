@@ -504,6 +504,49 @@ func (r *RAGRepo) NextGeneration(ctx context.Context, tenantID, collectionID, ve
 	return gen, nil
 }
 
+func (r *RAGRepo) SaveParsedDocument(ctx context.Context, parserVersion string, document source.Document) error {
+	return WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
+		versionID := fmt.Sprintf("%s#%d", document.Ref.ObjectID, document.Ref.ObservedSeq)
+		var existing string
+		err := tx.QueryRowContext(ctx, `
+			SELECT id FROM parsed_documents
+			WHERE tenant_id = $1 AND object_version_id = $2 AND parser = 'rag-structured' AND parser_version = $3
+			ORDER BY created_at DESC LIMIT 1`,
+			document.Ref.TenantID, versionID, parserVersion).Scan(&existing)
+		if err == nil {
+			return nil
+		}
+		if err != sql.ErrNoRows {
+			return fmt.Errorf("find parsed document: %w", err)
+		}
+		id := newPGID("parsed")
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO parsed_documents (tenant_id, id, object_version_id, parser, parser_version, block_count)
+			VALUES ($1, $2, $3, 'rag-structured', $4, $5)`,
+			document.Ref.TenantID, id, versionID, parserVersion, len(document.Blocks)); err != nil {
+			return fmt.Errorf("insert parsed document: %w", err)
+		}
+		for _, block := range document.Blocks {
+			locator, err := json.Marshal(block.Locator)
+			if err != nil {
+				return fmt.Errorf("marshal block locator: %w", err)
+			}
+			var parent any
+			if block.ParentID != "" {
+				parent = block.ParentID
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO blocks (tenant_id, id, parsed_document_id, ordinal, kind, parent_id, text, byte_start, byte_end, locator)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)`,
+				document.Ref.TenantID, block.ID, id, block.Ordinal, block.Kind, parent,
+				block.Text, block.ByteStart, block.ByteEnd, locator); err != nil {
+				return fmt.Errorf("insert parsed block: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
 // ReplaceVersionChunksAndStage is the single transactional publish boundary:
 // prior chunk rows for the version are replaced and the generation row is
 // upserted in 'staging' state, atomically. profileVersionID may be empty at
@@ -517,13 +560,21 @@ func (r *RAGRepo) ReplaceVersionChunksAndStage(ctx context.Context, tenantID, co
 				return fmt.Errorf("clear version chunks: %w", err)
 			}
 			for _, ch := range chunks {
+				spanRefs, err := json.Marshal(ch.SpanRefs)
+				if err != nil {
+					return fmt.Errorf("marshal chunk spans: %w", err)
+				}
+				start, end := ch.ByteStart, ch.ByteEnd
+				if len(ch.SpanRefs) == 0 && end == 0 {
+					end = len(ch.Content)
+				}
 				if _, err := tx.ExecContext(ctx, `
 					INSERT INTO chunks
 					    (tenant_id, id, object_version_id, chunk_profile_version_id,
 					     ordinal, text, byte_start, byte_end, span_refs, owner_actor_id)
-					VALUES ($1, $2, $3, $4, $5, $6, 0, $7, '[]'::jsonb, NULL)`,
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, NULL)`,
 					tenantID, ch.ID, versionID, profileVersionID, ch.ChunkIndex,
-					ch.Content, len(ch.Content)); err != nil {
+					ch.Content, start, end, spanRefs); err != nil {
 					return fmt.Errorf("insert chunk: %w", err)
 				}
 			}
@@ -569,7 +620,8 @@ func (r *RAGRepo) ChunkCountForVersion(ctx context.Context, tenantID, versionID 
 
 func (r *RAGRepo) ListChunks(ctx context.Context, tenantID, objectID, versionID string) ([]rag.DocumentChunk, error) {
 	rows, err := r.db.SQL.QueryContext(ctx, `
-		SELECT k.id, $2, ci.collection_id, k.ordinal, k.text, k.created_at
+		SELECT k.id, $2, ci.collection_id, k.ordinal, k.text, k.created_at,
+		       k.byte_start, k.byte_end, k.span_refs
 		FROM chunks k
 		JOIN source_object_versions v ON v.tenant_id = k.tenant_id AND v.id = k.object_version_id
 		JOIN collection_items ci ON ci.tenant_id = k.tenant_id AND ci.object_id = v.object_id
@@ -583,8 +635,13 @@ func (r *RAGRepo) ListChunks(ctx context.Context, tenantID, objectID, versionID 
 	for rows.Next() {
 		var ch rag.DocumentChunk
 		var collectionID sql.NullString
-		if err := rows.Scan(&ch.ID, &ch.DocumentID, &collectionID, &ch.ChunkIndex, &ch.Content, &ch.CreatedAt); err != nil {
+		var spans []byte
+		if err := rows.Scan(&ch.ID, &ch.DocumentID, &collectionID, &ch.ChunkIndex, &ch.Content, &ch.CreatedAt,
+			&ch.ByteStart, &ch.ByteEnd, &spans); err != nil {
 			return nil, err
+		}
+		if err := json.Unmarshal(spans, &ch.SpanRefs); err != nil {
+			return nil, fmt.Errorf("decode chunk spans: %w", err)
 		}
 		ch.CollectionID = collectionID.String
 		ch.QdrantPointID = ch.ID

@@ -197,9 +197,11 @@ type Span struct {
 // Locator retains real location metadata a source format supplies. Never
 // fabricate fields a source format cannot supply.
 type Locator struct {
-	Page    *int   `json:"page,omitempty"`
-	Box     string `json:"box,omitempty"`
-	Table   string `json:"table,omitempty"`
-	Clause  string `json:"clause,omitempty"`
-	Section string `json:"section,omitempty"`
+	Page         *int   `json:"page,omitempty"`
+	Box          string `json:"box,omitempty"`
+	Table        string `json:"table,omitempty"`
+	Clause       string `json:"clause,omitempty"`
+	Section      string `json:"section,omitempty"`
+	HeadingLevel int    `json:"heading_level,omitempty"`
+	Language     string `json:"language,omitempty"`
 }
