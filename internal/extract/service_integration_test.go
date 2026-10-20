@@ -151,6 +151,15 @@ func (f fixture) seedTemplate(t *testing.T, tpl extract.Template) {
 // dispatches under.
 func (f fixture) putPrice(t *testing.T, model string, unit billing.UnitKind, rateMicros int64) {
 	t.Helper()
+	f.putPriceRow(t, model, unit, rateMicros)
+	// Estimates always bound cached input like input, so both rates are needed.
+	if unit == billing.UnitInput {
+		f.putPriceRow(t, model, billing.UnitCachedInput, rateMicros)
+	}
+}
+
+func (f fixture) putPriceRow(t *testing.T, model string, unit billing.UnitKind, rateMicros int64) {
+	t.Helper()
 	err := f.billing.PutPrice(context.Background(), f.tenant, "price_"+model+"_"+string(unit), billing.Price{
 		SubjectType:   billing.PriceSubjectModel,
 		SubjectID:     model,

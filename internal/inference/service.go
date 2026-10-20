@@ -177,6 +177,14 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 	if req.Stream && capability == CapabilityEmbeddings {
 		return nil, ErrUnsupportedCapability
 	}
+	// Any prompt token can come back as cached input, which bills under its
+	// own rate (CONTRACTS: explicit billable units, no implicit free units).
+	// Declaring the bound here makes Reserve fail closed when the endpoint
+	// has no cached-input price, instead of dispatching and stranding the
+	// settlement in unknown liability when the provider reports cache hits.
+	if req.Estimate.CachedInputUnits < req.Estimate.InputUnits {
+		req.Estimate.CachedInputUnits = req.Estimate.InputUnits
+	}
 	if err := checkEstimate(capability, req.Estimate); err != nil {
 		return nil, err
 	}

@@ -171,6 +171,15 @@ func (f *openaiFx) mustEndpoint(t *testing.T, id string, caps []string) {
 
 func (f *openaiFx) price(t *testing.T, endpointID, capability string, unit billing.UnitKind, micros, qty int64) {
 	t.Helper()
+	f.putPriceRow(t, endpointID, capability, unit, micros, qty)
+	// Estimates always bound cached input like input, so both rates are needed.
+	if unit == billing.UnitInput {
+		f.putPriceRow(t, endpointID, capability, billing.UnitCachedInput, micros, qty)
+	}
+}
+
+func (f *openaiFx) putPriceRow(t *testing.T, endpointID, capability string, unit billing.UnitKind, micros, qty int64) {
+	t.Helper()
 	id := fmt.Sprintf("price-%s-%s-%s-%d", endpointID, capability, unit, time.Now().UnixNano())
 	if err := f.brepo.PutPrice(context.Background(), f.tenant, id, billing.Price{
 		SubjectType: billing.PriceSubjectEndpoint, SubjectID: endpointID,

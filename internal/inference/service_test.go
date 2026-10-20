@@ -183,8 +183,18 @@ func (f *fx) price(t *testing.T, capability string, unit billing.UnitKind, micro
 	f.priceFor(t, "ep-1", capability, unit, micros, qty)
 }
 
-// priceFor installs one endpoint-scoped rate row for a given endpoint.
+// priceFor installs one endpoint-scoped rate row for a given endpoint. An
+// input rate also seeds cached input at the same rate: the executor's
+// estimates always bound cached input like input, so both rates are required.
 func (f *fx) priceFor(t *testing.T, endpointID, capability string, unit billing.UnitKind, micros, qty int64) {
+	t.Helper()
+	f.putPriceRow(t, endpointID, capability, unit, micros, qty)
+	if unit == billing.UnitInput {
+		f.putPriceRow(t, endpointID, capability, billing.UnitCachedInput, micros, qty)
+	}
+}
+
+func (f *fx) putPriceRow(t *testing.T, endpointID, capability string, unit billing.UnitKind, micros, qty int64) {
 	t.Helper()
 	id := fmt.Sprintf("p-%s-%s-%s-%d", endpointID, capability, unit, fixtureSeq.Add(1))
 	if err := f.brepo.PutPrice(f.ctx, f.tenant, id, billing.Price{
@@ -305,6 +315,27 @@ func TestMissingPriceBlocksDispatch(t *testing.T) {
 	}
 	if n := f.reservationCount(t); n != 0 {
 		t.Fatalf("failed reserve left %d reservations", n)
+	}
+}
+
+// Estimates bound cached input like input, so an endpoint without a
+// cached-input rate must refuse dispatch up front: a provider reporting
+// cache hits would otherwise strand settlement in unknown liability
+// (observed live against Chutes).
+func TestMissingCachedInputPriceBlocksDispatch(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.putPriceRow(t, "ep-1", inference.CapabilityChat, billing.UnitInput, 1, 1)
+	f.putPriceRow(t, "ep-1", inference.CapabilityChat, billing.UnitOutput, 2, 1)
+	// Cached-input price deliberately absent.
+
+	_, err := f.svc.Execute(f.ctx, f.principal,
+		f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if !errors.Is(err, billing.ErrPriceMissing) {
+		t.Fatalf("expected ErrPriceMissing, got %v", err)
+	}
+	if f.upstream.calls != 0 {
+		t.Fatal("missing cached-input price must prevent dispatch")
 	}
 }
 

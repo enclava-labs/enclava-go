@@ -112,6 +112,11 @@ func usageFromMap(u map[string]any) billing.Usage {
 		"input_tokens": true, "prompt_tokens": true,
 		"output_tokens": true, "completion_tokens": true,
 		"total_tokens": true, "cached_tokens": true,
+		// Breakdown of completion/output tokens (OpenAI nests it under
+		// completion_tokens_details; vLLM/SGLang-based providers report it
+		// top level). Already billed as output — counting it again would
+		// double-charge, and leaving it unpriced would strand settlement.
+		"reasoning_tokens": true,
 	}
 	for k, v := range u {
 		if consumed[k] || strings.HasSuffix(k, "_details") {

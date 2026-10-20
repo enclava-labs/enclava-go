@@ -123,7 +123,7 @@ func newChatFixture(t *testing.T, searcher *fakeRAGSearcher, upstream *fakeChatU
 	}); err != nil {
 		t.Fatalf("create endpoint: %v", err)
 	}
-	for _, unit := range []billing.UnitKind{billing.UnitInput, billing.UnitOutput} {
+	for _, unit := range []billing.UnitKind{billing.UnitInput, billing.UnitOutput, billing.UnitCachedInput} {
 		if err := billingRepo.PutPrice(ctx, tenantA,
 			fmt.Sprintf("p-chat-%s-%d", unit, time.Now().UnixNano()),
 			billing.Price{

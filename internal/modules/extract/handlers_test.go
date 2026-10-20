@@ -79,7 +79,7 @@ func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 	}
 	// Seed rates for the vision capability the attempt dispatches under.
 	billingRepo := postgres.NewBillingRepo(db)
-	for _, u := range []billing.UnitKind{billing.UnitInput, billing.UnitOutput} {
+	for _, u := range []billing.UnitKind{billing.UnitInput, billing.UnitOutput, billing.UnitCachedInput} {
 		if err := billingRepo.PutPrice(ctx, tenant, "price_"+string(u), billing.Price{
 			SubjectType: billing.PriceSubjectModel, SubjectID: "priced-extract",
 			Capability: inference.CapabilityVision, Unit: u,

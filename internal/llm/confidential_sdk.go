@@ -105,17 +105,31 @@ func (p *ConfidentialSDK) CreateChatCompletion(ctx context.Context, body []byte)
 		return nil, ctx.Err()
 	}
 	if err != nil {
-		return nil, &UpstreamError{StatusCode: 502, Message: err.Error()}
+		return nil, sdkOperationError(err)
 	}
 	verdict, ok := result["verdict"].(map[string]any)
 	if !ok || verdict["status"] != "verified" {
-		return nil, &UpstreamError{StatusCode: 502, Message: "confidential SDK verdict not verified"}
+		// The provider already executed this request: not a definitive
+		// rejection, so liability must stay retained, never settle as free.
+		return nil, errors.New("confidential SDK verdict not verified after execution")
 	}
 	response, ok := result["response"]
 	if !ok {
-		return nil, &UpstreamError{StatusCode: 502, Message: "confidential SDK response missing"}
+		return nil, errors.New("confidential SDK response missing after execution")
 	}
 	return json.Marshal(response)
+}
+
+// sdkOperationError maps an SDK failure onto the executor's accounting
+// contract: only a definitive provider rejection is an UpstreamError (settled
+// with its reported usage). Never-dispatched and unknown outcomes stay plain
+// errors so the executor retains liability instead of settling them as free.
+func sdkOperationError(err error) error {
+	var sdkErr *ci.Error
+	if errors.As(err, &sdkErr) && sdkErr.Dispatch == ci.DispatchRejected && sdkErr.HTTPStatus > 0 {
+		return &UpstreamError{StatusCode: sdkErr.HTTPStatus, Message: sdkErr.Message}
+	}
+	return fmt.Errorf("confidential SDK: %w", err)
 }
 
 func (p *ConfidentialSDK) CreateChatCompletionStream(context.Context, []byte) (io.ReadCloser, error) {

@@ -3,9 +3,12 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+
+	ci "github.com/enclava-labs/confidential-inference-sdk/bindings/go"
 )
 
 func TestConfidentialSDKInvalidConfigFailsConstruction(t *testing.T) {
@@ -54,6 +57,30 @@ func TestConfidentialSDKConfigUsesOnlyTenantResolvedCredential(t *testing.T) {
 	}
 	if cfg["demo_provider"] != false {
 		t.Fatalf("operator trust settings were not preserved: %s", withCredential)
+	}
+}
+
+// Only a definitive provider rejection may settle as an upstream response;
+// anything that might have executed must stay a plain error so the executor
+// retains liability instead of settling it as free.
+func TestSDKOperationErrorAccountingMapping(t *testing.T) {
+	for _, tc := range []struct {
+		err        *ci.Error
+		wantStatus int
+	}{
+		{&ci.Error{Status: ci.StatusOperationFailed, Code: "provider_chat_failed", Dispatch: ci.DispatchRejected, HTTPStatus: 429}, 429},
+		{&ci.Error{Status: ci.StatusOperationFailed, Code: "provider_chat_failed", Dispatch: ci.DispatchUnknown}, 0},
+		{&ci.Error{Status: ci.StatusOperationFailed, Code: "policy_denied", Dispatch: ci.DispatchNotDispatched}, 0},
+		{&ci.Error{Status: ci.StatusPending, Code: "operation_timeout", Dispatch: ci.DispatchUnknown}, 0},
+	} {
+		var upstream *UpstreamError
+		got := sdkOperationError(tc.err)
+		if isUpstream := errors.As(got, &upstream); isUpstream != (tc.wantStatus > 0) {
+			t.Fatalf("%s/%s: upstream=%v, want %v", tc.err.Code, tc.err.Dispatch, isUpstream, tc.wantStatus > 0)
+		}
+		if tc.wantStatus > 0 && upstream.StatusCode != tc.wantStatus {
+			t.Fatalf("status = %d, want %d", upstream.StatusCode, tc.wantStatus)
+		}
 	}
 }
 

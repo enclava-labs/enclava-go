@@ -48,6 +48,23 @@ func TestUsageFromJSONUnrecognizedUnitsAreNotFree(t *testing.T) {
 	}
 }
 
+// Chutes/vLLM report reasoning_tokens top level as a subset of
+// completion_tokens (observed live: completion 6 incl. reasoning 1). It must
+// bill once as output — neither a second unit nor an unpriced one.
+func TestUsageFromJSONTopLevelReasoningTokensAreOutputBreakdown(t *testing.T) {
+	body := `{"usage":{"prompt_tokens":18,"completion_tokens":6,"reasoning_tokens":1,"total_tokens":24,"prompt_tokens_details":{"cached_tokens":3}}}`
+	u, ok := usageFromJSON([]byte(body))
+	if !ok {
+		t.Fatal("usage not parsed")
+	}
+	if u.InputUnits != 15 || u.CachedInputUnits != 3 || u.OutputUnits != 6 {
+		t.Fatalf("units wrong: %+v", u)
+	}
+	if len(u.OtherUnits) != 0 {
+		t.Fatalf("reasoning tokens billed as a separate unit: %+v", u.OtherUnits)
+	}
+}
+
 func TestUsageFromJSONMissingUsage(t *testing.T) {
 	if _, ok := usageFromJSON([]byte(`{"id":"c1"}`)); ok {
 		t.Fatal("missing usage must report unknown, not zero")

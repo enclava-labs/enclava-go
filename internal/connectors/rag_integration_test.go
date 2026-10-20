@@ -98,6 +98,13 @@ func newConnectorExecutor(t *testing.T, db *postgres.DB, tenant string) *inferen
 	}, "tester", time.Now().UTC().Add(-time.Minute)); err != nil {
 		t.Fatalf("put price: %v", err)
 	}
+	if err := billingRepo.PutPrice(ctx, tenant, "p-embed-cached", billing.Price{
+		SubjectType: billing.PriceSubjectEndpoint, SubjectID: "ep-embed",
+		Capability: inference.CapabilityEmbeddings, Unit: billing.UnitCachedInput,
+		RateMicros: 1, UnitQuantity: 1, Currency: "USD",
+	}, "tester", time.Now().UTC().Add(-time.Minute)); err != nil {
+		t.Fatalf("put price: %v", err)
+	}
 	svc, err := inference.NewService(inference.Deps{
 		Endpoints:  endpoints,
 		Sources:    sources,
