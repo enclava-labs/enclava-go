@@ -62,7 +62,7 @@ func sdkClientConfig(path, provider, key string) ([]byte, error) {
 func (p *ConfidentialSDK) Close() error { return p.client.Close() }
 
 func (p *ConfidentialSDK) Supports(capability string) bool {
-	return capability == "chat/completions" || capability == "vision"
+	return capability == "chat/completions" || capability == "vision" || capability == "embeddings"
 }
 
 func (p *ConfidentialSDK) VerifyAttestation(ctx context.Context) (AttestationStatus, error) {
@@ -89,6 +89,20 @@ func (p *ConfidentialSDK) AttestationStatus() AttestationStatus {
 }
 
 func (p *ConfidentialSDK) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
+	return p.execute(ctx, body, func(req any, timeout time.Duration) (map[string]any, error) {
+		return p.client.Chat(req, timeout)
+	})
+}
+
+func (p *ConfidentialSDK) CreateEmbeddings(ctx context.Context, body []byte) ([]byte, error) {
+	return p.execute(ctx, body, func(req any, timeout time.Duration) (map[string]any, error) {
+		return p.client.Embeddings(req, timeout)
+	})
+}
+
+// execute runs one blocking SDK operation under the caller's deadline and
+// enforces the verified-verdict contract on its result.
+func (p *ConfidentialSDK) execute(ctx context.Context, body []byte, call func(any, time.Duration) (map[string]any, error)) ([]byte, error) {
 	var req any
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, err
@@ -100,7 +114,7 @@ func (p *ConfidentialSDK) CreateChatCompletion(ctx context.Context, body []byte)
 			return nil, ctx.Err()
 		}
 	}
-	result, err := p.client.Chat(req, timeout)
+	result, err := call(req, timeout)
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
@@ -133,9 +147,6 @@ func sdkOperationError(err error) error {
 }
 
 func (p *ConfidentialSDK) CreateChatCompletionStream(context.Context, []byte) (io.ReadCloser, error) {
-	return nil, errors.New("unsupported capability")
-}
-func (p *ConfidentialSDK) CreateEmbeddings(context.Context, []byte) ([]byte, error) {
 	return nil, errors.New("unsupported capability")
 }
 func (p *ConfidentialSDK) DoResponsesRequest(context.Context, string, string, []byte) ([]byte, error) {

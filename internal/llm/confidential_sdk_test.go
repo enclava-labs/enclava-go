@@ -86,11 +86,12 @@ func TestSDKOperationErrorAccountingMapping(t *testing.T) {
 
 func TestConfidentialSDKUnsupportedCapabilities(t *testing.T) {
 	p := &ConfidentialSDK{}
-	if !p.Supports("chat/completions") || p.Supports("embeddings") || p.Supports("responses") {
+	if !p.Supports("chat/completions") || !p.Supports("embeddings") || p.Supports("responses") {
 		t.Fatal("capability support declaration is incorrect")
 	}
+	// Embeddings now go through the SDK; a nil client only fails at call time.
 	if _, err := p.CreateEmbeddings(context.Background(), nil); err == nil {
-		t.Fatal("embeddings unexpectedly supported")
+		t.Fatal("embeddings on a nil-client transport must fail")
 	}
 	if _, err := p.DoResponsesRequest(context.Background(), "POST", "/responses", nil); err == nil {
 		t.Fatal("responses unexpectedly supported")
