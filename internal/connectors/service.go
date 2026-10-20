@@ -499,6 +499,7 @@ func (s *Service) syncDocuments(ctx context.Context, p auth.Principal, source So
 			Metadata: map[string]any{
 				"connector_source_id": source.ID,
 				"connector_type":      source.Type,
+				"source_revision":     doc.Revision,
 			},
 		}); err != nil {
 			return map[string]any{"uploaded_documents": uploaded}, checkpoint, err
@@ -536,6 +537,7 @@ type connectorDocument struct {
 	Content   string
 	SourceID  string
 	SourceURI string
+	Revision  string
 }
 
 func (s *Service) documentsForSource(ctx context.Context, source Source) ([]connectorDocument, string, map[string]any, error) {
@@ -589,6 +591,12 @@ func (s *Service) fetchAPIDocuments(ctx context.Context, source Source) ([]conne
 		return s.fetchSlackDocuments(ctx, source)
 	case SourceTypeNotion:
 		docs, err := s.fetchNotionDocuments(ctx, source)
+		return docs, nil, err
+	case SourceTypeTeams:
+		docs, err := s.fetchTeamsDocuments(ctx, source)
+		return docs, nil, err
+	case SourceTypeGoogleDrive:
+		docs, err := s.fetchGoogleDriveDocuments(ctx, source)
 		return docs, nil, err
 	default:
 		return nil, nil, errors.New("unsupported connector source type")
@@ -995,11 +1003,12 @@ func connectorRequiresCredential(source Source) bool {
 		return false
 	}
 	switch source.Type {
-	case SourceTypeSlack, SourceTypeNotion:
+	case SourceTypeSlack, SourceTypeNotion, SourceTypeTeams, SourceTypeGoogleDrive:
 		return true
 	default:
 		return false
 	}
+
 }
 
 var connectorCredentialRefPattern = regexp.MustCompile(`^CONNECTOR_(GITHUB|SLACK|TEAMS|NOTION|GOOGLE_DRIVE)_[A-Z0-9_]+$`)
