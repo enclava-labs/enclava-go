@@ -710,31 +710,34 @@ func (s *Service) fetchSlackDocuments(ctx context.Context, source Source) ([]con
 	if !payload.OK {
 		return nil, nil, fmt.Errorf("slack conversations.history failed: %s", firstNonEmpty(payload.Error, "unknown_error"))
 	}
-	var b strings.Builder
+	// One document per message: the retrieval unit is the individual message,
+	// so an incremental sync adds new messages without replacing the indexed
+	// history of earlier ones. Thread relationships are a follow-up.
 	latestTS := strings.TrimSpace(stringFromAny(nonNilMap(source.Checkpoint)["slack_latest_ts"]))
+	documents := make([]connectorDocument, 0, len(payload.Messages))
 	for _, msg := range payload.Messages {
 		latestTS = maxSlackTimestamp(latestTS, msg.TS)
 		text := strings.TrimSpace(msg.Text)
 		if text == "" {
 			continue
 		}
-		_, _ = fmt.Fprintf(&b, "[%s %s] %s\n", msg.TS, msg.User, text)
+		documents = append(documents, connectorDocument{
+			FileName:  "slack-" + channelID + "-" + msg.TS + ".txt",
+			MimeType:  "text/plain",
+			Content:   fmt.Sprintf("[%s %s] %s", msg.TS, msg.User, text),
+			SourceID:  "slack:" + channelID + ":" + msg.TS,
+			SourceURI: "slack://channel/" + channelID + "/" + msg.TS,
+			Revision:  msg.TS,
+		})
 	}
 	checkpoint := map[string]any{}
 	if latestTS != "" {
 		checkpoint["slack_latest_ts"] = latestTS
 	}
-	content := strings.TrimSpace(b.String())
-	if content == "" {
+	if len(documents) == 0 {
 		return nil, checkpoint, nil
 	}
-	return []connectorDocument{{
-		FileName:  "slack-" + channelID + ".txt",
-		MimeType:  "text/plain",
-		Content:   content,
-		SourceID:  "slack:" + channelID,
-		SourceURI: "slack://channel/" + channelID,
-	}}, checkpoint, nil
+	return documents, checkpoint, nil
 }
 
 func (s *Service) fetchNotionDocuments(ctx context.Context, source Source) ([]connectorDocument, error) {

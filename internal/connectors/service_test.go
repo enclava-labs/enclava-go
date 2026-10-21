@@ -472,8 +472,8 @@ func TestSyncSlackSourceUsesTimestampCheckpoint(t *testing.T) {
 	if err := f.runNextJob(t); err != nil {
 		t.Fatalf("run second: %v", err)
 	}
-	if len(f.uploader.uploads) != 1 {
-		t.Fatalf("expected no new slack upload, got %d", len(f.uploader.uploads))
+	if len(f.uploader.uploads) != 2 {
+		t.Fatalf("expected one upload per message and no new ones, got %d", len(f.uploader.uploads))
 	}
 	updated, err := f.svc.GetSource(ctx, f.principal, src.ID)
 	if err != nil {
