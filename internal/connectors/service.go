@@ -36,6 +36,9 @@ type Repository interface {
 	UpdateConnection(ctx context.Context, c source.Connection) error
 	DeleteConnection(ctx context.Context, tenantID, id string) error
 	SetSyncState(ctx context.Context, tenantID, id string, syncedAt time.Time, syncStatus, syncError string) error
+	// ListSyncCandidates feeds the scheduler: active connections with a
+	// target collection, oldest-synced first, across tenants.
+	ListSyncCandidates(ctx context.Context, limit int) ([]source.Connection, error)
 }
 
 // RAGUploader is the rag ingest surface the sync attempt hands observed
@@ -51,6 +54,7 @@ type RAGUploader interface {
 type JobReader interface {
 	GetOwnedJob(ctx context.Context, tenantID, id, submitterKey string) (jobs.JobRow, error)
 	ListOwnedJobs(ctx context.Context, tenantID, submitterKey string, limit int) ([]jobs.JobRow, error)
+	ListConnectionJobs(ctx context.Context, tenantID, connectionID, status string, limit int) ([]jobs.JobRow, error)
 }
 
 type Service struct {
@@ -288,6 +292,17 @@ func (s *Service) DeleteSource(ctx context.Context, p auth.Principal, id string)
 // the handler. Idempotency binds tenant + connection + config identity.
 
 func (s *Service) SyncSource(ctx context.Context, p auth.Principal, sourceID string) (SyncJob, error) {
+	return s.syncSource(ctx, p, sourceID, 0)
+}
+
+// SyncSourceWindowed enqueues a scheduled sync whose idempotency key carries
+// the schedule window, so each interval produces one job instead of deduping
+// into the previous (already succeeded) manual/scheduled job.
+func (s *Service) SyncSourceWindowed(ctx context.Context, p auth.Principal, sourceID string, window int64) (SyncJob, error) {
+	return s.syncSource(ctx, p, sourceID, window)
+}
+
+func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID string, window int64) (SyncJob, error) {
 	if err := requireTenant(p); err != nil {
 		return SyncJob{}, err
 	}
@@ -306,10 +321,14 @@ func (s *Service) SyncSource(ctx context.Context, p auth.Principal, sourceID str
 		return SyncJob{}, fmt.Errorf("hash connection config: %w", err)
 	}
 	sum := sha256.Sum256(append(cfgBytes, []byte("\x00"+conn.CredentialRef)...))
+	key := "connector.sync:" + conn.ID + ":" + hex.EncodeToString(sum[:])
+	if window != 0 {
+		key += ":w" + strconv.FormatInt(window, 10)
+	}
 	job, _, err := s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
 		TenantID:       p.TenantID,
 		Operation:      OperationSync,
-		IdempotencyKey: "connector.sync:" + conn.ID + ":" + hex.EncodeToString(sum[:]),
+		IdempotencyKey: key,
 		Subject:        jobs.Subject{ConnectionID: conn.ID},
 		InputRef:       conn.ID,
 		InputHash:      hex.EncodeToString(sum[:]),
@@ -351,7 +370,16 @@ func (s *Service) ListSyncJobs(ctx context.Context, p auth.Principal, sourceID, 
 	if limit <= 0 {
 		limit = 25
 	}
-	rows, err := s.jobRows.ListOwnedJobs(ctx, p.TenantID, jobs.SubmitterKey(p), limit*4+offset)
+	var rows []jobs.JobRow
+	var err error
+	if wanted := strings.TrimSpace(sourceID); wanted != "" {
+		// Scheduled syncs run under the scheduler's principal; a source-scoped
+		// listing must show them to the source's managers, not just the last
+		// manual submitter.
+		rows, err = s.jobRows.ListConnectionJobs(ctx, p.TenantID, wanted, status, limit+offset)
+	} else {
+		rows, err = s.jobRows.ListOwnedJobs(ctx, p.TenantID, jobs.SubmitterKey(p), limit*4+offset)
+	}
 	if err != nil {
 		return nil, err
 	}

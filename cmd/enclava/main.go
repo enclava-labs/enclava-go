@@ -205,6 +205,14 @@ func main() {
 		}
 	}()
 
+	// Scheduled connector syncs: per-source sync_interval (default 1h, min
+	// 5m, "off" disables) re-enqueues connector.sync for due sources.
+	schedulerDone := make(chan struct{})
+	go func() {
+		defer close(schedulerDone)
+		connectors.NewScheduler(connectorSvc).Run(runnerCtx)
+	}()
+
 	chatbotSvc := chatbot.NewService(chatbotRepo, promptRepo, ragSvc, inferenceSvc)
 	promptSvc := prompts.NewService(promptRepo, chatbotSvc)
 
@@ -268,6 +276,7 @@ func main() {
 	// Drain order: runner first (releases fenced leases / requeues), then HTTP.
 	stopRunner()
 	<-runnerDone
+	<-schedulerDone
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {

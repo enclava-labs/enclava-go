@@ -158,6 +158,51 @@ func (r *SourceRepo) ListConnections(ctx context.Context, tenantID string) ([]so
 	return out, rows.Err()
 }
 
+// ListSyncCandidates returns active connections with a target collection,
+// oldest-synced first, across tenants — the scheduler's work list. Interval
+// filtering happens in the scheduler (per-source config).
+func (r *SourceRepo) ListSyncCandidates(ctx context.Context, limit int) ([]source.Connection, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := r.db.SQL.QueryContext(ctx, `
+		SELECT tenant_id::text, id, kind, name, credential_ref, config,
+		       target_collection_id, audience_default, status, created_by,
+		       synced_at, sync_status, sync_error
+		FROM connections
+		WHERE status = 'active' AND target_collection_id IS NOT NULL
+		ORDER BY COALESCE(synced_at, created_at) ASC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list sync candidates: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []source.Connection
+	for rows.Next() {
+		var c source.Connection
+		var config, audience []byte
+		var target, createdBy, syncStatus, syncError sql.NullString
+		var syncedAt sql.NullTime
+		if err := rows.Scan(&c.TenantID, &c.ID, &c.Kind, &c.Name, &c.CredentialRef,
+			&config, &target, &audience, &c.Status, &createdBy,
+			&syncedAt, &syncStatus, &syncError); err != nil {
+			return nil, fmt.Errorf("scan sync candidate: %w", err)
+		}
+		_ = json.Unmarshal(config, &c.Config)
+		c.TargetCollectionID = target.String
+		c.AudienceDefault = scanJSONList(audience)
+		c.CreatedBy = createdBy.String
+		if syncedAt.Valid {
+			t := syncedAt.Time
+			c.SyncedAt = &t
+		}
+		c.SyncStatus = syncStatus.String
+		c.SyncError = syncError.String
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 func (r *SourceRepo) UpdateConnectionStatus(ctx context.Context, tenantID, id, status string) error {
 	res, err := r.db.SQL.ExecContext(ctx,
 		`UPDATE connections SET status = $3 WHERE tenant_id = $1 AND id = $2`,

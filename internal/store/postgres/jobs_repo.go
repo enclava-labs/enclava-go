@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -227,6 +228,39 @@ func (r *JobsRepo) ListOwnedJobs(ctx context.Context, tenantID, submitterKey str
 		LIMIT $3`, tenantID, submitterKey, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list jobs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := []jobs.JobRow{}
+	for rows.Next() {
+		row, err := scanJobRow(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan job: %w", err)
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// ListConnectionJobs lists a connection's non-deleted jobs regardless of
+// submitter — scheduled syncs run under the scheduler's principal, and the
+// source's managers must still see them. Tenant + connection scoping is the
+// authorization boundary.
+func (r *JobsRepo) ListConnectionJobs(ctx context.Context, tenantID, connectionID, status string, limit int) ([]jobs.JobRow, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := `
+		SELECT ` + jobColumns + ` FROM jobs
+		WHERE tenant_id = $1 AND connection_id = $2 AND deleted_at IS NULL`
+	args := []any{tenantID, connectionID}
+	if status != "" {
+		query += ` AND status = $3`
+		args = append(args, status)
+	}
+	query += ` ORDER BY submitted_at DESC, id DESC LIMIT ` + strconv.Itoa(limit)
+	rows, err := r.db.SQL.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list connection jobs: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	out := []jobs.JobRow{}
