@@ -47,6 +47,7 @@ type Repository interface {
 	RemoveCollectionItem(ctx context.Context, tenantID, collectionID, objectID string) error
 	ListCollectionItems(ctx context.Context, tenantID, collectionID string) ([]string, error)
 	ListDocuments(ctx context.Context, tenantID, collectionID string, limit, offset int) ([]Document, error)
+	LiveCollectionSourceIDs(ctx context.Context, tenantID, collectionID string) (map[string]struct{}, error)
 	GetDocument(ctx context.Context, tenantID, objectID string) (Document, error)
 	DeleteObjectRows(ctx context.Context, tenantID, objectID string) error
 
@@ -286,6 +287,17 @@ func (s *Service) ListDocuments(ctx context.Context, p auth.Principal, collectio
 		return nil, err
 	}
 	return s.repo.ListDocuments(ctx, p.TenantID, c.ID, limit, offset)
+}
+
+// LiveSourceIDs returns the source ids still present in the collection, so a
+// caller driving incremental ingest can distinguish "unchanged" from
+// "deleted since last sync".
+func (s *Service) LiveSourceIDs(ctx context.Context, p auth.Principal, collectionID string) (map[string]struct{}, error) {
+	c, err := s.GetCollection(ctx, p, collectionID)
+	if err != nil {
+		return nil, err
+	}
+	return s.repo.LiveCollectionSourceIDs(ctx, p.TenantID, c.ID)
 }
 
 func (s *Service) DownloadDocument(ctx context.Context, p auth.Principal, documentID string) (Document, []byte, error) {

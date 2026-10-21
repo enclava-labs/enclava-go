@@ -486,6 +486,32 @@ func (r *RAGRepo) DeleteObjectRows(ctx context.Context, tenantID, objectID strin
 	})
 }
 
+// LiveCollectionSourceIDs returns the native source ids currently present in
+// a collection (not deleted or tombstoned). Connector syncs use it so an
+// unchanged-content skip never fires for a document the operator deleted —
+// the next sync must recreate it.
+func (r *RAGRepo) LiveCollectionSourceIDs(ctx context.Context, tenantID, collectionID string) (map[string]struct{}, error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `
+		SELECT o.native_id FROM source_objects o
+		JOIN collection_items ci ON ci.tenant_id = o.tenant_id AND ci.object_id = o.id
+		WHERE o.tenant_id = $1 AND ci.collection_id = $2
+		  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL`,
+		tenantID, collectionID)
+	if err != nil {
+		return nil, fmt.Errorf("live collection source ids: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := make(map[string]struct{})
+	for rows.Next() {
+		var nativeID string
+		if err := rows.Scan(&nativeID); err != nil {
+			return nil, fmt.Errorf("live collection source ids: %w", err)
+		}
+		out[nativeID] = struct{}{}
+	}
+	return out, rows.Err()
+}
+
 // ---------------------------------------------------------------------
 // Generations + chunks
 

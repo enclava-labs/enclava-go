@@ -21,6 +21,26 @@ import (
 
 type fakeRAGUploader struct {
 	uploads []rag.UploadDocumentInput
+	// live simulates the collection's present documents; nil means "track
+	// uploads automatically". deleted removes an id from the live set.
+	live    map[string]struct{}
+	deleted map[string]struct{}
+}
+
+func (f *fakeRAGUploader) LiveSourceIDs(ctx context.Context, p auth.Principal, collectionID string) (map[string]struct{}, error) {
+	if f.live == nil {
+		f.live = map[string]struct{}{}
+		for _, u := range f.uploads {
+			f.live[u.SourceID] = struct{}{}
+		}
+	}
+	out := make(map[string]struct{}, len(f.live))
+	for id := range f.live {
+		if _, gone := f.deleted[id]; !gone {
+			out[id] = struct{}{}
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeRAGUploader) UploadDocument(ctx context.Context, p auth.Principal, collectionID string, input rag.UploadDocumentInput) (rag.UploadDocumentOutput, error) {
@@ -362,6 +382,74 @@ func TestSyncGitHubSourceFetchesFiles(t *testing.T) {
 	if f.uploader.uploads[0].SourceType != SourceTypeGitHub || f.uploader.uploads[0].SourceID != "github:acme/docs:README.md" {
 		t.Fatalf("unexpected github source metadata: %#v", f.uploader.uploads[0])
 	}
+}
+
+func TestSyncReingestsDeletedDocument(t *testing.T) {
+	f := newConnectorFixture(t)
+	ctx := context.Background()
+	f.svc.setAllowPrivateBaseURL(true)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		writeTestJSON(t, w, map[string]any{
+			"ok": true,
+			"messages": []any{
+				map[string]any{"user": "U1", "text": "deleted doc returns", "ts": "2000.000001"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	src, err := f.svc.CreateSource(ctx, f.principal, CreateSourceInput{
+		Type:               SourceTypeSlack,
+		Name:               "Deleted Doc",
+		TargetCollectionID: "ragcol_test",
+		CredentialRef:      "CONNECTOR_SLACK_TOKEN",
+		Config:             map[string]any{"base_url": server.URL, "channel_id": "C777"},
+	})
+	if err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	bump := func(v string) {
+		t.Helper()
+		if _, err := f.svc.UpdateSource(ctx, f.principal, src.ID, UpdateSourceInput{
+			Config: map[string]any{"base_url": server.URL, "channel_id": "C777", "bump": v},
+		}); err != nil {
+			t.Fatalf("bump %s: %v", v, err)
+		}
+	}
+	sync := func() {
+		t.Helper()
+		if _, err := f.svc.SyncSource(ctx, f.principal, src.ID); err != nil {
+			t.Fatalf("sync: %v", err)
+		}
+		if err := f.runNextJob(t); err != nil {
+			t.Fatalf("run job: %v", err)
+		}
+	}
+	t.Setenv("CONNECTOR_SLACK_TOKEN", "slack-token")
+
+	sync()
+	if len(f.uploader.uploads) != 1 {
+		t.Fatalf("first sync should upload once, got %d", len(f.uploader.uploads))
+	}
+	bump("v2")
+	sync()
+	if len(f.uploader.uploads) != 1 {
+		t.Fatalf("unchanged existing document must skip, got %d uploads", len(f.uploader.uploads))
+	}
+	// Operator deletes the document; identical upstream content must now be
+	// re-ingested by the next sync instead of skipped forever.
+	if f.uploader.deleted == nil {
+		f.uploader.deleted = map[string]struct{}{}
+	}
+	f.uploader.deleted["slack:C777:2000.000001"] = struct{}{}
+	bump("v3")
+	sync()
+	if len(f.uploader.uploads) != 2 {
+		t.Fatalf("deleted document must be re-ingested, got %d uploads", len(f.uploader.uploads))
+	}
+	_ = requests
 }
 
 func TestSyncSlackSourceFetchesChannelHistory(t *testing.T) {

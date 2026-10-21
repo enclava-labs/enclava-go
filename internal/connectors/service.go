@@ -42,6 +42,9 @@ type Repository interface {
 // documents to. The principal is the frozen job principal — never forged.
 type RAGUploader interface {
 	UploadDocument(ctx context.Context, p auth.Principal, collectionID string, input rag.UploadDocumentInput) (rag.UploadDocumentOutput, error)
+	// LiveSourceIDs lets an unchanged-content skip fire only for documents
+	// that still exist; a deleted document must be re-ingested.
+	LiveSourceIDs(ctx context.Context, p auth.Principal, collectionID string) (map[string]struct{}, error)
 }
 
 // JobReader is the owner-bound durable job view for SyncStatus/ListJobs.
@@ -468,6 +471,7 @@ func (s *Service) syncDocuments(ctx context.Context, p auth.Principal, source So
 	previousHashes := stringMapFromAny(nonNilMap(source.Checkpoint)["document_hashes"])
 	nextHashes := copyStringMap(previousHashes)
 	uploaded := 0
+	var live map[string]struct{}
 	skippedUnchanged := 0
 	for i, doc := range documents {
 		fileName := strings.TrimSpace(doc.FileName)
@@ -485,9 +489,19 @@ func (s *Service) syncDocuments(ctx context.Context, p auth.Principal, source So
 		sourceID := firstNonEmpty(doc.SourceID, fileName)
 		hash := contentHash(content)
 		if !forceFullSync && previousHashes[sourceID] == hash {
-			nextHashes[sourceID] = hash
-			skippedUnchanged++
-			continue
+			// Unchanged content skips only while the document still exists;
+			// an operator deletion must be re-ingested by the next sync.
+			if live == nil {
+				live, err = s.rag.LiveSourceIDs(ctx, p, source.TargetCollectionID)
+				if err != nil {
+					return map[string]any{"uploaded_documents": uploaded}, checkpoint, fmt.Errorf("live source ids: %w", err)
+				}
+			}
+			if _, stillPresent := live[sourceID]; stillPresent {
+				nextHashes[sourceID] = hash
+				skippedUnchanged++
+				continue
+			}
 		}
 		if _, err := s.rag.UploadDocument(ctx, p, source.TargetCollectionID, rag.UploadDocumentInput{
 			FileName:   fileName,
