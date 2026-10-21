@@ -142,8 +142,22 @@ func (a *App) handleRAGDocumentByID(w http.ResponseWriter, r *http.Request, prin
 	parts := strings.Split(rest, "/")
 	documentID := parts[0]
 	if len(parts) > 1 {
-		// 01-22: reprocess dispatch is unmounted — embedding-producing work
-		// returns when executor-backed ingest lands.
+		// Executor-backed ingest landed with rag.embed; reprocess restages a
+		// document (new generation) and re-enqueues — the operator recovery
+		// for a terminal-unknown embed (e.g. worker loss mid-dispatch).
+		if parts[1] == "reprocess" && len(parts) == 2 && r.Method == http.MethodPost {
+			if !auth.HasScope(principal, "rag.manage") {
+				WriteForbidden(w, "missing required scope: rag.manage")
+				return
+			}
+			out, err := a.ragSvc.ReprocessDocument(r.Context(), principal, documentID)
+			if err != nil {
+				writeRAGNotFoundOrError(w, err, "rag_document_reprocess_failed")
+				return
+			}
+			WriteJSON(w, http.StatusAccepted, out)
+			return
+		}
 		WriteOpenAIError(w, http.StatusNotFound, "rag route not found", "invalid_request_error", "not_found")
 		return
 	}
