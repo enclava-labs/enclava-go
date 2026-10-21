@@ -4,6 +4,13 @@ FROM golang:1.26.4-alpine AS build
 
 WORKDIR /src
 
+# go.mod replaces the SDK binding with a dev-machine checkout at
+# ../enclava-proxy-sdk/...; provide the pinned upstream at that path so
+# container builds resolve the same module revision.
+RUN apk add --no-cache git ca-certificates \
+	&& git clone --quiet https://github.com/enclava-labs/confidential-inference-sdk /enclava-proxy-sdk/confidential-inference-sdk \
+	&& git -C /enclava-proxy-sdk/confidential-inference-sdk checkout --quiet cfcaae5c337a7bfdeef85ed7e060f4ea21fe5117
+
 COPY go.mod go.sum ./
 RUN go mod download
 
