@@ -101,29 +101,47 @@ func (s *Scheduler) Run(ctx context.Context) {
 }
 
 func (s *Scheduler) runOnce(ctx context.Context) {
-	conns, err := s.svc.repo.ListSyncCandidates(ctx, 500)
-	if err != nil {
-		log.Printf("connector scheduler: list candidates: %v", err)
-		return
-	}
 	now := time.Now().UTC()
-	for _, c := range conns {
-		if ctx.Err() != nil {
+	// Page through candidates: disabled or not-yet-due sources at the head
+	// (oldest synced first) must not consume the window and starve later
+	// due ones. Each tick walks bounded pages; remaining pages come back on
+	// the next tick.
+	const pageSize = 500
+	const maxPages = 10
+	for range maxPages {
+		conns, err := s.svc.repo.ListSyncCandidates(ctx, pageSize)
+		if err != nil {
+			log.Printf("connector scheduler: list candidates: %v", err)
 			return
 		}
-		var syncedAt time.Time
-		if c.SyncedAt != nil {
-			syncedAt = *c.SyncedAt
+		dueSeen := false
+		for _, c := range conns {
+			if ctx.Err() != nil {
+				return
+			}
+			var syncedAt time.Time
+			if c.SyncedAt != nil {
+				syncedAt = *c.SyncedAt
+			}
+			if !syncDue(c.Config, syncedAt, now) {
+				continue
+			}
+			dueSeen = true
+			// The job runs as the source's creator: authority the creator
+			// still holds. If they lost the collection, the sync fails
+			// honestly.
+			p := auth.Principal{TenantID: c.TenantID, ActorID: c.CreatedBy}
+			interval, _ := parseSyncInterval(c.Config)
+			if _, err := s.svc.SyncSourceWindowed(ctx, p, c.ID, now.Unix()/int64(interval/time.Second)); err != nil {
+				log.Printf("connector scheduler: sync %s: %v", c.ID, err)
+			}
 		}
-		if !syncDue(c.Config, syncedAt, now) {
-			continue
-		}
-		// The job runs as the source's creator: authority the creator still
-		// holds. If they lost the collection, the sync fails honestly.
-		p := auth.Principal{TenantID: c.TenantID, ActorID: c.CreatedBy}
-		interval, _ := parseSyncInterval(c.Config)
-		if _, err := s.svc.SyncSourceWindowed(ctx, p, c.ID, now.Unix()/int64(interval/time.Second)); err != nil {
-			log.Printf("connector scheduler: sync %s: %v", c.ID, err)
+		if len(conns) < pageSize || !dueSeen {
+			// Exhausted the list, or the head of the window had no due
+			// sources to advance past — nothing further this tick. shortcut:
+			// without dueSeen paging cannot make progress, since enqueueing
+			// refreshes synced_at only for due sources.
+			return
 		}
 	}
 }
