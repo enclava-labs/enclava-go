@@ -12,10 +12,13 @@ import (
 
 var ErrDeletePending = errors.New("extract deletion pending cancellation")
 
-// CancelJob requests worker cancellation without requiring inference admission.
 func (s *Service) CancelJob(ctx context.Context, p auth.Principal, id string) error {
-	if _, err := s.jobRows.GetOwnedJob(ctx, p.TenantID, id, jobs.SubmitterKey(p)); err != nil {
+	row, err := s.jobRows.GetOwnedJob(ctx, p.TenantID, id, jobs.SubmitterKey(p))
+	if err != nil {
 		return mapNotFound(err)
+	}
+	if row.Operation != OperationProcess && row.Operation != OperationVision {
+		return ErrNotFound
 	}
 	if err := s.jobs.Cancel(ctx, p, id); err != nil {
 		return mapNotFound(err)
@@ -29,6 +32,9 @@ func (s *Service) DeleteJob(ctx context.Context, p auth.Principal, id string) er
 	row, err := s.jobRows.GetOwnedJob(ctx, p.TenantID, id, jobs.SubmitterKey(p))
 	if err != nil {
 		return mapNotFound(err)
+	}
+	if row.Operation != OperationProcess && row.Operation != OperationVision {
+		return ErrNotFound
 	}
 	switch row.Status {
 	case jobs.StatusQueued, jobs.StatusRunning:

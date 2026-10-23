@@ -564,6 +564,9 @@ func (s *Service) GetJob(ctx context.Context, p auth.Principal, jobID string) (J
 	if err != nil {
 		return JobDetail{}, mapNotFound(err)
 	}
+	if row.Operation != OperationProcess && row.Operation != OperationVision {
+		return JobDetail{}, ErrNotFound
+	}
 	view := jobView(row)
 	detail := JobDetail{Job: view}
 	if row.ResultRef == "" {
