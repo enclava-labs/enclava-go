@@ -1,0 +1,167 @@
+package extract
+
+import (
+	"strings"
+	"testing"
+	"unicode/utf8"
+
+	"enclava-go/internal/source"
+)
+
+func TestChunkPreservesClauseParentAndExactSpans(t *testing.T) {
+	ref := source.ObjectRef{TenantID: "tenant", ObjectID: "object", ObservedSeq: 1}
+	doc := source.Document{Ref: ref, Blocks: []source.Block{
+		{ID: "h", Ordinal: 0, Kind: "heading", Text: "Exceptions", ByteStart: 0, ByteEnd: 10},
+		{ID: "c1", Ordinal: 1, Kind: "paragraph", ParentID: "h", Text: "1. The rule applies.", ByteStart: 11, ByteEnd: 31, Locator: source.Locator{Clause: "1"}},
+		{ID: "c2", Ordinal: 2, Kind: "paragraph", ParentID: "h", Text: "1. The rule applies.", ByteStart: 32, ByteEnd: 52, Locator: source.Locator{Clause: "1(a)"}},
+	}}
+	profile := source.ChunkProfile{ID: "cpv1", ProfileID: "legal", Version: 1, SizeCodePoints: 64,
+		BoundaryStrategy: "clause", IncludeParents: true, TableHandling: "atomic", PreserveClauses: true}
+	chunks, err := Chunk(doc, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 2 || chunks[0].Text != "Exceptions\n1. The rule applies." || chunks[1].Text != chunks[0].Text {
+		t.Fatalf("clauses/parent context were not retained: %#v", chunks)
+	}
+	if chunks[0].ID == chunks[1].ID || chunks[0].Spans[len(chunks[0].Spans)-1].BlockID == chunks[1].Spans[len(chunks[1].Spans)-1].BlockID {
+		t.Fatalf("similar clauses must retain distinct identities: %#v", chunks)
+	}
+	for _, chunk := range chunks {
+		for _, span := range chunk.Spans {
+			var found bool
+			for _, block := range doc.Blocks {
+				if span.BlockID == block.ID {
+					found = true
+					if span.ByteStart < 0 || span.ByteEnd > len(block.Text) || block.Text[span.ByteStart:span.ByteEnd] == "" {
+						t.Fatalf("span does not resolve inside source block: %+v", span)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("fabricated block reference: %+v", span)
+			}
+		}
+	}
+}
+
+func TestChunkUnicodeBoundsOverlapAndWarnings(t *testing.T) {
+	ref := source.ObjectRef{TenantID: "tenant", ObjectID: "object", ObservedSeq: 4}
+	text := "A🙂é界B🙂é界C"
+	table := "header\nrow one\nrow two"
+	doc := source.Document{Ref: ref, Blocks: []source.Block{
+		{ID: "long", Kind: "paragraph", Text: text, ByteStart: 10, ByteEnd: 10 + len(text)},
+		{ID: "table", Kind: "table", Text: table, ByteStart: 100, ByteEnd: 100 + len(table)},
+	}}
+	profile := source.ChunkProfile{ID: "cpv2", ProfileID: "doc", Version: 2, SizeCodePoints: 5,
+		OverlapCodePoints: 2, BoundaryStrategy: "paragraph", TableHandling: "atomic"}
+	chunks, err := Chunk(doc, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) < 4 {
+		t.Fatalf("long Unicode blocks should split: %#v", chunks)
+	}
+	for _, chunk := range chunks {
+		if !utf8.ValidString(chunk.Text) || utf8.RuneCountInString(chunk.Text) > profile.SizeCodePoints {
+			t.Fatalf("chunk is invalid UTF-8 or exceeds code-point size: %q", chunk.Text)
+		}
+		for _, span := range chunk.Spans {
+			var block source.Block
+			for _, b := range doc.Blocks {
+				if b.ID == span.BlockID {
+					block = b
+					break
+				}
+			}
+			part := block.Text[span.ByteStart:span.ByteEnd]
+			if part == "" || !utf8.ValidString(part) {
+				t.Fatalf("invalid source slice for span %+v", span)
+			}
+		}
+	}
+	if chunks[0].Spans[0].ByteEnd == chunks[1].Spans[0].ByteStart {
+		t.Fatal("expected overlap spans to repeat exact source bytes")
+	}
+	foundWarning := false
+	for _, chunk := range chunks {
+		for _, warning := range chunk.Warnings {
+			if strings.Contains(warning, "split") {
+				foundWarning = true
+			}
+		}
+	}
+	if !foundWarning {
+		t.Fatal("oversized clause/table should expose a split warning")
+	}
+}
+
+func TestChunkSkipsTablesAndRejectsInvalidOffsets(t *testing.T) {
+	ref := source.ObjectRef{TenantID: "tenant", ObjectID: "object", ObservedSeq: 1}
+	doc := source.Document{Ref: ref, Blocks: []source.Block{{ID: "t", Kind: "table", Text: "cell", ByteStart: 0, ByteEnd: 4}}}
+	profile := source.ChunkProfile{ID: "cpv1", ProfileID: "doc", Version: 1, SizeCodePoints: 8,
+		BoundaryStrategy: "paragraph", TableHandling: "skip"}
+	chunks, err := Chunk(doc, profile)
+	if err != nil || len(chunks) != 0 {
+		t.Fatalf("skip table: chunks=%v err=%v", chunks, err)
+	}
+	doc.Blocks[0].ByteStart = -1
+	profile.TableHandling = "atomic"
+	if _, err := Chunk(doc, profile); err == nil {
+		t.Fatal("invalid source offsets must be rejected")
+	}
+}
+
+func TestChunkTableRowWiseKeepsRowsTogether(t *testing.T) {
+	ref := source.ObjectRef{TenantID: "tenant", ObjectID: "table-doc", ObservedSeq: 1}
+	text := "h\nr1\nr2"
+	doc := source.Document{Ref: ref, Blocks: []source.Block{{ID: "table", Kind: "table", Text: text, ByteStart: 0, ByteEnd: len(text)}}}
+	profile := source.ChunkProfile{ID: "cpv", ProfileID: "table", Version: 1,
+		SizeCodePoints: 5, BoundaryStrategy: "paragraph", TableHandling: "row-wise"}
+	chunks, err := Chunk(doc, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 2 || chunks[0].Text != "h\nr1\n" || chunks[1].Text != "h\nr2" {
+		t.Fatalf("table rows should remain intact with header context: %#v", chunks)
+	}
+}
+
+func TestChunkBoundaryStrategyControlsGrouping(t *testing.T) {
+	ref := source.ObjectRef{TenantID: "tenant", ObjectID: "doc", ObservedSeq: 1}
+	doc := source.Document{Ref: ref, Blocks: []source.Block{
+		{ID: "h", Kind: "heading", Text: "Title", ByteStart: 0, ByteEnd: 5},
+		{ID: "p", Kind: "paragraph", ParentID: "h", Text: "Body", ByteStart: 6, ByteEnd: 10},
+	}}
+	profile := source.ChunkProfile{ID: "head-v1", ProfileID: "head", Version: 1,
+		SizeCodePoints: 20, BoundaryStrategy: "heading", TableHandling: "atomic"}
+	headings, err := Chunk(doc, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.ID, profile.ProfileID, profile.BoundaryStrategy = "paragraph-v1", "paragraph", "paragraph"
+	paragraphs, err := Chunk(doc, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(headings) != 1 || headings[0].Text != "Title\nBody" || len(paragraphs) != 2 {
+		t.Fatalf("boundary controls did not affect grouping: heading=%#v paragraph=%#v", headings, paragraphs)
+	}
+}
+
+func TestChunkClauseAttachesAvailableFootnote(t *testing.T) {
+	ref := source.ObjectRef{TenantID: "tenant", ObjectID: "legal", ObservedSeq: 1}
+	doc := source.Document{Ref: ref, Blocks: []source.Block{
+		{ID: "clause", Kind: "paragraph", Text: "The exception applies.", ByteStart: 0, ByteEnd: 22, Locator: source.Locator{Clause: "4,footnote:7"}},
+		{ID: "note", Kind: "paragraph", Text: "Subject to notice.", ByteStart: 23, ByteEnd: 41, Locator: source.Locator{Clause: "footnote:7"}},
+	}}
+	profile := source.ChunkProfile{ID: "legal-v1", ProfileID: "legal", Version: 1,
+		SizeCodePoints: 64, BoundaryStrategy: "clause", TableHandling: "atomic", PreserveClauses: true}
+	chunks, err := Chunk(doc, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 1 || chunks[0].Text != "The exception applies.\nSubject to notice." || len(chunks[0].Spans) != 2 {
+		t.Fatalf("available referenced footnote was not attached: %#v", chunks)
+	}
+}

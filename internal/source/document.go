@@ -32,6 +32,7 @@ type Chunk struct {
 	Text          string
 	Spans         []Span
 	ParentChunkID string
+	Warnings      []string
 }
 
 // ChunkProfile is one immutable, versioned processing profile. Sizes and
@@ -44,7 +45,7 @@ type ChunkProfile struct {
 	Version            int    // monotonic within ProfileID
 	SizeCodePoints     int
 	OverlapCodePoints  int
-	BoundaryStrategy   string // e.g. paragraph|sentence|heading|clause
+	BoundaryStrategy   string // fixed|heading|clause|paragraph|message|thread|code_lines
 	IncludeParents     bool
 	TableHandling      string // e.g. atomic|row-wise|skip
 	PreserveClauses    bool   // legal profiles keep clause/subsection context
