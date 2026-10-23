@@ -8,6 +8,16 @@ This documents the selected Go application as composed today. It is an implement
 
 Local users, roles, credentials, API keys and sessions are tenant-owned PostgreSQL records. Local account creation is administrator-controlled through the bootstrap/identity flows; there is no public signup. OIDC identities are bound by issuer and subject, and account linking requires an authenticated explicit flow. Session revocation is checked server-side. Public API credentials are verified against stored identity rows; request-supplied tenant/actor fields do not establish authority. Cookie-authenticated mutations use CSRF protection.
 
+## Structured document processing and previews
+
+The canonical parser in `internal/extract` accepts plain text, Markdown, HTML, CSV, JSON/JSONL, DOCX, PDF, and PNG images. PDF processing uses Poppler (`pdfinfo`, `pdftotext -bbox`, and `pdftoppm`); OCR uses Tesseract with installed language data. Startup probes the required `bubblewrap`/`prlimit` sandbox, Poppler binaries, Tesseract, and available OCR languages. Missing tools or isolation do not stop startup, but affected PDF/OCR work returns an explicit unavailable error instead of fabricated extraction.
+
+Native children run with a cleared environment, no network namespace, read-only system binaries, and only a private scratch directory writable. `prlimit` bounds CPU to 30 seconds, address space to 512 MiB, child processes to 16, and individual files to 16 MiB; native output is capped at 16 MiB. PDF input is capped at 100 pages and image input at 40 million pixels. Parser input is capped at 32 MiB; preview uploads use `MAX_UPLOAD_SIZE_MB` (default 15 MiB) and remain subject to the parser limit. DOCX expanded content and preview result reads are capped at 64 MiB.
+
+Chunk profiles are immutable versions: `id` identifies the version, while `profile_id` and `version` identify its family and sequence. Profile size and overlap are Unicode code points, not bytes or tokens. Result spans are UTF-8 byte ranges within extracted block text, not offsets into the original compressed file; page, clause, table, parent, thread, and line locations are shown only when the parser has them. Preview uses the same parser and chunker as downstream processing.
+
+Authenticated profile reads are `GET /api/v1/document-profiles` and `GET /api/v1/document-profiles/{immutable_version_id}`. The preview lifecycle is `POST /api/v1/document-previews` (bounded multipart `file` plus `chunk_profile_version_id`), `GET /api/v1/document-previews/{id}` (queued/running/succeeded/failed/cancelled/unknown status), `GET /api/v1/document-previews/{id}/result`, `GET /api/v1/document-previews/{id}/original` (owner-authorized retained upload), and `POST /api/v1/document-previews/{id}/cancel`. These owner-scoped routes use durable jobs and artifacts and do not require Qdrant or an inference endpoint. `/dashboard/documents` is an authenticated embedded review surface; it only reads/selects existing versions and submits previews. Profile creation and edits remain API-only.
+
 ## Selected public inference API
 
 Only these public inference paths are mounted; there is no generic upstream catch-all or `/api/v1` inference alias:
