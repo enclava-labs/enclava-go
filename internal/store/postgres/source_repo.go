@@ -511,6 +511,27 @@ func (r *SourceRepo) LatestObjectVersion(ctx context.Context, tenantID, objectID
 	return ver, nil
 }
 
+func (r *SourceRepo) GetObjectVersionByArtifact(ctx context.Context, tenantID, artifactRef string) (source.Object, source.ObjectVersion, error) {
+	var objectID string
+	var seq int64
+	err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT object_id, observed_seq FROM source_object_versions
+		WHERE tenant_id = $1 AND artifact_ref = $2`,
+		tenantID, artifactRef).Scan(&objectID, &seq)
+	if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+		return source.Object{}, source.ObjectVersion{}, source.ErrDenied
+	}
+	if err != nil {
+		return source.Object{}, source.ObjectVersion{}, fmt.Errorf("find object version by artifact: %w", err)
+	}
+	object, err := r.GetObject(ctx, tenantID, objectID)
+	if err != nil {
+		return source.Object{}, source.ObjectVersion{}, err
+	}
+	version, err := r.GetObjectVersion(ctx, tenantID, objectID, seq)
+	return object, version, err
+}
+
 // ---------------------------------------------------------------------
 // Identities, groups, memberships
 
