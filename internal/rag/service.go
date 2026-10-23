@@ -482,6 +482,7 @@ func (s *Service) processNewDocument(ctx context.Context, p auth.Principal, c Co
 		MimeType:         input.MimeType,
 		OriginalFilename: input.FileName,
 		Provenance:       string(prov),
+		Restrictions:     input.Restrictions,
 	}
 	if err := s.repo.InsertObjectVersion(ctx, p.TenantID, ver); err != nil {
 		return UploadDocumentOutput{}, err
@@ -607,6 +608,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	if len(document.Blocks) == 0 {
 		return "", errors.New("document has no extractable text")
 	}
+	document = applyConnectorStructure(document, obj, ver.Provenance)
 	parserVersion := "extract-v1"
 	if err := s.repo.SaveParsedDocument(ctx, parserVersion, document); err != nil {
 		return "", err

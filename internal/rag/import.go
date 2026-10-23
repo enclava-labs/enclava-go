@@ -41,6 +41,10 @@ func (s *Service) ImportArtifact(ctx context.Context, p auth.Principal, input Im
 	if err != nil || s.authorizer.CanReadVersion(ctx, p, object, version, source.ReadOptions{}) != nil {
 		return UploadDocumentOutput{}, source.ErrDenied
 	}
+	restrictions, err := s.authorizer.EffectiveRestrictions(ctx, object, &version, input.ArtifactRef)
+	if err != nil {
+		return UploadDocumentOutput{}, err
+	}
 	reader, err := s.artifacts.Read(ctx, artifacts.Ref{TenantID: p.TenantID, ID: input.ArtifactRef, Kind: artifacts.KindOriginal})
 	if err != nil {
 		return UploadDocumentOutput{}, source.ErrDenied
@@ -54,6 +58,7 @@ func (s *Service) ImportArtifact(ctx context.Context, p auth.Principal, input Im
 		FileName: version.OriginalFilename, MimeType: version.MimeType, Bytes: data,
 		SourceType: "import", SourceID: input.ArtifactRef, ProvenanceKind: "upload",
 		InputArtifact: input.ArtifactRef, Audience: []string{p.ActorID},
+		Restrictions: []source.SourceRestriction{restrictions},
 	})
 }
 
@@ -78,13 +83,25 @@ func (s *Service) ImportStoredResult(ctx context.Context, p auth.Principal, inpu
 	if err != nil || job.Status != "succeeded" || result.Status != "succeeded" || result.ResultRef == "" || result.InputRef == "" || result.Operation != "document.preview" {
 		return UploadDocumentOutput{}, source.ErrDenied
 	}
+	var restrictions []source.SourceRestriction
 	object, version, sourceErr := s.repo.FindArtifactObjectVersion(ctx, p.TenantID, result.InputRef)
 	if sourceErr == nil {
 		if s.authorizer.CanReadVersion(ctx, p, object, version, source.ReadOptions{}) != nil {
 			return UploadDocumentOutput{}, source.ErrDenied
 		}
+		effective, err := s.authorizer.EffectiveRestrictions(ctx, object, &version, result.InputRef)
+		if err != nil {
+			return UploadDocumentOutput{}, err
+		}
+		restrictions = append(restrictions, effective)
 	} else if !errors.Is(sourceErr, source.ErrDenied) {
 		return UploadDocumentOutput{}, sourceErr
+	} else {
+		rows, err := s.repo.RestrictionsForSubject(ctx, p.TenantID, source.RestrictionArtifact, result.InputRef)
+		if err != nil {
+			return UploadDocumentOutput{}, err
+		}
+		restrictions = rows
 	}
 	reader, err := s.artifacts.Read(ctx, artifacts.Ref{TenantID: p.TenantID, ID: result.ResultRef, Kind: artifacts.KindResult})
 	if err != nil {
@@ -99,7 +116,7 @@ func (s *Service) ImportStoredResult(ctx context.Context, p auth.Principal, inpu
 		FileName: "generated-result.txt", MimeType: "text/plain", Bytes: data,
 		SourceType: "generated", SourceID: input.ResultJobID, ProvenanceKind: "generated",
 		InputArtifact: result.InputRef, ResultJobID: input.ResultJobID,
-		ResultArtifact: result.ResultRef, Audience: []string{p.ActorID},
+		ResultArtifact: result.ResultRef, Audience: []string{p.ActorID}, Restrictions: restrictions,
 	})
 }
 

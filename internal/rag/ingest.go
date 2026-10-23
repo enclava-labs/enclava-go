@@ -56,10 +56,13 @@ func (s *Service) IngestJobHandler() jobs.HandlerFunc {
 			return "", source.ErrDenied
 		}
 		var observed struct {
-			Filename string `json:"filename"`
-			MIMEType string `json:"mime_type"`
-			NativeID string `json:"native_id"`
-			URL      string `json:"url"`
+			Filename       string         `json:"filename"`
+			MIMEType       string         `json:"mime_type"`
+			NativeID       string         `json:"native_id"`
+			ParentNativeID string         `json:"parent_native_id"`
+			Kind           string         `json:"kind"`
+			URL            string         `json:"url"`
+			Locator        source.Locator `json:"locator"`
 		}
 		if payload, ok := job.Policy["observation_payload"]; ok {
 			b, _ := json.Marshal(payload)
@@ -74,11 +77,14 @@ func (s *Service) IngestJobHandler() jobs.HandlerFunc {
 		if err := claim.MarkDispatched(ctx); err != nil {
 			return "", err
 		}
-		provenance, err := json.Marshal(map[string]string{
-			"connection_id": job.Subject.ConnectionID,
-			"source_kind":   fmt.Sprint(job.Policy["source_kind"]),
-			"native_id":     observed.NativeID,
-			"source_uri":    observed.URL,
+		provenance, err := json.Marshal(map[string]any{
+			"connection_id":    job.Subject.ConnectionID,
+			"source_kind":      fmt.Sprint(job.Policy["source_kind"]),
+			"native_id":        observed.NativeID,
+			"parent_native_id": observed.ParentNativeID,
+			"kind":             observed.Kind,
+			"source_uri":       observed.URL,
+			"locator":          observed.Locator,
 		})
 		if err != nil {
 			return "", fmt.Errorf("rag ingest: encode connector provenance: %w", err)
@@ -109,4 +115,32 @@ func (s *Service) IngestJobHandler() jobs.HandlerFunc {
 		}
 		return versionID, nil
 	}
+}
+func applyConnectorStructure(document source.Document, object source.Object, raw string) source.Document {
+	var metadata struct {
+		ConnectionID string         `json:"connection_id"`
+		Kind         string         `json:"kind"`
+		Locator      source.Locator `json:"locator"`
+	}
+	if json.Unmarshal([]byte(raw), &metadata) != nil || metadata.ConnectionID == "" {
+		return document
+	}
+	for i := range document.Blocks {
+		block := &document.Blocks[i]
+		if object.ParentObjectID != "" {
+			block.ParentID = object.ParentObjectID
+		}
+		block.Locator = metadata.Locator
+		switch metadata.Kind {
+		case "message", "teams_chat_message":
+			block.Kind = "message"
+		case "page", "block":
+			if block.Kind == "paragraph" || block.Kind == "" {
+				block.Kind = "heading"
+			}
+		case "table", "sheet":
+			block.Kind = "table"
+		}
+	}
+	return document
 }

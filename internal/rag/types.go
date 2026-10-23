@@ -122,18 +122,19 @@ type UpdateCollectionInput struct {
 }
 
 type UploadDocumentInput struct {
-	FileName       string         `json:"file_name"`
-	MimeType       string         `json:"mime_type"`
-	Bytes          []byte         `json:"-"`
-	SourceType     string         `json:"source_type,omitempty"`
-	SourceID       string         `json:"source_id,omitempty"`
-	SourceURI      string         `json:"source_uri,omitempty"`
-	Metadata       map[string]any `json:"metadata,omitempty"`
-	ProvenanceKind string         `json:"-"`
-	InputArtifact  string         `json:"-"`
-	ResultJobID    string         `json:"-"`
-	ResultArtifact string         `json:"-"`
-	Audience       []string       `json:"-"`
+	FileName       string                     `json:"file_name"`
+	MimeType       string                     `json:"mime_type"`
+	Bytes          []byte                     `json:"-"`
+	SourceType     string                     `json:"source_type,omitempty"`
+	SourceID       string                     `json:"source_id,omitempty"`
+	SourceURI      string                     `json:"source_uri,omitempty"`
+	Metadata       map[string]any             `json:"metadata,omitempty"`
+	ProvenanceKind string                     `json:"-"`
+	InputArtifact  string                     `json:"-"`
+	ResultJobID    string                     `json:"-"`
+	ResultArtifact string                     `json:"-"`
+	Audience       []string                   `json:"-"`
+	Restrictions   []source.SourceRestriction `json:"-"`
 }
 
 type SearchInput struct {
