@@ -40,9 +40,8 @@ func NewTeamsAdapter(connection source.Connection, resolver *auth.SecretResolver
 	if base == "" {
 		base = teamsGraph
 	}
-	u, err := url.Parse(base)
-	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return nil, errors.New("teams Graph base URL is invalid")
+	if _, err := requireAPIOrigin(base); err != nil {
+		return nil, errors.New("teams Graph base URL: " + err.Error())
 	}
 	if resolver == nil {
 		return nil, errors.New("teams secret resolver is required")

@@ -1048,6 +1048,26 @@ func refuseConnectorRedirect(*http.Request, []*http.Request) error {
 	return errors.New("connector redirects are not followed")
 }
 
+// requireAPIOrigin enforces https for connector API bases; plain http is
+// allowed only for loopback hosts so hermetic fixtures keep working.
+func requireAPIOrigin(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, errors.New("connector API base URL is invalid")
+	}
+	if u.Scheme == "https" {
+		return u, nil
+	}
+	if u.Scheme == "http" {
+		host := u.Hostname()
+		if host == "127.0.0.1" || host == "::1" || host == "localhost" {
+			return u, nil
+		}
+		return nil, errors.New("connector API base URL must be https (http is only allowed on loopback)")
+	}
+	return nil, errors.New("connector API base URL must be http(s)")
+}
+
 func (s *Service) validateConnectorSource(ctx context.Context, source Source) error {
 	if err := validateCredentialRef(source); err != nil {
 		return err

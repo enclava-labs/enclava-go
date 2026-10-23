@@ -315,3 +315,16 @@ func TestCreateSourceStillRejectsUnsafeCredentialsAndPrivateOrigins(t *testing.T
 		t.Fatal("private base URL accepted")
 	}
 }
+
+func TestRequireAPIOriginEnforcesHTTPSExceptLoopback(t *testing.T) {
+	for _, ok := range []string{"https://api.example.com", "https://api.example.com/v1", "http://127.0.0.1:9", "http://localhost:9", "http://[::1]:9"} {
+		if _, err := requireAPIOrigin(ok); err != nil {
+			t.Errorf("requireAPIOrigin(%q) = %v, want accepted", ok, err)
+		}
+	}
+	for _, bad := range []string{"http://api.example.com", "ftp://api.example.com", "https://user@api.example.com", "https://api.example.com?q=1", "", "https://"} {
+		if _, err := requireAPIOrigin(bad); err == nil {
+			t.Errorf("requireAPIOrigin(%q) accepted, want rejected", bad)
+		}
+	}
+}

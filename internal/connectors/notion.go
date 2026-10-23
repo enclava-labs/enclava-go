@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	notionMaxDepth = 8
-	notionMaxItems = 500
+	notionMaxDepth  = 8
+	notionMaxItems  = 500
 	notionAPIOrigin = "https://api.notion.com"
 )
 
@@ -35,22 +35,22 @@ type notionSelection struct {
 func notionAudienceGroup(id string) string { return "notion:audience:" + id }
 
 type NotionAdapter struct {
-	baseURL      string
-	token        string
-	tenantID     string
-	connectionID string
-	selections   []notionSelection
-	maxDepth     int
-	maxItems     int
-	client       *http.Client
-	requestMu           sync.Mutex
-	nextRequest         time.Time
-	snapshotMu          sync.Mutex
-	contentSnapshot     []ContentItem
-	contentSnapshotReady bool
-	accessSnapshot      []AccessGrant
-	accessSnapshotReady bool
-	membershipSnapshot  []AccessGrant
+	baseURL                 string
+	token                   string
+	tenantID                string
+	connectionID            string
+	selections              []notionSelection
+	maxDepth                int
+	maxItems                int
+	client                  *http.Client
+	requestMu               sync.Mutex
+	nextRequest             time.Time
+	snapshotMu              sync.Mutex
+	contentSnapshot         []ContentItem
+	contentSnapshotReady    bool
+	accessSnapshot          []AccessGrant
+	accessSnapshotReady     bool
+	membershipSnapshot      []AccessGrant
 	membershipSnapshotReady bool
 }
 
@@ -68,9 +68,9 @@ func NewNotionAdapter(conn source.Connection, resolver *auth.SecretResolver) (Ad
 	if base == "" {
 		base = notionAPIOrigin + "/v1"
 	}
-	parsed, err := url.Parse(base)
-	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return nil, errors.New("notion config.base_url must be an http(s) API URL")
+	parsed, err := requireAPIOrigin(base)
+	if err != nil {
+		return nil, errors.New("notion config.base_url: " + err.Error())
 	}
 	origin := parsed.Scheme + "://" + parsed.Host
 	token, err := resolver.Resolve(conn.TenantID, auth.SecretPurposeConnector, origin, ref)
@@ -162,7 +162,9 @@ func (a *NotionAdapter) validateConnection(conn source.Connection) error {
 	return nil
 }
 func (a *NotionAdapter) Content(ctx context.Context, conn source.Connection, cursor Cursor, limit int) (ContentPage, error) {
-	if err := a.validateConnection(conn); err != nil { return ContentPage{}, err }
+	if err := a.validateConnection(conn); err != nil {
+		return ContentPage{}, err
+	}
 	if limit < 1 || limit > 100 {
 		return ContentPage{}, errors.New("notion page limit must be between 1 and 100")
 	}
@@ -176,16 +178,22 @@ func (a *NotionAdapter) Content(ctx context.Context, conn source.Connection, cur
 	}
 	a.snapshotMu.Lock()
 	defer a.snapshotMu.Unlock()
-	if cursor != "" && !a.contentSnapshotReady { offset = 0 }
+	if cursor != "" && !a.contentSnapshotReady {
+		offset = 0
+	}
 	if cursor == "" || !a.contentSnapshotReady {
 		a.contentSnapshotReady = false
 		items, err := a.traverse(ctx)
-		if err != nil { return ContentPage{Completeness:CompletenessIncomplete}, err }
+		if err != nil {
+			return ContentPage{Completeness: CompletenessIncomplete}, err
+		}
 		a.contentSnapshot = items
 		a.contentSnapshotReady = true
 	}
 	items := a.contentSnapshot
-	if offset > len(items) { return ContentPage{}, errors.New("notion content cursor exceeds snapshot") }
+	if offset > len(items) {
+		return ContentPage{}, errors.New("notion content cursor exceeds snapshot")
+	}
 	end := offset + limit
 	if end > len(items) {
 		end = len(items)
@@ -211,81 +219,131 @@ func (a *NotionAdapter) traverseSelections(ctx context.Context, selections []not
 		}
 		if isPage {
 			var page struct {
-				ID string `json:"id"`
-				URL string `json:"url"`
-				LastEdited string `json:"last_edited_time"`
+				ID         string                     `json:"id"`
+				URL        string                     `json:"url"`
+				LastEdited string                     `json:"last_edited_time"`
 				Properties map[string]json.RawMessage `json:"properties"`
 			}
-			if err := a.get(ctx, "/pages/"+url.PathEscape(id), &page); err != nil { return err }
+			if err := a.get(ctx, "/pages/"+url.PathEscape(id), &page); err != nil {
+				return err
+			}
 			encoded, err := json.Marshal(page)
-			if err != nil { return err }
-			if page.ID != id || !validNotionPageURL(page.URL) { return errors.New("notion returned malformed page") }
+			if err != nil {
+				return err
+			}
+			if page.ID != id || !validNotionPageURL(page.URL) {
+				return errors.New("notion returned malformed page")
+			}
 			pageURL := page.URL
 			if !seen["page:"+id] {
 				seen["page:"+id] = true
-				items = append(items, ContentItem{NativeID:id, ParentNativeID:parent, Kind:"page", NativeRevision:page.LastEdited, URL:pageURL, MIMEType:"application/json", Content:encoded})
+				items = append(items, ContentItem{NativeID: id, ParentNativeID: parent, Kind: "page", NativeRevision: page.LastEdited, URL: pageURL, MIMEType: "application/json", Content: encoded})
 			}
-				if len(items) > a.maxItems { return errors.New("notion traversal exceeded configured item bound") }
+			if len(items) > a.maxItems {
+				return errors.New("notion traversal exceeded configured item bound")
+			}
 		}
 		cursor := ""
 		for pages := 0; ; pages++ {
-			if pages >= 100 { return errors.New("notion children pagination exceeded 100 pages") }
-			endpoint := "/blocks/"+url.PathEscape(id)+"/children?page_size=100"
-			if cursor != "" { endpoint += "&start_cursor="+url.QueryEscape(cursor) }
-			var result struct { Results []json.RawMessage `json:"results"`; HasMore bool `json:"has_more"`; Next string `json:"next_cursor"` }
-			if err := a.get(ctx, endpoint, &result); err != nil { return err }
+			if pages >= 100 {
+				return errors.New("notion children pagination exceeded 100 pages")
+			}
+			endpoint := "/blocks/" + url.PathEscape(id) + "/children?page_size=100"
+			if cursor != "" {
+				endpoint += "&start_cursor=" + url.QueryEscape(cursor)
+			}
+			var result struct {
+				Results []json.RawMessage `json:"results"`
+				HasMore bool              `json:"has_more"`
+				Next    string            `json:"next_cursor"`
+			}
+			if err := a.get(ctx, endpoint, &result); err != nil {
+				return err
+			}
 			for _, raw := range result.Results {
-				var block struct { ID string `json:"id"`; Type string `json:"type"`; LastEdited string `json:"last_edited_time"`; HasChildren bool `json:"has_children"`; URL string `json:"url"` }
-				if err := json.Unmarshal(raw, &block); err != nil || block.ID == "" || block.Type == "" { return errors.New("notion returned malformed block") }
-				if !validNotionPageURL(block.URL) { block.URL = "" }
+				var block struct {
+					ID          string `json:"id"`
+					Type        string `json:"type"`
+					LastEdited  string `json:"last_edited_time"`
+					HasChildren bool   `json:"has_children"`
+					URL         string `json:"url"`
+				}
+				if err := json.Unmarshal(raw, &block); err != nil || block.ID == "" || block.Type == "" {
+					return errors.New("notion returned malformed block")
+				}
+				if !validNotionPageURL(block.URL) {
+					block.URL = ""
+				}
 				if !seen["block:"+block.ID] {
 					seen["block:"+block.ID] = true
-					items = append(items, ContentItem{NativeID:block.ID, ParentNativeID:id, Kind:"block", NativeRevision:block.LastEdited, URL:block.URL, MIMEType:"application/json", Content:append([]byte(nil), raw...)})
-					if len(items) > a.maxItems { return errors.New("notion traversal exceeded configured item bound") }
+					items = append(items, ContentItem{NativeID: block.ID, ParentNativeID: id, Kind: "block", NativeRevision: block.LastEdited, URL: block.URL, MIMEType: "application/json", Content: append([]byte(nil), raw...)})
+					if len(items) > a.maxItems {
+						return errors.New("notion traversal exceeded configured item bound")
+					}
 				}
 				childPage := block.Type == "child_page"
 				if (block.HasChildren || childPage) && depth < a.maxDepth {
-					if err := walk(block.ID, id, depth+1, childPage); err != nil { return err }
+					if err := walk(block.ID, id, depth+1, childPage); err != nil {
+						return err
+					}
 				}
 			}
-			if !result.HasMore { break }
-			if result.Next == "" || result.Next == cursor { return errors.New("notion returned invalid pagination cursor") }
+			if !result.HasMore {
+				break
+			}
+			if result.Next == "" || result.Next == cursor {
+				return errors.New("notion returned invalid pagination cursor")
+			}
 			cursor = result.Next
 		}
 		return nil
 	}
 	for _, sel := range selections {
-		if err := walk(sel.PageID, "", 0, true); err != nil { return nil, fmt.Errorf("notion selected page %q: %w", sel.PageID, err) }
+		if err := walk(sel.PageID, "", 0, true); err != nil {
+			return nil, fmt.Errorf("notion selected page %q: %w", sel.PageID, err)
+		}
 	}
 	return items, nil
 }
 
 func (a *NotionAdapter) Access(ctx context.Context, conn source.Connection, cursor Cursor, limit int) (AccessPage, error) {
-	if err := a.validateConnection(conn); err != nil { return AccessPage{}, err }
+	if err := a.validateConnection(conn); err != nil {
+		return AccessPage{}, err
+	}
 	offset, err := notionOffset(cursor, limit)
-	if err != nil { return AccessPage{}, err }
+	if err != nil {
+		return AccessPage{}, err
+	}
 	a.snapshotMu.Lock()
 	defer a.snapshotMu.Unlock()
-	if cursor != "" && !a.accessSnapshotReady { offset = 0 }
+	if cursor != "" && !a.accessSnapshotReady {
+		offset = 0
+	}
 	if cursor == "" || !a.accessSnapshotReady {
 		a.accessSnapshotReady = false
 		all := make([]AccessGrant, 0)
 		seen := make(map[AccessGrant]struct{})
 		for _, sel := range a.selections {
-			var root struct { ID string `json:"id"` }
+			var root struct {
+				ID string `json:"id"`
+			}
 			err := a.get(ctx, "/pages/"+url.PathEscape(sel.PageID), &root)
-			if err != nil && !notionAccessLost(err) { return AccessPage{}, err }
+			if err != nil && !notionAccessLost(err) {
+				return AccessPage{}, err
+			}
 			effect := "allow"
-			items := []ContentItem{{NativeID:sel.PageID, Kind:"page"}}
+			items := []ContentItem{{NativeID: sel.PageID, Kind: "page"}}
 			if err != nil {
 				effect = "deny"
 			} else {
 				items, err = a.traverseSelections(ctx, []notionSelection{sel})
-				if err != nil { return AccessPage{}, err }
+				if err != nil {
+					return AccessPage{}, err
+				}
 			}
 			for _, item := range items {
 				for _, audience := range sel.Audiences {
-					grant := AccessGrant{NativeObjectID:item.NativeID, NativeObjectKind:item.Kind, NativeGroupID:notionAudienceGroup(audience.ID), Scope:"read", Effect:effect}
+					grant := AccessGrant{NativeObjectID: item.NativeID, NativeObjectKind: item.Kind, NativeGroupID: notionAudienceGroup(audience.ID), Scope: "read", Effect: effect}
 					if _, ok := seen[grant]; !ok {
 						seen[grant] = struct{}{}
 						all = append(all, grant)
@@ -298,35 +356,48 @@ func (a *NotionAdapter) Access(ctx context.Context, conn source.Connection, curs
 	}
 	all := a.accessSnapshot
 	start, end, next, err := notionBounds(offset, limit, len(all))
-	if err != nil { return AccessPage{}, err }
-	return AccessPage{Grants:all[start:end], NextCursor:next, Completeness:CompletenessComplete, Snapshot:true}, nil
+	if err != nil {
+		return AccessPage{}, err
+	}
+	return AccessPage{Grants: all[start:end], NextCursor: next, Completeness: CompletenessComplete, Snapshot: true}, nil
 }
 
 func notionAccessLost(err error) bool { return errors.Is(err, errNotionAccessLost) }
+
 var errNotionAccessLost = errors.New("notion publisher access lost")
 
 func (a *NotionAdapter) Membership(ctx context.Context, conn source.Connection, cursor Cursor, limit int) (MembershipPage, error) {
-	if err := a.validateConnection(conn); err != nil { return MembershipPage{}, err }
+	if err := a.validateConnection(conn); err != nil {
+		return MembershipPage{}, err
+	}
 	offset, err := notionOffset(cursor, limit)
-	if err != nil { return MembershipPage{}, err }
+	if err != nil {
+		return MembershipPage{}, err
+	}
 	a.snapshotMu.Lock()
 	defer a.snapshotMu.Unlock()
-	if cursor != "" && !a.membershipSnapshotReady { offset = 0 }
+	if cursor != "" && !a.membershipSnapshotReady {
+		offset = 0
+	}
 	if cursor == "" || !a.membershipSnapshotReady {
 		a.membershipSnapshotReady = false
 		for _, sel := range a.selections {
-			var root struct { ID string `json:"id"` }
-			if err := a.get(ctx, "/pages/"+url.PathEscape(sel.PageID), &root); err != nil {
-				return MembershipPage{Completeness:CompletenessIncomplete}, fmt.Errorf("revalidate selected Notion page %q: %w", sel.PageID, err)
+			var root struct {
+				ID string `json:"id"`
 			}
-			if root.ID != sel.PageID { return MembershipPage{Completeness:CompletenessIncomplete}, errors.New("notion returned a mismatched selected page") }
+			if err := a.get(ctx, "/pages/"+url.PathEscape(sel.PageID), &root); err != nil {
+				return MembershipPage{Completeness: CompletenessIncomplete}, fmt.Errorf("revalidate selected Notion page %q: %w", sel.PageID, err)
+			}
+			if root.ID != sel.PageID {
+				return MembershipPage{Completeness: CompletenessIncomplete}, errors.New("notion returned a mismatched selected page")
+			}
 		}
 		all := make([]AccessGrant, 0)
 		seen := make(map[AccessGrant]struct{})
 		for _, sel := range a.selections {
 			for _, audience := range sel.Audiences {
 				for _, member := range audience.Members {
-					grant := AccessGrant{NativeGroupID:notionAudienceGroup(audience.ID), NativePrincipalID:member}
+					grant := AccessGrant{NativeGroupID: notionAudienceGroup(audience.ID), NativePrincipalID: member}
 					if _, ok := seen[grant]; !ok {
 						seen[grant] = struct{}{}
 						all = append(all, grant)
@@ -339,24 +410,38 @@ func (a *NotionAdapter) Membership(ctx context.Context, conn source.Connection, 
 	}
 	all := a.membershipSnapshot
 	start, end, next, err := notionBounds(offset, limit, len(all))
-	if err != nil { return MembershipPage{}, err }
-	return MembershipPage{Memberships:all[start:end], NextCursor:next, Completeness:CompletenessComplete, Snapshot:true}, nil
+	if err != nil {
+		return MembershipPage{}, err
+	}
+	return MembershipPage{Memberships: all[start:end], NextCursor: next, Completeness: CompletenessComplete, Snapshot: true}, nil
 }
 
 func notionOffset(cursor Cursor, limit int) (int, error) {
-	if limit < 1 || limit > 100 { return 0, errors.New("notion page limit must be between 1 and 100") }
-	if cursor == "" { return 0, nil }
+	if limit < 1 || limit > 100 {
+		return 0, errors.New("notion page limit must be between 1 and 100")
+	}
+	if cursor == "" {
+		return 0, nil
+	}
 	offset, err := strconv.Atoi(string(cursor))
-	if err != nil || offset < 0 { return 0, errors.New("invalid notion cursor") }
+	if err != nil || offset < 0 {
+		return 0, errors.New("invalid notion cursor")
+	}
 	return offset, nil
 }
 
 func notionBounds(offset, limit, count int) (int, int, Cursor, error) {
-	if offset > count { return 0, 0, "", errors.New("notion cursor exceeds snapshot") }
+	if offset > count {
+		return 0, 0, "", errors.New("notion cursor exceeds snapshot")
+	}
 	end := offset + limit
-	if end > count { end = count }
+	if end > count {
+		end = count
+	}
 	var next Cursor
-	if end < count { next = Cursor(strconv.Itoa(end)) }
+	if end < count {
+		next = Cursor(strconv.Itoa(end))
+	}
 	return offset, end, next, nil
 }
 
@@ -377,14 +462,20 @@ func (a *NotionAdapter) waitRateLimit(ctx context.Context) error {
 }
 func (a *NotionAdapter) get(ctx context.Context, path string, target any) error {
 	for attempt := range 3 {
-		if err := a.waitRateLimit(ctx); err != nil { return err }
+		if err := a.waitRateLimit(ctx); err != nil {
+			return err
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.baseURL+path, nil)
-		if err != nil { return err }
+		if err != nil {
+			return err
+		}
 		req.Header.Set("Authorization", "Bearer "+a.token)
 		req.Header.Set("Notion-Version", "2022-06-28")
 		req.Header.Set("Accept", "application/json")
 		resp, err := a.client.Do(req)
-		if err != nil { return fmt.Errorf("notion request failed: %w", err) }
+		if err != nil {
+			return fmt.Errorf("notion request failed: %w", err)
+		}
 		status := resp.StatusCode
 		retryAfter := resp.Header.Get("Retry-After")
 		body, readErr := readConnectorBody(resp)
@@ -393,7 +484,9 @@ func (a *NotionAdapter) get(ctx context.Context, path string, target any) error 
 			if seconds, parseErr := strconv.Atoi(retryAfter); parseErr == nil && seconds > 0 {
 				delay = time.Duration(seconds) * time.Second
 			}
-			if delay > 2*time.Second { delay = 2*time.Second }
+			if delay > 2*time.Second {
+				delay = 2 * time.Second
+			}
 			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
@@ -404,19 +497,24 @@ func (a *NotionAdapter) get(ctx context.Context, path string, target any) error 
 			continue
 		}
 		if readErr != nil {
-			if status == http.StatusNotFound || status == http.StatusUnauthorized || status == http.StatusForbidden { return fmt.Errorf("%w: status %d", errNotionAccessLost, status) }
+			if status == http.StatusNotFound || status == http.StatusUnauthorized || status == http.StatusForbidden {
+				return fmt.Errorf("%w: status %d", errNotionAccessLost, status)
+			}
 			return readErr
 		}
-		if err := json.Unmarshal(body, target); err != nil { return fmt.Errorf("decode notion response: %w", err) }
+		if err := json.Unmarshal(body, target); err != nil {
+			return fmt.Errorf("decode notion response: %w", err)
+		}
 		return nil
 	}
 	return errors.New("notion rate limit retry bound exceeded")
 }
 func validNotionPageURL(raw string) bool {
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.User != nil { return false }
+	if err != nil || u.Scheme != "https" || u.User != nil {
+		return false
+	}
 	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
 	return host == "notion.so" || strings.HasSuffix(host, ".notion.so") ||
 		host == "notion.site" || strings.HasSuffix(host, ".notion.site")
 }
-
