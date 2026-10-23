@@ -662,6 +662,20 @@ func (r *RAGRepo) PublishGenerationFenced(ctx context.Context, tenantID, collect
 			return fmt.Errorf("generation is not staged: %s", state)
 		}
 		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO index_reconciliation
+			    (tenant_id, collection_id, object_version_id, generation, fence_token, state)
+			SELECT tenant_id, collection_id, object_version_id, generation, lease_fence, 'pending'
+			FROM index_generations
+			WHERE tenant_id=$1 AND collection_id=$2 AND state='published'
+			  AND object_version_id IN (
+			    SELECT id FROM source_object_versions WHERE tenant_id=$1 AND object_id=$3
+			  )
+			ON CONFLICT (tenant_id, collection_id, object_version_id, generation)
+			DO UPDATE SET state='pending', fence_token=EXCLUDED.fence_token`,
+			tenantID, collectionID, objectID); err != nil {
+			return fmt.Errorf("queue superseded generation cleanup: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
 			UPDATE index_generations old SET state='superseded'
 			FROM source_object_versions ov
 			WHERE old.tenant_id=$1 AND old.collection_id=$2 AND old.state='published'
@@ -805,31 +819,87 @@ func (r *RAGRepo) GetStoredResult(ctx context.Context, tenantID, jobID string) (
 	return result, nil
 }
 
-func (r *RAGRepo) GetKnowledgeImport(ctx context.Context, tenantID, collectionID, importRef string) (string, bool, error) {
-	var objectID string
-	err := r.db.SQL.QueryRowContext(ctx, `
-		SELECT object_id FROM knowledge_imports
-		WHERE tenant_id=$1 AND collection_id=$2 AND import_ref=$3`,
-		tenantID, collectionID, importRef).Scan(&objectID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
-	}
+func (r *RAGRepo) ReserveKnowledgeImport(ctx context.Context, tenantID, collectionID, importRef, objectID, kind string) (string, bool, error) {
+	_, err := r.db.SQL.ExecContext(ctx, `
+		INSERT INTO knowledge_imports (tenant_id, collection_id, import_ref, object_id, provenance_kind, state)
+		VALUES ($1,$2,$3,$4,$5,'reserved')
+		ON CONFLICT (tenant_id, collection_id, import_ref) DO NOTHING`,
+		tenantID, collectionID, importRef, objectID, kind)
 	if err != nil {
-		return "", false, fmt.Errorf("get knowledge import: %w", err)
+		return "", false, fmt.Errorf("reserve knowledge import: %w", err)
 	}
-	return objectID, true, nil
+	var reservedID, state string
+	err = r.db.SQL.QueryRowContext(ctx, `
+		SELECT object_id, state FROM knowledge_imports
+		WHERE tenant_id=$1 AND collection_id=$2 AND import_ref=$3`,
+		tenantID, collectionID, importRef).Scan(&reservedID, &state)
+	if err != nil {
+		return "", false, fmt.Errorf("read knowledge import reservation: %w", err)
+	}
+	return reservedID, state == "complete", nil
 }
 
 func (r *RAGRepo) RecordKnowledgeImport(ctx context.Context, tenantID, collectionID, importRef, objectID, kind string) error {
-	_, err := r.db.SQL.ExecContext(ctx, `
-		INSERT INTO knowledge_imports (tenant_id, collection_id, import_ref, object_id, provenance_kind)
-		VALUES ($1,$2,$3,$4,$5) ON CONFLICT (tenant_id, collection_id, import_ref) DO NOTHING`,
+	res, err := r.db.SQL.ExecContext(ctx, `
+		UPDATE knowledge_imports SET state='complete'
+		WHERE tenant_id=$1 AND collection_id=$2 AND import_ref=$3 AND object_id=$4 AND provenance_kind=$5`,
 		tenantID, collectionID, importRef, objectID, kind)
 	if err != nil {
 		return fmt.Errorf("record knowledge import: %w", err)
 	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return errors.New("record knowledge import: reservation missing or mismatched")
+	}
 	return nil
 }
+func (r *RAGRepo) ListPendingIndexReconciliations(ctx context.Context, tenantID string, limit int) ([]rag.IndexReconciliation, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := r.db.SQL.QueryContext(ctx, `
+		SELECT ir.tenant_id::text, ir.collection_id, c.qdrant_collection,
+		       ir.object_version_id, ir.generation, ir.fence_token
+		FROM index_reconciliation ir
+		JOIN index_generations g ON g.tenant_id=ir.tenant_id
+		  AND g.collection_id=ir.collection_id AND g.object_version_id=ir.object_version_id
+		  AND g.generation=ir.generation
+		JOIN knowledge_collections c ON c.tenant_id=ir.tenant_id AND c.id=ir.collection_id
+		WHERE ir.tenant_id=$1 AND ir.state='pending' AND g.state='superseded'
+		ORDER BY ir.created_at LIMIT $2`, tenantID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list pending index reconciliations: %w", err)
+	}
+	defer rows.Close()
+	var pending []rag.IndexReconciliation
+	for rows.Next() {
+		var item rag.IndexReconciliation
+		if err := rows.Scan(&item.TenantID, &item.CollectionID, &item.QdrantCollection,
+			&item.ObjectVersionID, &item.Generation, &item.FenceToken); err != nil {
+			return nil, fmt.Errorf("scan pending index reconciliation: %w", err)
+		}
+		pending = append(pending, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending index reconciliations: %w", err)
+	}
+	return pending, nil
+}
+
+func (r *RAGRepo) CompleteIndexReconciliation(ctx context.Context, item rag.IndexReconciliation) error {
+	res, err := r.db.SQL.ExecContext(ctx, `
+		UPDATE index_reconciliation SET state='complete'
+		WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3
+		  AND generation=$4 AND fence_token=$5 AND state='pending'`,
+		item.TenantID, item.CollectionID, item.ObjectVersionID, item.Generation, item.FenceToken)
+	if err != nil {
+		return fmt.Errorf("complete index reconciliation: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("index reconciliation reservation changed")
+	}
+	return nil
+}
+
 func (r *RAGRepo) ListPublishedGenerations(ctx context.Context, tenantID, collectionID string) ([]rag.IndexGeneration, error) {
 	rows, err := r.db.SQL.QueryContext(ctx, `
 		SELECT g.collection_id, c.qdrant_collection, o.id, g.object_version_id,
@@ -841,7 +911,9 @@ func (r *RAGRepo) ListPublishedGenerations(ctx context.Context, tenantID, collec
 		WHERE g.tenant_id=$1 AND g.collection_id=$2 AND g.state='published'
 		  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL AND o.observed_seq=v.observed_seq`,
 		tenantID, collectionID)
-	if err != nil { return nil, fmt.Errorf("list published generations: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("list published generations: %w", err)
+	}
 	defer rows.Close()
 	var result []rag.IndexGeneration
 	for rows.Next() {
@@ -851,7 +923,9 @@ func (r *RAGRepo) ListPublishedGenerations(ctx context.Context, tenantID, collec
 		}
 		result = append(result, generation)
 	}
-	if err := rows.Err(); err != nil { return nil, fmt.Errorf("iterate published generations: %w", err) }
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate published generations: %w", err)
+	}
 	return result, nil
 }
 
@@ -862,7 +936,9 @@ func (r *RAGRepo) ListGenerationChunks(ctx context.Context, tenantID, collection
 		FROM chunks
 		WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3 AND generation=$4
 		ORDER BY ordinal`, tenantID, collectionID, versionID, generation)
-	if err != nil { return nil, fmt.Errorf("list generation chunks: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("list generation chunks: %w", err)
+	}
 	defer rows.Close()
 	var result []rag.DocumentChunk
 	for rows.Next() {
@@ -871,22 +947,32 @@ func (r *RAGRepo) ListGenerationChunks(ctx context.Context, tenantID, collection
 		if err := rows.Scan(&chunk.ID, &chunk.DocumentID, &chunk.CollectionID, &chunk.Generation, &chunk.ChunkIndex, &chunk.Content, &chunk.ByteStart, &chunk.ByteEnd, &spans, &chunk.HeaderPath, &metadata, &chunk.QdrantPointID, &chunk.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan generation chunk: %w", err)
 		}
-		if err := json.Unmarshal(spans, &chunk.SpanRefs); err != nil { return nil, fmt.Errorf("decode chunk spans: %w", err) }
-		if err := json.Unmarshal(metadata, &chunk.Metadata); err != nil { return nil, fmt.Errorf("decode chunk metadata: %w", err) }
+		if err := json.Unmarshal(spans, &chunk.SpanRefs); err != nil {
+			return nil, fmt.Errorf("decode chunk spans: %w", err)
+		}
+		if err := json.Unmarshal(metadata, &chunk.Metadata); err != nil {
+			return nil, fmt.Errorf("decode chunk metadata: %w", err)
+		}
 		result = append(result, chunk)
 	}
-	if err := rows.Err(); err != nil { return nil, fmt.Errorf("iterate generation chunks: %w", err) }
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate generation chunks: %w", err)
+	}
 	return result, nil
 }
 
 func (r *RAGRepo) SaveEvidence(ctx context.Context, record rag.EvidenceRecord) error {
 	spans, err := json.Marshal(record.SpanRefs)
-	if err != nil { return fmt.Errorf("marshal evidence spans: %w", err) }
+	if err != nil {
+		return fmt.Errorf("marshal evidence spans: %w", err)
+	}
 	_, err = r.db.SQL.ExecContext(ctx, `
 		INSERT INTO rag_evidence (tenant_id,id,collection_id,object_id,object_version_id,observed_seq,generation,chunk_id,span_refs)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)`,
 		record.TenantID, record.ID, record.CollectionID, record.ObjectID, record.ObjectVersionID, record.ObservedSeq, record.Generation, record.ChunkID, spans)
-	if err != nil { return fmt.Errorf("save evidence record: %w", err) }
+	if err != nil {
+		return fmt.Errorf("save evidence record: %w", err)
+	}
 	return nil
 }
 
@@ -897,9 +983,15 @@ func (r *RAGRepo) GetEvidence(ctx context.Context, tenantID, id string) (rag.Evi
 		SELECT id,collection_id,object_id,object_version_id,observed_seq,generation,chunk_id,span_refs
 		FROM rag_evidence WHERE tenant_id=$1 AND id=$2`, tenantID, id).
 		Scan(&record.ID, &record.CollectionID, &record.ObjectID, &record.ObjectVersionID, &record.ObservedSeq, &record.Generation, &record.ChunkID, &spans)
-	if errors.Is(err, sql.ErrNoRows) { return rag.EvidenceRecord{}, source.ErrDenied }
-	if err != nil { return rag.EvidenceRecord{}, fmt.Errorf("get evidence record: %w", err) }
+	if errors.Is(err, sql.ErrNoRows) {
+		return rag.EvidenceRecord{}, source.ErrDenied
+	}
+	if err != nil {
+		return rag.EvidenceRecord{}, fmt.Errorf("get evidence record: %w", err)
+	}
 	record.TenantID = tenantID
-	if err := json.Unmarshal(spans, &record.SpanRefs); err != nil { return rag.EvidenceRecord{}, fmt.Errorf("decode evidence spans: %w", err) }
+	if err := json.Unmarshal(spans, &record.SpanRefs); err != nil {
+		return rag.EvidenceRecord{}, fmt.Errorf("decode evidence spans: %w", err)
+	}
 	return record, nil
 }

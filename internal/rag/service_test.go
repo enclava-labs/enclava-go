@@ -549,4 +549,107 @@ func TestReuploadSameSourceIsNewVersionNotDuplicate(t *testing.T) {
 	if doc.ObservedSeq != 2 {
 		t.Fatalf("expected observed_seq 2, got %d", doc.ObservedSeq)
 	}
+	points := f.vector.points[c.QdrantCollection]
+	if len(points) == 0 {
+		t.Fatal("current generation points are missing")
+	}
+	for _, point := range points {
+		if point.Payload["object_version_id"] != doc.ObjectVersionID {
+			t.Fatalf("orphan point survived publication: %#v", point.Payload)
+		}
+	}
+	var pending int
+	if err := f.db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM index_reconciliation WHERE tenant_id=$1 AND state='pending'`, f.tenant).Scan(&pending); err != nil || pending != 0 {
+		t.Fatalf("pending reconciliations = %d, err = %v", pending, err)
+	}
+}
+
+func TestKnowledgeImportReservationSurvivesCrashAfterObjectCreation(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	collection := f.collection(t)
+	reservedID, complete, err := f.repo.ReserveKnowledgeImport(ctx, f.tenant, collection.ID, "crashed-result", "ragdoc_first", "generated")
+	if err != nil || complete || reservedID != "ragdoc_first" {
+		t.Fatalf("first reservation = %q %v %v", reservedID, complete, err)
+	}
+	object := source.Object{
+		TenantID: f.tenant, ID: reservedID, Kind: "generated", NativeID: "crashed-result",
+		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: f.principal.ActorID, Audience: []string{f.principal.ActorID},
+	}
+	if _, err := f.repo.UpsertObject(ctx, object); err != nil {
+		t.Fatalf("create imported object: %v", err)
+	}
+
+	// Simulate process death after object creation but before RecordKnowledgeImport.
+	retryID, complete, err := f.repo.ReserveKnowledgeImport(ctx, f.tenant, collection.ID, "crashed-result", "ragdoc_second", "generated")
+	if err != nil || complete || retryID != reservedID {
+		t.Fatalf("retry reservation = %q %v %v", retryID, complete, err)
+	}
+	object.ID = retryID
+	if _, err := f.repo.UpsertObject(ctx, object); err != nil {
+		t.Fatalf("retry imported object: %v", err)
+	}
+	var count int
+	if err := f.db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM source_objects WHERE tenant_id=$1 AND id=$2`, f.tenant, reservedID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("objects after retry = %d, err = %v", count, err)
+	}
+	if err := f.repo.RecordKnowledgeImport(ctx, f.tenant, collection.ID, "crashed-result", reservedID, "generated"); err != nil {
+		t.Fatal(err)
+	}
+	retryID, complete, err = f.repo.ReserveKnowledgeImport(ctx, f.tenant, collection.ID, "crashed-result", "ragdoc_third", "generated")
+	if err != nil || !complete || retryID != reservedID {
+		t.Fatalf("completed reservation = %q %v %v", retryID, complete, err)
+	}
+}
+
+func TestImportArtifactInheritsSourceRestrictions(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	collection := f.collection(t)
+	writer, _, err := f.store.Begin(ctx, artifacts.Meta{
+		Ref: artifacts.Ref{TenantID: f.tenant, Kind: artifacts.KindOriginal}, MimeType: "text/plain",
+	}, time.Minute, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const body = "restricted source"
+	if _, err := writer.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Finalize(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ref := writer.Ref()
+	object, err := f.repo.UpsertObject(ctx, source.Object{
+		TenantID: f.tenant, ID: "source_import_fixture", Kind: "upload", NativeID: "import-source",
+		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: f.principal.ActorID, Audience: []string{f.principal.ActorID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repo.InsertObjectVersion(ctx, f.tenant, source.ObjectVersion{
+		ObjectID: object.ID, ObservedSeq: 1, ArtifactRef: ref.ID, SHA256: ref.SHA256,
+		ByteSize: int64(len(body)), MimeType: "text/plain", OriginalFilename: "restricted.txt",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	restriction := source.SourceRestriction{
+		TenantID: f.tenant, SubjectKind: source.RestrictionObject, SubjectID: object.ID,
+		DeniedCapabilities: []string{inference.CapabilityEmbeddings},
+	}
+	if err := f.repo.SetRestriction(ctx, restriction); err != nil {
+		t.Fatal(err)
+	}
+	out, err := f.svc.ImportArtifact(ctx, f.principal, rag.ImportArtifactInput{CollectionID: collection.ID, ArtifactRef: ref.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := f.repo.GetObjectVersion(ctx, f.tenant, out.Document.ID, out.Document.ObservedSeq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(version.Restrictions) != 1 || len(version.Restrictions[0].DeniedCapabilities) != 1 ||
+		version.Restrictions[0].DeniedCapabilities[0] != inference.CapabilityEmbeddings {
+		t.Fatalf("imported restrictions = %+v", version.Restrictions)
+	}
 }

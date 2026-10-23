@@ -128,19 +128,28 @@ func (s *Service) importBytes(ctx context.Context, p auth.Principal, collectionI
 	if !collectionManageable(collection, p) {
 		return UploadDocumentOutput{}, source.ErrDenied
 	}
-	objectID, found, err := s.repo.GetKnowledgeImport(ctx, p.TenantID, collectionID, importRef)
+	objectID, complete, err := s.repo.ReserveKnowledgeImport(ctx, p.TenantID, collectionID, importRef, newID("ragdoc"), kind)
 	if err != nil {
 		return UploadDocumentOutput{}, err
 	}
-	if found {
+	if complete {
 		doc, err := s.repo.GetDocument(ctx, p.TenantID, objectID)
 		return UploadDocumentOutput{Document: doc}, err
 	}
+	if doc, err := s.repo.GetDocument(ctx, p.TenantID, objectID); err == nil {
+		if err := s.repo.RecordKnowledgeImport(ctx, p.TenantID, collectionID, importRef, objectID, kind); err != nil {
+			return UploadDocumentOutput{}, err
+		}
+		return UploadDocumentOutput{Document: doc}, nil
+	} else if !errors.Is(err, source.ErrDenied) {
+		return UploadDocumentOutput{}, err
+	}
+	document.ObjectID = objectID
 	out, err := s.UploadDocument(ctx, p, collectionID, document)
 	if err != nil {
 		return UploadDocumentOutput{}, err
 	}
-	if err := s.repo.RecordKnowledgeImport(ctx, p.TenantID, collectionID, importRef, out.Document.ID, kind); err != nil {
+	if err := s.repo.RecordKnowledgeImport(ctx, p.TenantID, collectionID, importRef, objectID, kind); err != nil {
 		return UploadDocumentOutput{}, err
 	}
 	return out, nil

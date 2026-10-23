@@ -93,6 +93,15 @@ type IndexGeneration struct {
 	Tombstoned       bool
 }
 
+type IndexReconciliation struct {
+	TenantID         string
+	CollectionID     string
+	QdrantCollection string
+	ObjectVersionID  string
+	Generation       int64
+	FenceToken       int64
+}
+
 type StoredResult struct {
 	Operation string
 	Status    string
@@ -135,6 +144,7 @@ type UploadDocumentInput struct {
 	ResultArtifact string                     `json:"-"`
 	Audience       []string                   `json:"-"`
 	Restrictions   []source.SourceRestriction `json:"-"`
+	ObjectID       string                     `json:"-"`
 }
 
 type SearchInput struct {

@@ -66,8 +66,10 @@ type Repository interface {
 	MarkGenerationState(ctx context.Context, tenantID, collectionID, versionID string, generation int64, state string) error
 	NextGeneration(ctx context.Context, tenantID, collectionID, versionID string) (int64, error)
 	FindArtifactObjectVersion(ctx context.Context, tenantID, artifactID string) (source.Object, source.ObjectVersion, error)
+	ListPendingIndexReconciliations(ctx context.Context, tenantID string, limit int) ([]IndexReconciliation, error)
+	CompleteIndexReconciliation(ctx context.Context, reconciliation IndexReconciliation) error
+	ReserveKnowledgeImport(ctx context.Context, tenantID, collectionID, importRef, objectID, kind string) (reservedObjectID string, complete bool, err error)
 	ListGenerationsForConnection(ctx context.Context, tenantID, connectionID string) ([]IndexGeneration, error)
-	GetKnowledgeImport(ctx context.Context, tenantID, collectionID, importRef string) (string, bool, error)
 	RecordKnowledgeImport(ctx context.Context, tenantID, collectionID, importRef, objectID, kind string) error
 	GetStoredResult(ctx context.Context, tenantID, jobID string) (StoredResult, error)
 	PublishGenerationFenced(ctx context.Context, tenantID, collectionID, objectID, versionID string, generation int64, jobID, leaseOwner, attemptID string, fenceToken int64) error
@@ -448,9 +450,13 @@ func (s *Service) processNewDocument(ctx context.Context, p auth.Principal, c Co
 	if len(input.Audience) > 0 {
 		audience = input.Audience
 	}
+	objectID := input.ObjectID
+	if objectID == "" {
+		objectID = newID("ragdoc")
+	}
 	obj, err := s.repo.UpsertObject(ctx, source.Object{
 		TenantID:          p.TenantID,
-		ID:                newID("ragdoc"),
+		ID:                objectID,
 		Kind:              sourceType,
 		NativeID:          sourceID,
 		AuthorizationMode: source.AuthorizationAudience,
@@ -552,6 +558,9 @@ func (s *Service) JobHandler() jobs.HandlerFunc {
 }
 
 func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, error) {
+	if err := s.ReconcileIndexPoints(ctx, claim.Job().TenantID); err != nil {
+		return "", err
+	}
 	job := claim.Job()
 	var p auth.Principal
 	if err := json.Unmarshal(job.PrincipalSnapshot, &p); err != nil {
@@ -719,6 +728,9 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	}
 	// Publish only after the durable chunks and index writes exist.
 	if err := s.repo.PublishGenerationFenced(ctx, job.TenantID, c.ID, obj.ID, versionRowID(ver), generation, claim.JobID, claim.Owner, claim.AttemptID(), claim.FenceToken); err != nil {
+		return "", err
+	}
+	if err := s.ReconcileIndexPoints(ctx, job.TenantID); err != nil {
 		return "", err
 	}
 	return versionRowID(ver), nil

@@ -134,11 +134,14 @@ func applyConnectorStructure(document source.Document, object source.Object, raw
 		switch metadata.Kind {
 		case "message", "teams_chat_message":
 			block.Kind = "message"
-		case "page", "block":
+		case "page":
 			if block.Kind == "paragraph" || block.Kind == "" {
 				block.Kind = "heading"
 			}
 		case "table", "sheet":
+			block.Kind = "table"
+		}
+		if metadata.Locator.Table != "" && (block.Kind == "paragraph" || block.Kind == "") {
 			block.Kind = "table"
 		}
 	}

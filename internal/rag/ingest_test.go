@@ -1,7 +1,6 @@
 package rag
 
 import (
-	"encoding/json"
 	"testing"
 
 	"enclava-go/internal/source"
@@ -13,8 +12,8 @@ func TestApplyConnectorStructure(t *testing.T) {
 		locator                      source.Locator
 	}{
 		{name: "Slack thread message", metadata: `{"connection_id":"c","kind":"message"}`, parent: "thread-object", kind: "message"},
-		{name: "nested Notion block", metadata: `{"connection_id":"c","kind":"block"}`, parent: "page-object", kind: "heading"},
-		{name: "Drive sheet tab", metadata: `{"connection_id":"c","kind":"sheet","locator":{"table":"Budget 2026"}}`, kind: "table", locator: source.Locator{Table: "Budget 2026"}},
+		{name: "nested Notion block", metadata: `{"connection_id":"c","kind":"block"}`, parent: "page-object", kind: "paragraph"},
+		{name: "Drive sheet tab", metadata: `{"connection_id":"c","kind":"google_drive","locator":{"table":"Budget 2026"}}`, kind: "table", locator: source.Locator{Table: "Budget 2026"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -25,8 +24,7 @@ func TestApplyConnectorStructure(t *testing.T) {
 			}
 		})
 	}
-	var invalid json.RawMessage = []byte("{")
-	if got := applyConnectorStructure(source.Document{Blocks: []source.Block{{Kind: "paragraph"}}}, source.Object{}, string(invalid)); got.Blocks[0].Kind != "paragraph" {
+	if got := applyConnectorStructure(source.Document{Blocks: []source.Block{{Kind: "paragraph"}}}, source.Object{}, "{"); got.Blocks[0].Kind != "paragraph" {
 		t.Fatalf("non-connector document changed: %+v", got.Blocks[0])
 	}
 }

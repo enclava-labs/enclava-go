@@ -69,6 +69,38 @@ func (s *Service) AccessJobHandler() jobs.HandlerFunc {
 	}
 }
 
+func (s *Service) ReconcileIndexPoints(ctx context.Context, tenantID string) error {
+	if s.vectorStore == nil {
+		return errors.New("rag reconciliation: vector store is not configured")
+	}
+	for {
+		pending, err := s.repo.ListPendingIndexReconciliations(ctx, tenantID, 100)
+		if err != nil {
+			return err
+		}
+		if len(pending) == 0 {
+			return nil
+		}
+		for _, item := range pending {
+			published, err := s.repo.ListPublishedGenerations(ctx, tenantID, item.CollectionID)
+			if err != nil {
+				return err
+			}
+			for _, current := range published {
+				if current.ObjectVersionID == item.ObjectVersionID && current.Generation == item.Generation {
+					return fmt.Errorf("rag reconciliation: refusing to delete published generation %s/%d", item.ObjectVersionID, item.Generation)
+				}
+			}
+			if err := deleteReconciledGeneration(ctx, s.vectorStore, item, false); err != nil {
+				return err
+			}
+			if err := s.repo.CompleteIndexReconciliation(ctx, item); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 func integerPolicy(value any) (int64, bool) {
 	switch n := value.(type) {
 	case int64:
@@ -83,4 +115,18 @@ func integerPolicy(value any) (int64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+type generationPointDeleter interface {
+	DeleteGenerationPoints(ctx context.Context, collection, versionID string, generation int64) error
+}
+
+func deleteReconciledGeneration(ctx context.Context, store generationPointDeleter, item IndexReconciliation, isPublished bool) error {
+	if isPublished {
+		return fmt.Errorf("rag reconciliation: refusing to delete published generation %s/%d", item.ObjectVersionID, item.Generation)
+	}
+	if err := store.DeleteGenerationPoints(ctx, item.QdrantCollection, item.ObjectVersionID, item.Generation); err != nil {
+		return fmt.Errorf("delete orphan index generation: %w", err)
+	}
+	return nil
 }
