@@ -146,6 +146,9 @@ type SearchInput struct {
 type SearchResult struct {
 	DocumentID string         `json:"document_id"`
 	ChunkID    string         `json:"chunk_id"`
+	Generation int64          `json:"generation,omitempty"`
+	Spans      []source.Span  `json:"spans,omitempty"`
+	EvidenceID string         `json:"evidence_id,omitempty"`
 	ChunkStart int            `json:"chunk_start"`
 	ChunkEnd   int            `json:"chunk_end"`
 	Score      float64        `json:"score"`
