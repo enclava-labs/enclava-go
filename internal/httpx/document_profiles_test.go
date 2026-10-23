@@ -2,8 +2,13 @@ package httpx
 
 import (
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"enclava-go/internal/extract"
 	"enclava-go/internal/source"
 )
 
@@ -33,5 +38,21 @@ func TestDocumentProfileViewUsesImmutableVersionWireFields(t *testing.T) {
 	}
 	if _, ok := fields["id"].(string); !ok {
 		t.Fatal("profile response omitted the immutable version id")
+	}
+}
+
+func TestWritePreviewErrorTreatsUnknownFailuresAsInternal(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writePreviewError(recorder, errors.New("database unavailable"))
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusInternalServerError)
+	}
+	if strings.Contains(recorder.Body.String(), "database unavailable") {
+		t.Fatalf("internal error leaked in response: %s", recorder.Body.String())
+	}
+	client := httptest.NewRecorder()
+	writePreviewError(client, extract.ErrUnsupportedFormat)
+	if client.Code != http.StatusBadRequest {
+		t.Fatalf("known client error status = %d, want %d", client.Code, http.StatusBadRequest)
 	}
 }

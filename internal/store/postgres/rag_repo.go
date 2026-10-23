@@ -586,8 +586,14 @@ func (r *RAGRepo) ReplaceVersionChunksAndStage(ctx context.Context, tenantID, co
 	return WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
 		if profileVersionID != "" || len(chunks) > 0 {
 			if _, err := tx.ExecContext(ctx, `
-				DELETE FROM chunks WHERE tenant_id = $1 AND object_version_id = $2`,
-				tenantID, versionID); err != nil {
+				DELETE FROM chunks c
+				USING index_generations g, chunk_profiles p
+				WHERE c.tenant_id = $1 AND c.object_version_id = $2
+				  AND g.tenant_id = c.tenant_id AND g.object_version_id = c.object_version_id
+				  AND g.collection_id = $3
+				  AND p.tenant_id = c.tenant_id AND p.id = c.chunk_profile_version_id
+				  AND p.profile_id = 'rag-' || g.collection_id || '-structured'`,
+				tenantID, versionID, collectionID); err != nil {
 				return fmt.Errorf("clear version chunks: %w", err)
 			}
 			for _, ch := range chunks {

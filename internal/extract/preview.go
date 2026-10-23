@@ -278,7 +278,7 @@ func (s *PreviewService) JobHandler() jobs.HandlerFunc {
 		if cancelled || ctx.Err() != nil {
 			return "", context.Canceled
 		}
-		warnings := make([]string, 0)
+		warnings := append([]string(nil), doc.ParseWarnings...)
 		for _, chunk := range chunks {
 			warnings = append(warnings, chunk.Warnings...)
 		}
@@ -316,8 +316,9 @@ type previewBlock struct {
 }
 
 type previewDocument struct {
-	Ref    previewObjectRef `json:"ref"`
-	Blocks []previewBlock   `json:"blocks"`
+	Ref           previewObjectRef `json:"ref"`
+	Blocks        []previewBlock   `json:"blocks"`
+	ParseWarnings []string         `json:"parse_warnings,omitempty"`
 }
 
 type previewSpan struct {
@@ -351,7 +352,7 @@ func previewRef(ref source.ObjectRef) previewObjectRef {
 }
 
 func previewDocumentFrom(document source.Document) previewDocument {
-	out := previewDocument{Ref: previewRef(document.Ref), Blocks: make([]previewBlock, 0, len(document.Blocks))}
+	out := previewDocument{Ref: previewRef(document.Ref), Blocks: make([]previewBlock, 0, len(document.Blocks)), ParseWarnings: document.ParseWarnings}
 	for _, block := range document.Blocks {
 		out.Blocks = append(out.Blocks, previewBlock{ID: block.ID, Ordinal: block.Ordinal, Kind: block.Kind, ParentID: block.ParentID, Text: block.Text, ByteStart: block.ByteStart, ByteEnd: block.ByteEnd, Locator: block.Locator})
 	}

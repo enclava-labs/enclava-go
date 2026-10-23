@@ -35,6 +35,9 @@ func TestNativeRealDocumentFixtures(t *testing.T) {
 		if pdfErr != nil {
 			t.Fatalf("parse real PDF fixture: %v", pdfErr)
 		}
+		if len(pdfDoc.ParseWarnings) == 0 || !strings.Contains(pdfDoc.ParseWarnings[0], "page 1 contains embedded text; scanned regions not OCR'd") {
+			t.Fatalf("PDF preview omitted its partial OCR warning: %#v", pdfDoc.ParseWarnings)
+		}
 		assertNativeText(t, pdfDoc, "LEGAL EVIDENCE FIXTURE")
 		if pdfDoc.Blocks[0].Locator.Page == nil || *pdfDoc.Blocks[0].Locator.Page != 1 || pdfDoc.Blocks[0].Locator.Box == "" {
 			t.Fatalf("PDF page/box location missing: %#v", pdfDoc.Blocks[0].Locator)
@@ -54,6 +57,13 @@ func TestNativeRealDocumentFixtures(t *testing.T) {
 		if imageDoc.Blocks[0].Locator.Page == nil || *imageDoc.Blocks[0].Locator.Page != 1 || imageDoc.Blocks[0].Locator.Box == "" {
 			t.Fatalf("OCR page/box location missing: %#v", imageDoc.Blocks[0].Locator)
 		}
+	}
+}
+
+func TestNativeRejectsUnsupportedImageByContent(t *testing.T) {
+	_, err := parseNative(context.Background(), artifactsRef(), ParseOptions{}, []byte{0xff, 0xd8, 0xff, 0xd9}, "image")
+	if !errors.Is(err, ErrUnsupportedFormat) || !strings.Contains(err.Error(), "image/jpeg") {
+		t.Fatalf("JPEG input should be rejected with its actual format, got %v", err)
 	}
 }
 

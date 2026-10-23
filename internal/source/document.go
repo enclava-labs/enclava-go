@@ -3,8 +3,9 @@ package source
 // Document is the canonical structured representation of one parsed
 // ObjectVersion: immutable ordered Blocks plus the owning version identity.
 type Document struct {
-	Ref    ObjectRef // owning object + observed sequence
-	Blocks []Block   // immutable once parsed
+	Ref           ObjectRef
+	Blocks        []Block
+	ParseWarnings []string
 }
 
 // Block is one ordered structural unit of extracted text. ByteStart/ByteEnd

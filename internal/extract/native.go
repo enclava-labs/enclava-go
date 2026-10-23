@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -178,7 +179,7 @@ func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data
 	}
 	if format == "image" {
 		if len(data) < 8 || string(data[:8]) != "\x89PNG\r\n\x1a\n" {
-			return source.Document{}, fmt.Errorf("%w: only PNG OCR input is supported", ErrUnsupportedFormat)
+			return source.Document{}, fmt.Errorf("%w: %s is unsupported; only PNG image OCR is supported", ErrUnsupportedFormat, http.DetectContentType(data))
 		}
 		pixels, err := imageDimensions(data)
 		if err != nil {
@@ -209,6 +210,7 @@ func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data
 		return source.Document{}, err
 	}
 	var blocks []parseBlock
+	var parseWarnings []string
 	if format == "pdf" {
 		pdfinfo, _ := exec.LookPath("pdfinfo")
 		info, err := runNative(ctx, sandbox, prlimit, pdfinfo, []string{"/work/input"}, dir, 1<<20)
@@ -240,6 +242,11 @@ func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data
 		var rasterPixels int
 		if !caps.OCR && len(hasText) < pages {
 			return source.Document{}, fmt.Errorf("extract: PDF OCR unavailable: %s", caps.Reason)
+		}
+		for page := 1; page <= pages; page++ {
+			if hasText[page] {
+				parseWarnings = append(parseWarnings, fmt.Sprintf("page %d contains embedded text; scanned regions not OCR'd", page))
+			}
 		}
 		if caps.OCR {
 			for page := 1; page <= pages; page++ {
@@ -282,7 +289,9 @@ func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data
 			return source.Document{}, err
 		}
 	}
-	return makeDocument(opts.ObjectRef, ref, blocks), nil
+	document := makeDocument(opts.ObjectRef, ref, blocks)
+	document.ParseWarnings = parseWarnings
+	return document, nil
 }
 
 func pdfPageCount(info []byte) (int, error) {

@@ -259,5 +259,5 @@ func writePreviewError(w http.ResponseWriter, err error) {
 		WriteForbidden(w, "document preview is not authorized")
 		return
 	}
-	WriteOpenAIError(w, http.StatusBadRequest, "document preview request is invalid", "invalid_request_error", "document_preview_invalid")
+	WriteOpenAIError(w, http.StatusInternalServerError, "document preview could not be created", "server_error", "internal_error")
 }

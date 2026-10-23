@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"enclava-go/internal/source"
 )
@@ -59,5 +60,24 @@ func TestChunkProfilesRepoImmutableTenantVersions(t *testing.T) {
 	persisted, err := NewChunkProfilesRepo(restarted).Get(ctx, idTenantA, v1.ID)
 	if err != nil || persisted != gotV1 {
 		t.Fatalf("profile did not survive repository restart: %+v, %v", persisted, err)
+	}
+}
+
+func TestChunkProfilesRepoRollsBackFailedCreate(t *testing.T) {
+	db, _ := openIsolated(t)
+	db.SQL.SetMaxOpenConns(1)
+	ctx := context.Background()
+	seedTenant(t, ctx, db, idTenantA)
+	repo := NewChunkProfilesRepo(db)
+	invalid := source.ChunkProfile{ProfileID: "retry", BoundaryStrategy: "fixed", TableHandling: "row-wise"}
+	if _, err := repo.Create(ctx, idTenantA, invalid, "owner-a"); err == nil {
+		t.Fatal("invalid profile creation succeeded")
+	}
+	valid := source.ChunkProfile{ProfileID: "retry", SizeCodePoints: 120, BoundaryStrategy: "fixed", TableHandling: "row-wise"}
+	retryCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	created, err := repo.Create(retryCtx, idTenantA, valid, "owner-a")
+	if err != nil || created.Version != 1 {
+		t.Fatalf("create after failed transaction: profile=%+v err=%v", created, err)
 	}
 }

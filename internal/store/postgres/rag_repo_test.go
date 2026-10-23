@@ -101,7 +101,7 @@ func TestRAGRepoChunkProfileVersions(t *testing.T) {
 	}
 }
 
-func TestRAGRepoDocumentProjectionAndGenerations(t *testing.T) {
+func TestRAGRepoCollectionChunkReplacementPreservesSharedVersionChunks(t *testing.T) {
 	db := testdb.New(t)
 	ctx := context.Background()
 	tenant := testdb.SeedTenant(t, db, "docs")
@@ -165,7 +165,7 @@ func TestRAGRepoDocumentProjectionAndGenerations(t *testing.T) {
 	if err := repo.ReplaceVersionChunksAndStage(ctx, tenant, "ragcol_1", obj.ID, doc.ObjectVersionID, 1, gen, "", chunks); err == nil {
 		t.Fatal("expected chunk insert to fail without a bound profile")
 	}
-	profileID, err := repo.EnsureChunkProfile(ctx, tenant, "rag-ragcol_1", 100, 10)
+	profileID, err := repo.EnsureChunkProfile(ctx, tenant, "rag-ragcol_1-structured", 100, 10)
 	if err != nil {
 		t.Fatalf("ensure profile: %v", err)
 	}
@@ -193,5 +193,31 @@ func TestRAGRepoDocumentProjectionAndGenerations(t *testing.T) {
 	listed, err := repo.ListDocuments(ctx, tenant, "ragcol_1", 10, 0)
 	if err != nil || len(listed) != 1 {
 		t.Fatalf("list documents: %v %#v", err, listed)
+	}
+	if err := repo.InsertCollection(ctx, rag.Collection{
+		TenantID: tenant, ID: "ragcol_2", Name: "Other", QdrantCollection: "rag_2",
+		EmbeddingModel: "m", ChunkSize: 100, ChunkOverlap: 10, IsActive: true,
+	}); err != nil {
+		t.Fatalf("insert second collection: %v", err)
+	}
+	profileB, err := repo.EnsureChunkProfile(ctx, tenant, "rag-ragcol_2-structured", 100, 10)
+	if err != nil {
+		t.Fatalf("ensure second collection profile: %v", err)
+	}
+	chunksB := []rag.DocumentChunk{{ID: "chk_b", DocumentID: obj.ID, CollectionID: "ragcol_2", ChunkIndex: 0, Content: "other collection"}}
+	if err := repo.ReplaceVersionChunksAndStage(ctx, tenant, "ragcol_2", obj.ID, doc.ObjectVersionID, 1, 1, profileB, chunksB); err != nil {
+		t.Fatalf("stage second collection chunks: %v", err)
+	}
+	gen, err = repo.NextGeneration(ctx, tenant, "ragcol_1", doc.ObjectVersionID)
+	if err != nil || gen != 2 {
+		t.Fatalf("next replacement generation = %d, %v", gen, err)
+	}
+	chunksA2 := []rag.DocumentChunk{{ID: "chk_a2", DocumentID: obj.ID, CollectionID: "ragcol_1", ChunkIndex: 0, Content: "replacement"}}
+	if err := repo.ReplaceVersionChunksAndStage(ctx, tenant, "ragcol_1", obj.ID, doc.ObjectVersionID, 1, gen, profileID, chunksA2); err != nil {
+		t.Fatalf("replace first collection chunks: %v", err)
+	}
+	var remaining int
+	if err := db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM chunks WHERE tenant_id = $1 AND object_version_id = $2 AND id = 'chk_b'`, tenant, doc.ObjectVersionID).Scan(&remaining); err != nil || remaining != 1 {
+		t.Fatalf("replacing first collection deleted the other collection's chunk: count=%d err=%v", remaining, err)
 	}
 }

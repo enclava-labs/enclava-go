@@ -26,6 +26,7 @@ func (r *ChunkProfilesRepo) Create(ctx context.Context, tenantID string, profile
 	if err != nil {
 		return source.ChunkProfile{}, fmt.Errorf("begin chunk profile creation: %w", err)
 	}
+	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, tenantID+":"+profile.ProfileID); err != nil {
 		return source.ChunkProfile{}, fmt.Errorf("lock chunk profile family: %w", err)
 	}
