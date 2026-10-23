@@ -46,6 +46,8 @@ type JobReader interface {
 	ListOwnedJobs(ctx context.Context, tenantID, submitterKey string, limit int) ([]jobs.JobRow, error)
 	CountOwnedJobs(ctx context.Context, tenantID, submitterKey string) (int, error)
 	CountOwnedJobsSince(ctx context.Context, tenantID, submitterKey string, since time.Time) (int, error)
+	CountLiveArtifactReferences(ctx context.Context, tenantID, artifactRef, excludingJobID string) (int, error)
+	ListDeletedExtractJobs(ctx context.Context) ([]jobs.JobRow, error)
 }
 
 // Service owns the extract pipeline: Process persists the upload as a durable
@@ -61,7 +63,18 @@ type Service struct {
 	artifacts     *artifacts.Store
 	executor      Executor
 	endpoints     EndpointsLister
+	sources       source.SourceRepository
+	authorizer    *source.Authorizer
 	maxUploadMB   int64
+}
+
+// SetSourceRepository enables current source-grant checks for jobs tied to an
+// existing source version. Uploaded evidence remains owner-bound.
+func (s *Service) SetSourceRepository(repo source.SourceRepository) {
+	s.sources = repo
+	if repo != nil {
+		s.authorizer = source.NewAuthorizer(repo, 0)
+	}
 }
 
 // Executor is the shared authorized inference boundary the attempt dispatches
@@ -565,6 +578,9 @@ func (s *Service) GetJob(ctx context.Context, p auth.Principal, jobID string) (J
 		return JobDetail{}, mapNotFound(err)
 	}
 	if row.Operation != OperationProcess && row.Operation != OperationVision {
+		return JobDetail{}, ErrNotFound
+	}
+	if err := s.authorizeSource(ctx, p, row); err != nil {
 		return JobDetail{}, ErrNotFound
 	}
 	view := jobView(row)

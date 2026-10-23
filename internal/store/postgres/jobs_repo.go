@@ -313,6 +313,40 @@ func (r *JobsRepo) CountOwnedJobsSince(ctx context.Context, tenantID, submitterK
 	return total, nil
 }
 
+// CountLiveArtifactReferences protects a shared artifact from one job's
+// explicit deletion; deleted audit rows do not retain ownership.
+func (r *JobsRepo) CountLiveArtifactReferences(ctx context.Context, tenantID, artifactRef, excludingJobID string) (int, error) {
+	var count int
+	err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM jobs
+		WHERE tenant_id=$1::uuid AND id<>$3 AND deleted_at IS NULL
+		  AND status<>'deleted' AND (input_ref=$2 OR result_ref=$2)`,
+		tenantID, artifactRef, excludingJobID).Scan(&count)
+	return count, err
+}
+
+// ListDeletedExtractJobs resumes artifact cleanup initiated by an explicit
+// extraction delete after an application restart.
+func (r *JobsRepo) ListDeletedExtractJobs(ctx context.Context) ([]jobs.JobRow, error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `
+		SELECT `+jobColumns+` FROM jobs
+		WHERE operation IN ($1,$2) AND status='deleted'`,
+		extract.OperationProcess, extract.OperationVision)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []jobs.JobRow{}
+	for rows.Next() {
+		row, err := scanJobRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
 // Claim is the atomic lease grant (JOB-02). Inside one transaction it:
 //  1. sweeps running jobs with an expired lease AND an unfinished dispatched
 //     attempt to status=unknown — their upstream outcome was never observed

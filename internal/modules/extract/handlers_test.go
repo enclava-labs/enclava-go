@@ -183,6 +183,13 @@ func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 	if detail.Result == nil || detail.Result.TokensUsed != 1500 || detail.Result.Data["total"] != json.Number("12.5") {
 		t.Fatalf("unexpected detail: %+v", detail.Result)
 	}
+	originalReq := httptest.NewRequest(http.MethodGet, "/api/v1/extract/jobs/"+out.JobID+"/original", nil)
+	originalRec := httptest.NewRecorder()
+	handlers.HandleJobDetail(originalRec, originalReq, principal)
+	if originalRec.Code != http.StatusOK || originalRec.Header().Get("Content-Type") != "text/plain" ||
+		originalRec.Header().Get("X-Content-Type-Options") != "nosniff" || originalRec.Body.String() != "invoice text" {
+		t.Fatalf("original response: status=%d headers=%v body=%q", originalRec.Code, originalRec.Header(), originalRec.Body.String())
+	}
 }
 
 func TestHandleJobDetailDeniesForeignAndUnknown(t *testing.T) {
@@ -223,7 +230,14 @@ func TestHandleJobDetailDeniesForeignAndUnknown(t *testing.T) {
 	}
 
 	handlers := NewHandlers(svc, 5, nil)
-	_ = handlers // handlers read paths exercised through svc here
+	for _, suffix := range []string{"result", "original"} {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/extract/jobs/"+out.JobID+"/"+suffix, nil)
+		rec := httptest.NewRecorder()
+		handlers.HandleJobDetail(rec, req, principalB)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("foreign %s route status=%d body=%s", suffix, rec.Code, rec.Body.String())
+		}
+	}
 
 	// Foreign job id == unknown id: both ErrNotFound.
 	if _, err := svc.GetJob(ctx, principalB, out.JobID); !errors.Is(err, extractsvc.ErrNotFound) {
@@ -294,5 +308,7 @@ func newExtractService(t *testing.T, db *postgres.DB, tenant string, artRepo *po
 	if err != nil {
 		t.Fatalf("executor: %v", err)
 	}
-	return extractsvc.NewService(extractRepo, extractRepo, jobsRepo, jobsSvc, store, exec, endpoints, 5), jobsSvc
+	svc := extractsvc.NewService(extractRepo, extractRepo, jobsRepo, jobsSvc, store, exec, endpoints, 5)
+	svc.SetSourceRepository(sources)
+	return svc, jobsSvc
 }

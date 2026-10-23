@@ -1,18 +1,19 @@
 package extractmodule
 
 import (
-	"encoding/json"
-	"errors"
-	"net/http"
-	"path/filepath"
-	"strconv"
-	"strings"
-
 	"enclava-go/internal/auth"
 	"enclava-go/internal/extract"
 	"enclava-go/internal/httpx"
 	"enclava-go/internal/inference"
 	"enclava-go/internal/llm"
+	"encoding/json"
+	"errors"
+	"io"
+	"mime"
+	"net/http"
+	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 type Handlers struct {
@@ -169,6 +170,25 @@ func (h *Handlers) HandleJobDetail(w http.ResponseWriter, r *http.Request, princ
 		return
 	}
 	jobID := parts[0]
+	if len(parts) == 2 && parts[1] == "original" {
+		if r.Method != http.MethodGet {
+			httpx.WriteMethodNotAllowed(w)
+			return
+		}
+		reader, filename, contentType, err := h.svc.Original(r.Context(), principal, jobID)
+		if err != nil {
+			h.writeJobError(w, err, "job_original_failed")
+			return
+		}
+		defer reader.Close()
+		disposition := mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(filename)})
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Disposition", disposition)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = io.Copy(w, reader)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost {
 		if err := h.svc.CancelJob(r.Context(), principal, jobID); err != nil {
 			h.writeJobError(w, err, "job_cancel_failed")

@@ -105,6 +105,7 @@ func newFixture(t *testing.T) fixture {
 		t.Fatalf("executor: %v", err)
 	}
 	svc := extract.NewService(repo, repo, jobsRepo, jobsSvc, store, exec, endpoints, 5)
+	svc.SetSourceRepository(sources)
 
 	tenant := testdb.SeedTenant(t, db, "extract-tenant")
 	user := testdb.SeedUser(t, db, tenant, "extract@example.com", nil)
@@ -621,6 +622,146 @@ func TestCrossTenantJobReadsDenyIdentically(t *testing.T) {
 	list, total, err := f.svc.ListJobs(ctx, otherPrincipal, 20, 0)
 	if err != nil || len(list) != 0 || total != 0 {
 		t.Fatalf("other actor list: %d/%d %v", len(list), total, err)
+	}
+}
+func TestExplicitDeleteFencesAndCleansOnlyUnsharedArtifacts(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract")
+	f.putPrice(t, "priced-extract", billing.UnitInput, 1000)
+	f.putPrice(t, "priced-extract", billing.UnitOutput, 2000)
+	f.seedTemplate(t, extract.Template{
+		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u",
+		DefaultModel: "priced-extract", Enabled: true,
+	})
+	submit := func(content string) extract.ProcessOutput {
+		out, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
+			TemplateID: "invoice", FileName: "invoice.txt", MimeType: "text/plain", Bytes: []byte(content),
+		})
+		if err != nil {
+			t.Fatalf("submit job: %v", err)
+		}
+		return out
+	}
+	first := submit("shared evidence")
+	firstRow, err := f.jobsSvc.Get(ctx, f.principal, first.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, _, err := f.jobsSvc.Enqueue(ctx, f.principal, jobs.EnqueueRequest{
+		Operation: extract.OperationProcess, IdempotencyKey: "shared-reference",
+		InputRef: firstRow.InputRef, InputHash: firstRow.InputHash,
+		Policy: map[string]any{"file_name": "invoice.txt", "mime_type": "text/plain"},
+	})
+	if err != nil {
+		t.Fatalf("enqueue shared reference: %v", err)
+	}
+	claim := f.leaseClaim(t)
+	resultRef, err := f.svc.JobHandler()(ctx, claim, inputOpener(f, claim))
+	if err != nil {
+		t.Fatalf("run extraction: %v", err)
+	}
+	if _, err := claim.Complete(ctx, resultRef); err != nil {
+		t.Fatalf("complete extraction: %v", err)
+	}
+	detail, err := f.svc.GetJob(ctx, f.principal, first.JobID)
+	if err != nil || detail.Result == nil {
+		t.Fatalf("read result: detail=%+v err=%v", detail, err)
+	}
+	original, filename, contentType, err := f.svc.Original(ctx, f.principal, first.JobID)
+	if err != nil {
+		t.Fatalf("read original: %v", err)
+	}
+	body, err := io.ReadAll(original)
+	_ = original.Close()
+	if err != nil || filename != "invoice.txt" || contentType != "text/plain" || string(body) != "shared evidence" {
+		t.Fatalf("original = (%q,%q,%q,%v)", filename, contentType, body, err)
+	}
+	if err := f.svc.DeleteJob(ctx, f.principal, first.JobID); err != nil {
+		t.Fatalf("delete completed job: %v", err)
+	}
+	if _, err := f.store.Read(ctx, artifacts.Ref{TenantID: f.tenant, ID: firstRow.InputRef}); err != nil {
+		t.Fatalf("shared original should survive deletion: %v", err)
+	}
+	if _, err := f.store.Read(ctx, artifacts.Ref{TenantID: f.tenant, ID: resultRef}); !errors.Is(err, artifacts.ErrNotFound) {
+		t.Fatalf("unshared result remains readable, error=%v", err)
+	}
+	sharedRow, err := f.jobsSvc.Get(ctx, f.principal, shared.ID)
+	if err != nil || sharedRow.Status != jobs.StatusQueued {
+		t.Fatalf("shared job was changed by other deletion: %+v %v", sharedRow, err)
+	}
+
+	second := submit("cancel then delete")
+	if err := f.svc.DeleteJob(ctx, f.principal, second.JobID); !errors.Is(err, extract.ErrDeletePending) {
+		t.Fatalf("first active delete = %v, want cancellation pending", err)
+	}
+	if err := f.svc.DeleteJob(ctx, f.principal, second.JobID); err != nil {
+		t.Fatalf("delete cancelled job: %v", err)
+	}
+	if err := f.svc.ReconcileDeletedJobs(ctx); err != nil {
+		t.Fatalf("restart cleanup reconciliation: %v", err)
+	}
+	var status string
+	if err := f.db.SQL.QueryRowContext(ctx, `SELECT status FROM jobs WHERE tenant_id=$1::uuid AND id=$2`, f.tenant, second.JobID).Scan(&status); err != nil || status != jobs.StatusDeleted {
+		t.Fatalf("audit row status=%q err=%v", status, err)
+	}
+}
+
+func TestExtractionReadsAndDeletionRecheckCurrentSourceAudience(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract")
+	f.putPrice(t, "priced-extract", billing.UnitInput, 1000)
+	f.putPrice(t, "priced-extract", billing.UnitOutput, 1000)
+	f.seedTemplate(t, extract.Template{
+		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u",
+		DefaultModel: "priced-extract", Enabled: true,
+	})
+	out, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
+		TemplateID: "invoice", FileName: "invoice.txt", MimeType: "text/plain", Bytes: []byte("audience evidence"),
+	})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	claim := f.leaseClaim(t)
+	resultRef, err := f.svc.JobHandler()(ctx, claim, inputOpener(f, claim))
+	if err != nil {
+		t.Fatalf("run extraction: %v", err)
+	}
+	if _, err := claim.Complete(ctx, resultRef); err != nil {
+		t.Fatalf("complete extraction: %v", err)
+	}
+	obj, err := f.sources.UpsertObject(ctx, source.Object{
+		TenantID: f.tenant, ID: "extract-audience-object", Kind: "upload", NativeID: "audience-file",
+		AuthorizationMode: source.AuthorizationAudience, Audience: []string{f.principal.ActorID}, ObservedSeq: 1,
+	})
+	if err != nil {
+		t.Fatalf("create source object: %v", err)
+	}
+	if err := f.sources.InsertObjectVersion(ctx, f.tenant, source.ObjectVersion{
+		ObjectID: obj.ID, ObservedSeq: 1, ArtifactRef: claim.Job().InputRef,
+		OriginalFilename: "invoice.txt", MimeType: "text/plain",
+	}); err != nil {
+		t.Fatalf("create source version: %v", err)
+	}
+	objectRef, _ := json.Marshal(source.ObjectRef{TenantID: f.tenant, ObjectID: obj.ID, ObservedSeq: 1})
+	if _, err := f.db.SQL.ExecContext(ctx, `UPDATE jobs SET policy=policy || jsonb_build_object('object_ref',$3::jsonb) WHERE tenant_id=$1::uuid AND id=$2`, f.tenant, out.JobID, objectRef); err != nil {
+		t.Fatalf("bind source object to job: %v", err)
+	}
+	if _, err := f.svc.GetJob(ctx, f.principal, out.JobID); err != nil {
+		t.Fatalf("authorized source result read: %v", err)
+	}
+	if _, err := f.db.SQL.ExecContext(ctx, `UPDATE source_objects SET audience='[]'::jsonb WHERE tenant_id=$1::uuid AND id=$2`, f.tenant, obj.ID); err != nil {
+		t.Fatalf("revoke source audience: %v", err)
+	}
+	if _, err := f.svc.GetJob(ctx, f.principal, out.JobID); !errors.Is(err, extract.ErrNotFound) {
+		t.Fatalf("revoked result read = %v, want not found", err)
+	}
+	if _, _, _, err := f.svc.Original(ctx, f.principal, out.JobID); !errors.Is(err, extract.ErrNotFound) {
+		t.Fatalf("revoked original read = %v, want not found", err)
+	}
+	if err := f.svc.DeleteJob(ctx, f.principal, out.JobID); !errors.Is(err, extract.ErrNotFound) {
+		t.Fatalf("revoked deletion = %v, want not found", err)
 	}
 }
 

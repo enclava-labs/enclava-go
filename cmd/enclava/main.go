@@ -174,6 +174,10 @@ func main() {
 		endpointsRepo,
 		cfg.MaxUploadSizeMB,
 	)
+	extractSvc.SetSourceRepository(sourceRepo)
+	if err := extractSvc.ReconcileDeletedJobs(ctx); err != nil {
+		log.Fatalf("extract deletion recovery error: %v", err)
+	}
 	// Seed the bootstrap tenant's default extract templates and settings row
 	// through the owned service.
 	bootstrapTenantID, err := identityRepo.GetTenantBySlug(ctx, "bootstrap")
