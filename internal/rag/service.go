@@ -399,9 +399,6 @@ func (s *Service) ReprocessDocument(ctx context.Context, p auth.Principal, docum
 	return UploadDocumentOutput{Document: doc}, nil
 }
 
-
-
-
 // ---------------------------------------------------------------------
 // Ingest: durable artifact + object/version row + fenced embed job.
 

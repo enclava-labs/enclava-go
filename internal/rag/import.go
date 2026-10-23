@@ -22,9 +22,13 @@ type ImportResultInput struct {
 
 // ImportArtifact explicitly copies a readable original into a knowledge
 // collection; it never starts indexing until this call enqueues the embed job.
+// ErrInvalidInput marks caller-input validation failures (HTTP 400);
+// everything else from import paths is an internal failure.
+var ErrInvalidInput = errors.New("rag input")
+
 func (s *Service) ImportArtifact(ctx context.Context, p auth.Principal, input ImportArtifactInput) (UploadDocumentOutput, error) {
 	if input.ArtifactRef == "" || s.artifacts == nil {
-		return UploadDocumentOutput{}, errors.New("rag import: collection and artifact reference are required")
+		return UploadDocumentOutput{}, fmt.Errorf("%w: collection and artifact reference are required", ErrInvalidInput)
 	}
 	collection, err := s.GetCollection(ctx, p, input.CollectionID)
 	if err != nil {
@@ -57,7 +61,7 @@ func (s *Service) ImportArtifact(ctx context.Context, p auth.Principal, input Im
 // its original input must independently remain readable at import time.
 func (s *Service) ImportStoredResult(ctx context.Context, p auth.Principal, input ImportResultInput) (UploadDocumentOutput, error) {
 	if s.jobs == nil || s.artifacts == nil || input.ResultJobID == "" {
-		return UploadDocumentOutput{}, errors.New("rag import: result job is required")
+		return UploadDocumentOutput{}, fmt.Errorf("%w: result job is required", ErrInvalidInput)
 	}
 	collection, err := s.GetCollection(ctx, p, input.CollectionID)
 	if err != nil {

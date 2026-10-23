@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"enclava-go/internal/artifacts"
@@ -1173,9 +1174,33 @@ func (s *Service) connectorHTTPClient() *http.Client {
 	if s != nil && s.httpClient != nil {
 		return s.httpClient
 	}
+	return newConnectorHTTPClient()
+}
+
+// newConnectorHTTPClient enforces the public-origin policy at DIAL time:
+// validation-time DNS answers can change before the request dials
+// (rebinding), so the transport refuses non-public resolved addresses
+// there. Loopback stays reachable for hermetic fixtures.
+func newConnectorHTTPClient() *http.Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	dialer.Control = func(_, address string, _ syscall.RawConn) error {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return err
+		}
+		if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() && disallowedConnectorIP(ip) {
+			return fmt.Errorf("connector dial to non-public address %s refused", address)
+		}
+		return nil
+	}
 	return &http.Client{
 		Timeout:       30 * time.Second,
 		CheckRedirect: refuseConnectorRedirect,
+		Transport: &http.Transport{
+			DialContext:           dialer.DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+		},
 	}
 }
 

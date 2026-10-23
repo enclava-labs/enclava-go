@@ -55,7 +55,7 @@ func NewGitHubAdapter(c source.Connection, secrets *auth.SecretResolver) (Adapte
 			paths = []string{p}
 		}
 	}
-	return &GitHubAdapter{owner: owner, repo: repo, ref: firstNonEmpty(strings.TrimSpace(stringFromAny(c.Config["ref"])), "HEAD"), token: token, base: base, paths: paths, client: &http.Client{Timeout: 30 * time.Second, CheckRedirect: refuseConnectorRedirect}}, nil
+	return &GitHubAdapter{owner: owner, repo: repo, ref: firstNonEmpty(strings.TrimSpace(stringFromAny(c.Config["ref"])), "HEAD"), token: token, base: base, paths: paths, client: newConnectorHTTPClient()}, nil
 }
 func (g *GitHubAdapter) Capabilities() AdapterCapabilities {
 	return AdapterCapabilities{Content: true, Access: true, Membership: true, UnsupportedScopes: []string{"per-file ACL (GitHub permissions apply at repository scope)"}}

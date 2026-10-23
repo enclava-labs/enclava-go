@@ -46,7 +46,7 @@ func NewTeamsAdapter(connection source.Connection, resolver *auth.SecretResolver
 	if resolver == nil {
 		return nil, errors.New("teams secret resolver is required")
 	}
-	return &TeamsAdapter{connection: connection, resolver: resolver, client: &http.Client{Timeout: 30 * time.Second, CheckRedirect: refuseConnectorRedirect}, baseURL: base}, nil
+	return &TeamsAdapter{connection: connection, resolver: resolver, client: newConnectorHTTPClient(), baseURL: base}, nil
 }
 
 func (a *TeamsAdapter) Capabilities() AdapterCapabilities {

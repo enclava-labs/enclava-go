@@ -95,7 +95,7 @@ func NewNotionAdapter(conn source.Connection, resolver *auth.SecretResolver) (Ad
 	return &NotionAdapter{
 		baseURL: base, token: token, tenantID: conn.TenantID, connectionID: conn.ID,
 		selections: selections, maxDepth: depth, maxItems: items,
-		client: &http.Client{Timeout: 30 * time.Second, CheckRedirect: refuseConnectorRedirect},
+		client: newConnectorHTTPClient(),
 	}, nil
 }
 

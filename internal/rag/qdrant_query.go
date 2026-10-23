@@ -48,11 +48,21 @@ func FilterBuilder(tenantID string, generations []IndexGeneration, narrower map[
 
 // Query submits one branch or an explicit dense+sparse RRF query to Qdrant.
 func (c *QdrantClient) Query(ctx context.Context, collection string, in QueryInput) ([]QdrantSearchPoint, error) {
-	if in.Limit <= 0 { in.Limit = 5 }
-	if in.Mode == "" { in.Mode = QueryHybrid }
-	if in.Mode != QueryLexical && in.Mode != QuerySemantic && in.Mode != QueryHybrid { return nil, fmt.Errorf("unsupported query mode %q", in.Mode) }
-	if (in.Mode == QuerySemantic || in.Mode == QueryHybrid) && len(in.DenseVector) == 0 { return nil, fmt.Errorf("dense vector is required") }
-	if (in.Mode == QueryLexical || in.Mode == QueryHybrid) && strings.TrimSpace(in.LexicalText) == "" { return nil, fmt.Errorf("lexical text is required") }
+	if in.Limit <= 0 {
+		in.Limit = 5
+	}
+	if in.Mode == "" {
+		in.Mode = QueryHybrid
+	}
+	if in.Mode != QueryLexical && in.Mode != QuerySemantic && in.Mode != QueryHybrid {
+		return nil, fmt.Errorf("unsupported query mode %q", in.Mode)
+	}
+	if (in.Mode == QuerySemantic || in.Mode == QueryHybrid) && len(in.DenseVector) == 0 {
+		return nil, fmt.Errorf("dense vector is required")
+	}
+	if (in.Mode == QueryLexical || in.Mode == QueryHybrid) && strings.TrimSpace(in.LexicalText) == "" {
+		return nil, fmt.Errorf("lexical text is required")
+	}
 	path := "/collections/" + url.PathEscape(collection) + "/points/query"
 	payload := map[string]any{"limit": in.Limit, "with_payload": true}
 	dense := map[string]any{"query": in.DenseVector, "using": "dense", "filter": in.Filter, "limit": in.Limit}
@@ -67,12 +77,32 @@ func (c *QdrantClient) Query(ctx context.Context, collection string, in QueryInp
 	case QuerySemantic:
 		payload["query"], payload["using"], payload["filter"] = dense["query"], dense["using"], dense["filter"]
 	}
-	body, err := json.Marshal(payload); if err != nil { return nil, err }
-	status, response, err := c.do(ctx, http.MethodPost, path, body); if err != nil { return nil, err }
-	if status >= 300 { return nil, fmt.Errorf("qdrant query failed: status=%d body=%s", status, response) }
-	var envelope struct { Result json.RawMessage `json:"result"` }
-	if err := json.Unmarshal(response, &envelope); err != nil { return nil, fmt.Errorf("decode qdrant query response: %w", err) }
-	var result struct { Points []QdrantSearchPoint `json:"points"` }
-	if len(envelope.Result) > 0 && envelope.Result[0] == '[' { if err := json.Unmarshal(envelope.Result, &result.Points); err != nil { return nil, err } } else if err := json.Unmarshal(envelope.Result, &result); err != nil { return nil, err }
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	status, response, err := c.do(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, err
+	}
+	if status >= 300 {
+		return nil, fmt.Errorf("qdrant query failed: status=%d body=%s", status, response)
+	}
+	var envelope struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(response, &envelope); err != nil {
+		return nil, fmt.Errorf("decode qdrant query response: %w", err)
+	}
+	var result struct {
+		Points []QdrantSearchPoint `json:"points"`
+	}
+	if len(envelope.Result) > 0 && envelope.Result[0] == '[' {
+		if err := json.Unmarshal(envelope.Result, &result.Points); err != nil {
+			return nil, err
+		}
+	} else if err := json.Unmarshal(envelope.Result, &result); err != nil {
+		return nil, err
+	}
 	return result.Points, nil
 }

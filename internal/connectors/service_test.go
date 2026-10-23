@@ -3,6 +3,8 @@ package connectors
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -326,5 +328,23 @@ func TestRequireAPIOriginEnforcesHTTPSExceptLoopback(t *testing.T) {
 		if _, err := requireAPIOrigin(bad); err == nil {
 			t.Errorf("requireAPIOrigin(%q) accepted, want rejected", bad)
 		}
+	}
+}
+
+func TestConnectorHTTPClientRefusesPrivateDial(t *testing.T) {
+	client := newConnectorHTTPClient()
+	// Loopback must dial (hermetic fixtures).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer srv.Close()
+	if _, err := client.Get(srv.URL); err != nil {
+		t.Fatalf("loopback dial refused: %v", err)
+	}
+	// A private-range resolved address must be refused at dial time.
+	req, err := http.NewRequest(http.MethodGet, "http://192.0.2.1:1/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Transport.RoundTrip(req); err == nil {
+		t.Fatal("private-address dial accepted, want refusal")
 	}
 }

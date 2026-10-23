@@ -111,13 +111,13 @@ type dashboardStatsData struct {
 }
 
 type dashboardPageCommon struct {
-	ActivePage       string
-	PageTitle        string
-	AuthMode         string
-	UserEmail        string
-	DefaultScopes    string
+	ActivePage        string
+	PageTitle         string
+	AuthMode          string
+	UserEmail         string
+	DefaultScopes     string
 	KnowledgeReadable bool
-	ConnectorsManage bool
+	ConnectorsManage  bool
 }
 
 // dashboardIdentityData feeds page_identity: the signed-in account plus the

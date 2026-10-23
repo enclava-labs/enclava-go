@@ -376,30 +376,47 @@ func TestLexicalSearchSkipsEmbeddingAndRechecksRevocation(t *testing.T) {
 	ctx := context.Background()
 	c := f.collection(t)
 	upload, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{FileName: "secret.txt", MimeType: "text/plain", Bytes: []byte("private-copper-aster content")})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	f.runNextJob(t)
 	calls := f.embedding.calls
 	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "private copper", Mode: rag.QueryLexical})
-	if err != nil || len(results) == 0 { t.Fatalf("lexical-only retrieval: %#v err=%v", results, err) }
-	if f.embedding.calls != calls { t.Fatalf("lexical-only search called embedding executor: before=%d after=%d", calls, f.embedding.calls) }
-	if _, err := f.db.SQL.ExecContext(ctx, `UPDATE source_objects SET audience='[]'::jsonb WHERE tenant_id=$1 AND id=$2`, f.tenant, upload.Document.ID); err != nil { t.Fatal(err) }
+	if err != nil || len(results) == 0 {
+		t.Fatalf("lexical-only retrieval: %#v err=%v", results, err)
+	}
+	if f.embedding.calls != calls {
+		t.Fatalf("lexical-only search called embedding executor: before=%d after=%d", calls, f.embedding.calls)
+	}
+	if _, err := f.db.SQL.ExecContext(ctx, `UPDATE source_objects SET audience='[]'::jsonb WHERE tenant_id=$1 AND id=$2`, f.tenant, upload.Document.ID); err != nil {
+		t.Fatal(err)
+	}
 	revoked, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "private copper", Mode: rag.QueryLexical})
-	if err != nil || len(revoked) != 0 { t.Fatalf("revoked result leaked: %#v err=%v", revoked, err) }
+	if err != nil || len(revoked) != 0 {
+		t.Fatalf("revoked result leaked: %#v err=%v", revoked, err)
+	}
 	contextResult, err := f.svc.BuildContext(ctx, f.principal, results, 200)
-	if err != nil || strings.Contains(contextResult.Text, "private-copper-aster") || !contextResult.NeighborWithheld { t.Fatalf("revoked context was not withheld: %#v err=%v", contextResult, err) }
-	if _, err := f.svc.ResolveEvidence(ctx, f.principal, []string{results[0].EvidenceID}); !errors.Is(err, source.ErrDenied) { t.Fatalf("revoked evidence did not resolve as not found: %v", err) }
+	if err != nil || strings.Contains(contextResult.Text, "private-copper-aster") || !contextResult.NeighborWithheld {
+		t.Fatalf("revoked context was not withheld: %#v err=%v", contextResult, err)
+	}
+	if _, err := f.svc.ResolveEvidence(ctx, f.principal, []string{results[0].EvidenceID}); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("revoked evidence did not resolve as not found: %v", err)
+	}
 }
-
 
 func TestOptionalRewriteFailureFallsBackToDirectSearch(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 	c := f.collection(t)
 	upload, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{FileName: "direct.txt", MimeType: "text/plain", Bytes: []byte("original-query direct retrieval")})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	f.runNextJob(t)
 	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "original-query", Rewrite: true, RewriteModel: "embed-test", SelectSections: true, SectionModel: "embed-test"})
-	if err != nil || len(results) == 0 || results[0].DocumentID != upload.Document.ID { t.Fatalf("rewrite failure should retain direct search: %#v err=%v", results, err) }
+	if err != nil || len(results) == 0 || results[0].DocumentID != upload.Document.ID {
+		t.Fatalf("rewrite failure should retain direct search: %#v err=%v", results, err)
+	}
 }
 func TestServiceTenantAndGrantDeny(t *testing.T) {
 	f := newFixture(t)

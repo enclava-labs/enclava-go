@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -327,5 +328,12 @@ func (a *App) writeRAGNotFoundOrBadRequest(w http.ResponseWriter, err error, cod
 		WriteOpenAIError(w, http.StatusNotFound, "not found", "invalid_request_error", "not_found")
 		return
 	}
-	WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", code)
+	if errors.Is(err, rag.ErrInvalidInput) {
+		WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", code)
+		return
+	}
+	// Unexpected (infrastructure) failures are server errors without
+	// backend detail leakage.
+	log.Printf("rag request failed: %v", err)
+	WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", code)
 }
