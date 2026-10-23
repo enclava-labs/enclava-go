@@ -106,6 +106,10 @@ func (h *Handlers) HandleProcess(w http.ResponseWriter, r *http.Request, princip
 			httpx.WriteForbidden(w, err.Error())
 			return
 		}
+		if errors.Is(err, extract.ErrExtractionAdmissionLimited) {
+			httpx.WriteOpenAIError(w, http.StatusTooManyRequests, err.Error(), "rate_limit_error", "extraction_admission_limited")
+			return
+		}
 		lowerErr := strings.ToLower(err.Error())
 		if strings.Contains(lowerErr, "unsupported") || strings.Contains(lowerErr, "template") {
 			httpx.WriteOpenAIError(w, http.StatusUnprocessableEntity, err.Error(), "invalid_request_error", "extract_failed")

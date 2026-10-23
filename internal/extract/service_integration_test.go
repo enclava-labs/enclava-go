@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -806,5 +807,42 @@ func TestAttemptRestrictedInputDeniesBeforeDispatch(t *testing.T) {
 	}
 	if f.upstream.callCount.Load() != 0 {
 		t.Fatalf("upstream dispatched despite denied capability")
+	}
+}
+
+func TestProcessAdmissionLimitCountsOnlyQueuedAndRunning(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract")
+	f.seedTemplate(t, extract.Template{
+		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u",
+		DefaultModel: "priced-extract", Enabled: true,
+	})
+	for i := range extract.ExtractAdmissionLimit {
+		if _, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
+			TemplateID: "invoice", FileName: "admit.txt", MimeType: "text/plain",
+			Bytes: []byte(fmt.Sprintf("admission %d", i)),
+		}); err != nil {
+			t.Fatalf("submission rejected before admission limit: %v", err)
+		}
+	}
+	if _, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
+		TemplateID: "invoice", FileName: "admit.txt", MimeType: "text/plain",
+		Bytes: []byte("admission-over"),
+	}); !errors.Is(err, extract.ErrExtractionAdmissionLimited) {
+		t.Fatalf("submission over limit err=%v, want admission limit", err)
+	}
+	claim, err := f.jobsSvc.Lease(ctx, "admission-test", time.Minute)
+	if err != nil || claim == nil {
+		t.Fatalf("lease: claim=%v err=%v", claim, err)
+	}
+	if _, err := claim.Complete(ctx, ""); err != nil {
+		t.Fatalf("complete one job: %v", err)
+	}
+	if _, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
+		TemplateID: "invoice", FileName: "admit.txt", MimeType: "text/plain",
+		Bytes: []byte("admission-after"),
+	}); err != nil {
+		t.Fatalf("terminal job still counted: %v", err)
 	}
 }

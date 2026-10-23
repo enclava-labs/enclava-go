@@ -683,6 +683,16 @@ func (r *JobsRepo) CountActivePreviews(ctx context.Context, tenantID string) (in
 	return count, err
 }
 
+
+func (r *JobsRepo) CountActiveExtractions(ctx context.Context, tenantID string) (int, error) {
+	var count int
+	err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT count(*) FROM jobs
+		WHERE tenant_id = $1 AND operation IN ($2,$3) AND deleted_at IS NULL
+		  AND status IN ('queued','running')`,
+		tenantID, extract.OperationProcess, extract.OperationVision).Scan(&count)
+	return count, err
+}
 func (r *JobsRepo) ExpiredPreviewJobs(ctx context.Context, before time.Time, limit int) ([]extract.ExpiredPreview, error) {
 	rows, err := r.db.SQL.QueryContext(ctx, `
 		SELECT tenant_id::text, id, COALESCE(input_ref,''), COALESCE(result_ref,''),

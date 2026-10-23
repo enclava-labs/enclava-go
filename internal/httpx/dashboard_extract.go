@@ -2,6 +2,7 @@ package httpx
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -281,6 +282,10 @@ func (a *App) handleDashboardExtractProcess(w http.ResponseWriter, r *http.Reque
 		IdempotencyKey: strings.TrimSpace(r.FormValue("idempotency_key")),
 	})
 	if err != nil {
+		if errors.Is(err, extract.ErrExtractionAdmissionLimited) {
+			WriteJSON(w, http.StatusTooManyRequests, map[string]any{"error": err.Error()})
+			return
+		}
 		WriteJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
 		return
 	}

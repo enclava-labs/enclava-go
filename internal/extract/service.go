@@ -48,6 +48,7 @@ type JobReader interface {
 	CountOwnedJobsSince(ctx context.Context, tenantID, submitterKey string, since time.Time) (int, error)
 	CountLiveArtifactReferences(ctx context.Context, tenantID, artifactRef, excludingJobID string) (int, error)
 	ListDeletedExtractJobs(ctx context.Context) ([]jobs.JobRow, error)
+	CountActiveExtractions(ctx context.Context, tenantID string) (int, error)
 }
 
 // Service owns the extract pipeline: Process persists the upload as a durable
@@ -119,6 +120,13 @@ const maxExtractOutputTokens = 8192
 // get a fresh lease.
 const writeLeaseTTL = 10 * time.Minute
 
+// ExtractAdmissionLimit bounds a tenant's queued+running extraction jobs
+// (best-effort, like the preview cap): durable storage cannot be exhausted
+// by repeated submissions from valid credentials.
+const ExtractAdmissionLimit = 25
+
+var ErrExtractionAdmissionLimited = errors.New("extract: extraction admission limit reached")
+
 // uploadMIMEs maps accepted extensions to their declared media types.
 var uploadMIMEs = map[string]string{
 	".pdf": "application/pdf", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -171,6 +179,14 @@ func (s *Service) ProcessReader(ctx context.Context, p auth.Principal, input Pro
 		}
 	} else if err := s.validateInput(input); err != nil {
 		return ProcessOutput{}, err
+	}
+	// Fail fast on admission before any artifact bytes are persisted.
+	if s.jobRows != nil {
+		if active, err := s.jobRows.CountActiveExtractions(ctx, p.TenantID); err != nil {
+			return ProcessOutput{}, fmt.Errorf("count active extractions: %w", err)
+		} else if active >= ExtractAdmissionLimit {
+			return ProcessOutput{}, ErrExtractionAdmissionLimited
+		}
 	}
 	if !auth.ExtractTemplateAllowed(p, input.TemplateID) {
 		return ProcessOutput{}, ErrForbidden
