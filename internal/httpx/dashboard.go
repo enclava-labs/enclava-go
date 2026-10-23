@@ -180,6 +180,7 @@ func (a *App) registerDashboardRoutes() {
 	a.mux.HandleFunc("/dashboard/partials/prompt-templates", a.sessionAuth.RequireSession(a.handleDashboardPromptTemplates))
 	a.mux.HandleFunc("/dashboard/partials/connectors", a.sessionAuth.RequireSession(a.handleDashboardConnectors))
 	a.mux.HandleFunc("/dashboard/rag/documents/", a.sessionAuth.RequireSession(a.handleDashboardRAGDocumentDownload))
+	a.mux.HandleFunc("/dashboard/documents", a.sessionAuth.RequireSession(a.handleDashboardPageDocuments))
 	a.mux.HandleFunc("/dashboard/extract", a.sessionAuth.RequireSession(a.handleDashboardPageExtract))
 	a.mux.HandleFunc("/dashboard/keys", a.sessionAuth.RequireSession(a.handleDashboardPageKeys))
 	a.mux.HandleFunc("/dashboard/budgets", a.sessionAuth.RequireSession(a.handleDashboardPageBudgets))
@@ -297,6 +298,19 @@ func (a *App) handleDashboardPageExtract(w http.ResponseWriter, r *http.Request)
 	if err := dashboardTemplates.ExecuteTemplate(w, "page-extract", a.dashboardPageData(r, "extract", "Extract")); err != nil {
 		log.Printf("failed to render dashboard extract page: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_extract_page_render_failed")
+	}
+}
+
+func (a *App) handleDashboardPageDocuments(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	setNoStoreHeaders(w)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := dashboardTemplates.ExecuteTemplate(w, "page-documents", a.dashboardPageData(r, "documents", "Documents")); err != nil {
+		log.Printf("failed to render dashboard documents page: %v", err)
+		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_documents_page_render_failed")
 	}
 }
 
