@@ -110,7 +110,7 @@ func (a slackAdapter) messageItem(ctx context.Context, conn source.Connection, c
 	q := url.Values{"channel": {channel}, "message_ts": {msg.TS}}
 	var permalink struct { Permalink string `json:"permalink"` }
 	if err := a.call(ctx, conn, "chat.getPermalink", q, &permalink); err != nil { return ContentItem{}, err }
-	created, _ := time.Parse("150405.000000", msg.TS)
+	created := slackTimestamp(msg.TS)
 	parent := msg.ThreadTS
 	if parent != "" { parent = "slack:" + channel + ":" + parent }
 	return ContentItem{NativeID: "slack:" + channel + ":" + msg.TS, ParentNativeID: parent,
@@ -118,7 +118,20 @@ func (a slackAdapter) messageItem(ctx context.Context, conn source.Connection, c
 		Text: "[" + msg.TS + " " + msg.User + "] " + msg.Text, URL: permalink.Permalink, CreatedAt: optionalTime(created)}, nil
 }
 
-func optionalTime(t time.Time) *time.Time { if t.IsZero() { return nil }; return &t }
+func slackTimestamp(ts string) *time.Time {
+	seconds, fraction, _ := strings.Cut(ts, ".")
+	whole, err := strconv.ParseInt(seconds, 10, 64)
+	if err != nil { return nil }
+	nanos := int64(0)
+	if fraction != "" {
+		if len(fraction) > 9 { fraction = fraction[:9] }
+		fraction = fraction + strings.Repeat("0", 9-len(fraction))
+		nanos, err = strconv.ParseInt(fraction, 10, 64)
+		if err != nil { return nil }
+	}
+	value := time.Unix(whole, nanos).UTC()
+	return &value
+}
 
 func (a slackAdapter) fileItem(ctx context.Context, conn source.Connection, id string) (*ContentItem, error) {
 	if id == "" { return nil, errors.New("slack message file omitted id") }
