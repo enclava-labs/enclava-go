@@ -566,21 +566,22 @@ func (s *Service) GetJob(ctx context.Context, p auth.Principal, jobID string) (J
 	}
 	view := jobView(row)
 	detail := JobDetail{Job: view}
-	if row.ResultRef == "" || s.artifacts == nil {
+	if row.ResultRef == "" {
 		return detail, nil
+	}
+	if s.artifacts == nil {
+		return JobDetail{}, errors.New("extract result artifact store unavailable")
 	}
 	rc, err := s.artifacts.Read(ctx, artifacts.Ref{TenantID: p.TenantID, ID: row.ResultRef})
 	if err != nil {
-		// A missing/tombstoned result artifact degrades to "no result" —
-		// never reveals storage detail.
-		return detail, nil
+		return JobDetail{}, fmt.Errorf("read extract result artifact: %w", err)
 	}
 	defer func() { _ = rc.Close() }()
 	var res ResultView
 	decoder := json.NewDecoder(io.LimitReader(rc, 8<<20))
 	decoder.UseNumber()
 	if err := decoder.Decode(&res); err != nil {
-		return detail, nil
+		return JobDetail{}, fmt.Errorf("decode extract result artifact: %w", err)
 	}
 	detail.Result = &res
 	return detail, nil

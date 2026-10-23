@@ -163,25 +163,62 @@ func (h *Handlers) HandleJobsList(w http.ResponseWriter, r *http.Request, princi
 }
 
 func (h *Handlers) HandleJobDetail(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/extract/jobs/"), "/"), "/")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		httpx.WriteOpenAIError(w, http.StatusBadRequest, "job id is required", "invalid_request_error", "missing_job_id")
+		return
+	}
+	jobID := parts[0]
+	if len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost {
+		if err := h.svc.CancelJob(r.Context(), principal, jobID); err != nil {
+			h.writeJobError(w, err, "job_cancel_failed")
+			return
+		}
+		httpx.WriteJSON(w, http.StatusAccepted, map[string]string{"job_id": jobID, "status": "cancellation_requested"})
+		return
+	}
+	if len(parts) == 1 && r.Method == http.MethodDelete {
+		if err := h.svc.DeleteJob(r.Context(), principal, jobID); err != nil {
+			if errors.Is(err, extract.ErrDeletePending) {
+				httpx.WriteJSON(w, http.StatusAccepted, map[string]string{"job_id": jobID, "status": "cancellation_requested"})
+				return
+			}
+			h.writeJobError(w, err, "job_delete_failed")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if len(parts) == 2 && parts[1] != "result" || len(parts) > 2 {
+		http.NotFound(w, r)
+		return
+	}
 	if r.Method != http.MethodGet {
 		httpx.WriteMethodNotAllowed(w)
 		return
 	}
-	jobID := strings.TrimPrefix(r.URL.Path, "/api/v1/extract/jobs/")
-	if strings.TrimSpace(jobID) == "" {
-		httpx.WriteOpenAIError(w, http.StatusBadRequest, "job id is required", "invalid_request_error", "missing_job_id")
-		return
-	}
 	detail, err := h.svc.GetJob(r.Context(), principal, jobID)
 	if err != nil {
-		if errors.Is(err, extract.ErrNotFound) {
-			httpx.WriteOpenAIError(w, http.StatusNotFound, "job not found", "invalid_request_error", "not_found")
+		h.writeJobError(w, err, "job_fetch_failed")
+		return
+	}
+	if len(parts) == 2 {
+		if detail.Result == nil {
+			httpx.WriteOpenAIError(w, http.StatusConflict, "job result is not available", "invalid_request_error", "result_unavailable")
 			return
 		}
-		httpx.WriteOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error", "job_fetch_failed")
+		httpx.WriteJSON(w, http.StatusOK, detail.Result)
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, detail)
+}
+
+func (h *Handlers) writeJobError(w http.ResponseWriter, err error, code string) {
+	if errors.Is(err, extract.ErrNotFound) {
+		httpx.WriteOpenAIError(w, http.StatusNotFound, "job not found", "invalid_request_error", "not_found")
+		return
+	}
+	httpx.WriteOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error", code)
 }
 
 func (h *Handlers) HandleTemplates(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
