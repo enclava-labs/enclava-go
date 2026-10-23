@@ -268,11 +268,16 @@ func (a *App) handleDashboardExtractProcess(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// The real request principal — no API-key-id-zero authority.
+	operation := strings.TrimSpace(r.FormValue("operation"))
+	if operation == "image-recognition" {
+		operation = extract.OperationVision
+	}
+	if operation == "" {
+		operation = extract.OperationProcess
+	}
 	result, err := a.extractSvc.ProcessReader(r.Context(), p, extract.ProcessInput{
-		Operation: extract.OperationProcess, TemplateID: templateID,
-		Context: contextValues, FileName: filepath.Base(header.Filename),
-		MimeType: mimeType, Reader: file,
+		Operation: operation, TemplateID: templateID, Context: contextValues,
+		FileName: filepath.Base(header.Filename), MimeType: mimeType, Reader: file,
 		IdempotencyKey: strings.TrimSpace(r.FormValue("idempotency_key")),
 	})
 	if err != nil {

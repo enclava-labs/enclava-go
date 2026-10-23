@@ -73,9 +73,17 @@
                 </div>
 
                 <div class="space-y-2">
-                  <label class="text-sm font-medium leading-none">File</label>
+                  <label for="extract-operation" class="text-sm font-medium leading-none">Task</label>
+                  <select id="extract-operation" class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm">
+                    <option value="extract.process">Structured document extraction</option>
+                    <option value="image-recognition">Image recognition</option>
+                  </select>
+                  <p class="text-xs text-muted-foreground">The model must support the selected task. Results include their output-schema version (currently the local 2020-12 validator); schema validity does not prove factual correctness.</p>
+                </div>
+                <div class="space-y-2">
+                  <label for="extract-file-input" class="text-sm font-medium leading-none">File</label>
                   <div id="extract-dropzone" class="relative rounded-lg border-2 border-dashed border-input bg-muted/30 p-8 text-center cursor-pointer hover:border-primary/50 hover:bg-muted/50 transition-colors">
-                    <input type="file" id="extract-file-input" accept=".jpg,.jpeg,.png,.pdf" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer">
+                    <input type="file" id="extract-file-input" accept=".pdf,.jpg,.jpeg,.png,.txt,.md,.markdown,.html,.htm,.csv,.json,.docx" aria-label="Choose file to process" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
                     <div class="space-y-2">
                       <svg class="mx-auto h-10 w-10 text-muted-foreground/60" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
@@ -83,10 +91,10 @@
                       <p class="text-sm text-muted-foreground">
                         <span class="font-medium text-primary">Click to upload</span> or drag and drop
                       </p>
-                      <p class="text-xs text-muted-foreground">JPG, PNG, or PDF (max 10MB)</p>
+                      <p class="text-xs text-muted-foreground">PDF, JPG, PNG, TXT, Markdown, HTML, CSV, JSON, or DOCX. Upload limit follows server configuration.</p>
                     </div>
                   </div>
-                  <p id="extract-file-name" class="text-sm text-muted-foreground hidden"></p>
+                  <p id="extract-selected-file" class="text-sm text-muted-foreground" aria-live="polite"></p>
                 </div>
 
                 <button id="extract-process-btn" type="button" disabled class="w-full inline-flex items-center justify-center rounded-md text-sm font-medium bg-primary text-primary-foreground hover:bg-primary/90 h-10 px-4 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
@@ -251,4 +259,5 @@
   </main>
 
 {{template "layout-toast" .}}
+<script src="/dashboard/static/extraction.js" defer></script>
 {{end}}
