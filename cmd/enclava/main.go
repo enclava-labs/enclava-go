@@ -85,6 +85,8 @@ func main() {
 	if err := artifactStore.Reconcile(ctx); err != nil {
 		log.Fatalf("artifact reconcile error: %v", err)
 	}
+	native := extract.ProbeNative()
+	log.Printf("native document processing capabilities: PDF=%t OCR=%t languages=%v reason=%s", native.PDF, native.OCR, native.Languages, native.Reason)
 
 	jobsSvc := jobs.NewService(jobsRepoPG, 0)
 	billingSvc := billing.NewService(billingRepo)
