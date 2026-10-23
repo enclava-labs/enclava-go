@@ -197,18 +197,70 @@ func (a *App) handleRAGSearch(w http.ResponseWriter, r *http.Request, principal 
 		WriteMethodNotAllowed(w)
 		return
 	}
-	var input rag.SearchInput
-	if err := DecodeJSON(r, &input); err != nil {
+	var request struct {
+		Query   string        `json:"query"`
+		Mode    rag.QueryMode `json:"mode"`
+		Limit   int           `json:"limit"`
+		Rewrite bool          `json:"rewrite"`
+	}
+	if err := DecodeJSON(r, &request); err != nil {
 		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 		return
 	}
-	input.CollectionID = collectionID
-	results, err := a.ragSvc.Search(r.Context(), principal, input)
+	results, err := a.ragSvc.Search(r.Context(), principal, rag.SearchInput{
+		CollectionID: collectionID, Query: request.Query, Mode: request.Mode, Limit: request.Limit, Rewrite: request.Rewrite,
+	})
 	if err != nil {
 		a.writeRAGNotFoundOrBadRequest(w, err, "rag_search_failed")
 		return
 	}
-	WriteJSON(w, http.StatusOK, map[string]any{"results": results})
+	contextResult, err := a.ragSvc.BuildContext(r.Context(), principal, results, 12000)
+	if err != nil {
+		a.writeRAGNotFoundOrBadRequest(w, err, "rag_context_failed")
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{"results": results, "context": contextResult})
+}
+
+func (a *App) handleRAGImports(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
+	if a.ragSvc == nil {
+		WriteOpenAIError(w, http.StatusNotImplemented, "rag is not configured", "server_error", "not_configured")
+		return
+	}
+	if r.Method != http.MethodPost {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	var input struct {
+		CollectionID     string   `json:"collection_id"`
+		ArtifactRef      string   `json:"artifact_ref"`
+		ResultRef        string   `json:"result_ref"`
+		Audience         []string `json:"audience"`
+		ProfileVersionID string   `json:"profile_version_id"`
+	}
+	if err := DecodeJSON(r, &input); err != nil {
+		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
+		return
+	}
+	if input.ArtifactRef != "" && input.ResultRef == "" {
+		out, err := a.ragSvc.ImportArtifact(r.Context(), principal, rag.ImportArtifactInput{CollectionID: input.CollectionID, ArtifactRef: input.ArtifactRef})
+		if err != nil {
+			a.writeRAGNotFoundOrBadRequest(w, err, "rag_import_failed")
+			return
+		}
+		WriteJSON(w, http.StatusAccepted, out)
+		return
+	}
+	if input.ResultRef != "" && input.ArtifactRef == "" {
+		out, err := a.ragSvc.ImportStoredResult(r.Context(), principal, rag.ImportResultInput{CollectionID: input.CollectionID, ResultJobID: input.ResultRef})
+		if err != nil {
+			a.writeRAGNotFoundOrBadRequest(w, err, "rag_import_failed")
+			return
+		}
+		WriteJSON(w, http.StatusAccepted, out)
+		return
+	}
+	WriteOpenAIError(w, http.StatusBadRequest, "exactly one stored artifact or result reference is required", "invalid_request_error", "invalid_import")
 }
 
 func (a *App) handleRAGEvidenceByID(w http.ResponseWriter, r *http.Request, principal auth.Principal) {

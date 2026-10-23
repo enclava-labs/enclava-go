@@ -15,8 +15,9 @@
         <select class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="type" required>
           <option value="github">GitHub</option>
           <option value="slack">Slack</option>
+          <option value="teams">Microsoft Teams</option>
           <option value="notion">Notion</option>
-          <option value="linear">Linear</option>
+          <option value="google_drive">Google Drive</option>
         </select>
       </label>
       <label class="space-y-1 text-sm font-medium">
@@ -73,7 +74,12 @@
             </td>
             <td class="px-4 py-3">{{.Type}}</td>
             <td class="px-4 py-3 font-mono">{{.TargetCollectionID}}</td>
-            <td class="px-4 py-3">{{with .LastSyncAt}}{{.}}{{else}}Never{{end}}</td>
+            <td class="px-4 py-3">
+              {{if .Checkpoint}}<details><summary>Sync details</summary><pre class="whitespace-pre-wrap text-xs">{{printf "%v" .Checkpoint}}</pre></details>{{else}}No sync checkpoint{{end}}
+              <p class="text-xs text-amber-700">Access and membership snapshot freshness is not reported by this connector screen.</p>
+              <span class="inline-flex rounded border border-amber-300 px-2 py-1 text-xs text-amber-800">Access enumeration: not supported</span>
+              <span class="inline-flex rounded border border-amber-300 px-2 py-1 text-xs text-amber-800">Membership enumeration: not supported</span>
+            </td>
             <td class="px-4 py-3">{{if .IsEnabled}}Enabled{{else}}Disabled{{end}}</td>
             <td class="px-4 py-3">
               <div class="flex flex-wrap gap-2">

@@ -161,6 +161,7 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/api/v1/providers/", a.authenticated("pricing.manage", a.handleProviderByID))
 	a.mux.HandleFunc("/api/v1/processing-restrictions", a.authenticated("pricing.manage", a.handleProcessingRestrictions))
 	a.mux.HandleFunc("/api/v1/rag/collections", a.authenticated("rag", a.handleRAGCollections))
+	a.mux.HandleFunc("/api/v1/knowledge/imports", a.authenticated("rag", a.handleRAGImports))
 	a.mux.HandleFunc("/api/v1/rag/collections/", a.authenticated("rag", a.handleRAGCollectionByID))
 	a.mux.HandleFunc("/api/v1/rag/documents/", a.authenticated("rag", a.handleRAGDocumentByID))
 	a.mux.HandleFunc("/api/v1/rag/evidence/", a.authenticated("rag", a.handleRAGEvidenceByID))

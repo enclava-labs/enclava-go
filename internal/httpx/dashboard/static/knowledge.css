@@ -1,0 +1,2 @@
+#knowledge-search-results article { overflow-wrap: anywhere; }
+#knowledge-search-results a:focus-visible, #knowledge-search-form :focus-visible, #knowledge-import-form :focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }

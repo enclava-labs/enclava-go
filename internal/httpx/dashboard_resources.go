@@ -697,11 +697,9 @@ func dashboardConnectorConfig(r *http.Request) (map[string]any, error) {
 		return config, nil
 	}
 	config["documents"] = []any{map[string]any{
-		"file_name":  r.FormValue("file_name"),
-		"mime_type":  "text/plain",
-		"content":    content,
-		"source_id":  r.FormValue("source_id"),
-		"source_uri": r.FormValue("source_uri"),
+		"file_name": r.FormValue("file_name"),
+		"mime_type": "text/plain",
+		"content":   content,
 	}}
 	return config, nil
 }
