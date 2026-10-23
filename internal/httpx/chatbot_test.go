@@ -78,6 +78,9 @@ type staticRAG struct {
 func (s staticRAG) Search(context.Context, auth.Principal, rag.SearchInput) ([]rag.SearchResult, error) {
 	return nil, s.err
 }
+func (s staticRAG) BuildContext(context.Context, auth.Principal, []rag.SearchResult, int) (rag.ContextResult, error) {
+	return rag.ContextResult{}, s.err
+}
 
 type dialNetError struct {
 	msg string

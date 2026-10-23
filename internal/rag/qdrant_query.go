@@ -26,13 +26,19 @@ type QueryInput struct {
 	Mode        QueryMode
 }
 
-// FilterBuilder builds a Qdrant filter from server-authorized object versions.
-func FilterBuilder(tenantID string, objectVersions []string, narrower map[string]any) map[string]any {
+// FilterBuilder binds queries to current, published object generations and access state.
+func FilterBuilder(tenantID string, generations []IndexGeneration, narrower map[string]any) map[string]any {
+	generationFilters := make([]any, 0, len(generations))
+	for _, generation := range generations {
+		generationFilters = append(generationFilters, map[string]any{"must": []any{
+			map[string]any{"key": "object_version_id", "match": map[string]any{"value": generation.ObjectVersionID}},
+			map[string]any{"key": "generation", "match": map[string]any{"value": generation.Generation}},
+		}})
+	}
 	must := []any{
 		map[string]any{"key": "tenant_id", "match": map[string]any{"value": tenantID}},
-		map[string]any{"key": "object_version_id", "match": map[string]any{"any": objectVersions}},
-		map[string]any{"key": "publication_state", "match": map[string]any{"value": "published"}},
-		map[string]any{"key": "tombstoned", "match": map[string]any{"value": false}},
+		map[string]any{"key": "access_enabled", "match": map[string]any{"value": true}},
+		map[string]any{"should": generationFilters},
 	}
 	if narrower != nil {
 		must = append(must, narrower)

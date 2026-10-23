@@ -211,6 +211,38 @@ func (a *App) handleRAGSearch(w http.ResponseWriter, r *http.Request, principal 
 	WriteJSON(w, http.StatusOK, map[string]any{"results": results})
 }
 
+func (a *App) handleRAGEvidenceByID(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
+	if a.ragSvc == nil {
+		WriteOpenAIError(w, http.StatusNotImplemented, "rag is not configured", "server_error", "not_configured")
+		return
+	}
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/rag/evidence/"), "/")
+	parts := strings.Split(rest, "/")
+	if len(parts) == 1 && r.Method == http.MethodGet {
+		resolved, err := a.ragSvc.ResolveEvidence(r.Context(), principal, []string{parts[0]})
+		if err != nil {
+			writeRAGNotFoundOrError(w, err, "rag_evidence_not_found")
+			return
+		}
+		WriteJSON(w, http.StatusOK, resolved[0])
+		return
+	}
+	if len(parts) == 2 && parts[1] == "copy" && r.Method == http.MethodGet {
+		blob, err := a.ragSvc.DownloadEvidenceCopy(r.Context(), principal, parts[0])
+		if err != nil {
+			writeRAGNotFoundOrError(w, err, "rag_evidence_not_found")
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", `attachment; filename="retained-copy"`)
+		w.Header().Set("X-Enclava-Evidence-View", "retained-copy")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(blob)
+		return
+	}
+	WriteMethodNotAllowed(w)
+}
+
 func paginationFromRequest(r *http.Request) (int, int) {
 	limit := 20
 	offset := 0

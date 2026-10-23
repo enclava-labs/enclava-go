@@ -53,6 +53,10 @@ type Repository interface {
 	LiveCollectionSourceIDs(ctx context.Context, tenantID, collectionID string) (map[string]struct{}, error)
 	GetDocument(ctx context.Context, tenantID, objectID string) (Document, error)
 	DeleteObjectRows(ctx context.Context, tenantID, objectID string) error
+	ListPublishedGenerations(ctx context.Context, tenantID, collectionID string) ([]IndexGeneration, error)
+	ListGenerationChunks(ctx context.Context, tenantID, collectionID, versionID string, generation int64) ([]DocumentChunk, error)
+	SaveEvidence(ctx context.Context, record EvidenceRecord) error
+	GetEvidence(ctx context.Context, tenantID, id string) (EvidenceRecord, error)
 
 	// Index generations + chunks (single transactional publish boundary).
 	// ReplaceVersionChunksAndStage deletes any prior chunk rows for the
@@ -395,140 +399,8 @@ func (s *Service) ReprocessDocument(ctx context.Context, p auth.Principal, docum
 	return UploadDocumentOutput{Document: doc}, nil
 }
 
-// Search resolves the caller's authorized object set BEFORE querying Qdrant:
-// the query itself is scoped, never post-filtered only.
-func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInput) ([]SearchResult, error) {
-	query := strings.TrimSpace(input.Query)
-	if query == "" {
-		return nil, errors.New("query is required")
-	}
-	c, err := s.GetCollection(ctx, p, strings.TrimSpace(input.CollectionID))
-	if err != nil {
-		return nil, err
-	}
-	objectIDs, err := s.repo.ListCollectionItems(ctx, p.TenantID, c.ID)
-	if err != nil {
-		return nil, err
-	}
-	allowedVersions := []string{}
-	queryInputs := []source.ObjectRef{}
-	for _, oid := range objectIDs {
-		obj, err := s.repo.GetObject(ctx, p.TenantID, oid)
-		if err != nil {
-			continue // deleted/unknown objects deny identically
-		}
-		if err := s.authorizer.CanRead(ctx, p, obj, source.ReadOptions{}); err != nil {
-			continue
-		}
-		doc, err := s.repo.GetDocument(ctx, p.TenantID, oid)
-		if err != nil || doc.Status != DocumentStatusReady || doc.ObjectVersionID == "" {
-			continue
-		}
-		allowedVersions = append(allowedVersions, doc.ObjectVersionID)
-		queryInputs = append(queryInputs, source.ObjectRef{ObjectID: oid})
-	}
-	if len(allowedVersions) == 0 {
-		return []SearchResult{}, nil
-	}
-	filter := map[string]any{
-		"must": []any{
-			map[string]any{"key": "object_version_id", "match": map[string]any{"any": allowedVersions}},
-		},
-	}
-	if len(input.Filter) > 0 {
-		filter["must"] = append(filter["must"].([]any), input.Filter)
-	}
-	vectors, err := s.embed(ctx, p, c.EmbeddingModel, []string{query}, embedScope{Inputs: queryInputs})
-	if err != nil {
-		return nil, err
-	}
-	results, err := s.vectorStore.SearchHybrid(ctx, c.QdrantCollection, vectors[0], sparseVector(query), input.Limit, filter)
-	if err != nil {
-		return nil, err
-	}
-	return mergeSearchSections(results, input.Limit), nil
-}
 
-func mergeSearchSections(points []QdrantSearchPoint, limit int) []SearchResult {
-	if limit <= 0 {
-		limit = 5
-	}
-	out := make([]SearchResult, 0, len(points))
-	for _, point := range points {
-		p := point.Payload
-		docID := stringFromPayload(p, "document_id")
-		index := intFromPayload(p["chunk_index"])
-		content := stringFromPayload(p, "content")
-		headerPath := stringFromPayload(p, "header_path")
-		merged := false
-		for i := range out {
-			if out[i].DocumentID != docID || out[i].HeaderPath != headerPath {
-				continue
-			}
-			switch {
-			case index == out[i].ChunkEnd+1:
-				out[i].Content += content
-				out[i].ChunkEnd = index
-				merged = true
-			case index == out[i].ChunkStart-1:
-				out[i].Content = content + out[i].Content
-				out[i].ChunkStart = index
-				merged = true
-			}
-			if merged {
-				break
-			}
-		}
-		if merged {
-			continue
-		}
-		if len(out) < limit {
-			out = append(out, SearchResult{
-				DocumentID: docID,
-				ChunkID:    stringFromPayload(p, "chunk_id"),
-				ChunkStart: index,
-				ChunkEnd:   index,
-				Score:      point.Score,
-				Content:    content,
-				SourceURI:  stringFromPayload(p, "source_uri"),
-				FileName:   stringFromPayload(p, "file_name"),
-				HeaderPath: headerPath,
-				Metadata:   mapFromPayload(p, "metadata"),
-			})
-		}
-	}
-	for i := range out {
-		for j := i + 1; j < len(out); {
-			if out[i].DocumentID != out[j].DocumentID || out[i].HeaderPath != out[j].HeaderPath ||
-				(out[i].ChunkEnd+1 != out[j].ChunkStart && out[j].ChunkEnd+1 != out[i].ChunkStart) {
-				j++
-				continue
-			}
-			if out[j].ChunkStart < out[i].ChunkStart {
-				out[i].Content = out[j].Content + out[i].Content
-				out[i].ChunkStart = out[j].ChunkStart
-			} else {
-				out[i].Content += out[j].Content
-				out[i].ChunkEnd = out[j].ChunkEnd
-			}
-			out = append(out[:j], out[j+1:]...)
-		}
-	}
-	return out
-}
 
-func intFromPayload(value any) int {
-	switch n := value.(type) {
-	case float64:
-		return int(n)
-	case int:
-		return n
-	case int64:
-		return int(n)
-	default:
-		return 0
-	}
-}
 
 // ---------------------------------------------------------------------
 // Ingest: durable artifact + object/version row + fenced embed job.

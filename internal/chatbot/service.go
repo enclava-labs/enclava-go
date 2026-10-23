@@ -43,6 +43,7 @@ type PromptRepository interface {
 // passed through unchanged so a caller can never forge collection authority.
 type RAGSearcher interface {
 	Search(ctx context.Context, p auth.Principal, input rag.SearchInput) ([]rag.SearchResult, error)
+	BuildContext(ctx context.Context, p auth.Principal, candidates []rag.SearchResult, characterLimit int) (rag.ContextResult, error)
 }
 
 // Executor is the single authorized priced model-dispatch boundary;
@@ -417,8 +418,14 @@ func ragInputs(results []rag.SearchResult) []source.ObjectRef {
 		if _, dup := seen[id]; dup {
 			continue
 		}
-		seen[id] = struct{}{}
-		refs = append(refs, source.ObjectRef{ObjectID: id})
+		ref := source.ObjectRef{ObjectID: id}
+		for _, span := range r.Spans {
+			if span.Ref.ObjectID == id && span.Ref.ObservedSeq > 0 {
+				ref = span.Ref
+				break
+			}
+		}
+		refs = append(refs, ref)
 	}
 	return refs
 }
@@ -512,7 +519,11 @@ func (s *Service) retrieveRAG(ctx context.Context, p auth.Principal, bot Instanc
 		}
 		results = append(results, found...)
 	}
-	return results, buildRAGContext(results, maxChars), nil
+	context, err := s.rag.BuildContext(ctx, p, results, maxChars)
+	if err != nil {
+		return nil, "", err
+	}
+	return results, context.Text, nil
 }
 
 func (s *Service) ensureConversation(ctx context.Context, p auth.Principal, bot Instance, req chatCompletionRequest) (Conversation, error) {
@@ -631,33 +642,6 @@ func latestUserInput(messages []map[string]any) (string, int) {
 	return "", -1
 }
 
-func buildRAGContext(results []rag.SearchResult, maxChars int) string {
-	if len(results) == 0 || maxChars <= 0 {
-		return ""
-	}
-	var b strings.Builder
-	b.WriteString("Relevant context:\n")
-	for i, result := range results {
-		if b.Len() >= maxChars {
-			break
-		}
-		content := strings.TrimSpace(result.Content)
-		if content == "" {
-			continue
-		}
-		source := strings.TrimSpace(result.FileName)
-		if source == "" {
-			source = result.DocumentID
-		}
-		line := fmt.Sprintf("[%d] %s\n%s\n\n", i+1, source, content)
-		remaining := maxChars - b.Len()
-		if len(line) > remaining {
-			line = line[:remaining]
-		}
-		b.WriteString(line)
-	}
-	return strings.TrimSpace(b.String())
-}
 
 func cloneMessages(messages []map[string]any) []map[string]any {
 	out := make([]map[string]any, len(messages))

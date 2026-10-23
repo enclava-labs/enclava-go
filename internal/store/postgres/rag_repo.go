@@ -830,3 +830,76 @@ func (r *RAGRepo) RecordKnowledgeImport(ctx context.Context, tenantID, collectio
 	}
 	return nil
 }
+func (r *RAGRepo) ListPublishedGenerations(ctx context.Context, tenantID, collectionID string) ([]rag.IndexGeneration, error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `
+		SELECT g.collection_id, c.qdrant_collection, o.id, g.object_version_id,
+		       g.generation, g.state, false
+		FROM index_generations g
+		JOIN source_object_versions v ON v.tenant_id=g.tenant_id AND v.id=g.object_version_id
+		JOIN source_objects o ON o.tenant_id=v.tenant_id AND o.id=v.object_id
+		JOIN knowledge_collections c ON c.tenant_id=g.tenant_id AND c.id=g.collection_id
+		WHERE g.tenant_id=$1 AND g.collection_id=$2 AND g.state='published'
+		  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL AND o.observed_seq=v.observed_seq`,
+		tenantID, collectionID)
+	if err != nil { return nil, fmt.Errorf("list published generations: %w", err) }
+	defer rows.Close()
+	var result []rag.IndexGeneration
+	for rows.Next() {
+		var generation rag.IndexGeneration
+		if err := rows.Scan(&generation.CollectionID, &generation.QdrantCollection, &generation.ObjectID, &generation.ObjectVersionID, &generation.Generation, &generation.State, &generation.Tombstoned); err != nil {
+			return nil, fmt.Errorf("scan published generation: %w", err)
+		}
+		result = append(result, generation)
+	}
+	if err := rows.Err(); err != nil { return nil, fmt.Errorf("iterate published generations: %w", err) }
+	return result, nil
+}
+
+func (r *RAGRepo) ListGenerationChunks(ctx context.Context, tenantID, collectionID, versionID string, generation int64) ([]rag.DocumentChunk, error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `
+		SELECT id, object_version_id, collection_id, generation, ordinal, text,
+		       byte_start, byte_end, span_refs, block_path, locator, qdrant_point_id, created_at
+		FROM chunks
+		WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3 AND generation=$4
+		ORDER BY ordinal`, tenantID, collectionID, versionID, generation)
+	if err != nil { return nil, fmt.Errorf("list generation chunks: %w", err) }
+	defer rows.Close()
+	var result []rag.DocumentChunk
+	for rows.Next() {
+		var chunk rag.DocumentChunk
+		var spans, metadata []byte
+		if err := rows.Scan(&chunk.ID, &chunk.DocumentID, &chunk.CollectionID, &chunk.Generation, &chunk.ChunkIndex, &chunk.Content, &chunk.ByteStart, &chunk.ByteEnd, &spans, &chunk.HeaderPath, &metadata, &chunk.QdrantPointID, &chunk.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan generation chunk: %w", err)
+		}
+		if err := json.Unmarshal(spans, &chunk.SpanRefs); err != nil { return nil, fmt.Errorf("decode chunk spans: %w", err) }
+		if err := json.Unmarshal(metadata, &chunk.Metadata); err != nil { return nil, fmt.Errorf("decode chunk metadata: %w", err) }
+		result = append(result, chunk)
+	}
+	if err := rows.Err(); err != nil { return nil, fmt.Errorf("iterate generation chunks: %w", err) }
+	return result, nil
+}
+
+func (r *RAGRepo) SaveEvidence(ctx context.Context, record rag.EvidenceRecord) error {
+	spans, err := json.Marshal(record.SpanRefs)
+	if err != nil { return fmt.Errorf("marshal evidence spans: %w", err) }
+	_, err = r.db.SQL.ExecContext(ctx, `
+		INSERT INTO rag_evidence (tenant_id,id,collection_id,object_id,object_version_id,observed_seq,generation,chunk_id,span_refs)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)`,
+		record.TenantID, record.ID, record.CollectionID, record.ObjectID, record.ObjectVersionID, record.ObservedSeq, record.Generation, record.ChunkID, spans)
+	if err != nil { return fmt.Errorf("save evidence record: %w", err) }
+	return nil
+}
+
+func (r *RAGRepo) GetEvidence(ctx context.Context, tenantID, id string) (rag.EvidenceRecord, error) {
+	var record rag.EvidenceRecord
+	var spans []byte
+	err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT id,collection_id,object_id,object_version_id,observed_seq,generation,chunk_id,span_refs
+		FROM rag_evidence WHERE tenant_id=$1 AND id=$2`, tenantID, id).
+		Scan(&record.ID, &record.CollectionID, &record.ObjectID, &record.ObjectVersionID, &record.ObservedSeq, &record.Generation, &record.ChunkID, &spans)
+	if errors.Is(err, sql.ErrNoRows) { return rag.EvidenceRecord{}, source.ErrDenied }
+	if err != nil { return rag.EvidenceRecord{}, fmt.Errorf("get evidence record: %w", err) }
+	record.TenantID = tenantID
+	if err := json.Unmarshal(spans, &record.SpanRefs); err != nil { return rag.EvidenceRecord{}, fmt.Errorf("decode evidence spans: %w", err) }
+	return record, nil
+}

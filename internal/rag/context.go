@@ -33,12 +33,26 @@ func BuildContext(ctx context.Context, p auth.Principal, candidates []SearchResu
 			continue
 		}
 		if len(hit.Spans) != 0 {
-			span := hit.Spans[0]
-			key := span.Ref.TenantID + "\x00" + span.Ref.ObjectID + "\x00" + itoa64(span.Ref.ObservedSeq) + "\x00" + span.BlockID + "\x00" + itoa64(hit.Generation) + "\x00" + itoa(span.ByteStart) + ":" + itoa(span.ByteEnd)
-			if _, ok := seen[key]; ok {
+			var key strings.Builder
+			key.WriteString(strconv.FormatInt(hit.Generation, 10))
+			for _, span := range hit.Spans {
+				key.WriteByte(0)
+				key.WriteString(span.Ref.TenantID)
+				key.WriteByte(0)
+				key.WriteString(span.Ref.ObjectID)
+				key.WriteByte(0)
+				key.WriteString(strconv.FormatInt(span.Ref.ObservedSeq, 10))
+				key.WriteByte(0)
+				key.WriteString(span.BlockID)
+				key.WriteByte(0)
+				key.WriteString(strconv.Itoa(span.ByteStart))
+				key.WriteByte(':')
+				key.WriteString(strconv.Itoa(span.ByteEnd))
+			}
+			if _, ok := seen[key.String()]; ok {
 				continue
 			}
-			seen[key] = struct{}{}
+			seen[key.String()] = struct{}{}
 		}
 		text := strings.TrimSpace(hit.Content)
 		if text == "" {
@@ -65,5 +79,3 @@ func BuildContext(ctx context.Context, p auth.Principal, candidates []SearchResu
 	return out
 }
 
-func itoa(n int) string { return strconv.Itoa(n) }
-func itoa64(n int64) string { return strconv.FormatInt(n, 10) }

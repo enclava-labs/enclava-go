@@ -139,24 +139,55 @@ type UploadDocumentInput struct {
 type SearchInput struct {
 	CollectionID string         `json:"collection_id"`
 	Query        string         `json:"query"`
+	Mode         QueryMode      `json:"mode,omitempty"`
 	Limit        int            `json:"limit,omitempty"`
-	Filter       map[string]any `json:"filter,omitempty"`
+	Rewrite       bool           `json:"rewrite,omitempty"`
+	RewriteModel  string         `json:"rewrite_model,omitempty"`
+	SelectSections bool          `json:"select_sections,omitempty"`
+	SectionModel  string         `json:"section_model,omitempty"`
+	Filter        map[string]any `json:"filter,omitempty"`
 }
 
 type SearchResult struct {
-	DocumentID string         `json:"document_id"`
-	ChunkID    string         `json:"chunk_id"`
-	Generation int64          `json:"generation,omitempty"`
-	Spans      []source.Span  `json:"spans,omitempty"`
+	DocumentID   string         `json:"document_id"`
+	CollectionID    string         `json:"collection_id,omitempty"`
+	ObjectVersionID string         `json:"-"`
+	ChunkID      string         `json:"chunk_id"`
+	Generation   int64          `json:"generation,omitempty"`
+	Spans        []source.Span  `json:"spans,omitempty"`
 	EvidenceID string         `json:"evidence_id,omitempty"`
 	ChunkStart int            `json:"chunk_start"`
 	ChunkEnd   int            `json:"chunk_end"`
 	Score      float64        `json:"score"`
 	Content    string         `json:"content"`
-	SourceURI  string         `json:"source_uri,omitempty"`
+	SourceURI  string         `json:"-"`
 	FileName   string         `json:"file_name,omitempty"`
 	HeaderPath string         `json:"header_path,omitempty"`
-	Metadata   map[string]any `json:"metadata,omitempty"`
+	Metadata   map[string]any `json:"-"`
+}
+
+type EvidenceRecord struct {
+	TenantID        string
+	ID              string
+	CollectionID    string
+	ObjectID        string
+	ObjectVersionID string
+	ObservedSeq     int64
+	Generation      int64
+	ChunkID         string
+	SpanRefs        []source.Span
+}
+
+type EvidenceResolution struct {
+	ID                string          `json:"id"`
+	Status            string          `json:"status"`
+	NativeLink        string          `json:"native_link,omitempty"`
+	RetainedCopyLabel string          `json:"retained_copy_label,omitempty"`
+	RetainedCopyURL   string          `json:"retained_copy_url,omitempty"`
+	Locations         []source.Locator `json:"locations,omitempty"`
+	Spans             []source.Span   `json:"spans,omitempty"`
+	CitedGeneration   int64           `json:"cited_generation,omitempty"`
+	CurrentGeneration int64           `json:"current_generation,omitempty"`
 }
 
 type UploadDocumentOutput struct {

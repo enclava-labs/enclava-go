@@ -85,6 +85,12 @@ func (f *fakeRAGSearcher) Search(ctx context.Context, p auth.Principal, input ra
 		},
 	}, nil
 }
+func (f *fakeRAGSearcher) BuildContext(_ context.Context, _ auth.Principal, candidates []rag.SearchResult, limit int) (rag.ContextResult, error) {
+	return rag.ContextResult{Text: rag.BuildContext(context.Background(), auth.Principal{}, candidates, limit, allowContext{}).Text}, nil
+}
+
+type allowContext struct{}
+func (allowContext) CanReadObject(context.Context, auth.Principal, string) bool { return true }
 
 type chatFixture struct {
 	svc         *chatbot.Service

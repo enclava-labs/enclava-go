@@ -217,6 +217,9 @@ func (f *fakeVectorStore) SearchHybrid(ctx context.Context, collection string, v
 	}
 	return out, nil
 }
+func (f *fakeVectorStore) Query(ctx context.Context, collection string, input rag.QueryInput) ([]rag.QdrantSearchPoint, error) {
+	return f.SearchHybrid(ctx, collection, input.DenseVector, rag.SparseVector{}, input.Limit, input.Filter)
+}
 
 type fixture struct {
 	db        *postgres.DB
@@ -225,6 +228,7 @@ type fixture struct {
 	jobs      *jobs.Service
 	store     *artifacts.Store
 	vector    *fakeVectorStore
+	embedding *fakeEmbeddingUpstream
 	tenant    string
 	principal auth.Principal
 }
@@ -243,7 +247,8 @@ func newFixture(t *testing.T) *fixture {
 	}
 	vector := newFakeVectorStore()
 	repo := postgres.NewRAGRepo(db)
-	svc := rag.NewService(repo, vector, newExecutor(t, db, tenant, &fakeEmbeddingUpstream{}), "embed-test", store, jobsSvc)
+	embedding := &fakeEmbeddingUpstream{}
+	svc := rag.NewService(repo, vector, newExecutor(t, db, tenant, embedding), "embed-test", store, jobsSvc)
 	p := auth.Principal{
 		TenantID:            tenant,
 		ActorID:             user.ID,
@@ -254,7 +259,7 @@ func newFixture(t *testing.T) *fixture {
 		AllowedModelsAll:    true,
 		AllowedEndpointsAll: true,
 	}
-	return &fixture{db: db, svc: svc, repo: repo, jobs: jobsSvc, store: store, vector: vector, tenant: tenant, principal: p}
+	return &fixture{db: db, svc: svc, repo: repo, jobs: jobsSvc, store: store, vector: vector, embedding: embedding, tenant: tenant, principal: p}
 }
 
 func (f *fixture) collection(t *testing.T) rag.Collection {
@@ -337,6 +342,24 @@ func TestServiceUploadIndexSearchDelete(t *testing.T) {
 	if len(results) == 0 || results[0].DocumentID != upload.Document.ID {
 		t.Fatalf("unexpected search results: %#v", results)
 	}
+	if results[0].EvidenceID == "" {
+		t.Fatal("retrieval result has no server-minted evidence ID")
+	}
+	resolved, err := f.svc.ResolveEvidence(ctx, f.principal, []string{results[0].EvidenceID})
+	if err != nil || len(resolved) != 1 || resolved[0].Status != "current" || resolved[0].RetainedCopyLabel != "retained copy" {
+		t.Fatalf("resolve current evidence: %#v err=%v", resolved, err)
+	}
+	if _, err := f.svc.ResolveEvidence(ctx, f.principal, []string{"forged-evidence-id"}); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("forged evidence should use the not-found outcome, got %v", err)
+	}
+	contextResult, err := f.svc.BuildContext(ctx, f.principal, results, 100)
+	if err != nil || contextResult.CharacterLimit != 100 || !strings.Contains(contextResult.Text, results[0].EvidenceID) {
+		t.Fatalf("build evidence context: %#v err=%v", contextResult, err)
+	}
+	copyBytes, err := f.svc.DownloadEvidenceCopy(ctx, f.principal, results[0].EvidenceID)
+	if err != nil || string(copyBytes) != "enclava rag search content for integration testing" {
+		t.Fatalf("authorized retained copy download: %q err=%v", copyBytes, err)
+	}
 	if _, blob, err := f.svc.DownloadDocument(ctx, f.principal, upload.Document.ID); err != nil || string(blob) == "" {
 		t.Fatalf("download: %v", err)
 	}
@@ -348,6 +371,36 @@ func TestServiceUploadIndexSearchDelete(t *testing.T) {
 	}
 }
 
+func TestLexicalSearchSkipsEmbeddingAndRechecksRevocation(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	upload, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{FileName: "secret.txt", MimeType: "text/plain", Bytes: []byte("private-copper-aster content")})
+	if err != nil { t.Fatal(err) }
+	f.runNextJob(t)
+	calls := f.embedding.calls
+	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "private copper", Mode: rag.QueryLexical})
+	if err != nil || len(results) == 0 { t.Fatalf("lexical-only retrieval: %#v err=%v", results, err) }
+	if f.embedding.calls != calls { t.Fatalf("lexical-only search called embedding executor: before=%d after=%d", calls, f.embedding.calls) }
+	if _, err := f.db.SQL.ExecContext(ctx, `UPDATE source_objects SET audience='[]'::jsonb WHERE tenant_id=$1 AND id=$2`, f.tenant, upload.Document.ID); err != nil { t.Fatal(err) }
+	revoked, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "private copper", Mode: rag.QueryLexical})
+	if err != nil || len(revoked) != 0 { t.Fatalf("revoked result leaked: %#v err=%v", revoked, err) }
+	contextResult, err := f.svc.BuildContext(ctx, f.principal, results, 200)
+	if err != nil || strings.Contains(contextResult.Text, "private-copper-aster") || !contextResult.NeighborWithheld { t.Fatalf("revoked context was not withheld: %#v err=%v", contextResult, err) }
+	if _, err := f.svc.ResolveEvidence(ctx, f.principal, []string{results[0].EvidenceID}); !errors.Is(err, source.ErrDenied) { t.Fatalf("revoked evidence did not resolve as not found: %v", err) }
+}
+
+
+func TestOptionalRewriteFailureFallsBackToDirectSearch(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	upload, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{FileName: "direct.txt", MimeType: "text/plain", Bytes: []byte("original-query direct retrieval")})
+	if err != nil { t.Fatal(err) }
+	f.runNextJob(t)
+	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "original-query", Rewrite: true, RewriteModel: "embed-test", SelectSections: true, SectionModel: "embed-test"})
+	if err != nil || len(results) == 0 || results[0].DocumentID != upload.Document.ID { t.Fatalf("rewrite failure should retain direct search: %#v err=%v", results, err) }
+}
 func TestServiceTenantAndGrantDeny(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
