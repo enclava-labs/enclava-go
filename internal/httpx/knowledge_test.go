@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +19,30 @@ import (
 	"enclava-go/internal/store/postgres"
 	"enclava-go/internal/testdb"
 )
+
+func TestKnowledgeNavigationRequiresReadableScope(t *testing.T) {
+	render := func(readable, manage bool) string {
+		t.Helper()
+		var out bytes.Buffer
+		err := dashboardTemplates.ExecuteTemplate(&out, "layout-nav", dashboardPageCommon{
+			KnowledgeReadable: readable,
+			ConnectorsManage:  manage,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	if strings.Contains(render(false, false), `href="/dashboard/rag"`) {
+		t.Fatal("knowledge navigation visible without a readable scope")
+	}
+	if !strings.Contains(render(true, false), `>Knowledge</a>`) {
+		t.Fatal("knowledge navigation missing for readable principal")
+	}
+	if !strings.Contains(render(false, true), `href="/dashboard/connectors"`) {
+		t.Fatal("source navigation missing for connector manager")
+	}
+}
 
 func TestKnowledgeImportHTTPAuthorizationAndDuplicate(t *testing.T) {
 	db := testdb.New(t)

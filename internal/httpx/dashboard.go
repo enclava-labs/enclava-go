@@ -111,11 +111,13 @@ type dashboardStatsData struct {
 }
 
 type dashboardPageCommon struct {
-	ActivePage    string
-	PageTitle     string
-	AuthMode      string
-	UserEmail     string
-	DefaultScopes string
+	ActivePage       string
+	PageTitle        string
+	AuthMode         string
+	UserEmail        string
+	DefaultScopes    string
+	KnowledgeReadable bool
+	ConnectorsManage bool
 }
 
 // dashboardIdentityData feeds page_identity: the signed-in account plus the
@@ -203,6 +205,10 @@ func (a *App) dashboardPageData(r *http.Request, activePage, pageTitle string) d
 		PageTitle:     pageTitle,
 		AuthMode:      "session",
 		DefaultScopes: strings.Join(dashboardDefaultScopes, ", "),
+	}
+	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
+		data.KnowledgeReadable = auth.HasScope(principal, "rag") || auth.HasScope(principal, "connectors.manage")
+		data.ConnectorsManage = auth.HasScope(principal, "connectors.manage")
 	}
 	// The principal is session-verified; the email renders in the account
 	// menu so the operator sees which employee account holds the session.
