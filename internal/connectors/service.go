@@ -422,6 +422,20 @@ func (s *Service) GetSyncJob(ctx context.Context, p auth.Principal, id string) (
 	return jobView(row.Job), nil
 }
 
+func (s *Service) CancelSyncJob(ctx context.Context, p auth.Principal, id string) error {
+	if err := requireTenant(p); err != nil {
+		return err
+	}
+	if s.jobRows == nil || s.jobs == nil {
+		return errors.New("connectors: durable jobs are not configured")
+	}
+	row, err := s.jobRows.GetOwnedJob(ctx, p.TenantID, strings.TrimSpace(id), jobs.SubmitterKey(p))
+	if err != nil || row.Operation != OperationSync {
+		return source.ErrDenied
+	}
+	return s.jobs.Cancel(ctx, p, row.ID)
+}
+
 // JobHandler is the jobs.Runner handler for connector.sync. It runs the
 // fetch/upload pipeline under the fenced lease using the frozen submitting
 // principal — registered by the executor plan; not dispatched until then.

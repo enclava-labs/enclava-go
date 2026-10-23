@@ -1,6 +1,93 @@
 package connectors
 
-import "time"
+import (
+	"context"
+	"time"
+
+	"enclava-go/internal/source"
+)
+
+type SourceKind string
+
+const (
+	SourceKindGitHub      SourceKind = SourceKind(source.ConnectionGitHub)
+	SourceKindSlack       SourceKind = SourceKind(source.ConnectionSlack)
+	SourceKindTeams       SourceKind = SourceKind(source.ConnectionTeams)
+	SourceKindNotion      SourceKind = SourceKind(source.ConnectionNotion)
+	SourceKindGoogleDrive SourceKind = SourceKind(source.ConnectionGoogleDrive)
+)
+
+// Cursor is opaque provider state scoped to one connection and stream.
+type Cursor string
+
+type Completeness string
+
+const (
+	CompletenessComplete   Completeness = "complete"
+	CompletenessIncomplete Completeness = "incomplete"
+)
+
+type StreamKind string
+
+const (
+	StreamContent    StreamKind = "content"
+	StreamAccess     StreamKind = "access"
+	StreamMembership StreamKind = "membership"
+)
+
+// ContentItem carries provider identity and material, never a local source ref.
+type ContentItem struct {
+	NativeID, ParentNativeID string
+	Kind, NativeRevision     string
+	Content                  []byte
+	Text                     string
+	URL                      string
+	CreatedAt, UpdatedAt     *time.Time
+	Locator                  source.Locator
+}
+
+// AccessGrant identifies provider-native principals until a binding resolves.
+type AccessGrant struct {
+	NativeObjectID, NativePrincipalID, NativeGroupID string
+	Scope, Effect                                    string
+	Inherited                                        bool
+}
+
+type ContentPage struct {
+	Items        []ContentItem
+	NextCursor   Cursor
+	Completeness Completeness
+	Snapshot     bool
+}
+
+type AccessPage struct {
+	Grants       []AccessGrant
+	NextCursor   Cursor
+	Completeness Completeness
+	Snapshot     bool
+}
+
+type MembershipPage struct {
+	Memberships  []AccessGrant
+	NextCursor   Cursor
+	Completeness Completeness
+	Snapshot     bool
+}
+
+// Adapter pages are bounded; incomplete pages cannot authorize deletion.
+type Adapter interface {
+	Content(context.Context, source.Connection, Cursor, int) (ContentPage, error)
+	Access(context.Context, source.Connection, Cursor, int) (AccessPage, error)
+	Membership(context.Context, source.Connection, Cursor, int) (MembershipPage, error)
+	Capabilities() AdapterCapabilities
+}
+
+type AdapterCapabilities struct {
+	Content, Access, Membership bool
+	UnsupportedScopes           []string
+}
+
+type AdapterFactories map[SourceKind]func(source.Connection) (Adapter, error)
 
 // Canonical source kinds (schema CHECK constraint); linear was a legacy
 // alias and is rejected — there is no linear adapter in the canonical set.

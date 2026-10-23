@@ -133,23 +133,32 @@ func (a *App) handleConnectorSyncJobByID(w http.ResponseWriter, r *http.Request,
 		WriteOpenAIError(w, http.StatusNotImplemented, "connectors are not configured", "server_error", "not_configured")
 		return
 	}
-	if r.Method != http.MethodGet {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/connectors/sync-jobs/"), "/")
-	if id == "" {
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/connectors/sync-jobs/"), "/")
+	parts := strings.Split(rest, "/")
+	if rest == "" || parts[0] == "" {
 		WriteOpenAIError(w, http.StatusBadRequest, "sync job id is required", "invalid_request_error", "missing_sync_job")
 		return
 	}
-	job, err := a.connectorSvc.GetSyncJob(r.Context(), principal, id)
+	if len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost {
+		if err := a.connectorSvc.CancelSyncJob(r.Context(), principal, parts[0]); err != nil {
+			writeConnectorNotFoundOrError(w, err, "connector_sync_job_cancel_failed")
+			return
+		}
+		WriteJSON(w, http.StatusAccepted, map[string]any{"id": parts[0], "status": connectors.JobStatusCancelled})
+		return
+	}
+	if len(parts) != 1 || r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	job, err := a.connectorSvc.GetSyncJob(r.Context(), principal, parts[0])
 	if err != nil {
 		writeConnectorNotFoundOrError(w, err, "connector_sync_job_fetch_failed")
 		return
 	}
 	WriteJSON(w, http.StatusOK, job)
-}
 
+}
 func writeConnectorSyncError(w http.ResponseWriter, err error, job any) {
 	if errors.Is(err, sql.ErrNoRows) || errors.Is(err, sourceapi.ErrDenied) {
 		WriteOpenAIError(w, http.StatusNotFound, "connector source not found", "invalid_request_error", "not_found")

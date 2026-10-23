@@ -596,6 +596,24 @@ func (a *App) handleDashboardConnectorAction(r *http.Request, p auth.Principal) 
 		return "", "Invalid form data"
 	}
 	switch strings.TrimSpace(r.FormValue("action")) {
+	case "sync_source":
+		sourceID := strings.TrimSpace(r.FormValue("source_id"))
+		if sourceID == "" {
+			return "", "Connector source ID is required"
+		}
+		if _, err := a.connectorSvc.SyncSource(r.Context(), p, sourceID); err != nil {
+			return "", err.Error()
+		}
+		return "Connector sync queued", ""
+	case "cancel_sync":
+		jobID := strings.TrimSpace(r.FormValue("job_id"))
+		if jobID == "" {
+			return "", "Connector sync job ID is required"
+		}
+		if err := a.connectorSvc.CancelSyncJob(r.Context(), p, jobID); err != nil {
+			return "", err.Error()
+		}
+		return "Connector sync cancellation requested", ""
 	case "create_source":
 		config, err := dashboardConnectorConfig(r)
 		if err != nil {
