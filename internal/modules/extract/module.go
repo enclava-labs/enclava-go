@@ -9,11 +9,12 @@ import (
 
 type Module struct {
 	svc         *extract.Service
+	previews    *extract.PreviewService
 	maxUploadMB int64
 }
 
-func New(svc *extract.Service, maxUploadMB int64) *Module {
-	return &Module{svc: svc, maxUploadMB: maxUploadMB}
+func New(svc *extract.Service, previews *extract.PreviewService, maxUploadMB int64) *Module {
+	return &Module{svc: svc, previews: previews, maxUploadMB: maxUploadMB}
 }
 
 func (m *Module) Name() string { return "extract" }
@@ -29,4 +30,5 @@ func (m *Module) Register(mux *http.ServeMux, platform *httpx.App) {
 	mux.HandleFunc("/api/v1/extract/models", platform.Authenticated("extract", h.HandleModels))
 	mux.HandleFunc("/api/v1/extract/settings", platform.Authenticated("extract", h.HandleSettings))
 	mux.HandleFunc("/api/v1/extract/health", platform.Authenticated("extract", h.HandleHealth))
+	httpx.RegisterDocumentPreviewRoutes(mux, platform, m.previews, m.maxUploadMB)
 }

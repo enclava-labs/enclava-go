@@ -716,15 +716,23 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		return "", errors.New("document has no extractable text")
 	}
 	parserVersion := "extract-v1"
-	sourceBlocks := document.Blocks
-	blocks := make([]chunkBlock, len(sourceBlocks))
-	for i, block := range sourceBlocks {
-		blocks[i] = chunkBlock{Kind: block.Kind, Text: block.Text, Level: block.Locator.HeadingLevel, ByteStart: block.ByteStart, ByteEnd: block.ByteEnd}
-	}
 	if err := s.repo.SaveParsedDocument(ctx, parserVersion, document); err != nil {
 		return "", err
 	}
-	structuredChunks := chunkStructured(blocks, c.ChunkSize, c.ChunkOverlap)
+	profileFamily := "rag-" + c.ID + "-structured"
+	profileVersionID, err := s.repo.EnsureChunkProfile(ctx, job.TenantID, profileFamily, c.ChunkSize, c.ChunkOverlap)
+	if err != nil {
+		return "", err
+	}
+	profile := source.ChunkProfile{
+		ID: profileVersionID, ProfileID: profileFamily, Version: 1,
+		SizeCodePoints: c.ChunkSize, OverlapCodePoints: c.ChunkOverlap,
+		BoundaryStrategy: "fixed", TableHandling: "row-wise",
+	}
+	structuredChunks, err := extract.Chunk(document, profile)
+	if err != nil {
+		return "", err
+	}
 	if len(structuredChunks) == 0 {
 		return "", errors.New("document has no extractable text")
 	}
@@ -779,21 +787,21 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 			"source_type": obj.Kind, "source_id": obj.NativeID, "source_uri": sourceURI,
 			"metadata": docMetadata,
 		}
-		chunk.ByteStart, chunk.ByteEnd = structuredChunks[i].ByteStart, structuredChunks[i].ByteEnd
-		chunk.HeaderPath = structuredChunks[i].HeaderPath
-		spanPayload := make([]map[string]any, 0, len(structuredChunks[i].BlockIndexes))
-		for _, blockIndex := range structuredChunks[i].BlockIndexes {
-			b := sourceBlocks[blockIndex]
-			span := source.Span{
-				Ref:     source.ObjectRef{TenantID: job.TenantID, ObjectID: objectID, ObservedSeq: seq},
-				BlockID: b.ID, ByteStart: 0, ByteEnd: len(b.Text),
-			}
+		spanPayload := make([]map[string]any, 0, len(structuredChunks[i].Spans))
+		for _, span := range structuredChunks[i].Spans {
 			chunk.SpanRefs = append(chunk.SpanRefs, span)
 			spanPayload = append(spanPayload, map[string]any{
-				"block_id": b.ID, "byte_start": b.ByteStart, "byte_end": b.ByteEnd,
+				"block_id": span.BlockID, "byte_start": span.ByteStart, "byte_end": span.ByteEnd,
 			})
 		}
-		payload["header_path"] = chunk.HeaderPath
+		for j, span := range structuredChunks[i].Spans {
+			if j == 0 || span.ByteStart < chunk.ByteStart {
+				chunk.ByteStart = span.ByteStart
+			}
+			if span.ByteEnd > chunk.ByteEnd {
+				chunk.ByteEnd = span.ByteEnd
+			}
+		}
 		payload["block_spans"] = spanPayload
 		chunks = append(chunks, chunk)
 		points = append(points, QdrantPoint{
@@ -801,11 +809,6 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		})
 	}
 
-	profileFamily := "rag-" + c.ID + "-structured"
-	profileVersionID, err := s.repo.EnsureChunkProfile(ctx, job.TenantID, profileFamily, c.ChunkSize, c.ChunkOverlap)
-	if err != nil {
-		return "", err
-	}
 	// Stage the generation: chunks + staging row commit atomically BEFORE
 	// any Qdrant write; a crash leaves a staging generation, never a doc
 	// claiming indexed state.

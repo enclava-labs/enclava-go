@@ -2,16 +2,23 @@ package rag
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
-
 	"enclava-go/internal/artifacts"
 	"enclava-go/internal/auth"
 	"enclava-go/internal/billing"
 	"enclava-go/internal/inference"
 	"enclava-go/internal/source"
+	"encoding/json"
+	"fmt"
+	"io"
+	"unicode/utf8"
 )
+
+func tokenEstimate(text string) int {
+	if text == "" {
+		return 0
+	}
+	return (utf8.RuneCountInString(text) + 3) / 4
+}
 
 // maxEmbeddingInputs caps batch size by item count; maxEmbeddingBatchUnits
 // caps the summed estimate so one batch always sits inside the routed

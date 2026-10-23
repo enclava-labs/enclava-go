@@ -70,6 +70,7 @@ func main() {
 	extractRepo := postgres.NewExtractRepo(pgDB)
 	jobsRepoPG := postgres.NewJobsRepo(pgDB)
 	artifactRepo := postgres.NewArtifactRepo(pgDB)
+	chunkProfilesRepo := postgres.NewChunkProfilesRepo(pgDB)
 	ragRepo := postgres.NewRAGRepo(pgDB)
 	bindingsRepo := postgres.NewResponseBindingsRepo(pgDB)
 	sourceRepo := postgres.NewSourceRepo(pgDB)
@@ -189,12 +190,13 @@ func main() {
 
 	qdrantClient := rag.NewQdrantClient(cfg.QdrantURL, cfg.UpstreamTimeout)
 	ragSvc := rag.NewService(ragRepo, qdrantClient, inferenceSvc, cfg.DefaultEmbeddingModel, artifactStore, jobsSvc)
+	previewSvc := extract.NewPreviewService(chunkProfilesRepo, jobsRepoPG, jobsSvc, artifactStore, sourceRepo, cfg.MaxUploadSizeMB)
 	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG, ragSvc)
 
-	// Worker: extract and embed job handlers dispatch through the shared
-	// executor — leased fenced claims only, no synchronous provider path.
+	// Worker: extract, preview and embed jobs use the same durable runner.
 	jobsRunner := jobs.NewRunner(jobsSvc, artifactStore, map[string]jobs.HandlerFunc{
 		extract.OperationProcess: extractSvc.JobHandler(),
+		extract.OperationPreview: previewSvc.JobHandler(),
 		rag.OperationEmbed:       ragSvc.JobHandler(),
 		connectors.OperationSync: connectorSvc.JobHandler(),
 	}, jobs.RunnerConfig{})
@@ -256,7 +258,7 @@ func main() {
 
 	// The extract module mounts its API routes on the app's mux — every
 	// processing call it makes funnels through the shared executor.
-	extractmodule.New(extractSvc, cfg.MaxUploadSizeMB).Register(app.Mux(), app)
+	extractmodule.New(extractSvc, previewSvc, cfg.MaxUploadSizeMB).Register(app.Mux(), app)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr(),
