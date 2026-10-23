@@ -58,6 +58,8 @@ func (s *Service) IngestJobHandler() jobs.HandlerFunc {
 		var observed struct {
 			Filename string `json:"filename"`
 			MIMEType string `json:"mime_type"`
+			NativeID string `json:"native_id"`
+			URL      string `json:"url"`
 		}
 		if payload, ok := job.Policy["observation_payload"]; ok {
 			b, _ := json.Marshal(payload)
@@ -72,11 +74,20 @@ func (s *Service) IngestJobHandler() jobs.HandlerFunc {
 		if err := claim.MarkDispatched(ctx); err != nil {
 			return "", err
 		}
+		provenance, err := json.Marshal(map[string]string{
+			"connection_id": job.Subject.ConnectionID,
+			"source_kind":   fmt.Sprint(job.Policy["source_kind"]),
+			"native_id":     observed.NativeID,
+			"source_uri":    observed.URL,
+		})
+		if err != nil {
+			return "", fmt.Errorf("rag ingest: encode connector provenance: %w", err)
+		}
 		version := source.ObjectVersion{
 			ObjectID: ref.ObjectID, ObservedSeq: ref.ObservedSeq,
 			ArtifactRef: artifactID, SHA256: job.InputHash,
 			MimeType: observed.MIMEType, OriginalFilename: observed.Filename,
-			Provenance: fmt.Sprintf(`{"connection_id":%q,"source_kind":%q,"native_id":%q}`, job.Subject.ConnectionID, fmt.Sprint(job.Policy["source_kind"]), fmt.Sprint(job.Policy["native_id"])),
+			Provenance: string(provenance),
 		}
 		if prior, getErr := s.repo.GetObjectVersion(ctx, job.TenantID, ref.ObjectID, ref.ObservedSeq); getErr == nil {
 			if prior.ArtifactRef != version.ArtifactRef || prior.SHA256 != version.SHA256 {

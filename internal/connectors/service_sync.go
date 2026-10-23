@@ -236,7 +236,7 @@ func connectorPayload(item ContentItem, filename, mimeType string) json.RawMessa
 }
 
 func connectorProvenance(conn source.Connection, item ContentItem) string {
-	payload, _ := json.Marshal(map[string]any{"connection_id": conn.ID, "source_kind": conn.Kind, "native_id": item.NativeID, "url": item.URL, "created_at": item.CreatedAt, "updated_at": item.UpdatedAt, "locator": item.Locator})
+	payload, _ := json.Marshal(map[string]any{"connection_id": conn.ID, "source_kind": conn.Kind, "native_id": item.NativeID, "source_uri": item.URL, "created_at": item.CreatedAt, "updated_at": item.UpdatedAt, "locator": item.Locator})
 	return string(payload)
 }
 
