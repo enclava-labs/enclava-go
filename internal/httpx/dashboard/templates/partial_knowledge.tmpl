@@ -11,7 +11,7 @@
   </form>
   <div id="knowledge-search-results" class="mt-4" aria-live="polite"></div>
   {{else}}<p class="mt-2 text-sm text-muted-foreground">No readable collections are available.</p>{{end}}
-  <form class="mt-5 flex flex-wrap items-end gap-3" id="knowledge-import-form">
+  <form class="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-end" id="knowledge-import-form">
     <label class="space-y-1 text-sm font-medium"><span>Import stored result into collection</span><select name="collection_id" class="rounded-md border bg-background px-3 py-2">{{range .Collections}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select></label>
     <label class="space-y-1 text-sm font-medium"><span>Stored result reference</span><input name="result_ref" class="rounded-md border bg-background px-3 py-2" required></label>
     <button class="rounded-md border px-4 py-2" type="submit">Import result</button>

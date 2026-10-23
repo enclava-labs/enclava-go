@@ -86,4 +86,7 @@
   }
   document.addEventListener('DOMContentLoaded', function () { attach(document); });
   document.addEventListener('htmx:afterSwap', function (event) { attach(event.target); });
+  // This script loads inside the swapped partial itself, after this swap's
+  // htmx:afterSwap already fired — attach immediately (idempotent).
+  attach(document);
 })();
