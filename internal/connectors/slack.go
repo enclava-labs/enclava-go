@@ -1,7 +1,7 @@
 package connectors
 
 import (
-	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,10 +11,30 @@ import (
 	"strings"
 	"time"
 
-	"mini-enclava/internal/source"
+	"enclava-go/internal/source"
 )
 
 const slackPageLimit = 200
+
+type slackAccessCursor struct {
+	Members, History string
+	MembersDone, HistoryDone bool
+}
+
+func encodeSlackAccessCursor(cursor slackAccessCursor) Cursor {
+	raw, _ := json.Marshal(cursor)
+	return Cursor("access:" + base64.RawURLEncoding.EncodeToString(raw))
+}
+
+func decodeSlackAccessCursor(cursor Cursor) (slackAccessCursor, error) {
+	if cursor == "" { return slackAccessCursor{}, nil }
+	if !strings.HasPrefix(string(cursor), "access:") { return slackAccessCursor{}, errors.New("invalid slack access cursor") }
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(string(cursor), "access:"))
+	if err != nil { return slackAccessCursor{}, err }
+	var state slackAccessCursor
+	if err := json.Unmarshal(raw, &state); err != nil { return slackAccessCursor{}, err }
+	return state, nil
+}
 
 type slackAdapter struct {
 	client *http.Client
@@ -149,24 +169,100 @@ func (a slackAdapter) fileItem(ctx context.Context, conn source.Connection, id s
 func (a slackAdapter) Access(ctx context.Context, conn source.Connection, cursor Cursor, limit int) (AccessPage, error) {
 	if err := slackConnection(conn); err != nil { return AccessPage{}, err }
 	if limit < 1 || limit > slackPageLimit { return AccessPage{}, errors.New("slack page limit must be between 1 and 200") }
+	state, err := decodeSlackAccessCursor(cursor)
+	if err != nil { return AccessPage{Completeness: CompletenessIncomplete}, err }
 	channel := slackChannel(conn)
-	q := url.Values{"channel": {channel}}
-	if cursor != "" { q.Set("cursor", string(cursor)) }
-	var data struct { Members []string `json:"members"`; Metadata struct { NextCursor string `json:"next_cursor"` } `json:"response_metadata"` }
-	err := a.call(ctx, conn, "conversations.members", q, &data)
-	page := AccessPage{Completeness: CompletenessComplete}
-	if err != nil { page.Completeness = CompletenessIncomplete; return page, err }
-	for _, uid := range data.Members { page.Grants = append(page.Grants, AccessGrant{NativeObjectID: "slack:"+channel, NativeObjectKind: "channel", NativePrincipalID: uid, NativeGroupID: channel, Scope: "read", Effect: "allow", Inherited: true}) }
-	page.NextCursor = Cursor(data.Metadata.NextCursor)
-	page.Snapshot = true
+	page := AccessPage{Completeness: CompletenessComplete, Snapshot: true}
+	if !state.MembersDone {
+		q := url.Values{"channel": {channel}, "limit": {strconv.Itoa(limit)}}
+		if state.Members != "" { q.Set("cursor", state.Members) }
+		var data struct { Members []string `json:"members"`; Metadata struct { NextCursor string `json:"next_cursor"` } `json:"response_metadata"` }
+		if err := a.call(ctx, conn, "conversations.members", q, &data); err != nil {
+			page.Completeness = CompletenessIncomplete
+			return page, err
+		}
+		for _, uid := range data.Members { page.Grants = append(page.Grants, AccessGrant{NativeObjectID: "slack:"+channel, NativeObjectKind: "channel", NativePrincipalID: uid, NativeGroupID: channel, Scope: "read", Effect: "allow", Inherited: true}) }
+		state.Members = data.Metadata.NextCursor
+		state.MembersDone = state.Members == ""
+	}
+	if !state.HistoryDone {
+		q := url.Values{"channel": {channel}, "limit": {strconv.Itoa(limit)}}
+		if state.History != "" { q.Set("cursor", state.History) }
+		var data struct {
+			Messages []slackMessage `json:"messages"`
+			HasMore bool `json:"has_more"`
+			Metadata struct { NextCursor string `json:"next_cursor"` } `json:"response_metadata"`
+		}
+		if err := a.call(ctx, conn, "conversations.history", q, &data); err != nil {
+			page.Completeness = CompletenessIncomplete
+			return page, err
+		}
+		for _, msg := range data.Messages {
+			for _, file := range msg.Files {
+				grants, err := a.fileShareGrants(ctx, conn, file.ID)
+				if err != nil { page.Completeness = CompletenessIncomplete; return page, err }
+				page.Grants = append(page.Grants, grants...)
+			}
+			if msg.ReplyCount > 0 {
+				replies, err := a.threadMessages(ctx, conn, channel, msg.TS, limit)
+				if err != nil { page.Completeness = CompletenessIncomplete; return page, err }
+				for _, reply := range replies {
+					for _, file := range reply.Files {
+						grants, err := a.fileShareGrants(ctx, conn, file.ID)
+						if err != nil { page.Completeness = CompletenessIncomplete; return page, err }
+						page.Grants = append(page.Grants, grants...)
+					}
+				}
+			}
+		}
+		if data.HasMore && data.Metadata.NextCursor == "" {
+			page.Completeness = CompletenessIncomplete
+			return page, errors.New("slack history has_more without next_cursor")
+		}
+		state.History = data.Metadata.NextCursor
+		state.HistoryDone = !data.HasMore
+	}
+	if len(page.Grants) > limit {
+		page.Completeness = CompletenessIncomplete
+		return page, errors.New("slack access page exceeds requested bound")
+	}
+	if !state.MembersDone || !state.HistoryDone { page.NextCursor = encodeSlackAccessCursor(state) }
 	return page, nil
+}
+
+func (a slackAdapter) fileShareGrants(ctx context.Context, conn source.Connection, id string) ([]AccessGrant, error) {
+	var data struct { File struct {
+		ID string `json:"id"`
+		External bool `json:"is_external"`
+		Shares map[string]map[string]json.RawMessage `json:"shares"`
+	} `json:"file"` }
+	if err := a.call(ctx, conn, "files.info", url.Values{"file": {id}}, &data); err != nil { return nil, err }
+	if data.File.External { return nil, nil }
+	if data.File.ID == "" { return nil, errors.New("slack files.info omitted file id") }
+	var grants []AccessGrant
+	for _, scope := range []string{"public", "private"} {
+		for channel := range data.File.Shares[scope] {
+			grants = append(grants, AccessGrant{NativeObjectID: "slack:file:"+data.File.ID, NativeObjectKind: "file", NativeGroupID: channel, Scope: "read", Effect: "allow"})
+		}
+	}
+	return grants, nil
 }
 
 func (a slackAdapter) Membership(ctx context.Context, conn source.Connection, cursor Cursor, limit int) (MembershipPage, error) {
 	page := MembershipPage{Completeness: CompletenessComplete, Snapshot: true}
-	access, err := a.Access(ctx, conn, cursor, limit)
-	if err != nil { page.Completeness = CompletenessIncomplete; return page, err }
-	page.Memberships, page.NextCursor = access.Grants, access.NextCursor
+	if err := slackConnection(conn); err != nil { return MembershipPage{}, err }
+	if limit < 1 || limit > slackPageLimit { return MembershipPage{}, errors.New("slack page limit must be between 1 and 200") }
+	q := url.Values{"channel": {slackChannel(conn)}, "limit": {strconv.Itoa(limit)}}
+	if cursor != "" { q.Set("cursor", string(cursor)) }
+	var data struct { Members []string `json:"members"`; Metadata struct { NextCursor string `json:"next_cursor"` } `json:"response_metadata"` }
+	if err := a.call(ctx, conn, "conversations.members", q, &data); err != nil {
+		page.Completeness = CompletenessIncomplete
+		return page, err
+	}
+	for _, uid := range data.Members {
+		page.Memberships = append(page.Memberships, AccessGrant{NativeGroupID: slackChannel(conn), NativePrincipalID: uid, Scope: "member", Effect: "allow"})
+	}
+	page.NextCursor = Cursor(data.Metadata.NextCursor)
 	return page, nil
 }
 

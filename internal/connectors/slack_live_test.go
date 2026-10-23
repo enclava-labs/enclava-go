@@ -7,7 +7,7 @@ import (
 	"os"
 	"testing"
 
-	"mini-enclava/internal/source"
+	"enclava-go/internal/source"
 )
 
 func TestLiveSlack(t *testing.T) {

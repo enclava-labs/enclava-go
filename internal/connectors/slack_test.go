@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"mini-enclava/internal/source"
+	"enclava-go/internal/source"
 )
 
 func TestSlackThreadsAndCursors(t *testing.T) {
@@ -71,3 +71,28 @@ func TestSlackRateLimitReportsRetryAfter(t *testing.T) {
 	if err == nil || err.Error() != "slack conversations.history rate limited (Retry-After 0)" { t.Fatalf("error=%v", err) }
 }
 
+
+func TestSlackFileAccessUsesFilesShares(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/conversations.members":
+			fmt.Fprint(w, `{"ok":true,"members":["U1"]}`)
+		case "/conversations.history":
+			fmt.Fprint(w, `{"ok":true,"messages":[{"user":"U1","text":"attached","ts":"1.000001","files":[{"id":"F1"}]}],"has_more":false}`)
+		case "/files.info":
+			fmt.Fprint(w, `{"ok":true,"file":{"id":"F1","shares":{"public":{"C2":[{"channel_id":"C2"}]}}}}`)
+		default:
+			t.Errorf("unexpected endpoint %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("CONNECTOR_SLACK_TEST", "test-token")
+	a := slackAdapter{client: server.Client()}
+	conn := source.Connection{Kind: source.ConnectionSlack, CredentialRef: "CONNECTOR_SLACK_TEST", Config: map[string]any{"channel_id":"C1", "base_url":server.URL}}
+	page, err := a.Access(context.Background(), conn, "", 10)
+	if err != nil { t.Fatal(err) }
+	if len(page.Grants) != 2 || page.Grants[0].NativeObjectKind != "channel" || page.Grants[1].NativeObjectID != "slack:file:F1" || page.Grants[1].NativeGroupID != "C2" {
+		t.Fatalf("file access was not sourced independently: %+v", page.Grants)
+	}
+}
