@@ -288,6 +288,9 @@ func (s *Service) ProcessReader(ctx context.Context, p auth.Principal, input Pro
 				return ProcessOutput{Success: true, JobID: existing.ID, Status: existing.Status, ModelUsed: model}, nil
 			}
 		}
+		// No job row exists, so nothing references the input artifact —
+		// delete it rather than orphaning durable bytes.
+		_ = s.artifacts.Delete(ctx, ref)
 		return ProcessOutput{}, fmt.Errorf("enqueue extract job: %w", err)
 	}
 	return ProcessOutput{
