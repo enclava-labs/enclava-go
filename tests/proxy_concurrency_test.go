@@ -259,9 +259,15 @@ func TestProxyTwoProcess(t *testing.T) {
 	for _, cap := range []string{"chat/completions", "embeddings", "responses"} {
 		price(cap, billing.UnitInput, 1)
 		price(cap, billing.UnitOutput, 1)
+		// The executor bounds cached input like input, so both rates are
+		// required — an unpriced cached-input rate refuses dispatch.
+		price(cap, billing.UnitCachedInput, 1)
 	}
 
-	chatBound := estimateUnits(proxyChatBody) + outputBound // +2 later
+	// The executor's reserve bound carries cached input = input units on
+	// top of input (CONTRACTS: no implicit free units), so the chat hold is
+	// input + cached + output at these 1µ-per-unit rates.
+	chatBound := 2*estimateUnits(proxyChatBody) + outputBound // +2 later
 
 	dataDir := t.TempDir() // one shared durable artifact root for both processes
 	env := map[string]string{
