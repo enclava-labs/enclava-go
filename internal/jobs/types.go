@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+
+	"enclava-go/internal/artifacts"
+	"enclava-go/internal/source"
 )
 
 // Job statuses. "unknown" means the outcome was never observed; cancellation
@@ -100,4 +103,27 @@ type Progress struct {
 	Percent   int
 	Message   string
 	UpdatedAt time.Time
+}
+
+// ConnectorStreamCheckpoint stores one independently fenced provider stream.
+type ConnectorStreamCheckpoint struct {
+	TenantID, ConnectionID, Stream string
+	RunID                          string
+	Fence                          int64
+	Cursor                         string
+	ObservedSeq, RunStartSeq       int64
+	Complete, Incomplete           bool
+	LastError                      string
+}
+
+// ConnectorObservation binds native evidence to canonical local identities.
+type ConnectorObservation struct {
+	TenantID, ConnectionID, Stream string
+	RunID                          string
+	ObservedSeq                    int64
+	NativeID                       string
+	ObjectRef                      source.ObjectRef
+	Payload                        json.RawMessage
+	ArtifactRef                    artifacts.Ref
+	ProcessingError                string
 }

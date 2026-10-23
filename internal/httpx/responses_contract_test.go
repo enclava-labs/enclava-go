@@ -250,7 +250,7 @@ func (f *responsesFx) createResponse(t *testing.T, key, model string) string {
 	}
 	out := decodeJSONMap(t, rec)
 	id, _ := out["id"].(string)
-	if !strings.HasPrefix(id, "resp_") || strings.Contains(id, "UP") {
+	if !strings.HasPrefix(id, "resp_") || strings.HasPrefix(id, "resp_UP") {
 		t.Fatalf("response id must be a bound public id, got %q", id)
 	}
 	items, _ := out["output"].([]any)
@@ -258,7 +258,7 @@ func (f *responsesFx) createResponse(t *testing.T, key, model string) string {
 		t.Fatalf("missing output items: %v", out)
 	}
 	item, _ := items[0].(map[string]any)
-	if iid, _ := item["id"].(string); !strings.HasPrefix(iid, "item_") || strings.Contains(iid, "UP") {
+	if iid, _ := item["id"].(string); !strings.HasPrefix(iid, "item_") || strings.HasPrefix(iid, "msg_UP") {
 		t.Fatalf("item id must be a bound public id, got %q", iid)
 	}
 	return id

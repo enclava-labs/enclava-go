@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"enclava-go/internal/jobs"
 	"enclava-go/internal/source"
 )
 
@@ -39,6 +40,7 @@ const (
 type ContentItem struct {
 	NativeID, ParentNativeID string
 	Kind, NativeRevision     string
+	Filename, MIMEType       string
 	Content                  []byte
 	Text                     string
 	URL                      string
@@ -48,9 +50,9 @@ type ContentItem struct {
 
 // AccessGrant identifies provider-native principals until a binding resolves.
 type AccessGrant struct {
-	NativeObjectID, NativePrincipalID, NativeGroupID string
-	Scope, Effect                                    string
-	Inherited                                        bool
+	NativeObjectID, NativeObjectKind, NativePrincipalID, NativeGroupID string
+	Scope, Effect                                                      string
+	Inherited                                                          bool
 }
 
 type ContentPage struct {
@@ -89,6 +91,17 @@ type AdapterCapabilities struct {
 
 type AdapterFactories map[SourceKind]func(source.Connection) (Adapter, error)
 
+type StreamState = jobs.ConnectorStreamCheckpoint
+
+type Observation = jobs.ConnectorObservation
+type ObservationRepository interface {
+	StartRun(context.Context, string, string, string, string) (StreamState, error)
+	GetStream(context.Context, string, string, string) (StreamState, error)
+	PersistPage(context.Context, StreamState, []Observation, string, bool, bool, string) (StreamState, error)
+	ListObservations(context.Context, StreamState) ([]Observation, error)
+	WithFence(context.Context, StreamState, func(source.Tx) error) error
+}
+
 // Canonical source kinds (schema CHECK constraint); linear was a legacy
 // alias and is rejected — there is no linear adapter in the canonical set.
 const (
@@ -101,7 +114,11 @@ const (
 
 // Durable job operation enqueued by SyncSource. The job persists queued
 // until the shared executor registers the handler.
-const OperationSync = "connector.sync"
+const (
+	OperationSync   = "connector.sync"
+	OperationIngest = "rag.ingest"
+	OperationAccess = "rag.access"
+)
 
 const (
 	JobStatusQueued    = "queued"

@@ -20,9 +20,9 @@ import (
 	"strings"
 	"time"
 
+	"enclava-go/internal/artifacts"
 	"enclava-go/internal/auth"
 	"enclava-go/internal/jobs"
-	"enclava-go/internal/rag"
 	"enclava-go/internal/source"
 )
 
@@ -41,15 +41,6 @@ type Repository interface {
 	ListSyncCandidates(ctx context.Context, limit int) ([]source.Connection, error)
 }
 
-// RAGUploader is the rag ingest surface the sync attempt hands observed
-// documents to. The principal is the frozen job principal — never forged.
-type RAGUploader interface {
-	UploadDocument(ctx context.Context, p auth.Principal, collectionID string, input rag.UploadDocumentInput) (rag.UploadDocumentOutput, error)
-	// LiveSourceIDs lets an unchanged-content skip fire only for documents
-	// that still exist; a deleted document must be re-ingested.
-	LiveSourceIDs(ctx context.Context, p auth.Principal, collectionID string) (map[string]struct{}, error)
-}
-
 // JobReader is the owner-bound durable job view for SyncStatus/ListJobs.
 type JobReader interface {
 	GetOwnedJob(ctx context.Context, tenantID, id, submitterKey string) (jobs.JobRow, error)
@@ -57,28 +48,41 @@ type JobReader interface {
 	ListConnectionJobs(ctx context.Context, tenantID, connectionID, status string, limit int) ([]jobs.JobRow, error)
 }
 
+type CanonicalSourceRepository interface {
+	source.SourceRepository
+	WithTx(context.Context, func(source.Tx) error) error
+	ObjectForNativeID(context.Context, string, string, string, string) (source.Object, error)
+	SourceIdentityForNativeID(context.Context, string, string, string) (source.SourceIdentity, error)
+	SourceGroupForNativeID(context.Context, string, string, string) (source.SourceGroup, error)
+	InsertSourceGroup(context.Context, source.SourceGroup) error
+}
+
 type Service struct {
-	repo       Repository
-	jobs       *jobs.Service
-	jobRows    JobReader
-	rag        RAGUploader
-	httpClient *http.Client
-	// allowPrivateBaseURL permits loopback and private config.base_url hosts.
-	// NewService leaves it false; tests enable it for httptest servers.
+	repo                Repository
+	jobs                *jobs.Service
+	jobRows             JobReader
+	adapters            AdapterFactories
+	observations        ObservationRepository
+	artifacts           *artifacts.Store
+	canonical           CanonicalSourceRepository
+	httpClient          *http.Client
 	allowPrivateBaseURL bool
 }
 
-func NewService(repo Repository, jobSvc *jobs.Service, jobRows JobReader, ragSvc RAGUploader) *Service {
+func NewService(repo Repository, jobSvc *jobs.Service, jobRows JobReader) *Service {
 	return &Service{
 		repo:    repo,
 		jobs:    jobSvc,
 		jobRows: jobRows,
-		rag:     ragSvc,
 		httpClient: &http.Client{
 			Timeout:       30 * time.Second,
 			CheckRedirect: refuseConnectorRedirect,
 		},
 	}
+}
+
+func (s *Service) SetSyncDependencies(adapters AdapterFactories, observations ObservationRepository, artifactStore *artifacts.Store, canonical CanonicalSourceRepository) {
+	s.adapters, s.observations, s.artifacts, s.canonical = adapters, observations, artifactStore, canonical
 }
 
 func (s *Service) setAllowPrivateBaseURL(allow bool) {
@@ -306,8 +310,8 @@ func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID str
 	if err := requireTenant(p); err != nil {
 		return SyncJob{}, err
 	}
-	if s.jobs == nil {
-		return SyncJob{}, errors.New("connectors: durable jobs are not configured")
+	if s.jobs == nil || s.observations == nil || s.artifacts == nil || s.canonical == nil || s.adapters == nil {
+		return SyncJob{}, errors.New("connectors: durable sync is not configured")
 	}
 	conn, err := s.repo.GetConnection(ctx, p.TenantID, strings.TrimSpace(sourceID))
 	if err != nil {
@@ -315,6 +319,28 @@ func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID str
 	}
 	if conn.Status != "active" {
 		return SyncJob{}, errors.New("connector source is disabled")
+	}
+	factory, ok := s.adapters[SourceKind(conn.Kind)]
+	if !ok {
+		return SyncJob{}, fmt.Errorf("connector kind %q is not configured", conn.Kind)
+	}
+	adapter, err := factory(conn)
+	if err != nil {
+		return SyncJob{}, err
+	}
+	capabilities := adapter.Capabilities()
+	streams := []StreamKind{}
+	if capabilities.Content {
+		streams = append(streams, StreamContent)
+	}
+	if capabilities.Access {
+		streams = append(streams, StreamAccess)
+	}
+	if capabilities.Membership {
+		streams = append(streams, StreamMembership)
+	}
+	if len(streams) == 0 {
+		return SyncJob{}, errors.New("connector adapter exposes no sync streams")
 	}
 	cfgBytes, err := json.Marshal(conn.Config)
 	if err != nil {
@@ -325,19 +351,25 @@ func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID str
 	if window != 0 {
 		key += ":w" + strconv.FormatInt(window, 10)
 	}
-	job, _, err := s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
-		TenantID:       p.TenantID,
-		Operation:      OperationSync,
-		IdempotencyKey: key,
-		Subject:        jobs.Subject{ConnectionID: conn.ID},
-		InputRef:       conn.ID,
-		InputHash:      hex.EncodeToString(sum[:]),
-		Policy:         map[string]any{"connection_id": conn.ID},
-	})
-	if err != nil {
-		return SyncJob{}, err
+	var response jobs.Job
+	for _, stream := range streams {
+		job, _, err := s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
+			TenantID:       p.TenantID,
+			Operation:      OperationSync,
+			IdempotencyKey: key + ":" + string(stream),
+			Subject:        jobs.Subject{ConnectionID: conn.ID},
+			InputRef:       conn.ID,
+			InputHash:      hex.EncodeToString(sum[:]),
+			Policy:         map[string]any{"connection_id": conn.ID, "stream": string(stream)},
+		})
+		if err != nil {
+			return SyncJob{}, err
+		}
+		if stream == StreamContent || response.ID == "" {
+			response = job
+		}
 	}
-	return jobView(job), nil
+	return jobView(response), nil
 }
 
 func jobView(j jobs.Job) SyncJob {
@@ -447,145 +479,59 @@ func (s *Service) JobHandler() jobs.HandlerFunc {
 
 func (s *Service) attemptSync(ctx context.Context, claim *jobs.Claim) (string, error) {
 	job := claim.Job()
-	var p auth.Principal
-	if err := json.Unmarshal(job.PrincipalSnapshot, &p); err != nil {
+	var principal auth.Principal
+	if err := json.Unmarshal(job.PrincipalSnapshot, &principal); err != nil {
 		return "", fmt.Errorf("decode frozen principal: %w", err)
 	}
 	conn, err := s.repo.GetConnection(ctx, job.TenantID, job.Subject.ConnectionID)
 	if err != nil {
 		return "", err
 	}
+	if conn.Status != "active" {
+		return "", errors.New("connector source is no longer active")
+	}
+	if s.observations == nil || s.artifacts == nil || s.canonical == nil || s.adapters == nil {
+		return "", errors.New("connectors: durable sync is not configured")
+	}
+	stream := StreamKind(stringFromAny(job.Policy["stream"]))
+	switch stream {
+	case StreamContent, StreamAccess, StreamMembership:
+	default:
+		return "", errors.New("connector sync job has no valid stream")
+	}
+	factory, ok := s.adapters[SourceKind(conn.Kind)]
+	if !ok {
+		return "", fmt.Errorf("connector kind %q is not configured", conn.Kind)
+	}
+	adapter, err := factory(conn)
+	if err != nil {
+		return "", err
+	}
+	if err := s.validateConnectorSource(ctx, connectionView(conn)); err != nil {
+		return "", err
+	}
+	capabilities := adapter.Capabilities()
+	if stream == StreamContent && !capabilities.Content ||
+		stream == StreamAccess && !capabilities.Access ||
+		stream == StreamMembership && !capabilities.Membership {
+		return "", fmt.Errorf("connector adapter does not support %s observations", stream)
+	}
 	if err := claim.MarkDispatched(ctx); err != nil {
 		return "", err
 	}
-	v := connectionView(conn)
-	stats, checkpoint, syncErr := s.syncDocuments(ctx, p, v)
-	completedAt := time.Now().UTC()
-	status := JobStatusSucceeded
-	errMsg := ""
-	if syncErr != nil {
-		status = JobStatusFailed
-		errMsg = syncErr.Error()
+	if err := s.runDurableStream(ctx, claim, principal, conn, adapter, stream); err != nil {
+		_ = s.repo.SetSyncState(ctx, conn.TenantID, conn.ID, time.Now().UTC(), JobStatusFailed, err.Error())
+		return "", err
 	}
-	_ = s.repo.SetSyncState(ctx, job.TenantID, conn.ID, completedAt, status, errMsg)
-	if syncErr != nil {
-		return "", syncErr
-	}
-	if len(checkpoint) > 0 {
-		v.Checkpoint = checkpoint
-		conn2 := viewConnection(v, job.TenantID, conn.CreatedBy)
-		conn2.Status = conn.Status
-		if err := s.repo.UpdateConnection(ctx, conn2); err != nil && !errors.Is(err, source.ErrDenied) {
+	if stream == StreamContent {
+		if err := s.repo.SetSyncState(ctx, conn.TenantID, conn.ID, time.Now().UTC(), JobStatusSucceeded, ""); err != nil {
 			return "", err
 		}
 	}
-	statsJSON, _ := json.Marshal(stats)
-	return string(statsJSON), nil
+	return `{"stream":"` + string(stream) + `","complete":true}`, nil
 }
 
 // ---------------------------------------------------------------------
-// Fetch/upload pipeline — worker-side only now; SyncSource enqueues.
-
-func (s *Service) syncDocuments(ctx context.Context, p auth.Principal, source Source) (map[string]any, map[string]any, error) {
-	if s.rag == nil {
-		return map[string]any{"uploaded_documents": 0}, nil, errors.New("rag service is not configured")
-	}
-	if strings.TrimSpace(source.TargetCollectionID) == "" {
-		return map[string]any{"uploaded_documents": 0}, nil, errors.New("target_collection_id is required for connector sync")
-	}
-	if err := s.validateConnectorSource(ctx, source); err != nil {
-		return map[string]any{"uploaded_documents": 0}, nil, err
-	}
-	documents, documentSource, checkpoint, err := s.documentsForSource(ctx, source)
-	if err != nil {
-		return map[string]any{"uploaded_documents": 0}, checkpoint, err
-	}
-	if len(documents) == 0 {
-		stats := map[string]any{"uploaded_documents": 0, "fetched_documents": 0, "document_source": documentSource}
-		if documentSource == "api" {
-			stats["no_changes"] = true
-			return stats, checkpoint, nil
-		}
-		return stats, checkpoint, errors.New("connector sync produced no documents")
-	}
-
-	forceFullSync := boolFromAny(source.Config["force_full_sync"], false)
-	previousHashes := stringMapFromAny(nonNilMap(source.Checkpoint)["document_hashes"])
-	nextHashes := copyStringMap(previousHashes)
-	uploaded := 0
-	var live map[string]struct{}
-	skippedUnchanged := 0
-	for i, doc := range documents {
-		fileName := strings.TrimSpace(doc.FileName)
-		if fileName == "" {
-			fileName = fmt.Sprintf("%s-document-%d.txt", source.Type, i+1)
-		}
-		mimeType := strings.TrimSpace(doc.MimeType)
-		if mimeType == "" {
-			mimeType = "text/plain"
-		}
-		content := []byte(doc.Content)
-		if len(content) == 0 {
-			continue
-		}
-		sourceID := firstNonEmpty(doc.SourceID, fileName)
-		hash := contentHash(content)
-		if !forceFullSync && previousHashes[sourceID] == hash {
-			// Unchanged content skips only while the document still exists;
-			// an operator deletion must be re-ingested by the next sync.
-			if live == nil {
-				live, err = s.rag.LiveSourceIDs(ctx, p, source.TargetCollectionID)
-				if err != nil {
-					return map[string]any{"uploaded_documents": uploaded}, checkpoint, fmt.Errorf("live source ids: %w", err)
-				}
-			}
-			if _, stillPresent := live[sourceID]; stillPresent {
-				nextHashes[sourceID] = hash
-				skippedUnchanged++
-				continue
-			}
-		}
-		if _, err := s.rag.UploadDocument(ctx, p, source.TargetCollectionID, rag.UploadDocumentInput{
-			FileName:   fileName,
-			MimeType:   mimeType,
-			Bytes:      content,
-			SourceType: source.Type,
-			SourceID:   sourceID,
-			SourceURI:  doc.SourceURI,
-			Metadata: map[string]any{
-				"connector_source_id": source.ID,
-				"connector_type":      source.Type,
-				"source_revision":     doc.Revision,
-			},
-		}); err != nil {
-			return map[string]any{"uploaded_documents": uploaded}, checkpoint, err
-		}
-		nextHashes[sourceID] = hash
-		uploaded++
-	}
-	if uploaded == 0 {
-		stats := map[string]any{
-			"uploaded_documents": uploaded,
-			"fetched_documents":  len(documents),
-			"document_source":    documentSource,
-		}
-		if skippedUnchanged > 0 {
-			stats["skipped_unchanged"] = skippedUnchanged
-			checkpoint = nonNilMap(checkpoint)
-			checkpoint["document_hashes"] = nextHashes
-			return stats, checkpoint, nil
-		}
-		return stats, checkpoint, errors.New("connector sync produced no non-empty content")
-	}
-	checkpoint = nonNilMap(checkpoint)
-	checkpoint["document_hashes"] = nextHashes
-	return map[string]any{
-		"uploaded_documents": uploaded,
-		"fetched_documents":  len(documents),
-		"skipped_unchanged":  skippedUnchanged,
-		"document_source":    documentSource,
-	}, checkpoint, nil
-}
 
 type connectorDocument struct {
 	FileName  string
@@ -962,36 +908,6 @@ func boolFromAny(v any, fallback bool) bool {
 	return fallback
 }
 
-func stringMapFromAny(v any) map[string]string {
-	out := map[string]string{}
-	switch raw := v.(type) {
-	case map[string]string:
-		for key, value := range raw {
-			out[key] = value
-		}
-	case map[string]any:
-		for key, value := range raw {
-			if s := strings.TrimSpace(stringFromAny(value)); s != "" {
-				out[key] = s
-			}
-		}
-	}
-	return out
-}
-
-func copyStringMap(in map[string]string) map[string]string {
-	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
-}
-
-func contentHash(content []byte) string {
-	sum := sha256.Sum256(content)
-	return fmt.Sprintf("%x", sum[:])
-}
-
 func maxSlackTimestamp(a, b string) string {
 	a = strings.TrimSpace(a)
 	b = strings.TrimSpace(b)
@@ -1223,4 +1139,57 @@ func notionBlockText(block map[string]any) string {
 		}
 	}
 	return strings.Join(parts, "")
+}
+
+type legacyAdapter struct {
+	service *Service
+	kind    SourceKind
+}
+
+func NewLegacyAdapter(service *Service, kind SourceKind) Adapter {
+	return legacyAdapter{service: service, kind: kind}
+}
+
+func (a legacyAdapter) Capabilities() AdapterCapabilities {
+	return AdapterCapabilities{Content: true, UnsupportedScopes: []string{"access", "membership"}}
+}
+
+func (a legacyAdapter) Content(ctx context.Context, connection source.Connection, cursor Cursor, limit int) (ContentPage, error) {
+	view := connectionView(connection)
+	if string(a.kind) != connection.Kind {
+		return ContentPage{}, errors.New("connector adapter kind does not match connection")
+	}
+	if cursor != "" {
+		return ContentPage{}, errors.New("legacy connector adapter does not support paging")
+	}
+	if limit <= 0 || limit > 100 {
+		return ContentPage{}, errors.New("connector page limit must be between 1 and 100")
+	}
+	docs, _, _, err := a.service.documentsForSource(ctx, view)
+	if err != nil {
+		return ContentPage{}, err
+	}
+	if len(docs) > limit {
+		return ContentPage{Completeness: CompletenessIncomplete, Snapshot: false}, errors.New("legacy adapter listing exceeds bounded page size")
+	}
+	page := ContentPage{Completeness: CompletenessComplete, Snapshot: true}
+	for _, doc := range docs {
+		nativeID := firstNonEmpty(doc.SourceID, doc.SourceURI, doc.FileName)
+		if nativeID == "" {
+			return ContentPage{}, errors.New("connector item has no native identity")
+		}
+		page.Items = append(page.Items, ContentItem{
+			NativeID: nativeID, Kind: connection.Kind, NativeRevision: doc.Revision,
+			Filename: doc.FileName, MIMEType: doc.MimeType, Content: []byte(doc.Content), URL: doc.SourceURI,
+		})
+	}
+	return page, nil
+}
+
+func (legacyAdapter) Access(context.Context, source.Connection, Cursor, int) (AccessPage, error) {
+	return AccessPage{Completeness: CompletenessIncomplete}, errors.New("source does not expose access enumeration through the legacy adapter")
+}
+
+func (legacyAdapter) Membership(context.Context, source.Connection, Cursor, int) (MembershipPage, error) {
+	return MembershipPage{Completeness: CompletenessIncomplete}, errors.New("source does not expose membership enumeration through the legacy adapter")
 }

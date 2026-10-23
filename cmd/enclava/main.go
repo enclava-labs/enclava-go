@@ -195,7 +195,18 @@ func main() {
 	qdrantClient := rag.NewQdrantClient(cfg.QdrantURL, cfg.UpstreamTimeout)
 	ragSvc := rag.NewService(ragRepo, qdrantClient, inferenceSvc, cfg.DefaultEmbeddingModel, artifactStore, jobsSvc)
 	previewSvc := extract.NewPreviewService(chunkProfilesRepo, jobsRepoPG, jobsSvc, artifactStore, sourceRepo, cfg.MaxUploadSizeMB)
-	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG, ragSvc)
+	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG)
+	adapterFactories := connectors.AdapterFactories{}
+	for _, kind := range []connectors.SourceKind{
+		connectors.SourceKindGitHub, connectors.SourceKindSlack, connectors.SourceKindTeams,
+		connectors.SourceKindNotion, connectors.SourceKindGoogleDrive,
+	} {
+		kind := kind
+		adapterFactories[kind] = func(source.Connection) (connectors.Adapter, error) {
+			return connectors.NewLegacyAdapter(connectorSvc, kind), nil
+		}
+	}
+	connectorSvc.SetSyncDependencies(adapterFactories, postgres.NewConnectorObservationsRepo(pgDB), artifactStore, sourceRepo)
 
 	// Worker: extract, preview and embed jobs use the same durable runner.
 	jobsRunner := jobs.NewRunner(jobsSvc, artifactStore, map[string]jobs.HandlerFunc{

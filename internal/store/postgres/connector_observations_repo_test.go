@@ -26,7 +26,7 @@ func TestConnectorStreamPagesPersistBeforeCursorAndFenceOldRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err = repo.PersistPage(ctx, first, []postgres.ConnectorObservation{{NativeID: "message-1", Payload: json.RawMessage(`{"text":"hello"}`), ArtifactRef: artifacts.Ref{TenantID: tenant, ID: "artifact-1", Kind: artifacts.KindOriginal, Version: 1}}}, "opaque-next", false, true, "")
+	first, err = repo.PersistPage(ctx, first, []postgres.ConnectorObservation{{TenantID: tenant, ConnectionID: connectionID, Stream: string(connectors.StreamContent), RunID: first.RunID, NativeID: "message-1", ObjectRef: source.ObjectRef{TenantID: tenant, ObjectID: "object-message-1", ObservedSeq: 1}, Payload: json.RawMessage(`{"text":"hello"}`), ArtifactRef: artifacts.Ref{TenantID: tenant, ID: "artifact-1", Kind: artifacts.KindOriginal, Version: 1}}}, "opaque-next", false, true, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,5 +53,33 @@ func TestConnectorStreamPagesPersistBeforeCursorAndFenceOldRuns(t *testing.T) {
 	}
 	if !stored.Complete || stored.Incomplete || stored.ObservedSeq != 1 || stored.RunID != second.RunID {
 		t.Fatalf("terminal checkpoint mismatch: %#v", stored)
+	}
+	third, err := repo.StartRun(ctx, tenant, connectionID, string(connectors.StreamContent), "00000000-0000-4000-8000-000000000003")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Cursor != "" || third.RunStartSeq != 1 || third.Fence <= second.Fence {
+		t.Fatalf("new complete scan did not reset its cursor boundary: %#v", third)
+	}
+	currentRun, err := repo.ListObservations(ctx, third)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(currentRun) != 0 {
+		t.Fatalf("new scan inherited observations from prior A→B→A history: %#v", currentRun)
+	}
+	membership, err := repo.StartRun(ctx, tenant, connectionID, string(connectors.StreamMembership), "00000000-0000-4000-8000-000000000004")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if membership.Fence == 0 || membership.Cursor != "" {
+		t.Fatalf("membership stream did not initialize independently: %#v", membership)
+	}
+	stillContent, err := repo.GetStream(ctx, tenant, connectionID, string(connectors.StreamContent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stillContent.RunID != third.RunID || stillContent.Fence != third.Fence {
+		t.Fatalf("membership run interfered with content stream: %#v", stillContent)
 	}
 }
