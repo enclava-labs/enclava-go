@@ -196,6 +196,7 @@ func main() {
 	// Worker: extract, preview and embed jobs use the same durable runner.
 	jobsRunner := jobs.NewRunner(jobsSvc, artifactStore, map[string]jobs.HandlerFunc{
 		extract.OperationProcess: extractSvc.JobHandler(),
+		extract.OperationVision:  extractSvc.JobHandler(),
 		extract.OperationPreview: previewSvc.JobHandler(),
 		rag.OperationEmbed:       ragSvc.JobHandler(),
 		connectors.OperationSync: connectorSvc.JobHandler(),

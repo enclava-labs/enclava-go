@@ -77,12 +77,12 @@ func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("upsert template: %v", err)
 	}
-	// Seed rates for the vision capability the attempt dispatches under.
+	// Structured text extraction uses chat capability after local parsing.
 	billingRepo := postgres.NewBillingRepo(db)
 	for _, u := range []billing.UnitKind{billing.UnitInput, billing.UnitOutput, billing.UnitCachedInput} {
 		if err := billingRepo.PutPrice(ctx, tenant, "price_"+string(u), billing.Price{
 			SubjectType: billing.PriceSubjectModel, SubjectID: "priced-extract",
-			Capability: inference.CapabilityVision, Unit: u,
+			Capability: inference.CapabilityChat, Unit: u,
 			RateMicros: 10_000, UnitQuantity: 1000, Currency: "USD",
 			EffectiveFrom: time.Now().Add(-time.Hour).UTC(),
 		}, principal.ActorID, time.Now().Add(-time.Hour).UTC()); err != nil {
@@ -109,25 +109,25 @@ func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 	if err := writer.WriteField("template_id", "invoice"); err != nil {
 		t.Fatalf("write template field: %v", err)
 	}
-	fileWriter, err := writer.CreateFormFile("file", "invoice.pdf")
+	fileWriter, err := writer.CreateFormFile("file", "invoice.txt")
 	if err != nil {
 		t.Fatalf("create form file: %v", err)
 	}
-	if _, err := fileWriter.Write([]byte("%PDF-1.7 fake")); err != nil {
+	if _, err := fileWriter.Write([]byte("invoice text")); err != nil {
 		t.Fatalf("write form file: %v", err)
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close multipart writer: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/extract/process", &body)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/extract/jobs", &body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	rec := httptest.NewRecorder()
 
 	handlers.HandleProcess(rec, req, principal)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected status 202, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	var out struct {
 		JobID  string `json:"job_id"`
@@ -164,7 +164,7 @@ func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 		Scan(&capability, &model, &amount); err != nil {
 		t.Fatalf("query usage record: %v", err)
 	}
-	if capability != inference.CapabilityVision || model != "priced-extract" || amount <= 0 {
+	if capability != inference.CapabilityChat || model != "priced-extract" || amount <= 0 {
 		t.Fatalf("unexpected usage: cap=%s model=%s amount=%d", capability, model, amount)
 	}
 	if err := db.SQL.QueryRowContext(ctx,

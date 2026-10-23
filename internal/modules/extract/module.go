@@ -21,7 +21,6 @@ func (m *Module) Name() string { return "extract" }
 
 func (m *Module) Register(mux *http.ServeMux, platform *httpx.App) {
 	h := NewHandlers(m.svc, m.maxUploadMB, platform)
-	mux.HandleFunc("/api/v1/extract/process", platform.Authenticated("extract", h.HandleProcess))
 	mux.HandleFunc("/api/v1/extract/jobs", platform.Authenticated("extract", h.HandleJobsList))
 	mux.HandleFunc("/api/v1/extract/jobs/", platform.Authenticated("extract", h.HandleJobDetail))
 	mux.HandleFunc("/api/v1/extract/templates/reset-defaults", platform.Authenticated("extract.manage", h.HandleTemplatesResetDefaults))

@@ -545,6 +545,12 @@
         showToast('Document processing failed.', 'error');
         return;
       }
+      if (result.data.job_id) {
+        resultsContent.textContent = 'Extraction job ' + result.data.job_id + ' is ' + (result.data.status || 'queued') + '.';
+        showToast('Extraction job submitted.', 'success');
+        loadExtractJobs();
+        return;
+      }
       renderExtractResults(result.data);
       showToast('Document processed successfully.', 'success');
       loadExtractJobs();

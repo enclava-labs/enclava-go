@@ -222,11 +222,16 @@ func (a *App) handleDashboardExtractProcess(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, a.maxUploadMB*1024*1024)
-	if err := r.ParseMultipartForm(a.maxUploadMB * 1024 * 1024); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, a.maxUploadMB*1024*1024+64*1024)
+	if err := r.ParseMultipartForm(32 * 1024); err != nil {
 		WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid multipart form or file too large"})
 		return
 	}
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
 
 	templateID := strings.TrimSpace(r.FormValue("template_id"))
 	if templateID == "" {
@@ -234,16 +239,18 @@ func (a *App) handleDashboardExtractProcess(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	if r.MultipartForm == nil || len(r.MultipartForm.File) != 1 || len(r.MultipartForm.File["file"]) != 1 {
+		WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "exactly one file is required"})
+		return
+	}
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "file is required"})
 		return
 	}
-	defer func() { _ = file.Close() }()
-
-	content, err := io.ReadAll(file)
-	if err != nil {
-		WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "failed to read uploaded file"})
+	defer file.Close()
+	if header.Size <= 0 || header.Size > a.maxUploadMB*1024*1024 {
+		WriteJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "file size is outside the allowed limit"})
 		return
 	}
 
@@ -262,18 +269,20 @@ func (a *App) handleDashboardExtractProcess(w http.ResponseWriter, r *http.Reque
 	}
 
 	// The real request principal — no API-key-id-zero authority.
-	result, err := a.extractSvc.Process(r.Context(), p, extract.ProcessInput{
-		TemplateID: templateID,
-		Context:    contextValues,
-		FileName:   filepath.Base(header.Filename),
-		MimeType:   mimeType,
-		Bytes:      content,
+	result, err := a.extractSvc.ProcessReader(r.Context(), p, extract.ProcessInput{
+		Operation: extract.OperationProcess, TemplateID: templateID,
+		Context: contextValues, FileName: filepath.Base(header.Filename),
+		MimeType: mimeType, Reader: file,
+		IdempotencyKey: strings.TrimSpace(r.FormValue("idempotency_key")),
 	})
 	if err != nil {
 		WriteJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
 		return
 	}
-	WriteJSON(w, http.StatusOK, result)
+	WriteJSON(w, http.StatusAccepted, map[string]any{
+		"job_id": result.JobID, "status": result.Status,
+		"status_url": "/api/v1/extract/jobs/" + result.JobID,
+	})
 }
 
 // handleDashboardExtractJobs returns recent extract jobs as JSON.

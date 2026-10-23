@@ -3,7 +3,6 @@ package extractmodule
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -33,8 +32,8 @@ func (h *Handlers) HandleProcess(w http.ResponseWriter, r *http.Request, princip
 	}
 	// No provider-readiness or budget gate here: the shared executor resolves
 	// route capability and admits/settles billing for the actual attempt.
-	r.Body = http.MaxBytesReader(w, r.Body, h.maxUploadMB*1024*1024)
-	if err := r.ParseMultipartForm(h.maxUploadMB * 1024 * 1024); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, h.maxUploadMB*1024*1024+64*1024)
+	if err := r.ParseMultipartForm(32 * 1024); err != nil {
 		httpx.WriteOpenAIError(w, http.StatusBadRequest, "invalid multipart form", "invalid_request_error", "invalid_form")
 		return
 	}
@@ -48,22 +47,27 @@ func (h *Handlers) HandleProcess(w http.ResponseWriter, r *http.Request, princip
 		return
 	}
 
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
+	if r.MultipartForm == nil || len(r.MultipartForm.File) != 1 || len(r.MultipartForm.File["file"]) != 1 {
+		httpx.WriteOpenAIError(w, http.StatusBadRequest, "exactly one file is required", "invalid_request_error", "invalid_file_count")
+		return
+	}
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		httpx.WriteOpenAIError(w, http.StatusBadRequest, "file is required", "invalid_request_error", "missing_file")
 		return
 	}
-	defer func() {
-		_ = file.Close()
-	}()
-
-	content, err := io.ReadAll(file)
-	if err != nil {
-		httpx.WriteOpenAIError(w, http.StatusBadRequest, "failed to read uploaded file", "invalid_request_error", "invalid_file")
+	defer file.Close()
+	if header.Size <= 0 || header.Size > h.maxUploadMB*1024*1024 {
+		httpx.WriteOpenAIError(w, http.StatusRequestEntityTooLarge, "file size is outside the allowed limit", "invalid_request_error", "file_too_large")
 		return
 	}
-	mimeType := header.Header.Get("Content-Type")
-	if strings.TrimSpace(mimeType) == "" {
+	mimeType := strings.TrimSpace(header.Header.Get("Content-Type"))
+	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
 
@@ -79,13 +83,18 @@ func (h *Handlers) HandleProcess(w http.ResponseWriter, r *http.Request, princip
 		}
 	}
 
-	result, err := h.svc.Process(r.Context(), principal, extract.ProcessInput{
-		TemplateID:     templateID,
-		Context:        contextValues,
-		FileName:       filepath.Base(header.Filename),
-		MimeType:       mimeType,
-		Bytes:          content,
-		IdempotencyKey: strings.TrimSpace(r.FormValue("idempotency_key")),
+	operation := strings.TrimSpace(r.FormValue("operation"))
+	if operation == "image-recognition" {
+		operation = extract.OperationVision
+	}
+	if operation == "" {
+		operation = extract.OperationProcess
+	}
+	result, err := h.svc.ProcessReader(r.Context(), principal, extract.ProcessInput{
+		Operation:  operation,
+		TemplateID: templateID, Context: contextValues,
+		FileName: filepath.Base(header.Filename), MimeType: mimeType,
+		Reader: file, IdempotencyKey: strings.TrimSpace(r.FormValue("idempotency_key")),
 	})
 	if err != nil {
 		if errors.Is(err, extract.ErrNotFound) {
@@ -104,9 +113,10 @@ func (h *Handlers) HandleProcess(w http.ResponseWriter, r *http.Request, princip
 		httpx.WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "extract_failed")
 		return
 	}
-	// Billing is settled inside the attempt by the shared executor — no
-	// platform RecordUsage/EnforceBudget call here.
-	httpx.WriteJSON(w, http.StatusOK, result)
+	httpx.WriteJSON(w, http.StatusAccepted, map[string]any{
+		"job_id": result.JobID, "status": result.Status,
+		"status_url": "/api/v1/extract/jobs/" + result.JobID,
+	})
 }
 
 func extractTemplateIDFromRequest(r *http.Request) string {
@@ -119,6 +129,10 @@ func extractTemplateIDFromRequest(r *http.Request) string {
 }
 
 func (h *Handlers) HandleJobsList(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
+	if r.Method == http.MethodPost {
+		h.HandleProcess(w, r, principal)
+		return
+	}
 	if r.Method != http.MethodGet {
 		httpx.WriteMethodNotAllowed(w)
 		return
