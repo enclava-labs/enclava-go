@@ -196,15 +196,22 @@ func main() {
 	ragSvc := rag.NewService(ragRepo, qdrantClient, inferenceSvc, cfg.DefaultEmbeddingModel, artifactStore, jobsSvc)
 	previewSvc := extract.NewPreviewService(chunkProfilesRepo, jobsRepoPG, jobsSvc, artifactStore, sourceRepo, cfg.MaxUploadSizeMB)
 	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG)
-	adapterFactories := connectors.AdapterFactories{}
-	for _, kind := range []connectors.SourceKind{
-		connectors.SourceKindGitHub, connectors.SourceKindSlack, connectors.SourceKindTeams,
-		connectors.SourceKindNotion, connectors.SourceKindGoogleDrive,
-	} {
-		kind := kind
-		adapterFactories[kind] = func(source.Connection) (connectors.Adapter, error) {
-			return connectors.NewLegacyAdapter(connectorSvc, kind), nil
-		}
+	adapterFactories := connectors.AdapterFactories{
+		connectors.SourceKindGitHub: func(c source.Connection) (connectors.Adapter, error) {
+			return connectors.NewGitHubAdapter(c, secretResolver)
+		},
+		connectors.SourceKindSlack: func(c source.Connection) (connectors.Adapter, error) {
+			return connectors.NewSlackAdapter(c)
+		},
+		connectors.SourceKindTeams: func(c source.Connection) (connectors.Adapter, error) {
+			return connectors.NewTeamsAdapter(c, secretResolver)
+		},
+		connectors.SourceKindNotion: func(c source.Connection) (connectors.Adapter, error) {
+			return connectors.NewNotionAdapter(c, secretResolver)
+		},
+		connectors.SourceKindGoogleDrive: func(source.Connection) (connectors.Adapter, error) {
+			return connectors.NewGDriveAdapter(connectorSvc), nil
+		},
 	}
 	connectorSvc.SetSyncDependencies(adapterFactories, postgres.NewConnectorObservationsRepo(pgDB), artifactStore, sourceRepo)
 
@@ -214,6 +221,8 @@ func main() {
 		extract.OperationVision:  extractSvc.JobHandler(),
 		extract.OperationPreview: previewSvc.JobHandler(),
 		rag.OperationEmbed:       ragSvc.JobHandler(),
+		rag.OperationIngest:      ragSvc.IngestJobHandler(),
+		rag.OperationAccess:      ragSvc.AccessJobHandler(),
 		connectors.OperationSync: connectorSvc.JobHandler(),
 	}, jobs.RunnerConfig{})
 	runnerCtx, stopRunner := context.WithCancel(context.Background())

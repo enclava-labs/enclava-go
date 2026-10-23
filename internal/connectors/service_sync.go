@@ -122,6 +122,14 @@ func (s *Service) runContentStream(ctx context.Context, claim *jobs.Claim, princ
 	return errors.New("connector content listing exceeded page limit")
 }
 
+func readCapableScope(scope string) bool {
+	switch scope {
+	case "", "read", "view", "reader", "commenter", "writer", "editor", "owner", "organizer", "fileOrganizer", "member", "post", "reply":
+		return true
+	}
+	return false
+}
+
 func (s *Service) observeContentItem(ctx context.Context, conn source.Connection, item ContentItem) (Observation, error) {
 	if item.NativeID == "" {
 		return Observation{}, errors.New("connector content item native id is required")
@@ -134,7 +142,13 @@ func (s *Service) observeContentItem(ctx context.Context, conn source.Connection
 	}
 	var parentID string
 	if item.ParentNativeID != "" {
-		if parent, err := s.canonical.ObjectForNativeID(ctx, conn.TenantID, conn.ID, kind, item.ParentNativeID); err == nil {
+		// Parents may be observed under a different kind than the child
+		// (e.g. Notion block parented by a page), so fall back cross-kind.
+		parent, err := s.canonical.ObjectForNativeID(ctx, conn.TenantID, conn.ID, kind, item.ParentNativeID)
+		if err != nil {
+			parent, err = s.canonical.ObjectForNativeIDCrossKind(ctx, conn.TenantID, conn.ID, item.ParentNativeID)
+		}
+		if err == nil {
 			parentID = parent.ID
 		}
 	}
@@ -349,7 +363,9 @@ func (s *Service) applyGrantSnapshot(ctx context.Context, principal auth.Princip
 			memberships = append(memberships, source.SourceGroupMembership{TenantID: conn.TenantID, ConnectionID: conn.ID, GroupID: group.ID, MemberID: identity.ID, AccessRevision: revision})
 			continue
 		}
-		if grant.Scope != "" && grant.Scope != "read" && grant.Scope != "view" {
+		// Provider roles (Drive reader/writer/owner, etc.) all imply
+		// readability for search authorization; unknown values are garbage.
+		if !readCapableScope(grant.Scope) {
 			return fmt.Errorf("unsupported source access scope %q", grant.Scope)
 		}
 		object, err := s.canonical.ObjectForNativeID(ctx, conn.TenantID, conn.ID, firstNonEmpty(grant.NativeObjectKind, conn.Kind), grant.NativeObjectID)

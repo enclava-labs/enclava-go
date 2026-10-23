@@ -104,8 +104,10 @@ func TestTeamsAdapterPagesChannelRepliesAndChats(t *testing.T) {
 	if page.Items[1].NativeID != "teams:chat:chat:chatmsg" || page.Items[1].ParentNativeID != "" || page.Items[1].Kind != "teams_chat_message" {
 		t.Fatalf("chat message = %#v", page.Items[1])
 	}
-	if messageRequests != 2 {
-		t.Fatalf("429 requests = %d, want retry", messageRequests)
+	// 429 + page-1 + page-2 listings; the retry itself is proven by the
+	// later successful listings (a surfaced 429 would have failed earlier).
+	if messageRequests != 3 {
+		t.Fatalf("messages requests = %d, want 3 (429 retry + two pages)", messageRequests)
 	}
 	members, err := a.Membership(context.Background(), connection, "", 2)
 	if err != nil {

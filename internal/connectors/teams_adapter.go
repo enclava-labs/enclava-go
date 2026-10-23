@@ -2,6 +2,8 @@ package connectors
 
 import (
 	"context"
+	"enclava-go/internal/auth"
+	"enclava-go/internal/source"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,8 +13,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"enclava-go/internal/auth"
-	"enclava-go/internal/source"
 )
 
 const teamsGraph = "https://graph.microsoft.com/v1.0"
@@ -152,9 +152,13 @@ func (a *TeamsAdapter) doJSON(req *http.Request, target any) error {
 }
 
 func (a *TeamsAdapter) get(ctx context.Context, token, endpoint string, target any) error {
-	if !connectorSameOrigin(a.baseURL, endpoint) { return errors.New("teams pagination URL changed origin") }
+	if !connectorSameOrigin(a.baseURL, endpoint) {
+		return errors.New("teams pagination URL changed origin")
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
 	return a.doJSON(req, target)
@@ -162,16 +166,23 @@ func (a *TeamsAdapter) get(ctx context.Context, token, endpoint string, target a
 
 type teamsPage struct {
 	Value []json.RawMessage `json:"value"`
-	Next string `json:"@odata.nextLink"`
+	Next  string            `json:"@odata.nextLink"`
 }
+
 func (a *TeamsAdapter) list(ctx context.Context, token, endpoint string, max int) ([]json.RawMessage, error) {
 	items := make([]json.RawMessage, 0)
 	for pages := 0; endpoint != ""; pages++ {
-		if pages >= 100 { return nil, errors.New("teams pagination exceeded 100 pages") }
+		if pages >= 100 {
+			return nil, errors.New("teams pagination exceeded 100 pages")
+		}
 		var page teamsPage
-		if err := a.get(ctx, token, endpoint, &page); err != nil { return nil, err }
+		if err := a.get(ctx, token, endpoint, &page); err != nil {
+			return nil, err
+		}
 		items = append(items, page.Value...)
-		if len(items) > max { return nil, errors.New("teams listing exceeded configured bound") }
+		if len(items) > max {
+			return nil, errors.New("teams listing exceeded configured bound")
+		}
 		endpoint = page.Next
 	}
 	return items, nil
@@ -179,32 +190,71 @@ func (a *TeamsAdapter) list(ctx context.Context, token, endpoint string, max int
 
 func (a *TeamsAdapter) selectedTeams() []string {
 	if raw, ok := a.connection.Config["team_ids"].([]any); ok {
-		ids := make([]string, 0, len(raw)); for _, v := range raw { if id := strings.TrimSpace(stringFromAny(v)); id != "" { ids = append(ids, id) } }; return ids
+		ids := make([]string, 0, len(raw))
+		for _, v := range raw {
+			if id := strings.TrimSpace(stringFromAny(v)); id != "" {
+				ids = append(ids, id)
+			}
+		}
+		return ids
 	}
-	if id := strings.TrimSpace(stringFromAny(a.connection.Config["team_id"])); id != "" { return []string{id} }
+	if id := strings.TrimSpace(stringFromAny(a.connection.Config["team_id"])); id != "" {
+		return []string{id}
+	}
 	return nil
 }
 func (a *TeamsAdapter) selectedChats() []string {
-	raw, _ := a.connection.Config["chat_ids"].([]any); ids := make([]string, 0, len(raw)); for _, v := range raw { if id := strings.TrimSpace(stringFromAny(v)); id != "" { ids = append(ids, id) } }; return ids
+	raw, _ := a.connection.Config["chat_ids"].([]any)
+	ids := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if id := strings.TrimSpace(stringFromAny(v)); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 func teamsID(s string) string { return url.PathEscape(s) }
-func parseTeamsTime(raw string) *time.Time { t, err := time.Parse(time.RFC3339Nano, raw); if err != nil { return nil }; return &t }
+func parseTeamsTime(raw string) *time.Time {
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return nil
+	}
+	return &t
+}
 
 type graphMessage struct {
-	ID string `json:"id"`
-	Body struct { Content string `json:"content"` } `json:"body"`
-	Created string `json:"createdDateTime"`
+	ID   string `json:"id"`
+	Body struct {
+		Content string `json:"content"`
+	} `json:"body"`
+	Created  string `json:"createdDateTime"`
 	Modified string `json:"lastModifiedDateTime"`
-	WebURL string `json:"webUrl"`
-	From struct { User struct { ID, DisplayName string } `json:"user"` } `json:"from"`
-	Attachments []struct { ID, Name, ContentType, ContentURL string } `json:"attachments"`
+	WebURL   string `json:"webUrl"`
+	From     struct {
+		User struct{ ID, DisplayName string } `json:"user"`
+	} `json:"from"`
+	Attachments []struct{ ID, Name, ContentType, ContentURL string } `json:"attachments"`
 }
+
 func (a *TeamsAdapter) Content(ctx context.Context, c source.Connection, cursor Cursor, limit int) (ContentPage, error) {
-	if c.ID != a.connection.ID || c.Kind != source.ConnectionTeams { return ContentPage{}, errors.New("teams adapter connection mismatch") }
-	if limit < 1 || limit > 100 { return ContentPage{}, errors.New("teams page limit must be between 1 and 100") }
+	if c.ID != a.connection.ID || c.Kind != source.ConnectionTeams {
+		return ContentPage{}, errors.New("teams adapter connection mismatch")
+	}
+	if limit < 1 || limit > 100 {
+		return ContentPage{}, errors.New("teams page limit must be between 1 and 100")
+	}
 	offset := 0
-	if cursor != "" { n, err := strconv.Atoi(string(cursor)); if err != nil || n < 0 { return ContentPage{}, errors.New("invalid teams cursor") }; offset = n }
-	token, err := a.token(ctx); if err != nil { return ContentPage{}, err }
+	if cursor != "" {
+		n, err := strconv.Atoi(string(cursor))
+		if err != nil || n < 0 {
+			return ContentPage{}, errors.New("invalid teams cursor")
+		}
+		offset = n
+	}
+	token, err := a.token(ctx)
+	if err != nil {
+		return ContentPage{}, err
+	}
 	items := make([]ContentItem, 0)
 	appendItem := func(item ContentItem) error {
 		if len(items) == teamsMaxItems {
@@ -214,15 +264,44 @@ func (a *TeamsAdapter) Content(ctx context.Context, c source.Connection, cursor 
 		return nil
 	}
 	for _, team := range a.selectedTeams() {
-		channels, err := a.list(ctx, token, a.baseURL+"/teams/"+teamsID(team)+"/channels?$top=100", teamsMaxItems); if err != nil { return ContentPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list channels for team %s: %w", team, err) }
+		channels, err := a.list(ctx, token, a.baseURL+"/teams/"+teamsID(team)+"/channels?$top=100", teamsMaxItems)
+		if err != nil {
+			return ContentPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list channels for team %s: %w", team, err)
+		}
 		for _, raw := range channels {
-			var channel struct { ID string `json:"id"`; MembershipType string `json:"membershipType"` }; if err := json.Unmarshal(raw, &channel); err != nil || channel.ID == "" { return ContentPage{}, errors.New("teams channel payload is malformed") }
-			if !allowedTeamChannel(a.connection.Config, team, channel.ID) { continue }
-			messages, err := a.list(ctx, token, a.baseURL+"/teams/"+teamsID(team)+"/channels/"+teamsID(channel.ID)+"/messages?$top=50", teamsMaxItems); if err != nil { return ContentPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list %s channel %s messages: %w", channel.MembershipType, channel.ID, err) }
+			var channel struct {
+				ID             string `json:"id"`
+				MembershipType string `json:"membershipType"`
+			}
+			if err := json.Unmarshal(raw, &channel); err != nil || channel.ID == "" {
+				return ContentPage{}, errors.New("teams channel payload is malformed")
+			}
+			if !allowedTeamChannel(a.connection.Config, team, channel.ID) {
+				continue
+			}
+			messages, err := a.list(ctx, token, a.baseURL+"/teams/"+teamsID(team)+"/channels/"+teamsID(channel.ID)+"/messages?$top=50", teamsMaxItems)
+			if err != nil {
+				return ContentPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list %s channel %s messages: %w", channel.MembershipType, channel.ID, err)
+			}
 			for _, messageRaw := range messages {
-				var m graphMessage; if err := json.Unmarshal(messageRaw, &m); err != nil || m.ID == "" { return ContentPage{}, errors.New("teams message payload is malformed") }
+				var m graphMessage
+				if err := json.Unmarshal(messageRaw, &m); err != nil || m.ID == "" {
+					return ContentPage{}, errors.New("teams message payload is malformed")
+				}
 				if err := appendItem(teamsMessageItem(team, channel.ID, channel.MembershipType, m, "")); err != nil {
 					return ContentPage{Completeness: CompletenessIncomplete}, err
+				}
+				for _, at := range m.Attachments {
+					id := at.ID
+					if id == "" {
+						id = at.Name
+					}
+					if id != "" {
+						item := ContentItem{NativeID: "teams:" + team + ":" + channel.ID + ":" + m.ID + ":attachment:" + id, ParentNativeID: "teams:" + team + ":" + channel.ID + ":" + m.ID, Kind: "teams_attachment", Filename: at.Name, MIMEType: at.ContentType, URL: at.ContentURL}
+						if err := appendItem(item); err != nil {
+							return ContentPage{Completeness: CompletenessIncomplete}, err
+						}
+					}
 				}
 				replies, err := a.list(ctx, token, a.baseURL+"/teams/"+teamsID(team)+"/channels/"+teamsID(channel.ID)+"/messages/"+teamsID(m.ID)+"/replies?$top=50", teamsMaxItems)
 				if err != nil {
@@ -237,23 +316,14 @@ func (a *TeamsAdapter) Content(ctx context.Context, c source.Connection, cursor 
 						return ContentPage{Completeness: CompletenessIncomplete}, err
 					}
 				}
-				for _, at := range m.Attachments {
-					id := at.ID
-					if id == "" {
-						id = at.Name
-					}
-					if id != "" {
-						item := ContentItem{NativeID: "teams:" + team + ":" + channel.ID + ":" + m.ID + ":attachment:" + id, ParentNativeID: "teams:" + team + ":" + channel.ID + ":" + m.ID, Kind: "teams_attachment", Filename: at.Name, MIMEType: at.ContentType, URL: at.ContentURL}
-						if err := appendItem(item); err != nil {
-							return ContentPage{Completeness: CompletenessIncomplete}, err
-						}
-					}
-				}
+			}
 		}
 	}
-	}
 	for _, chat := range a.selectedChats() {
-		messages, err := a.list(ctx, token, a.baseURL+"/chats/"+teamsID(chat)+"/messages?$top=50", teamsMaxItems); if err != nil { return ContentPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list configured chat %s messages (Chat.Read.All/ChatMessage.Read.All required): %w", chat, err) }
+		messages, err := a.list(ctx, token, a.baseURL+"/chats/"+teamsID(chat)+"/messages?$top=50", teamsMaxItems)
+		if err != nil {
+			return ContentPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list configured chat %s messages (Chat.Read.All/ChatMessage.Read.All required): %w", chat, err)
+		}
 		for _, raw := range messages {
 			var m graphMessage
 			if err := json.Unmarshal(raw, &m); err != nil || m.ID == "" {
@@ -268,18 +338,47 @@ func (a *TeamsAdapter) Content(ctx context.Context, c source.Connection, cursor 
 			}
 		}
 	}
-	if offset > len(items) { return ContentPage{}, errors.New("teams cursor exceeds listing") }
-	end := offset + limit; if end > len(items) { end = len(items) }
+	if offset > len(items) {
+		return ContentPage{}, errors.New("teams cursor exceeds listing")
+	}
+	end := offset + limit
+	if end > len(items) {
+		end = len(items)
+	}
 	page := ContentPage{Items: items[offset:end], Completeness: CompletenessComplete, Snapshot: end == len(items)}
-	if end < len(items) { page.NextCursor = Cursor(strconv.Itoa(end)) }
+	if end < len(items) {
+		page.NextCursor = Cursor(strconv.Itoa(end))
+	}
 	return page, nil
 }
 func teamsMessageItem(team, channel, membership string, m graphMessage, parent string) ContentItem {
-	id := "teams:"+team+":"+channel+":"+m.ID; kind := "teams_channel_message"; if parent != "" { kind = "teams_channel_reply" }
-	return ContentItem{NativeID: id, ParentNativeID: func() string { if parent != "" { return "teams:"+team+":"+channel+":"+parent }; return "" }(), Kind: kind+":"+membership, NativeRevision: m.Modified, Text: m.Body.Content, URL: m.WebURL, CreatedAt: parseTeamsTime(m.Created), UpdatedAt: parseTeamsTime(m.Modified)}
+	id := "teams:" + team + ":" + channel + ":" + m.ID
+	kind := "teams_channel_message"
+	if parent != "" {
+		kind = "teams_channel_reply"
+	}
+	return ContentItem{NativeID: id, ParentNativeID: func() string {
+		if parent != "" {
+			return "teams:" + team + ":" + channel + ":" + parent
+		}
+		return ""
+	}(), Kind: kind + ":" + membership, NativeRevision: m.Modified, Text: m.Body.Content, URL: m.WebURL, CreatedAt: parseTeamsTime(m.Created), UpdatedAt: parseTeamsTime(m.Modified)}
 }
 func allowedTeamChannel(config map[string]any, team, channel string) bool {
-	allowed, ok := config["channel_ids"].(map[string]any); if !ok { return true }; raw, ok := allowed[team].([]any); if !ok { return false }; for _, v := range raw { if stringFromAny(v) == channel { return true } }; return false
+	allowed, ok := config["channel_ids"].(map[string]any)
+	if !ok {
+		return true
+	}
+	raw, ok := allowed[team].([]any)
+	if !ok {
+		return false
+	}
+	for _, v := range raw {
+		if stringFromAny(v) == channel {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *TeamsAdapter) Membership(ctx context.Context, c source.Connection, cursor Cursor, limit int) (MembershipPage, error) {

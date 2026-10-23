@@ -52,6 +52,7 @@ type CanonicalSourceRepository interface {
 	source.SourceRepository
 	WithTx(context.Context, func(source.Tx) error) error
 	ObjectForNativeID(context.Context, string, string, string, string) (source.Object, error)
+	ObjectForNativeIDCrossKind(context.Context, string, string, string) (source.Object, error)
 	SourceIdentityForNativeID(context.Context, string, string, string) (source.SourceIdentity, error)
 	SourceGroupForNativeID(context.Context, string, string, string) (source.SourceGroup, error)
 	InsertSourceGroup(context.Context, source.SourceGroup) error
