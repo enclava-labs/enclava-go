@@ -13,6 +13,7 @@ import (
 
 	"enclava-go/internal/artifacts"
 	"enclava-go/internal/auth"
+	"enclava-go/internal/extract"
 	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
 	"enclava-go/internal/source"
@@ -82,6 +83,7 @@ type Service struct {
 	executor              Executor
 	defaultEmbeddingModel string
 	artifacts             *artifacts.Store
+	parser                *extract.Parser
 	jobs                  *jobs.Service
 	authorizer            *source.Authorizer
 	maxUploadMB           int64
@@ -101,6 +103,7 @@ func NewService(repo Repository, vectorStore VectorStore, executor Executor, def
 		executor:              executor,
 		defaultEmbeddingModel: defaultEmbeddingModel,
 		artifacts:             artifactStore,
+		parser:                extract.NewParser(artifactStore),
 		jobs:                  jobSvc,
 		authorizer:            source.NewAuthorizer(repo, 0),
 		maxUploadMB:           512,
@@ -701,85 +704,33 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		return versionRowID(ver), nil // complete: nothing to index
 	}
 
-	rc, err := s.artifacts.Read(ctx, artifacts.Ref{TenantID: job.TenantID, ID: ver.ArtifactRef, Kind: artifacts.KindOriginal})
-	if err != nil {
-		return "", fmt.Errorf("read input artifact: %w", err)
-	}
-	defer func() { _ = rc.Close() }()
-	blob, err := readAll(rc)
-	if err != nil {
-		return "", fmt.Errorf("read artifact bytes: %w", err)
-	}
-	text, err := ExtractText(ver.OriginalFilename, ver.MimeType, blob)
+	ref := artifacts.Ref{TenantID: job.TenantID, ID: ver.ArtifactRef, Kind: artifacts.KindOriginal}
+	objectRef := source.ObjectRef{TenantID: job.TenantID, ObjectID: objectID, ObservedSeq: seq}
+	document, err := s.parser.Parse(ctx, ref, extract.ParseOptions{
+		Filename: ver.OriginalFilename, MIMEType: ver.MimeType, ObjectRef: objectRef,
+	})
 	if err != nil {
 		return "", err
 	}
-	var blocks []parsedBlock
-	parserVersion := "rag-structured-v1"
-	format := structuredFormat(ver.OriginalFilename, ver.MimeType)
-	if format == "markdown" {
-		blocks = parseMarkdownBlocks(string(blob))
-	} else if format == "html" {
-		blocks = parseHTMLBlocks(string(blob))
-	}
-	structured := format != ""
-	if structured {
-		if len(blocks) == 0 {
-			blocks = []parsedBlock{{Kind: "paragraph", Text: text, ByteStart: 0, ByteEnd: len(text)}}
-		}
-	} else {
-		blocks = []parsedBlock{{Kind: "paragraph", Text: text, ByteStart: 0, ByteEnd: len(text)}}
-	}
-	sourceBlocks := make([]source.Block, len(blocks))
-	var headingIDs [6]string
-	for i, block := range blocks {
-		blockID := newID("block")
-		parentID := ""
-		if block.Kind == "heading" {
-			if block.Level < 1 || block.Level > 6 {
-				return "", errors.New("invalid parsed heading level")
-			}
-			if block.Level > 1 {
-				parentID = headingIDs[block.Level-2]
-			}
-			for level := block.Level - 1; level < len(headingIDs); level++ {
-				headingIDs[level] = ""
-			}
-			headingIDs[block.Level-1] = blockID
-		} else {
-			for level := len(headingIDs) - 1; level >= 0; level-- {
-				if headingIDs[level] != "" {
-					parentID = headingIDs[level]
-					break
-				}
-			}
-		}
-		sourceBlocks[i] = source.Block{
-			ID: blockID, Ordinal: i, Kind: block.Kind, ParentID: parentID,
-			Text: block.Text, ByteStart: block.ByteStart, ByteEnd: block.ByteEnd,
-			Locator: source.Locator{HeadingLevel: block.Level, Language: block.Language},
-		}
-	}
-	if structured {
-		if err := s.repo.SaveParsedDocument(ctx, parserVersion, source.Document{
-			Ref:    source.ObjectRef{TenantID: job.TenantID, ObjectID: objectID, ObservedSeq: seq},
-			Blocks: sourceBlocks,
-		}); err != nil {
-			return "", err
-		}
-	}
-	var structuredChunks []structuredChunk
-	var chunkTexts []string
-	if structured {
-		structuredChunks = chunkStructured(blocks, c.ChunkSize, c.ChunkOverlap)
-		for _, chunk := range structuredChunks {
-			chunkTexts = append(chunkTexts, chunk.Text)
-		}
-	} else {
-		chunkTexts = ChunkText(text, c.ChunkSize, c.ChunkOverlap)
-	}
-	if len(chunkTexts) == 0 {
+	if len(document.Blocks) == 0 {
 		return "", errors.New("document has no extractable text")
+	}
+	parserVersion := "extract-v1"
+	sourceBlocks := document.Blocks
+	blocks := make([]chunkBlock, len(sourceBlocks))
+	for i, block := range sourceBlocks {
+		blocks[i] = chunkBlock{Kind: block.Kind, Text: block.Text, Level: block.Locator.HeadingLevel, ByteStart: block.ByteStart, ByteEnd: block.ByteEnd}
+	}
+	if err := s.repo.SaveParsedDocument(ctx, parserVersion, document); err != nil {
+		return "", err
+	}
+	structuredChunks := chunkStructured(blocks, c.ChunkSize, c.ChunkOverlap)
+	if len(structuredChunks) == 0 {
+		return "", errors.New("document has no extractable text")
+	}
+	chunkTexts := make([]string, 0, len(structuredChunks))
+	for _, chunk := range structuredChunks {
+		chunkTexts = append(chunkTexts, chunk.Text)
 	}
 
 	if err := claim.MarkDispatched(ctx); err != nil {
@@ -828,34 +779,29 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 			"source_type": obj.Kind, "source_id": obj.NativeID, "source_uri": sourceURI,
 			"metadata": docMetadata,
 		}
-		if structured {
-			chunk.ByteStart, chunk.ByteEnd = structuredChunks[i].ByteStart, structuredChunks[i].ByteEnd
-			chunk.HeaderPath = structuredChunks[i].HeaderPath
-			spanPayload := make([]map[string]any, 0, len(structuredChunks[i].BlockIndexes))
-			for _, blockIndex := range structuredChunks[i].BlockIndexes {
-				b := sourceBlocks[blockIndex]
-				span := source.Span{
-					Ref:     source.ObjectRef{TenantID: job.TenantID, ObjectID: objectID, ObservedSeq: seq},
-					BlockID: b.ID, ByteStart: 0, ByteEnd: len(b.Text),
-				}
-				chunk.SpanRefs = append(chunk.SpanRefs, span)
-				spanPayload = append(spanPayload, map[string]any{
-					"block_id": b.ID, "byte_start": b.ByteStart, "byte_end": b.ByteEnd,
-				})
+		chunk.ByteStart, chunk.ByteEnd = structuredChunks[i].ByteStart, structuredChunks[i].ByteEnd
+		chunk.HeaderPath = structuredChunks[i].HeaderPath
+		spanPayload := make([]map[string]any, 0, len(structuredChunks[i].BlockIndexes))
+		for _, blockIndex := range structuredChunks[i].BlockIndexes {
+			b := sourceBlocks[blockIndex]
+			span := source.Span{
+				Ref:     source.ObjectRef{TenantID: job.TenantID, ObjectID: objectID, ObservedSeq: seq},
+				BlockID: b.ID, ByteStart: 0, ByteEnd: len(b.Text),
 			}
-			payload["header_path"] = chunk.HeaderPath
-			payload["block_spans"] = spanPayload
+			chunk.SpanRefs = append(chunk.SpanRefs, span)
+			spanPayload = append(spanPayload, map[string]any{
+				"block_id": b.ID, "byte_start": b.ByteStart, "byte_end": b.ByteEnd,
+			})
 		}
+		payload["header_path"] = chunk.HeaderPath
+		payload["block_spans"] = spanPayload
 		chunks = append(chunks, chunk)
 		points = append(points, QdrantPoint{
 			ID: pointID, Vector: vectors[i], Sparse: sparseVector(chunkText), Payload: payload,
 		})
 	}
 
-	profileFamily := "rag-" + c.ID
-	if structured {
-		profileFamily += "-" + format
-	}
+	profileFamily := "rag-" + c.ID + "-structured"
 	profileVersionID, err := s.repo.EnsureChunkProfile(ctx, job.TenantID, profileFamily, c.ChunkSize, c.ChunkOverlap)
 	if err != nil {
 		return "", err

@@ -474,6 +474,11 @@ func (r *RAGRepo) DeleteObjectRows(ctx context.Context, tenantID, objectID strin
 			  (SELECT id FROM source_object_versions WHERE tenant_id = $1 AND object_id = $2)`, []any{tenantID, objectID}},
 			{`DELETE FROM chunks WHERE tenant_id = $1 AND object_version_id IN
 			  (SELECT id FROM source_object_versions WHERE tenant_id = $1 AND object_id = $2)`, []any{tenantID, objectID}},
+			{`DELETE FROM blocks WHERE tenant_id = $1 AND parsed_document_id IN
+			  (SELECT id FROM parsed_documents WHERE tenant_id = $1 AND object_version_id IN
+			   (SELECT id FROM source_object_versions WHERE tenant_id = $1 AND object_id = $2))`, []any{tenantID, objectID}},
+			{`DELETE FROM parsed_documents WHERE tenant_id = $1 AND object_version_id IN
+			  (SELECT id FROM source_object_versions WHERE tenant_id = $1 AND object_id = $2)`, []any{tenantID, objectID}},
 			{`DELETE FROM source_object_versions WHERE tenant_id = $1 AND object_id = $2`, []any{tenantID, objectID}},
 			{`DELETE FROM source_objects WHERE tenant_id = $1 AND id = $2`, []any{tenantID, objectID}},
 		}
