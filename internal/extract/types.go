@@ -2,11 +2,17 @@ package extract
 
 import (
 	"errors"
+	"io"
 	"time"
 )
 
-// OperationProcess is the durable-jobs operation extract enqueues.
-const OperationProcess = "extract.process"
+// OperationProcess and OperationVision are durable processing operations.
+const (
+	OperationProcess = "extract.process"
+	OperationVision  = "extract.vision"
+)
+
+const OperationImageRecognition = OperationVision
 
 var (
 	// ErrNotFound is the single public outcome for unknown AND forbidden
@@ -20,11 +26,14 @@ var (
 // input artifact before any job work; IdempotencyKey, when set, is the
 // caller's replay identity (defaults to the input content hash).
 type ProcessInput struct {
+	Operation      string
 	TemplateID     string
 	Context        map[string]any
 	FileName       string
 	MimeType       string
 	Bytes          []byte
+	Reader         io.Reader
+	DocumentText   string
 	IdempotencyKey string
 }
 
@@ -100,6 +109,7 @@ type ResultView struct {
 	ValidationWarnings   []string       `json:"validation_warnings"`
 	SchemaVersion        string         `json:"schema_version"`
 	OutputSchema         map[string]any `json:"output_schema"`
+	Generated            bool           `json:"generated,omitempty"`
 	PromptTokensUsed     int            `json:"prompt_tokens_used"`
 	CompletionTokensUsed int            `json:"completion_tokens_used"`
 	TokensUsed           int            `json:"tokens_used"`

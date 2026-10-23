@@ -3,9 +3,7 @@ package extract
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +19,7 @@ import (
 	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
 	"enclava-go/internal/llm"
+	"enclava-go/internal/source"
 )
 
 // TemplatesRepo is the tenant-scoped extract_templates persistence boundary.
@@ -43,6 +42,7 @@ type SettingsRepo interface {
 // resolve to the same jobs.ErrJobNotFound outcome.
 type JobReader interface {
 	GetOwnedJob(ctx context.Context, tenantID, id, submitterKey string) (jobs.JobRow, error)
+	GetIdempotency(ctx context.Context, tenantID, operation, key string) (jobs.JobRow, error)
 	ListOwnedJobs(ctx context.Context, tenantID, submitterKey string, limit int) ([]jobs.JobRow, error)
 	CountOwnedJobs(ctx context.Context, tenantID, submitterKey string) (int, error)
 	CountOwnedJobsSince(ctx context.Context, tenantID, submitterKey string, since time.Time) (int, error)
@@ -106,7 +106,17 @@ const maxExtractOutputTokens = 8192
 // get a fresh lease.
 const writeLeaseTTL = 10 * time.Minute
 
+// uploadMIMEs maps accepted extensions to their declared media types.
+var uploadMIMEs = map[string]string{
+	".pdf": "application/pdf", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+	".png": "image/png", ".txt": "text/plain", ".md": "text/markdown",
+	".markdown": "text/markdown", ".html": "text/html", ".htm": "text/html",
+	".csv": "text/csv", ".json": "application/json",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
 // SeedDefaults seeds the tenant's default templates (idempotent upserts).
+
 func (s *Service) SeedDefaults(ctx context.Context, p auth.Principal) error {
 	for _, t := range DefaultTemplates() {
 		if err := s.templatesRepo.UpsertTemplate(ctx, p.TenantID, t); err != nil {
@@ -121,11 +131,32 @@ func (s *Service) SeedDefaults(ctx context.Context, p auth.Principal) error {
 // its durable id. No provider dispatch happens here — the worker runs the
 // attempt through JobHandler under the fenced lease.
 func (s *Service) Process(ctx context.Context, p auth.Principal, input ProcessInput) (ProcessOutput, error) {
+	return s.ProcessReader(ctx, p, input)
+}
+
+func (s *Service) ProcessReader(ctx context.Context, p auth.Principal, input ProcessInput) (ProcessOutput, error) {
+	if input.Operation == "" {
+		input.Operation = OperationProcess
+	}
+	if input.Operation != OperationProcess && input.Operation != OperationVision {
+		return ProcessOutput{}, fmt.Errorf("unsupported extraction operation %q", input.Operation)
+	}
+	input.MimeType = normalizedUploadMIME(input.FileName, input.MimeType)
 	start := time.Now()
 	if p.TenantID == "" {
 		return ProcessOutput{}, fmt.Errorf("%w: tenant is required", ErrForbidden)
 	}
-	if err := s.validateInput(input); err != nil {
+	if input.Reader != nil {
+		if strings.TrimSpace(input.TemplateID) == "" || strings.TrimSpace(input.FileName) == "" {
+			return ProcessOutput{}, errors.New("template_id and file are required")
+		}
+		if err := validateContextValues(input.Context); err != nil {
+			return ProcessOutput{}, err
+		}
+		if err := validateUploadMetadata(input); err != nil {
+			return ProcessOutput{}, err
+		}
+	} else if err := s.validateInput(input); err != nil {
 		return ProcessOutput{}, err
 	}
 	if !auth.ExtractTemplateAllowed(p, input.TemplateID) {
@@ -153,61 +184,83 @@ func (s *Service) Process(ctx context.Context, p auth.Principal, input ProcessIn
 		return ProcessOutput{}, fmt.Errorf("encode output_schema snapshot: %w", err)
 	}
 
+	capability := inference.CapabilityChat
+	if strings.HasPrefix(strings.ToLower(input.MimeType), "image/") {
+		capability = inference.CapabilityVision
+	}
 	model, err := s.resolveModel(ctx, p.TenantID, template)
+	if err != nil {
+		return ProcessOutput{}, err
+	}
+	endpointID, err := s.resolveEndpoint(ctx, p.TenantID, model, capability)
 	if err != nil {
 		return ProcessOutput{}, err
 	}
 	// Persist the input BEFORE the job row exists — the job's input_ref binds
 	// the finalized artifact version.
-	w, ref, err := s.artifacts.Begin(ctx, artifacts.Meta{
+	w, _, err := s.artifacts.Begin(ctx, artifacts.Meta{
 		Ref:      artifacts.Ref{TenantID: p.TenantID, Kind: artifacts.KindOriginal},
 		MimeType: input.MimeType,
 	}, writeLeaseTTL, s.maxUploadMB*1024*1024)
 	if err != nil {
 		return ProcessOutput{}, fmt.Errorf("begin input artifact: %w", err)
 	}
-	if _, err := w.Write(input.Bytes); err != nil {
+	reader := input.Reader
+	if reader == nil {
+		reader = bytes.NewReader(input.Bytes)
+	}
+	if err := copyUpload(ctx, w, reader, input.FileName); err != nil {
 		_ = w.Abort(ctx)
 		return ProcessOutput{}, fmt.Errorf("write input artifact: %w", err)
 	}
 	if err := w.Finalize(ctx); err != nil {
 		return ProcessOutput{}, fmt.Errorf("finalize input artifact: %w", err)
 	}
-	ref = w.Ref()
+	ref := w.Ref()
+	if ref.ByteSize == 0 {
+		_ = s.artifacts.Delete(ctx, ref)
+		return ProcessOutput{}, errors.New("uploaded file is empty")
+	}
 
 	idem := strings.TrimSpace(input.IdempotencyKey)
-	sum := sha256.Sum256(input.Bytes)
-	inputHash := hex.EncodeToString(sum[:])
 	if idem == "" {
-		idem = "extract:" + input.TemplateID + ":" + inputHash
+		idem = "extract:" + input.TemplateID + ":" + ref.SHA256
 	}
 
+	policy := map[string]any{
+		"task_version": 1, "task_operation": input.Operation,
+		"template_id": template.ID, "model": model,
+		"capability": capability, "endpoint_id": endpointID,
+		"system_prompt": template.SystemPrompt, "user_prompt": template.UserPrompt,
+		"file_name": filepath.Base(input.FileName), "mime_type": input.MimeType,
+		"file_size": ref.ByteSize, "input_version": int64(ref.Version),
+		"output_schema_json": string(outputSchemaJSON), "schema_version": outputSchemaVersion,
+		"context": input.Context,
+	}
+	existing, replay, err := s.existingSubmission(ctx, p, input.Operation, idem, ref.SHA256, policy)
+	if err != nil {
+		_ = s.artifacts.Delete(ctx, ref)
+		return ProcessOutput{}, err
+	}
+	if replay {
+		_ = s.artifacts.Delete(ctx, ref)
+		return ProcessOutput{Success: true, JobID: existing.ID, Status: existing.Status, ModelUsed: model}, nil
+	}
 	job, _, err := s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
-		TenantID:       p.TenantID,
-		Operation:      OperationProcess,
-		IdempotencyKey: idem,
-		Subject: jobs.Subject{
-			ObjectID:         ref.ID,
-			ObservedRevision: int64(ref.Version),
-		},
-		InputRef:  ref.ID,
-		InputHash: inputHash,
-		Policy: map[string]any{
-			"template_id":        template.ID,
-			"model":              model,
-			"file_name":          input.FileName,
-			"mime_type":          input.MimeType,
-			"file_size":          int64(len(input.Bytes)),
-			"input_version":      int64(ref.Version),
-			"output_schema_json": string(outputSchemaJSON),
-			"schema_version":     outputSchemaVersion,
-			"context":            input.Context,
-		},
+		TenantID: p.TenantID, Operation: input.Operation, IdempotencyKey: idem,
+		Subject:  jobs.Subject{ObjectID: ref.ID, ObservedRevision: int64(ref.Version)},
+		InputRef: ref.ID, InputHash: ref.SHA256, Policy: policy,
 	})
 	if err != nil {
+		if errors.Is(err, jobs.ErrIdempotencyConflict) {
+			_ = s.artifacts.Delete(ctx, ref)
+			existing, replay, lookupErr := s.existingSubmission(ctx, p, input.Operation, idem, ref.SHA256, policy)
+			if lookupErr == nil && replay {
+				return ProcessOutput{Success: true, JobID: existing.ID, Status: existing.Status, ModelUsed: model}, nil
+			}
+		}
 		return ProcessOutput{}, fmt.Errorf("enqueue extract job: %w", err)
 	}
-
 	return ProcessOutput{
 		Success:          true,
 		JobID:            job.ID,
@@ -225,13 +278,28 @@ func (s *Service) Process(ctx context.Context, p auth.Principal, input ProcessIn
 		CostMicros:           0,
 	}, nil
 }
-
-// JobHandler is the jobs.Runner handler for OperationProcess; composition
-// mounts it so leased extract jobs dispatch through the shared executor.
-func (s *Service) JobHandler() jobs.HandlerFunc {
-	return func(ctx context.Context, claim *jobs.Claim, input jobs.InputFunc) (string, error) {
-		return s.attempt(ctx, claim, input)
+func (s *Service) existingSubmission(ctx context.Context, p auth.Principal, operation, key, inputHash string, policy map[string]any) (jobs.Job, bool, error) {
+	row, err := s.jobRows.GetIdempotency(ctx, p.TenantID, operation, key)
+	if errors.Is(err, jobs.ErrJobNotFound) {
+		return jobs.Job{}, false, nil
 	}
+	if err != nil {
+		return jobs.Job{}, false, fmt.Errorf("check extract idempotency: %w", err)
+	}
+	if row.SubmitterKey != jobs.SubmitterKey(p) || row.Status == jobs.StatusDeleted ||
+		row.InputHash != inputHash || !sameJobPolicy(row.Policy, policy) {
+		return jobs.Job{}, false, jobs.ErrIdempotencyConflict
+	}
+	return row.Job, true, nil
+}
+
+func sameJobPolicy(a, b map[string]any) bool {
+	left, err := json.Marshal(a)
+	if err != nil {
+		return false
+	}
+	right, err := json.Marshal(b)
+	return err == nil && bytes.Equal(left, right)
 }
 
 // attempt executes one claimed extract job under the fenced lease. The
@@ -255,11 +323,25 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 	if !template.Enabled {
 		return "", errors.New("template is inactive")
 	}
+	if stringValue(job.Policy["task_operation"]) != job.Operation ||
+		(job.Operation != OperationProcess && job.Operation != OperationVision) {
+		return "", errors.New("unsupported extraction task operation")
+	}
 	model, _ := job.Policy["model"].(string)
 	if strings.TrimSpace(model) == "" {
-		if model, err = s.resolveModel(ctx, job.TenantID, template); err != nil {
-			return "", err
-		}
+		return "", errors.New("job is missing its selected model")
+	}
+	taskVersion, ok := job.Policy["task_version"].(float64)
+	if !ok || taskVersion != 1 {
+		return "", fmt.Errorf("unsupported extraction task version %v", job.Policy["task_version"])
+	}
+	capability := stringValue(job.Policy["capability"])
+	if capability != inference.CapabilityChat && capability != inference.CapabilityVision {
+		return "", errors.New("job is missing its selected inference capability")
+	}
+	endpointID := stringValue(job.Policy["endpoint_id"])
+	if endpointID == "" {
+		return "", errors.New("job is missing its selected endpoint")
 	}
 	// Template allowlist is re-checked here; model/endpoint/restriction
 	// authorization is the executor's job alone.
@@ -288,25 +370,48 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 		return "", fmt.Errorf("read input artifact: %w", err)
 	}
 	defer func() { _ = in.Close() }()
-	inBytes, err := io.ReadAll(in)
+	inBytes, err := io.ReadAll(contextReader{ctx: ctx, reader: in})
 	if err != nil {
 		return "", fmt.Errorf("read input bytes: %w", err)
 	}
 
-	promptSystem, promptUser := interpolate(template.SystemPrompt, template.UserPrompt, contextMap(job.Policy["context"]))
-
-	// Job fencing marks dispatch; the executor alone reserves/settles —
-	// a denied or unpriced request fails before any upstream write.
-	if err := claim.MarkDispatched(ctx); err != nil {
-		return "", err
+	systemPrompt, systemOK := job.Policy["system_prompt"].(string)
+	userPrompt, userOK := job.Policy["user_prompt"].(string)
+	if !systemOK || !userOK || systemPrompt == "" || userPrompt == "" {
+		return "", errors.New("job is missing its immutable prompt snapshot")
 	}
-
+	promptSystem, promptUser := interpolate(systemPrompt, userPrompt, contextMap(job.Policy["context"]))
 	inInput := ProcessInput{
 		TemplateID: template.ID,
 		Context:    contextMap(job.Policy["context"]),
 		FileName:   stringValue(job.Policy["file_name"]),
 		MimeType:   stringValue(job.Policy["mime_type"]),
 		Bytes:      inBytes,
+	}
+	mimeType := strings.ToLower(inInput.MimeType)
+	if !strings.HasPrefix(mimeType, "image/") {
+		inputVersion, _ := job.Policy["input_version"].(float64)
+		doc, parseErr := NewParser(s.artifacts).Parse(ctx, artifacts.Ref{
+			TenantID: job.TenantID, ID: job.InputRef, Kind: artifacts.KindOriginal,
+			Version: int(inputVersion),
+		}, ParseOptions{
+			Filename: inInput.FileName, MIMEType: mimeType,
+			ObjectRef: source.ObjectRef{TenantID: job.TenantID, ObjectID: job.InputRef, ObservedSeq: 1},
+		})
+		if parseErr != nil {
+			return "", fmt.Errorf("parse extraction input: %w", parseErr)
+		}
+		var text strings.Builder
+		for _, block := range doc.Blocks {
+			if text.Len() > 0 {
+				text.WriteByte('\n')
+			}
+			text.WriteString(block.Text)
+		}
+		inInput.DocumentText = text.String()
+	}
+	if err := claim.MarkDispatched(ctx); err != nil {
+		return "", err
 	}
 	payload, err := json.Marshal(s.buildProviderRequest(model, template, promptSystem, promptUser, inInput))
 	if err != nil {
@@ -315,8 +420,9 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 
 	inputVersion, _ := job.Policy["input_version"].(float64)
 	res, err := s.executor.Execute(ctx, p, inference.Request{
-		Capability: inference.CapabilityChat,
+		Capability: capability,
 		Model:      model,
+		EndpointID: endpointID,
 		Payload:    payload,
 		Artifacts: []artifacts.Ref{{
 			TenantID: job.TenantID,
@@ -359,6 +465,10 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 		completionUnits = int(res.Usage.Units[billing.UnitOutput])
 	}
 
+	costMicros := int64(0)
+	if res.Usage != nil {
+		costMicros = res.Usage.AmountMicros
+	}
 	resultDoc := ResultView{
 		ID:                   newID("res"),
 		JobID:                job.ID,
@@ -368,9 +478,12 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 		ValidationWarnings:   validationWarnings,
 		SchemaVersion:        stringValue(job.Policy["schema_version"]),
 		OutputSchema:         template.OutputSchema,
+		Generated:            job.Operation == OperationVision,
 		PromptTokensUsed:     promptUnits,
 		CompletionTokensUsed: completionUnits,
 		TokensUsed:           promptUnits + completionUnits,
+		CostMicros:           costMicros,
+		CostCents:            costMicros / 10_000,
 		CreatedAt:            time.Now().UTC(),
 	}
 	docBytes, err := json.Marshal(resultDoc)
@@ -590,13 +703,36 @@ func (s *Service) validateInput(input ProcessInput) error {
 	if int64(len(input.Bytes)) > s.maxUploadMB*1024*1024 {
 		return fmt.Errorf("file exceeds max size of %dMB", s.maxUploadMB)
 	}
-	ext := strings.ToLower(filepath.Ext(input.FileName))
-	allowed := map[string]struct{}{".pdf": {}, ".jpg": {}, ".jpeg": {}, ".png": {}}
-	if _, ok := allowed[ext]; !ok {
-		return fmt.Errorf("unsupported file type: %s", ext)
+	if err := validateUploadMetadata(input); err != nil {
+		return err
 	}
 	if err := validateContextValues(input.Context); err != nil {
 		return err
+	}
+	return nil
+}
+func normalizedUploadMIME(filename, media string) string {
+	if media != "" && media != "application/octet-stream" {
+		return media
+	}
+	if inferred := uploadMIMEs[strings.ToLower(filepath.Ext(filename))]; inferred != "" {
+		return inferred
+	}
+	return media
+}
+
+func validateUploadMetadata(input ProcessInput) error {
+	ext := strings.ToLower(filepath.Ext(input.FileName))
+	media := strings.ToLower(strings.TrimSpace(strings.SplitN(input.MimeType, ";", 2)[0]))
+	want, ok := uploadMIMEs[ext]
+	if !ok {
+		return fmt.Errorf("unsupported file type: %s", ext)
+	}
+	if media != "" && media != "application/octet-stream" && media != want {
+		return fmt.Errorf("file MIME type %q does not match %s", media, ext)
+	}
+	if input.Operation == OperationVision && !strings.HasPrefix(want, "image/") {
+		return errors.New("image recognition requires an image file")
 	}
 	return nil
 }
@@ -618,34 +754,48 @@ func (s *Service) resolveModel(ctx context.Context, tenantID string, t Template)
 	}
 	return "", errors.New("no models available")
 }
+func (s *Service) resolveEndpoint(ctx context.Context, tenantID, model, capability string) (string, error) {
+	endpoints, err := s.endpoints.ListCapabilities(ctx, tenantID, capability)
+	if err != nil {
+		return "", fmt.Errorf("list endpoints for extraction: %w", err)
+	}
+	sort.Slice(endpoints, func(i, j int) bool { return endpoints[i].ID < endpoints[j].ID })
+	for _, endpoint := range endpoints {
+		if !endpoint.Enabled {
+			continue
+		}
+		for _, binding := range endpoint.Capabilities {
+			alias, ok := strings.CutPrefix(binding, inference.ModelCapabilityPrefix)
+			if !ok {
+				continue
+			}
+			alias, _, _ = strings.Cut(alias, "=")
+			if alias == model {
+				return endpoint.ID, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("selected model %q has no enabled %s endpoint", model, capability)
+}
 
 func (s *Service) buildProviderRequest(model string, template Template, systemPrompt, userPrompt string, input ProcessInput) map[string]any {
-	b64 := base64.StdEncoding.EncodeToString(input.Bytes)
-	dataURL := fmt.Sprintf("data:%s;base64,%s", input.MimeType, b64)
-
 	content := []map[string]any{}
 	mime := strings.ToLower(input.MimeType)
-	if strings.Contains(mime, "image/") {
+	if strings.HasPrefix(mime, "image/") {
+		b64 := base64.StdEncoding.EncodeToString(input.Bytes)
 		content = append(content, map[string]any{
 			"type": "image_url",
 			"image_url": map[string]any{
-				"url":    dataURL,
+				"url":    fmt.Sprintf("data:%s;base64,%s", input.MimeType, b64),
 				"detail": "high",
 			},
 		})
-	} else {
-		content = append(content, map[string]any{
-			"type": "input_file",
-			"input_file": map[string]any{
-				"filename":  input.FileName,
-				"file_data": dataURL,
-			},
-		})
 	}
-	content = append(content, map[string]any{
-		"type": "text",
-		"text": userPrompt,
-	})
+	text := userPrompt
+	if input.DocumentText != "" {
+		text += "\n\nDocument text:\n" + input.DocumentText
+	}
+	content = append(content, map[string]any{"type": "text", "text": text})
 
 	responseFormat := map[string]any{"type": "json_object"}
 	if len(template.OutputSchema) > 0 {

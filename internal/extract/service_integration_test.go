@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -148,12 +149,10 @@ func (f fixture) seedTemplate(t *testing.T, tpl extract.Template) {
 	}
 }
 
-// putPrice seeds one model rate for the vision capability extraction
-// dispatches under.
+// putPrice seeds one model rate for the capability used by parsed text tasks.
 func (f fixture) putPrice(t *testing.T, model string, unit billing.UnitKind, rateMicros int64) {
 	t.Helper()
 	f.putPriceRow(t, model, unit, rateMicros)
-	// Estimates always bound cached input like input, so both rates are needed.
 	if unit == billing.UnitInput {
 		f.putPriceRow(t, model, billing.UnitCachedInput, rateMicros)
 	}
@@ -162,13 +161,9 @@ func (f fixture) putPrice(t *testing.T, model string, unit billing.UnitKind, rat
 func (f fixture) putPriceRow(t *testing.T, model string, unit billing.UnitKind, rateMicros int64) {
 	t.Helper()
 	err := f.billing.PutPrice(context.Background(), f.tenant, "price_"+model+"_"+string(unit), billing.Price{
-		SubjectType:   billing.PriceSubjectModel,
-		SubjectID:     model,
-		Capability:    inference.CapabilityVision,
-		Unit:          unit,
-		RateMicros:    rateMicros,
-		UnitQuantity:  1000,
-		Currency:      "USD",
+		SubjectType: billing.PriceSubjectModel, SubjectID: model,
+		Capability: inference.CapabilityChat, Unit: unit,
+		RateMicros: rateMicros, UnitQuantity: 1000, Currency: "USD",
 		EffectiveFrom: time.Now().Add(-time.Hour).UTC(),
 	}, f.principal.ActorID, time.Now().Add(-time.Hour).UTC())
 	if err != nil {
@@ -241,14 +236,15 @@ func TestTemplateCRUDTenantScoped(t *testing.T) {
 func TestProcessPersistsInputArtifactAndJobRow(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract")
 	f.seedTemplate(t, extract.Template{
 		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u",
 		DefaultModel: "priced-extract", Enabled: true,
 	})
 
 	out, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
-		TemplateID: "invoice", FileName: "invoice.pdf", MimeType: "application/pdf",
-		Bytes: []byte("%PDF-1.7 fake"),
+		TemplateID: "invoice", FileName: "invoice.txt", MimeType: "text/plain",
+		Bytes: []byte("invoice text"),
 	})
 	if err != nil {
 		t.Fatalf("process: %v", err)
@@ -265,6 +261,9 @@ func TestProcessPersistsInputArtifactAndJobRow(t *testing.T) {
 	if job.Operation != extract.OperationProcess || job.InputRef == "" {
 		t.Fatalf("unexpected job: %+v", job)
 	}
+	if job.Policy["endpoint_id"] != "ep-extract" || job.Policy["capability"] != inference.CapabilityChat {
+		t.Fatalf("route snapshot was not frozen: %#v", job.Policy)
+	}
 	// Frozen principal snapshot is on the row.
 	var snap auth.Principal
 	if err := json.Unmarshal(job.PrincipalSnapshot, &snap); err != nil || snap.TenantID != f.tenant {
@@ -276,6 +275,40 @@ func TestProcessPersistsInputArtifactAndJobRow(t *testing.T) {
 		t.Fatalf("read input artifact: %v", err)
 	}
 	_ = rc.Close()
+}
+func TestProcessIdempotencyReplaysAndRejectsChangedInput(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract")
+	f.seedTemplate(t, extract.Template{
+		ID: "invoice", Name: "Invoice", SystemPrompt: "Extract.", UserPrompt: "Return JSON.",
+		DefaultModel: "priced-extract", Enabled: true,
+	})
+	input := extract.ProcessInput{
+		TemplateID: "invoice", FileName: "invoice.txt", MimeType: "text/plain",
+		Bytes: []byte("same invoice"), IdempotencyKey: "invoice-upload-1",
+	}
+	first, err := f.svc.Process(ctx, f.principal, input)
+	if err != nil {
+		t.Fatalf("first submission: %v", err)
+	}
+	retry, err := f.svc.Process(ctx, f.principal, input)
+	if err != nil || retry.JobID != first.JobID {
+		t.Fatalf("exact retry = (%+v, %v), want job %s", retry, err, first.JobID)
+	}
+	input.Bytes = []byte("changed invoice")
+	if _, err := f.svc.Process(ctx, f.principal, input); !errors.Is(err, jobs.ErrIdempotencyConflict) {
+		t.Fatalf("changed input error = %v, want idempotency conflict", err)
+	}
+	var ready int
+	if err := f.db.SQL.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM artifacts WHERE tenant_id=$1::uuid AND kind='original' AND state='final'`,
+		f.tenant).Scan(&ready); err != nil {
+		t.Fatalf("count retained inputs: %v", err)
+	}
+	if ready != 1 {
+		t.Fatalf("final input artifacts=%d, want one; retries must clean newly orphaned bytes", ready)
+	}
 }
 
 func TestProcessRejectsDisallowedModelAndTemplate(t *testing.T) {
@@ -292,7 +325,7 @@ func TestProcessRejectsDisallowedModelAndTemplate(t *testing.T) {
 	p2.AllowedExtractTemplatesAll = false
 	p2.AllowedExtractTemplates = map[string]struct{}{"other": {}}
 	if _, err := f.svc.Process(ctx, p2, extract.ProcessInput{
-		TemplateID: "invoice", FileName: "a.pdf", Bytes: []byte("x"), MimeType: "application/pdf",
+		TemplateID: "invoice", FileName: "a.txt", Bytes: []byte("x"), MimeType: "text/plain",
 	}); !errors.Is(err, extract.ErrForbidden) {
 		t.Fatalf("disallowed template: %v, want ErrForbidden", err)
 	}
@@ -303,7 +336,7 @@ func TestProcessRejectsDisallowedModelAndTemplate(t *testing.T) {
 	p.AllowedModelsAll = false
 	p.AllowedModels = map[string]struct{}{"other-model": {}}
 	out, err := f.svc.Process(ctx, p, extract.ProcessInput{
-		TemplateID: "invoice", FileName: "a.pdf", Bytes: []byte("x"), MimeType: "application/pdf",
+		TemplateID: "invoice", FileName: "a.txt", Bytes: []byte("x"), MimeType: "text/plain",
 	})
 	if err != nil {
 		t.Fatalf("process enqueue: %v", err)
@@ -331,8 +364,8 @@ func TestAttemptPricedModelReservesAndSettles(t *testing.T) {
 	})
 
 	out, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
-		TemplateID: "invoice", FileName: "invoice.pdf", MimeType: "application/pdf",
-		Bytes: []byte("%PDF-1.7 fake"),
+		TemplateID: "invoice", FileName: "invoice.txt", MimeType: "text/plain",
+		Bytes: []byte("invoice text"),
 	})
 	if err != nil {
 		t.Fatalf("process: %v", err)
@@ -387,6 +420,62 @@ func TestAttemptPricedModelReservesAndSettles(t *testing.T) {
 		t.Fatalf("job status=%s", detail.Job.Status)
 	}
 }
+func TestVisionJobUsesImagePayloadAndStoresGeneratedResult(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedEndpoint(t, "priced-vision")
+	for _, unit := range []billing.UnitKind{billing.UnitInput, billing.UnitCachedInput, billing.UnitOutput} {
+		err := f.billing.PutPrice(ctx, f.tenant, "vision_"+string(unit), billing.Price{
+			SubjectType: billing.PriceSubjectModel, SubjectID: "priced-vision",
+			Capability: inference.CapabilityVision, Unit: unit,
+			RateMicros: 1000, UnitQuantity: 1000, Currency: "USD",
+			EffectiveFrom: time.Now().Add(-time.Hour).UTC(),
+		}, f.principal.ActorID, time.Now().Add(-time.Hour).UTC())
+		if err != nil {
+			t.Fatalf("seed vision price: %v", err)
+		}
+	}
+	f.upstream.response = []byte(`{"usage":{"prompt_tokens":8,"completion_tokens":2},"choices":[{"message":{"content":"{\"label\":\"page\"}"}}]}`)
+	f.seedTemplate(t, extract.Template{
+		ID: "image-labels", Name: "Image labels", SystemPrompt: "Describe visible items.",
+		UserPrompt: "Return a label.", DefaultModel: "priced-vision", Enabled: true,
+		OutputSchema: map[string]any{
+			"type": "object", "properties": map[string]any{"label": map[string]any{"type": "string"}},
+			"required": []any{"label"},
+		},
+	})
+	image, err := os.ReadFile("testdata/scanned-page.png")
+	if err != nil {
+		t.Fatalf("read image fixture: %v", err)
+	}
+	out, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
+		Operation: extract.OperationVision, TemplateID: "image-labels",
+		FileName: "scanned-page.png", MimeType: "image/png", Bytes: image,
+	})
+	if err != nil {
+		t.Fatalf("submit image task: %v", err)
+	}
+	claim := f.leaseClaim(t)
+	resultRef, err := f.svc.JobHandler()(ctx, claim, inputOpener(f, claim))
+	if err != nil {
+		t.Fatalf("run image task: %v", err)
+	}
+	if _, err := claim.Complete(ctx, resultRef); err != nil {
+		t.Fatalf("complete image task: %v", err)
+	}
+	detail, err := f.svc.GetJob(ctx, f.principal, out.JobID)
+	if err != nil {
+		t.Fatalf("read image result: %v", err)
+	}
+	if detail.Job.Status != jobs.StatusSucceeded || detail.Result == nil ||
+		!detail.Result.Generated || detail.Result.Data["label"] != "page" {
+		t.Fatalf("unexpected generated image result: %+v", detail)
+	}
+	if f.upstream.callCount.Load() != 1 {
+		t.Fatalf("upstream calls=%d, want one", f.upstream.callCount.Load())
+	}
+}
+
 func TestAttemptUsesSnapshotSchemaAndExactNumberValidation(t *testing.T) {
 	for _, test := range []struct {
 		name            string
@@ -422,7 +511,7 @@ func TestAttemptUsesSnapshotSchemaAndExactNumberValidation(t *testing.T) {
 				},
 			})
 			out, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
-				TemplateID: "invoice", FileName: "invoice.pdf", MimeType: "application/pdf", Bytes: []byte("%PDF-1.7 fixture"),
+				TemplateID: "invoice", FileName: "invoice.txt", MimeType: "text/plain", Bytes: []byte("invoice text"),
 			})
 			if err != nil {
 				t.Fatalf("process: %v", err)
@@ -470,8 +559,8 @@ func TestAttemptUnpricedModelRefusesBeforeProvider(t *testing.T) {
 	})
 
 	_, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
-		TemplateID: "invoice", FileName: "invoice.pdf", MimeType: "application/pdf",
-		Bytes: []byte("%PDF-1.7 fake"),
+		TemplateID: "invoice", FileName: "invoice.txt", MimeType: "text/plain",
+		Bytes: []byte("invoice text"),
 	})
 	if err != nil {
 		t.Fatalf("process: %v", err)
@@ -499,13 +588,14 @@ func TestAttemptUnpricedModelRefusesBeforeProvider(t *testing.T) {
 func TestCrossTenantJobReadsDenyIdentically(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract")
 	f.seedTemplate(t, extract.Template{
 		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u",
 		DefaultModel: "priced-extract", Enabled: true,
 	})
 	out, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
-		TemplateID: "invoice", FileName: "invoice.pdf", MimeType: "application/pdf",
-		Bytes: []byte("%PDF-1.7 fake"),
+		TemplateID: "invoice", FileName: "invoice.txt", MimeType: "text/plain",
+		Bytes: []byte("invoice text"),
 	})
 	if err != nil {
 		t.Fatalf("process: %v", err)
@@ -549,8 +639,8 @@ func TestAttemptRestrictedInputDeniesBeforeDispatch(t *testing.T) {
 	})
 
 	out, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
-		TemplateID: "invoice", FileName: "invoice.pdf", MimeType: "application/pdf",
-		Bytes: []byte("%PDF-1.7 fake"),
+		TemplateID: "invoice", FileName: "invoice.txt", MimeType: "text/plain",
+		Bytes: []byte("invoice text"),
 	})
 	if err != nil {
 		t.Fatalf("process: %v", err)
@@ -559,12 +649,12 @@ func TestAttemptRestrictedInputDeniesBeforeDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get job: %v", err)
 	}
-	// Deny the vision capability for this input artifact.
+	// Deny the text capability for this input artifact.
 	if err := f.sources.SetRestriction(ctx, source.SourceRestriction{
 		TenantID:           f.tenant,
 		SubjectKind:        source.RestrictionArtifact,
 		SubjectID:          job.InputRef,
-		DeniedCapabilities: []string{inference.CapabilityVision},
+		DeniedCapabilities: []string{inference.CapabilityChat},
 	}); err != nil {
 		t.Fatalf("set restriction: %v", err)
 	}

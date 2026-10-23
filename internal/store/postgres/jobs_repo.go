@@ -190,10 +190,21 @@ func (r *JobsRepo) InsertJob(ctx context.Context, rec jobs.InsertRecord) (*jobs.
 		rec.InputHash, nullString(rec.InputRef), policy,
 		nullString(rec.Subject.ConnectionID), nullString(rec.Subject.ObjectID),
 		nullInt64(rec.Subject.ObservedRevision)), &sameKey)
+
 	if err != nil {
 		return nil, false, fmt.Errorf("load idempotent job: %w", mapNoRows(err))
 	}
 	return &row, sameKey, nil
+}
+func (r *JobsRepo) GetIdempotency(ctx context.Context, tenantID, operation, key string) (jobs.JobRow, error) {
+	row, err := scanJobRow(r.db.SQL.QueryRowContext(ctx, `
+		SELECT `+jobColumns+` FROM jobs
+		WHERE tenant_id = $1 AND operation = $2 AND idempotency_key = $3`,
+		tenantID, operation, key))
+	if err != nil {
+		return jobs.JobRow{}, fmt.Errorf("get idempotent job: %w", mapNoRows(err))
+	}
+	return row, nil
 }
 
 func (r *JobsRepo) GetJob(ctx context.Context, tenantID, id string) (jobs.JobRow, error) {
