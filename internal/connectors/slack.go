@@ -1,6 +1,7 @@
 package connectors
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -135,7 +136,7 @@ func (a slackAdapter) messageItem(ctx context.Context, conn source.Connection, c
 	if parent != "" { parent = "slack:" + channel + ":" + parent }
 	return ContentItem{NativeID: "slack:" + channel + ":" + msg.TS, ParentNativeID: parent,
 		Kind: "message", NativeRevision: msg.TS, Filename: "slack-" + channel + "-" + msg.TS + ".txt", MIMEType: "text/plain",
-		Text: "[" + msg.TS + " " + msg.User + "] " + msg.Text, URL: permalink.Permalink, CreatedAt: optionalTime(created)}, nil
+		Text: "[" + msg.TS + " " + msg.User + "] " + msg.Text, URL: permalink.Permalink, CreatedAt: created}, nil
 }
 
 func slackTimestamp(ts string) *time.Time {
