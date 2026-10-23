@@ -1,6 +1,11 @@
 package extract
 
 import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -164,4 +169,110 @@ func TestChunkClauseAttachesAvailableFootnote(t *testing.T) {
 	if len(chunks) != 1 || chunks[0].Text != "The exception applies.\nSubject to notice." || len(chunks[0].Spans) != 2 {
 		t.Fatalf("available referenced footnote was not attached: %#v", chunks)
 	}
+}
+
+func TestChunkRealPDFAndDOCXWithVersionedControls(t *testing.T) {
+	if os.Getenv("ENCLAVA_NATIVE_INTEGRATION") != "1" {
+		t.Skip("native PDF processing requires ENCLAVA_NATIVE_INTEGRATION=1")
+	}
+	pdf, err := os.ReadFile("testdata/legal-document.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pdfParser, pdfRef := testParser(t, pdf, "application/pdf")
+	pdfDoc, err := pdfParser.Parse(context.Background(), pdfRef, ParseOptions{
+		Filename: "legal-document.pdf", MIMEType: "application/pdf",
+		ObjectRef: source.ObjectRef{TenantID: "tenant", ObjectID: "legal-pdf", ObservedSeq: 1},
+	})
+	if err != nil {
+		t.Fatalf("parse legal PDF: %v", err)
+	}
+	originalPDF := append([]source.Block(nil), pdfDoc.Blocks...)
+	small, large := source.ChunkProfile{
+		ID: "legal-v1", ProfileID: "legal", Version: 1, SizeCodePoints: 1,
+		BoundaryStrategy: "clause", TableHandling: "row-wise", PreserveClauses: true,
+	}, source.ChunkProfile{
+		ID: "legal-v2", ProfileID: "legal", Version: 2, SizeCodePoints: 4000,
+		BoundaryStrategy: "paragraph", TableHandling: "atomic",
+	}
+	pdfSmall, err := Chunk(pdfDoc, small)
+	if err != nil {
+		t.Fatalf("chunk legal PDF with v1: %v", err)
+	}
+	pdfLarge, err := Chunk(pdfDoc, large)
+	if err != nil {
+		t.Fatalf("chunk legal PDF with v2: %v", err)
+	}
+	if len(pdfSmall) <= len(pdfLarge) || !reflect.DeepEqual(originalPDF, pdfDoc.Blocks) {
+		t.Fatalf("profile controls failed to vary chunking or changed source evidence: small=%d large=%d", len(pdfSmall), len(pdfLarge))
+	}
+	assertResolvedChunkSpans(t, pdfDoc, pdfSmall)
+	assertResolvedChunkSpans(t, pdfDoc, pdfLarge)
+
+	docx := docxChunkFixture(t)
+	docxParser, docxRef := testParser(t, docx, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+	docxDoc, err := docxParser.Parse(context.Background(), docxRef, ParseOptions{
+		Filename: "legal-fixture.docx", MIMEType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		ObjectRef: source.ObjectRef{TenantID: "tenant", ObjectID: "legal-docx", ObservedSeq: 1},
+	})
+	if err != nil {
+		t.Fatalf("parse DOCX fixture: %v", err)
+	}
+	docxProfile := small
+	docxProfile.ID, docxProfile.SizeCodePoints = "legal-docx-v1", 64
+	docxChunks, err := Chunk(docxDoc, docxProfile)
+	if err != nil {
+		t.Fatalf("chunk DOCX with legal profile: %v", err)
+	}
+	assertResolvedChunkSpans(t, docxDoc, docxChunks)
+	attachedFootnote := false
+	for _, chunk := range docxChunks {
+		if strings.Contains(chunk.Text, "Clause text") && strings.Contains(chunk.Text, "Footnote context") {
+			attachedFootnote = true
+		}
+	}
+	if !attachedFootnote {
+		t.Fatalf("DOCX footnote context was not attached: %#v", docxChunks)
+	}
+}
+
+func assertResolvedChunkSpans(t *testing.T, doc source.Document, chunks []source.Chunk) {
+	t.Helper()
+	for _, chunk := range chunks {
+		for _, span := range chunk.Spans {
+			resolved := false
+			for _, block := range doc.Blocks {
+				if block.ID == span.BlockID && span.ByteStart >= 0 && span.ByteEnd <= len(block.Text) &&
+					block.Text[span.ByteStart:span.ByteEnd] != "" {
+					resolved = true
+					break
+				}
+			}
+			if !resolved {
+				t.Fatalf("chunk %s has unresolved source span %+v", chunk.ID, span)
+			}
+		}
+	}
+}
+
+func docxChunkFixture(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, content := range map[string]string{
+		"word/document.xml":  `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:numPr><w:numId w:val="4"/><w:ilvl w:val="0"/></w:numPr></w:pPr><w:r><w:t>Clause text</w:t><w:footnoteReference w:id="1"/></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>Heading cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>`,
+		"word/footnotes.xml": `<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:id="1"><w:p><w:r><w:t>Footnote context</w:t></w:r></w:p></w:footnote></w:footnotes>`,
+	} {
+		f, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }

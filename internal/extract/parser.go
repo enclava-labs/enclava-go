@@ -74,10 +74,10 @@ func (p *Parser) Parse(ctx context.Context, ref artifacts.Ref, opts ParseOptions
 		digest := sha256.Sum256(data)
 		ref.SHA256 = hex.EncodeToString(digest[:])
 	}
-	if !utf8.Valid(data) && formatFor(opts.Filename, opts.MIMEType) != "pdf" && formatFor(opts.Filename, opts.MIMEType) != "image" {
+	format := formatFor(opts.Filename, opts.MIMEType)
+	if !utf8.Valid(data) && format != "pdf" && format != "image" && format != "docx" {
 		return source.Document{}, fmt.Errorf("%w: invalid UTF-8", ErrMalformedDocument)
 	}
-	format := formatFor(opts.Filename, opts.MIMEType)
 	var blocks []parseBlock
 	switch format {
 	case "text":
