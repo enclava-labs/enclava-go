@@ -224,7 +224,11 @@ func (a *TeamsAdapter) Content(ctx context.Context, c source.Connection, cursor 
 				if err := appendItem(teamsMessageItem(team, channel.ID, channel.MembershipType, m, "")); err != nil {
 					return ContentPage{Completeness: CompletenessIncomplete}, err
 				}
-				replies, err := a.list(ctx, token, a.baseURL+"/teams/"+teamsID(team)+"/channels/"+teamsID(channel.ID)+"/messages/"+teamsID(m.ID)+"/replies?$top=50", teamsMaxItems); if err != nil { return ContentPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list replies for channel %s message %s: %w", channel.ID, m.ID, err) }
+				replies, err := a.list(ctx, token, a.baseURL+"/teams/"+teamsID(team)+"/channels/"+teamsID(channel.ID)+"/messages/"+teamsID(m.ID)+"/replies?$top=50", teamsMaxItems)
+				if err != nil {
+					return ContentPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list replies for channel %s message %s: %w", channel.ID, m.ID, err)
+				}
+				for _, replyRaw := range replies {
 					var reply graphMessage
 					if err := json.Unmarshal(replyRaw, &reply); err != nil || reply.ID == "" {
 						return ContentPage{}, errors.New("teams reply payload is malformed")
@@ -232,6 +236,8 @@ func (a *TeamsAdapter) Content(ctx context.Context, c source.Connection, cursor 
 					if err := appendItem(teamsMessageItem(team, channel.ID, channel.MembershipType, reply, m.ID)); err != nil {
 						return ContentPage{Completeness: CompletenessIncomplete}, err
 					}
+				}
+				for _, at := range m.Attachments {
 					id := at.ID
 					if id == "" {
 						id = at.Name
@@ -242,8 +248,9 @@ func (a *TeamsAdapter) Content(ctx context.Context, c source.Connection, cursor 
 							return ContentPage{Completeness: CompletenessIncomplete}, err
 						}
 					}
-			}
+				}
 		}
+	}
 	}
 	for _, chat := range a.selectedChats() {
 		messages, err := a.list(ctx, token, a.baseURL+"/chats/"+teamsID(chat)+"/messages?$top=50", teamsMaxItems); if err != nil { return ContentPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list configured chat %s messages (Chat.Read.All/ChatMessage.Read.All required): %w", chat, err) }
