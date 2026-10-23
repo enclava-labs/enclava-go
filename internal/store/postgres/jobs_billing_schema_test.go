@@ -312,7 +312,7 @@ func TestChunkProfileVersioning(t *testing.T) {
 	if _, err := db.SQL.ExecContext(ctx, `
 		INSERT INTO chunk_profiles (tenant_id, id, profile_id, version, name,
 		                            boundary_strategy, max_size_codepoints)
-		VALUES ($1, 'cp_dup', 'fam_1', 2, 'dup', 'sentence', 1000)`, idTenantA); !isUniqueViolation(err) {
+		VALUES ($1, 'cp_dup', 'fam_1', 2, 'dup', 'paragraph', 1000)`, idTenantA); !isUniqueViolation(err) {
 		t.Fatalf("duplicate (tenant_id,profile_id,version) must conflict, got %v", err)
 	}
 

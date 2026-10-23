@@ -101,3 +101,5 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 )
+
+require github.com/santhosh-tekuri/jsonschema/v6 v6.0.3

@@ -2,12 +2,12 @@ package postgres_test
 
 import (
 	"context"
-	"errors"
-	"testing"
-
 	"enclava-go/internal/extract"
 	"enclava-go/internal/store/postgres"
 	"enclava-go/internal/testdb"
+	"encoding/json"
+	"errors"
+	"testing"
 )
 
 func TestExtractRepoTemplatesTenantScoped(t *testing.T) {
@@ -21,8 +21,13 @@ func TestExtractRepoTemplatesTenantScoped(t *testing.T) {
 		ID: "invoice", Name: "Invoice", Description: "d",
 		SystemPrompt: "s", UserPrompt: "u",
 		ContextSchema: map[string]any{"company": map[string]any{"type": "string"}},
-		OutputSchema:  map[string]any{"type": "object", "properties": map[string]any{"total": map[string]any{"type": "number"}}},
-		DefaultModel:  "m1", Enabled: true, IsDefault: false, OwnerActorID: "actor-1",
+		OutputSchema: map[string]any{
+			"type": "object",
+			"$defs": map[string]any{
+				"amount": map[string]any{"minimum": int64(9007199254740993)},
+			},
+		},
+		DefaultModel: "m1", Enabled: true, IsDefault: false, OwnerActorID: "actor-1",
 	}
 	if err := repo.UpsertTemplate(ctx, tenantA, tpl); err != nil {
 		t.Fatalf("upsert: %v", err)
@@ -35,6 +40,10 @@ func TestExtractRepoTemplatesTenantScoped(t *testing.T) {
 		got.ContextSchema["company"] == nil || got.OutputSchema["type"] != "object" ||
 		got.OwnerActorID != "actor-1" {
 		t.Fatalf("round trip mismatch: %+v", got)
+	}
+	amountSchema := got.OutputSchema["$defs"].(map[string]any)["amount"].(map[string]any)
+	if amountSchema["minimum"] != json.Number("9007199254740993") {
+		t.Fatalf("output schema number was not preserved: %#v", amountSchema["minimum"])
 	}
 
 	// Update path.

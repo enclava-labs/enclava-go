@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -211,7 +212,9 @@ func scanExtractTemplate(row interface{ Scan(dest ...any) error }) (extract.Temp
 		}
 	}
 	if len(outRaw) > 0 {
-		if err := json.Unmarshal(outRaw, &t.OutputSchema); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(outRaw))
+		decoder.UseNumber()
+		if err := decoder.Decode(&t.OutputSchema); err != nil {
 			return extract.Template{}, fmt.Errorf("decode output schema: %w", err)
 		}
 	}
