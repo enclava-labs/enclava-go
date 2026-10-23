@@ -232,11 +232,9 @@ func (a *App) handleRAGImports(w http.ResponseWriter, r *http.Request, principal
 		return
 	}
 	var input struct {
-		CollectionID     string   `json:"collection_id"`
-		ArtifactRef      string   `json:"artifact_ref"`
-		ResultRef        string   `json:"result_ref"`
-		Audience         []string `json:"audience"`
-		ProfileVersionID string   `json:"profile_version_id"`
+		CollectionID string `json:"collection_id"`
+		ArtifactRef  string `json:"artifact_ref"`
+		ResultRef    string `json:"result_ref"`
 	}
 	if err := DecodeJSON(r, &input); err != nil {
 		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")

@@ -196,6 +196,7 @@ func main() {
 	ragSvc := rag.NewService(ragRepo, qdrantClient, inferenceSvc, cfg.DefaultEmbeddingModel, artifactStore, jobsSvc)
 	previewSvc := extract.NewPreviewService(chunkProfilesRepo, jobsRepoPG, jobsSvc, artifactStore, sourceRepo, cfg.MaxUploadSizeMB)
 	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG)
+	connectorSvc.SetCredentialResolver(secretResolver)
 	adapterFactories := connectors.AdapterFactories{
 		connectors.SourceKindGitHub: func(c source.Connection) (connectors.Adapter, error) {
 			return connectors.NewGitHubAdapter(c, secretResolver)

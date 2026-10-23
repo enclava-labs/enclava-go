@@ -160,6 +160,18 @@ func driveRoot(c source.Connection) string {
 func driveSharedID(c source.Connection) string {
 	return firstNonEmpty(strings.TrimSpace(stringFromAny(c.Config["shared_drive_id"])), strings.TrimSpace(stringFromAny(c.Config["drive_id"])))
 }
+func driveTypeAllowed(c source.Connection, mimeType string) bool {
+	allowed := stringListFromAny(c.Config["mime_types"])
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, candidate := range allowed {
+		if strings.TrimSpace(candidate) == mimeType {
+			return true
+		}
+	}
+	return false
+}
 
 func (a DriveAdapter) Content(ctx context.Context, c source.Connection, cursor Cursor, limit int) (ContentPage, error) {
 	if limit <= 0 || limit > drivePageSize {
@@ -267,6 +279,9 @@ func (a DriveAdapter) driveFiles(ctx context.Context, c source.Connection, state
 	}
 	page := ContentPage{Completeness: CompletenessComplete, Snapshot: listing.Next == ""}
 	for _, f := range listing.Files {
+		if !driveTypeAllowed(c, f.MimeType) {
+			continue
+		}
 		item, err := a.driveItem(ctx, c, f)
 		if err != nil {
 			return ContentPage{Completeness: CompletenessIncomplete}, err
@@ -442,6 +457,13 @@ func (a DriveAdapter) driveChanges(ctx context.Context, c source.Connection, sta
 				if len(state.Removed) > driveMaxFiles {
 					return ContentPage{Completeness: CompletenessIncomplete}, errors.New("google_drive pending deletion set exceeds configured bound")
 				}
+			}
+			continue
+		}
+		if !driveTypeAllowed(c, change.File.MimeType) {
+			if inScope {
+				state.Removed = appendDriveID(state.Removed, id)
+				state.InScope = removeDriveID(state.InScope, id)
 			}
 			continue
 		}

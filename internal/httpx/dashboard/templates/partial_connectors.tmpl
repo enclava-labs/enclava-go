@@ -4,7 +4,7 @@
   {{if .Error}}<div class="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800 dark:border-red-900/40 dark:bg-red-950/30 dark:text-red-200">{{.Error}}</div>{{end}}
 
   <div class="rounded-lg border bg-card p-5">
-    <form class="grid gap-4 md:grid-cols-6" hx-post="/dashboard/partials/connectors" hx-target="#dashboard-connectors" hx-swap="innerHTML">
+    <form id="connector-create-form" class="grid gap-4 md:grid-cols-6" hx-post="/dashboard/partials/connectors" hx-target="#dashboard-connectors" hx-swap="innerHTML">
       <input type="hidden" name="action" value="create_source">
       <label class="space-y-1 text-sm font-medium">
         <span>Source name</span>
@@ -27,22 +27,33 @@
         </select>
       </label>
       <label class="space-y-1 text-sm font-medium">
-        <span>Credential reference</span>
-        <input class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="credential_ref">
+        <span>Credential reference (configured for this tenant)</span>
+        <select class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="credential_ref" required>
+          <option value="">Select a configured credential reference</option>
+          {{range index .CredentialRefs "github"}}<option value="{{.RefID}}">GitHub · {{.RefID}}</option>{{end}}
+          {{range index .CredentialRefs "slack"}}<option value="{{.RefID}}">Slack · {{.RefID}}</option>{{end}}
+          {{range index .CredentialRefs "teams"}}<option value="{{.RefID}}">Teams · {{.RefID}}</option>{{end}}
+          {{range index .CredentialRefs "notion"}}<option value="{{.RefID}}">Notion · {{.RefID}}</option>{{end}}
+          {{range index .CredentialRefs "google_drive"}}<option value="{{.RefID}}">Drive · {{.RefID}}</option>{{end}}
+        </select>
       </label>
-      <label class="space-y-1 text-sm font-medium">
-        <span>Source file name</span>
-        <input class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="file_name">
-      </label>
-      <button class="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground" type="submit">Create</button>
-      <label class="space-y-1 text-sm font-medium md:col-span-3">
-        <span>Source content</span>
-        <textarea class="min-h-20 w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="content"></textarea>
-      </label>
-      <label class="space-y-1 text-sm font-medium md:col-span-3">
-        <span>Connector config JSON</span>
-        <textarea class="min-h-20 w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="config_json"></textarea>
-      </label>
+      <label class="space-y-1 text-sm font-medium"><span>Sync interval</span><select class="w-full rounded-md border bg-background px-3 py-2" name="sync_interval"><option value="1h">Hourly</option><option value="6h">Every 6 hours</option><option value="24h">Daily</option></select></label>
+      <fieldset class="grid gap-3 rounded border p-3 md:col-span-6"><legend>GitHub scope — owner, repository, ref, paths</legend>
+        <input class="rounded border bg-background p-2" name="owner" aria-label="GitHub owner"><input class="rounded border bg-background p-2" name="repo" aria-label="GitHub repository"><input class="rounded border bg-background p-2" name="ref" aria-label="GitHub ref"><input class="rounded border bg-background p-2" name="paths" aria-label="GitHub paths, comma separated">
+      </fieldset>
+      <fieldset class="grid gap-3 rounded border p-3 md:col-span-6"><legend>Slack scope — configured channel (private channels require a token authorized for that channel)</legend>
+        <input class="rounded border bg-background p-2" name="channel_ids" aria-label="Slack channel ID">
+      </fieldset>
+      <fieldset class="grid gap-3 rounded border p-3 md:col-span-6"><legend>Teams scope — tenant, team, channels and configured chat IDs</legend>
+        <input class="rounded border bg-background p-2" name="tenant_id" aria-label="Teams tenant ID"><input class="rounded border bg-background p-2" name="team_id" aria-label="Teams team ID"><input class="rounded border bg-background p-2" name="channel_ids" aria-label="Teams channel IDs, comma separated"><input class="rounded border bg-background p-2" name="chat_ids" aria-label="Teams configured chat IDs, comma separated">
+      </fieldset>
+      <fieldset class="grid gap-3 rounded border p-3 md:col-span-6"><legend>Notion — selected page IDs and authorization</legend>
+        <input class="rounded border bg-background p-2" name="page_ids" aria-label="Notion selected page IDs, comma separated"><label>Authorization mode <span class="rounded border px-2 py-1 font-mono">published_audience</span></label><input class="rounded border bg-background p-2" name="notion_audience" aria-label="Enclava audience ID"><input class="rounded border bg-background p-2" name="notion_members" aria-label="Observed source user principal IDs, comma separated">
+      </fieldset>
+      <fieldset class="grid gap-3 rounded border p-3 md:col-span-6"><legend>Google Drive — folder/drive and allowed file types</legend>
+        <input class="rounded border bg-background p-2" name="folder_id" aria-label="Drive folder ID"><input class="rounded border bg-background p-2" name="drive_id" aria-label="Drive ID"><input class="rounded border bg-background p-2" name="mime_types" aria-label="Allowed MIME types, comma separated">
+      </fieldset>
+      <button class="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground" type="submit">Create source</button>
     </form>
   </div>
 
@@ -67,6 +78,7 @@
         </thead>
         <tbody class="divide-y">
           {{range .Sources}}
+          {{$source := .}}
           <tr>
             <td class="px-4 py-3">
               <p class="font-medium">{{.Name}}</p>
@@ -75,13 +87,37 @@
             <td class="px-4 py-3">{{.Type}}</td>
             <td class="px-4 py-3 font-mono">{{.TargetCollectionID}}</td>
             <td class="px-4 py-3">
-              {{if .Checkpoint}}<details><summary>Sync details</summary><pre class="whitespace-pre-wrap text-xs">{{printf "%v" .Checkpoint}}</pre></details>{{else}}No sync checkpoint{{end}}
-              <p class="text-xs text-amber-700">Access and membership snapshot freshness is not reported by this connector screen.</p>
-              <span class="inline-flex rounded border border-amber-300 px-2 py-1 text-xs text-amber-800">Access enumeration: not supported</span>
-              <span class="inline-flex rounded border border-amber-300 px-2 py-1 text-xs text-amber-800">Membership enumeration: not supported</span>
-            </td>
+              {{if .Checkpoint}}<details><summary>Sync checkpoint</summary><pre class="whitespace-pre-wrap text-xs">{{printf "%v" .Checkpoint}}</pre></details>{{else}}No sync checkpoint{{end}}
+              {{with index $.LatestJobs .ID}}<p>Last run: <strong>{{.Status}}</strong> · {{.CreatedAt}}</p>
+                {{with .Stats}}<details><summary>Stream progress and permission freshness</summary><pre class="whitespace-pre-wrap text-xs">{{printf "%v" .}}</pre></details>{{end}}
+                {{with .ErrorMessage}}<details><summary>Errors</summary><p>{{.}}</p></details>{{end}}
+              {{else}}No recorded sync job{{end}}
+              <details><summary>Content, access and membership progress</summary>
+                {{with index (index $.Streams .ID) "content"}}<p>Content: {{if .Complete}}complete{{else if .Incomplete}}incomplete{{else}}in progress{{end}} · observed seq {{.ObservedSeq}}{{with .LastError}} · error: {{.}}{{end}}</p>{{else}}<p>Content: no checkpoint</p>{{end}}
+                {{with index (index $.Streams .ID) "access"}}<p>Access: {{if .Complete}}complete{{else if .Incomplete}}incomplete{{else}}in progress{{end}} · observed seq {{.ObservedSeq}}{{with .LastError}} · error: {{.}}{{end}}</p>{{else}}<p>Access: no checkpoint</p>{{end}}
+                {{with index (index $.Streams .ID) "membership"}}<p>Membership: {{if .Complete}}complete{{else if .Incomplete}}incomplete{{else}}in progress{{end}} · observed seq {{.ObservedSeq}}{{with .LastError}} · error: {{.}}{{end}}</p>{{else}}<p>Membership: no checkpoint</p>{{end}}
+                <p>Last complete grant snapshot: {{with index (index $.PermissionFreshness .ID) "access"}}{{.}}{{else}}not available{{end}}</p>
+                <p>Last complete membership snapshot: {{with index (index $.PermissionFreshness .ID) "membership"}}{{.}}{{else}}not available{{end}}</p>
+              </details>
+              {{with index $.Capabilities .ID}}<p class="text-xs">Streams: content {{if .Content}}available{{else}}<strong>not supported</strong>{{end}} · access {{if .Access}}available{{else}}<strong>not supported</strong>{{end}} · membership {{if .Membership}}available{{else}}<strong>not supported</strong>{{end}}</p>{{range .UnsupportedScopes}}<span class="inline-flex rounded border border-amber-300 px-2 py-1 text-xs">Not supported: {{.}}</span>{{end}}{{else}}<span class="text-amber-700">Adapter capabilities unavailable; status is unknown.</span>{{end}}
             <td class="px-4 py-3">{{if .IsEnabled}}Enabled{{else}}Disabled{{end}}</td>
             <td class="px-4 py-3">
+              {{if $.CanManageBindings}}
+              <details class="mb-3"><summary>Verified source-user bindings</summary>
+                <ul class="mt-2 space-y-2 text-xs">{{range index $.Bindings $source.ID}}
+                  <li><code>{{.NativeID}}</code> → <code>{{if .MappedUserID}}{{.MappedUserID}}{{else}}unbound{{end}}</code>
+                    {{if .MappedUserID}}<form class="inline" hx-post="/dashboard/partials/connectors" hx-target="#dashboard-connectors" hx-swap="innerHTML"><input type="hidden" name="action" value="revoke_source_binding"><input type="hidden" name="source_id" value="{{$source.ID}}"><input type="hidden" name="binding_id" value="{{.ID}}"><button type="submit" class="underline">Revoke</button></form>{{end}}
+                  </li>{{else}}<li>No observed source users.</li>{{end}}
+                </ul>
+                <form class="mt-3 grid gap-2" hx-post="/dashboard/partials/connectors" hx-target="#dashboard-connectors" hx-swap="innerHTML">
+                  <input type="hidden" name="action" value="bind_source_principal"><input type="hidden" name="source_id" value="{{.ID}}">
+                  <label class="text-xs">Observed native user ID<input class="block w-full rounded border bg-background p-2" name="native_user_id" required></label>
+                  <label class="text-xs">Enclava user ID<input class="block w-full rounded border bg-background p-2" name="mapped_user_id" required></label>
+                  <label class="text-xs">Administrator verification evidence<input class="block w-full rounded border bg-background p-2" name="verification_evidence" required></label>
+                  <button type="submit" class="rounded border px-3 py-2 text-xs">Bind user</button>
+                </form>
+              </details>
+              {{end}}
               <div class="flex flex-wrap gap-2">
                 <form hx-post="/dashboard/partials/connectors" hx-target="#dashboard-connectors" hx-swap="innerHTML">
                   <input type="hidden" name="action" value="sync_source">
@@ -131,8 +167,8 @@
           <tr>
             <td class="px-4 py-3 font-mono">{{.ID}}</td>
             <td class="px-4 py-3 font-mono">{{.ConnectorSourceID}}</td>
-            <td class="px-4 py-3">{{.Status}}</td>
-            <td class="px-4 py-3">{{.ErrorMessage}}</td>
+            <td class="px-4 py-3">{{.Status}} {{if or (eq .Status "queued") (eq .Status "running")}}<form hx-post="/dashboard/partials/connectors" hx-target="#dashboard-connectors" hx-swap="innerHTML"><input type="hidden" name="action" value="cancel_sync"><input type="hidden" name="job_id" value="{{.ID}}"><button type="submit" class="underline">Cancel</button></form>{{end}}<details><summary>Stream progress / item errors</summary><pre class="whitespace-pre-wrap text-xs">{{printf "%v" .Stats}}</pre>{{with .ErrorMessage}}<p>{{.}}</p>{{end}}</details></td>
+            <td class="px-4 py-3">{{if .ErrorMessage}}<details><summary>Errors</summary><p>{{.ErrorMessage}}</p></details>{{else}}—{{end}}</td>
             <td class="px-4 py-3">{{.CreatedAt}}</td>
           </tr>
           {{end}}
@@ -142,4 +178,5 @@
     {{end}}
   </div>
 </div>
+<script src="/dashboard/static/connectors.js" defer></script>
 {{end}}

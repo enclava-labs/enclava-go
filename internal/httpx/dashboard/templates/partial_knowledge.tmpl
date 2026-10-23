@@ -1,0 +1,22 @@
+{{define "partial-knowledge"}}
+<link rel="stylesheet" href="/dashboard/static/knowledge.css">
+<section class="rounded-lg border bg-card p-5" aria-labelledby="knowledge-search-title">
+  <h2 id="knowledge-search-title" class="font-semibold">Knowledge search</h2>
+  {{if .Collections}}
+  <form id="knowledge-search-form" class="mt-4 grid gap-3 md:grid-cols-4">
+    <label class="space-y-1 text-sm font-medium"><span>Readable collection</span><select name="collection_id" class="w-full rounded-md border bg-background px-3 py-2" required>{{range .Collections}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select></label>
+    <label class="space-y-1 text-sm font-medium"><span>Search mode</span><select name="mode" class="w-full rounded-md border bg-background px-3 py-2"><option value="hybrid">Hybrid</option><option value="lexical">Lexical</option><option value="semantic">Semantic</option></select></label>
+    <label class="space-y-1 text-sm font-medium md:col-span-2"><span>Query</span><input name="query" class="w-full rounded-md border bg-background px-3 py-2" required></label>
+    <button class="rounded-md bg-primary px-4 py-2 text-primary-foreground" type="submit">Search</button>
+  </form>
+  <div id="knowledge-search-results" class="mt-4" aria-live="polite"></div>
+  {{else}}<p class="mt-2 text-sm text-muted-foreground">No readable collections are available.</p>{{end}}
+  <form class="mt-5 flex flex-wrap items-end gap-3" id="knowledge-import-form">
+    <label class="space-y-1 text-sm font-medium"><span>Import stored result into collection</span><select name="collection_id" class="rounded-md border bg-background px-3 py-2">{{range .Collections}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select></label>
+    <label class="space-y-1 text-sm font-medium"><span>Stored result reference</span><input name="result_ref" class="rounded-md border bg-background px-3 py-2" required></label>
+    <button class="rounded-md border px-4 py-2" type="submit">Import result</button>
+  </form>
+  <div id="knowledge-import-status" role="status" aria-live="polite"></div>
+</section>
+<script src="/dashboard/static/knowledge.js" defer></script>
+{{end}}

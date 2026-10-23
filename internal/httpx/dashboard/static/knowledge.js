@@ -35,12 +35,25 @@
               card.appendChild(node('p', 'Evidence: ' + (item.evidence_id || 'unavailable') + ' · ' + (item.file_name || 'source'), 'mt-2 font-mono text-xs'));
               card.appendChild(node('p', 'Generation: ' + (item.generation || 'unknown'), 'text-xs text-muted-foreground'));
               if (item.evidence_id) {
+                var evidenceURL = '/api/v1/rag/evidence/' + encodeURIComponent(item.evidence_id);
+                var evidenceState = node('p', 'Evidence state: resolving…', 'text-xs text-muted-foreground');
+                var evidenceRequest;
+                function resolveEvidence() {
+                  if (!evidenceRequest) evidenceRequest = request(evidenceURL);
+                  return evidenceRequest;
+                }
+                card.appendChild(evidenceState);
+                resolveEvidence().then(function (evidence) {
+                  evidenceState.textContent = 'Evidence state: ' + (evidence.status || 'unknown');
+                }).catch(function () {
+                  evidenceState.textContent = 'Evidence state: unavailable';
+                });
                 var link = node('a', 'Resolve evidence');
-                link.href = '/api/v1/rag/evidence/' + encodeURIComponent(item.evidence_id);
+                link.href = evidenceURL;
                 link.className = 'mr-3 text-sm underline';
                 link.addEventListener('click', function (e) {
                   e.preventDefault();
-                  request(link.href).then(function (evidence) {
+                  resolveEvidence().then(function (evidence) {
                     var detail = node('p', null, 'mt-2 text-xs');
                     detail.textContent = 'Status: ' + evidence.status + '; locations: ' + JSON.stringify(evidence.locations || evidence.spans || []);
                     if (evidence.native_link) { var native = node('a', 'Open source'); native.href = evidence.native_link; native.rel = 'noopener noreferrer'; detail.appendChild(document.createTextNode(' ')); detail.appendChild(native); }
@@ -54,7 +67,7 @@
             });
             if (!(result.results || []).length) target.appendChild(node('p', 'No authorized results.', 'text-sm text-muted-foreground'));
             var context = result.context || {};
-            if (context.incomplete || context.denied || context.incomplete_context || context.denied_neighbors) target.appendChild(node('p', 'Context is incomplete; some neighboring source content is unavailable or denied.', 'rounded bg-yellow-50 p-2 text-sm text-yellow-900'));
+            if (context.incomplete || context.neighbor_withheld || context.denied || context.incomplete_context || context.denied_neighbors) target.appendChild(node('p', context.neighbor_withheld ? 'Context is incomplete; a neighboring source item was withheld because it is unavailable or denied.' : 'Context is incomplete; some source content is unavailable.', 'rounded bg-yellow-50 p-2 text-sm text-yellow-900'));
           })
           .catch(function (error) { target.replaceChildren(node('p', error.message, 'text-sm text-red-700')); });
       });

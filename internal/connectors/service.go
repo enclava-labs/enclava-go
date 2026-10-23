@@ -55,7 +55,12 @@ type CanonicalSourceRepository interface {
 	ObjectForNativeIDCrossKind(context.Context, string, string, string) (source.Object, error)
 	SourceIdentityForNativeID(context.Context, string, string, string) (source.SourceIdentity, error)
 	SourceGroupForNativeID(context.Context, string, string, string) (source.SourceGroup, error)
+	InsertSourceIdentity(context.Context, source.SourceIdentity) error
 	InsertSourceGroup(context.Context, source.SourceGroup) error
+	SourceIdentitiesForConnection(context.Context, string, string) ([]source.SourceIdentity, error)
+	UserExists(context.Context, string, string) (bool, error)
+	SourceIdentityByID(context.Context, string, string) (source.SourceIdentity, error)
+	ObservedSourceIdentity(context.Context, string, string, string) (source.SourceIdentity, error)
 }
 
 type Service struct {
@@ -65,6 +70,7 @@ type Service struct {
 	adapters            AdapterFactories
 	observations        ObservationRepository
 	artifacts           *artifacts.Store
+	secrets             *auth.SecretResolver
 	canonical           CanonicalSourceRepository
 	httpClient          *http.Client
 	allowPrivateBaseURL bool
@@ -84,6 +90,55 @@ func NewService(repo Repository, jobSvc *jobs.Service, jobRows JobReader) *Servi
 
 func (s *Service) SetSyncDependencies(adapters AdapterFactories, observations ObservationRepository, artifactStore *artifacts.Store, canonical CanonicalSourceRepository) {
 	s.adapters, s.observations, s.artifacts, s.canonical = adapters, observations, artifactStore, canonical
+}
+func (s *Service) SetCredentialResolver(resolver *auth.SecretResolver) {
+	s.secrets = resolver
+}
+
+func (s *Service) CredentialRefs(p auth.Principal, kind string) []auth.SecretRefMeta {
+	if s.secrets == nil || !auth.HasScope(p, "connectors.manage") {
+		return nil
+	}
+	provider := credentialProviderForType(kind)
+	refs := s.secrets.Metadata(p.TenantID)
+	out := make([]auth.SecretRefMeta, 0, len(refs))
+	for _, ref := range refs {
+		if ref.Purpose == auth.SecretPurposeConnector && strings.HasPrefix(ref.RefID, "CONNECTOR_"+provider+"_") {
+			out = append(out, ref)
+		}
+	}
+	return out
+}
+func (s *Service) GetCapabilities(ctx context.Context, p auth.Principal, sourceID string) (AdapterCapabilities, error) {
+	v, err := s.GetSource(ctx, p, sourceID)
+	if err != nil {
+		return AdapterCapabilities{}, err
+	}
+	factory := s.adapters[SourceKind(v.Type)]
+	if factory == nil {
+		return AdapterCapabilities{}, errors.New("connector adapter is not configured")
+	}
+	adapter, err := factory(viewConnection(v, p.TenantID, p.ActorID))
+	if err != nil {
+		return AdapterCapabilities{}, err
+	}
+	return adapter.Capabilities(), nil
+}
+func (s *Service) GetStreamState(ctx context.Context, p auth.Principal, sourceID, stream string) (StreamState, error) {
+	if !auth.HasScope(p, "connectors.manage") {
+		return StreamState{}, source.ErrDenied
+	}
+	if stream != string(StreamContent) && stream != string(StreamAccess) && stream != string(StreamMembership) {
+		return StreamState{}, errors.New("invalid connector stream")
+	}
+	v, err := s.GetSource(ctx, p, sourceID)
+	if err != nil {
+		return StreamState{}, err
+	}
+	if s.observations == nil {
+		return StreamState{}, errors.New("connector observations are not configured")
+	}
+	return s.observations.GetStream(ctx, p.TenantID, v.ID, stream)
 }
 
 func (s *Service) setAllowPrivateBaseURL(allow bool) {

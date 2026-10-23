@@ -3,6 +3,7 @@ package httpx
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	"enclava-go/internal/llm"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
+	"enclava-go/internal/source"
 	"enclava-go/internal/store/postgres"
 )
 
@@ -107,11 +109,18 @@ type dashboardPromptTemplatesData struct {
 }
 
 type dashboardConnectorsData struct {
-	Sources     []connectors.Source
-	Jobs        []connectors.SyncJob
-	Collections []rag.Collection
-	Success     string
-	Error       string
+	Sources             []connectors.Source
+	Jobs                []connectors.SyncJob
+	Collections         []rag.Collection
+	Bindings            map[string][]source.SourceIdentity
+	CredentialRefs      map[string][]auth.SecretRefMeta
+	Success             string
+	Error               string
+	CanManageBindings   bool
+	Capabilities        map[string]connectors.AdapterCapabilities
+	LatestJobs          map[string]connectors.SyncJob
+	Streams             map[string]map[string]connectors.StreamState
+	PermissionFreshness map[string]map[string]time.Time
 }
 
 func (a *App) handleDashboardPageProviders(w http.ResponseWriter, r *http.Request) {
@@ -465,7 +474,52 @@ func (a *App) handleDashboardConnectors(w http.ResponseWriter, r *http.Request) 
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_connector_jobs_failed")
 		return
 	}
-	data := dashboardConnectorsData{Sources: sources, Jobs: jobs, Success: successMessage, Error: errorMessage}
+	data := dashboardConnectorsData{Sources: sources, Jobs: jobs, Success: successMessage, Error: errorMessage, Bindings: map[string][]source.SourceIdentity{}, CanManageBindings: auth.HasScope(p, auth.ScopePlatformAdmin)}
+	data.CredentialRefs = map[string][]auth.SecretRefMeta{}
+	for _, kind := range []string{"github", "slack", "teams", "notion", "google_drive"} {
+		data.CredentialRefs[kind] = a.connectorSvc.CredentialRefs(p, kind)
+	}
+	data.Capabilities = map[string]connectors.AdapterCapabilities{}
+	for _, connection := range sources {
+		if caps, err := a.connectorSvc.GetCapabilities(r.Context(), p, connection.ID); err == nil {
+			data.Capabilities[connection.ID] = caps
+		}
+	}
+	data.LatestJobs = map[string]connectors.SyncJob{}
+	for _, job := range jobs {
+		if _, exists := data.LatestJobs[job.ConnectorSourceID]; !exists {
+			data.LatestJobs[job.ConnectorSourceID] = job
+		}
+	}
+	data.Streams = map[string]map[string]connectors.StreamState{}
+	data.PermissionFreshness = map[string]map[string]time.Time{}
+	for _, connection := range sources {
+		streams := map[string]connectors.StreamState{}
+		for _, stream := range []string{"content", "access", "membership"} {
+			if state, err := a.connectorSvc.GetStreamState(r.Context(), p, connection.ID, stream); err == nil {
+				streams[stream] = state
+			}
+		}
+		data.Streams[connection.ID] = streams
+		freshness := map[string]time.Time{}
+		if a.sourceRepo != nil {
+			if _, at, err := a.sourceRepo.LatestCompleteRevision(r.Context(), p.TenantID, connection.ID, source.SnapshotGrants); err == nil {
+				freshness["access"] = at
+			}
+			if _, at, err := a.sourceRepo.LatestCompleteRevision(r.Context(), p.TenantID, connection.ID, source.SnapshotMembership); err == nil {
+				freshness["membership"] = at
+			}
+		}
+		data.PermissionFreshness[connection.ID] = freshness
+	}
+	if data.CanManageBindings {
+		for _, connection := range sources {
+			rows, err := a.connectorSvc.ListSourceBindings(r.Context(), p, connection.ID)
+			if err == nil {
+				data.Bindings[connection.ID] = rows
+			}
+		}
+	}
 	data.Collections, _ = a.ragSvc.ListCollections(r.Context(), p)
 	if err := dashboardTemplates.ExecuteTemplate(w, "partial-connectors", data); err != nil {
 		log.Printf("failed to render dashboard connectors: %v", err)
@@ -478,6 +532,33 @@ func (a *App) handleDashboardRAGAction(r *http.Request, p auth.Principal) (strin
 		return "", "Invalid form data"
 	}
 	switch strings.TrimSpace(r.FormValue("action")) {
+	case "upload_document":
+		if r.MultipartForm == nil || len(r.MultipartForm.File) != 1 || len(r.MultipartForm.File["file"]) != 1 {
+			return "", "Exactly one file is required"
+		}
+		defer func() { _ = r.MultipartForm.RemoveAll() }()
+		collectionID := strings.TrimSpace(r.FormValue("collection_id"))
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			return "", "File is required"
+		}
+		defer file.Close()
+		maxBytes := a.maxUploadMB * 1024 * 1024
+		if header.Size <= 0 || header.Size > maxBytes {
+			return "", "File size is outside the allowed limit"
+		}
+		data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+		if err != nil || int64(len(data)) > maxBytes {
+			return "", "Unable to read file within the allowed limit"
+		}
+		mimeType := header.Header.Get("Content-Type")
+		if strings.TrimSpace(mimeType) == "" {
+			mimeType = "application/octet-stream"
+		}
+		if _, err := a.ragSvc.UploadDocument(r.Context(), p, collectionID, rag.UploadDocumentInput{FileName: header.Filename, MimeType: mimeType, Bytes: data}); err != nil {
+			return "", err.Error()
+		}
+		return "Document upload queued", ""
 	case "create_collection":
 		chunkSize := dashboardFormInt(r, "chunk_size", rag.DefaultChunkSize)
 		chunkOverlap := dashboardFormInt(r, "chunk_overlap", rag.DefaultChunkOverlap)
@@ -614,6 +695,20 @@ func (a *App) handleDashboardConnectorAction(r *http.Request, p auth.Principal) 
 			return "", err.Error()
 		}
 		return "Connector sync cancellation requested", ""
+	case "bind_source_principal":
+		_, err := a.connectorSvc.BindSourcePrincipal(r.Context(), p, connectors.BindSourcePrincipalInput{
+			ConnectionID: r.FormValue("source_id"), NativeUserID: r.FormValue("native_user_id"),
+			MappedUserID: r.FormValue("mapped_user_id"), VerificationEvidence: r.FormValue("verification_evidence"),
+		})
+		if err != nil {
+			return "", err.Error()
+		}
+		return "Source principal binding verified and saved", ""
+	case "revoke_source_binding":
+		if err := a.connectorSvc.RevokeConnectionSourceBinding(r.Context(), p, r.FormValue("source_id"), r.FormValue("binding_id")); err != nil {
+			return "", err.Error()
+		}
+		return "Source principal binding revoked", ""
 	case "create_source":
 		config, err := dashboardConnectorConfig(r)
 		if err != nil {
@@ -688,18 +783,51 @@ func dashboardJSONMap(raw string) (map[string]any, error) {
 }
 
 func dashboardConnectorConfig(r *http.Request) (map[string]any, error) {
-	config, err := dashboardJSONMap(r.FormValue("config_json"))
-	if err != nil {
-		return nil, err
+	config := map[string]any{"sync_interval": r.FormValue("sync_interval")}
+	split := func(key string) []any {
+		parts := strings.FieldsFunc(r.FormValue(key), func(r rune) bool { return r == ',' || r == '\n' || r == '\r' })
+		out := make([]any, 0, len(parts))
+		for _, part := range parts {
+			if value := strings.TrimSpace(part); value != "" {
+				out = append(out, value)
+			}
+		}
+		return out
 	}
-	content := strings.TrimSpace(r.FormValue("content"))
-	if content == "" {
-		return config, nil
+	switch r.FormValue("type") {
+	case "github":
+		config["owner"], config["repo"], config["ref"], config["paths"] = r.FormValue("owner"), r.FormValue("repo"), r.FormValue("ref"), split("paths")
+	case "slack":
+		channels := split("channel_ids")
+		if len(channels) != 1 {
+			return nil, fmt.Errorf("Slack supports one configured channel per connection")
+		}
+		config["channel_id"] = channels[0]
+		config["reconcile"] = "true"
+	case "teams":
+		config["tenant_id"], config["team_id"], config["chat_ids"] = r.FormValue("tenant_id"), r.FormValue("team_id"), split("chat_ids")
+		channels := split("channel_ids")
+		channelMap := map[string]any{}
+		if len(channels) > 0 {
+			channelMap[r.FormValue("team_id")] = channels
+		}
+		config["channel_ids"] = channelMap
+	case "notion":
+		audience := strings.TrimSpace(r.FormValue("notion_audience"))
+		members := split("notion_members")
+		if audience == "" || len(members) == 0 {
+			return nil, fmt.Errorf("Notion published_audience requires an audience ID and at least one Enclava user")
+		}
+		selected := []any{}
+		for _, id := range split("page_ids") {
+			selected = append(selected, map[string]any{"page_id": id, "audiences": []any{map[string]any{"id": audience, "members": members}}})
+		}
+		config["selected_pages"] = selected
+		config["authorization_mode"] = "published_audience"
+	case "google_drive":
+		config["folder_id"], config["drive_id"], config["mime_types"] = r.FormValue("folder_id"), r.FormValue("drive_id"), split("mime_types")
+	default:
+		return nil, fmt.Errorf("unsupported connector type")
 	}
-	config["documents"] = []any{map[string]any{
-		"file_name": r.FormValue("file_name"),
-		"mime_type": "text/plain",
-		"content":   content,
-	}}
 	return config, nil
 }

@@ -549,6 +549,38 @@ func (r *SourceRepo) InsertSourceIdentity(ctx context.Context, id source.SourceI
 	return nil
 }
 
+func (r *SourceRepo) SourceIdentitiesForConnection(ctx context.Context, tenantID, connectionID string) ([]source.SourceIdentity, error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `SELECT tenant_id::text,id,connection_id,source_user_native_id,COALESCE(mapped_user_id,'') FROM source_identities WHERE tenant_id=$1 AND connection_id=$2 ORDER BY source_user_native_id`, tenantID, connectionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []source.SourceIdentity{}
+	for rows.Next() {
+		var row source.SourceIdentity
+		if err := rows.Scan(&row.TenantID, &row.ID, &row.ConnectionID, &row.NativeID, &row.MappedUserID); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+func (r *SourceRepo) SourceIdentityByID(ctx context.Context, tenantID, id string) (source.SourceIdentity, error) {
+	var row source.SourceIdentity
+	err := r.db.SQL.QueryRowContext(ctx, `SELECT tenant_id::text,id,connection_id,source_user_native_id,COALESCE(mapped_user_id,'') FROM source_identities WHERE tenant_id=$1 AND id=$2`, tenantID, id).Scan(&row.TenantID, &row.ID, &row.ConnectionID, &row.NativeID, &row.MappedUserID)
+	if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+		return source.SourceIdentity{}, source.ErrDenied
+	}
+	return row, err
+}
+
+func (r *SourceRepo) UserExists(ctx context.Context, tenantID, userID string) (bool, error) {
+	var exists bool
+	err := r.db.SQL.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE tenant_id=$1 AND id=$2 AND status='active')`, tenantID, userID).Scan(&exists)
+	return exists, err
+}
+
 func (r *SourceRepo) InsertSourceGroup(ctx context.Context, g source.SourceGroup) error {
 	_, err := r.db.SQL.ExecContext(ctx, `
 		INSERT INTO source_groups

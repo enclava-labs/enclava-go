@@ -61,15 +61,49 @@ func (a *App) handleConnectorSourceByID(w http.ResponseWriter, r *http.Request, 
 		if parts[1] == "sync" && len(parts) == 2 && r.Method == http.MethodPost {
 			job, err := a.connectorSvc.SyncSource(r.Context(), principal, sourceID)
 			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) || errors.Is(err, sourceapi.ErrDenied) {
-					WriteOpenAIError(w, http.StatusNotFound, "connector source not found", "invalid_request_error", "not_found")
-					return
-				}
-				WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "connector_sync_invalid")
+				writeConnectorNotFoundOrError(w, err, "connector_sync_invalid")
 				return
 			}
 			WriteJSON(w, http.StatusAccepted, job)
 			return
+		}
+		if parts[1] == "bindings" {
+			if !auth.HasScope(principal, auth.ScopePlatformAdmin) {
+				WriteForbidden(w, "tenant administrator access is required")
+				return
+			}
+			if len(parts) == 2 && r.Method == http.MethodGet {
+				rows, err := a.connectorSvc.ListSourceBindings(r.Context(), principal, sourceID)
+				if err != nil {
+					writeConnectorNotFoundOrError(w, err, "connector_bindings_list_failed")
+					return
+				}
+				WriteJSON(w, http.StatusOK, map[string]any{"bindings": rows})
+				return
+			}
+			if len(parts) == 2 && r.Method == http.MethodPost {
+				var input connectors.BindSourcePrincipalInput
+				if err := DecodeJSON(r, &input); err != nil {
+					WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
+					return
+				}
+				input.ConnectionID = sourceID
+				row, err := a.connectorSvc.BindSourcePrincipal(r.Context(), principal, input)
+				if err != nil {
+					WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "connector_binding_invalid")
+					return
+				}
+				WriteJSON(w, http.StatusCreated, row)
+				return
+			}
+			if len(parts) == 3 && r.Method == http.MethodDelete {
+				if err := a.connectorSvc.RevokeConnectionSourceBinding(r.Context(), principal, sourceID, parts[2]); err != nil {
+					writeConnectorNotFoundOrError(w, err, "connector_binding_revoke_failed")
+					return
+				}
+				WriteJSON(w, http.StatusOK, map[string]any{"revoked": true, "id": parts[2]})
+				return
+			}
 		}
 		WriteOpenAIError(w, http.StatusNotFound, "connector route not found", "invalid_request_error", "not_found")
 		return

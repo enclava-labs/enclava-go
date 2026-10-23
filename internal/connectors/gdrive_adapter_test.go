@@ -237,3 +237,14 @@ func TestGDriveOversizedFileFailsExplicitly(t *testing.T) {
 		t.Fatalf("oversized result page=%#v error=%v", page, err)
 	}
 }
+
+func TestDriveTypeAllowlist(t *testing.T) {
+	connection := source.Connection{Config: map[string]any{"mime_types": []any{"application/pdf", "text/plain"}}}
+	if !driveTypeAllowed(connection, "application/pdf") || driveTypeAllowed(connection, "image/png") {
+		t.Fatal("Drive file type allowlist was not enforced")
+	}
+	connection.Config["mime_types"] = []any{}
+	if !driveTypeAllowed(connection, "image/png") {
+		t.Fatal("empty Drive type allowlist must preserve default all-types behavior")
+	}
+}
