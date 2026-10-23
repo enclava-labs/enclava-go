@@ -1,6 +1,7 @@
 package extract
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -141,6 +142,16 @@ func (s *Service) Process(ctx context.Context, p auth.Principal, input ProcessIn
 	if !template.Enabled {
 		return ProcessOutput{}, errors.New("template is inactive")
 	}
+	if template.OutputSchema == nil {
+		template.OutputSchema = map[string]any{}
+	}
+	if _, err := compileOutputSchema(template.OutputSchema); err != nil {
+		return ProcessOutput{}, fmt.Errorf("invalid output_schema: %w", err)
+	}
+	outputSchemaJSON, err := json.Marshal(template.OutputSchema)
+	if err != nil {
+		return ProcessOutput{}, fmt.Errorf("encode output_schema snapshot: %w", err)
+	}
 
 	model, err := s.resolveModel(ctx, p.TenantID, template)
 	if err != nil {
@@ -182,13 +193,15 @@ func (s *Service) Process(ctx context.Context, p auth.Principal, input ProcessIn
 		InputRef:  ref.ID,
 		InputHash: inputHash,
 		Policy: map[string]any{
-			"template_id":   template.ID,
-			"model":         model,
-			"file_name":     input.FileName,
-			"mime_type":     input.MimeType,
-			"file_size":     int64(len(input.Bytes)),
-			"input_version": int64(ref.Version),
-			"context":       input.Context,
+			"template_id":        template.ID,
+			"model":              model,
+			"file_name":          input.FileName,
+			"mime_type":          input.MimeType,
+			"file_size":          int64(len(input.Bytes)),
+			"input_version":      int64(ref.Version),
+			"output_schema_json": string(outputSchemaJSON),
+			"schema_version":     outputSchemaVersion,
+			"context":            input.Context,
 		},
 	})
 	if err != nil {
@@ -252,6 +265,22 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 	// authorization is the executor's job alone.
 	if !auth.ExtractTemplateAllowed(p, template.ID) {
 		return "", ErrForbidden
+	}
+	if stringValue(job.Policy["schema_version"]) != outputSchemaVersion {
+		return "", fmt.Errorf("unsupported extraction schema version %q", stringValue(job.Policy["schema_version"]))
+	}
+	// The job snapshot keeps template edits from changing the validation contract.
+	schemaSnapshot, ok := job.Policy["output_schema_json"].(string)
+	if !ok || schemaSnapshot == "" {
+		return "", errors.New("job is missing its output schema snapshot")
+	}
+	schemaDecoder := json.NewDecoder(strings.NewReader(schemaSnapshot))
+	schemaDecoder.UseNumber()
+	if err := schemaDecoder.Decode(&template.OutputSchema); err != nil {
+		return "", fmt.Errorf("decode job output schema snapshot: %w", err)
+	}
+	if _, err := compileOutputSchema(template.OutputSchema); err != nil {
+		return "", fmt.Errorf("invalid job output schema: %w", err)
 	}
 
 	in, err := input(ctx)
@@ -337,6 +366,8 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 		RawResponse:          rawContent,
 		ValidationErrors:     validationErrors,
 		ValidationWarnings:   validationWarnings,
+		SchemaVersion:        stringValue(job.Policy["schema_version"]),
+		OutputSchema:         template.OutputSchema,
 		PromptTokensUsed:     promptUnits,
 		CompletionTokensUsed: completionUnits,
 		TokensUsed:           promptUnits + completionUnits,
@@ -433,7 +464,9 @@ func (s *Service) GetJob(ctx context.Context, p auth.Principal, jobID string) (J
 	}
 	defer func() { _ = rc.Close() }()
 	var res ResultView
-	if err := json.NewDecoder(io.LimitReader(rc, 8<<20)).Decode(&res); err != nil {
+	decoder := json.NewDecoder(io.LimitReader(rc, 8<<20))
+	decoder.UseNumber()
+	if err := decoder.Decode(&res); err != nil {
 		return detail, nil
 	}
 	detail.Result = &res
@@ -471,8 +504,11 @@ func (s *Service) UpsertTemplate(ctx context.Context, p auth.Principal, t Templa
 	if t.OutputSchema == nil {
 		t.OutputSchema = map[string]any{}
 	}
-	if len(t.OutputSchema) > 0 && !isObjectSchema(t.OutputSchema) {
-		return errors.New("output_schema must be a JSON object schema")
+	if len(t.OutputSchema) > 0 {
+		if _, err := compileOutputSchema(t.OutputSchema); err != nil {
+			return fmt.Errorf("invalid output_schema: %w", err)
+		}
+		t.OutputSchema["$schema"] = outputSchemaVersion
 	}
 	if t.OwnerActorID == "" {
 		t.OwnerActorID = p.ActorID
@@ -671,21 +707,6 @@ func isPrimitiveSchema(schema map[string]any) bool {
 	return true
 }
 
-func isObjectSchema(schema map[string]any) bool {
-	if len(schema) == 0 {
-		return true
-	}
-	if typ, ok := schema["type"]; ok && !schemaTypeAllows(typ, "object") {
-		return false
-	}
-	if props, ok := schema["properties"]; ok {
-		if _, ok := props.(map[string]any); !ok {
-			return false
-		}
-	}
-	return true
-}
-
 type usageInfo struct {
 	Prompt     int
 	Completion int
@@ -693,16 +714,21 @@ type usageInfo struct {
 }
 
 func parseProviderExtraction(raw []byte) (map[string]any, string, usageInfo, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
 	var envelope map[string]any
-	if err := json.Unmarshal(raw, &envelope); err != nil {
+	if err := decoder.Decode(&envelope); err != nil {
 		return nil, "", usageInfo{}, fmt.Errorf("decode provider response: %w", err)
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return nil, "", usageInfo{}, errors.New("invalid trailing provider response data")
 	}
 
 	usage := usageInfo{}
 	if usageRaw, ok := envelope["usage"].(map[string]any); ok {
-		usage.Prompt = int(toFloat(usageRaw["prompt_tokens"]))
-		usage.Completion = int(toFloat(usageRaw["completion_tokens"]))
-		usage.Total = int(toFloat(usageRaw["total_tokens"]))
+		usage.Prompt = providerUsageCount(usageRaw["prompt_tokens"])
+		usage.Completion = providerUsageCount(usageRaw["completion_tokens"])
+		usage.Total = providerUsageCount(usageRaw["total_tokens"])
 	}
 
 	choicesRaw, ok := envelope["choices"].([]any)
@@ -756,9 +782,14 @@ func parseJSONBody(content string) (map[string]any, error) {
 	if t == "" {
 		return map[string]any{}, errors.New("empty model response")
 	}
+	decoder := json.NewDecoder(strings.NewReader(t))
+	decoder.UseNumber()
 	var out map[string]any
-	if err := json.Unmarshal([]byte(t), &out); err != nil {
+	if err := decoder.Decode(&out); err != nil {
 		return nil, err
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return nil, errors.New("invalid trailing JSON data")
 	}
 	return out, nil
 }
@@ -773,8 +804,11 @@ func (s *Service) validateOutput(data map[string]any, template Template) ([]stri
 	if _, hasParseErr := data["_parse_error"]; hasParseErr {
 		errorsList = append(errorsList, "model output is not valid JSON")
 	}
-	if len(template.OutputSchema) > 0 {
-		errorsList = append(errorsList, validateAgainstSchema(data, template.OutputSchema, "$")...)
+	compiled, err := compileOutputSchema(template.OutputSchema)
+	if err != nil {
+		errorsList = append(errorsList, err.Error())
+	} else if err := compiled.validate(data); err != nil {
+		errorsList = append(errorsList, err.Error())
 	}
 	if template.ID == "detailed_invoice" {
 		if _, ok := data["invoice_number"]; !ok {
@@ -784,183 +818,10 @@ func (s *Service) validateOutput(data map[string]any, template Template) ([]stri
 			warnings = append(warnings, "missing total_amount")
 		}
 	}
+	if len(errorsList) == 0 {
+		warnings = append(warnings, "schema-valid output does not establish factual accuracy")
+	}
 	return errorsList, warnings
-}
-
-func validateAgainstSchema(value any, schema map[string]any, path string) []string {
-	if len(schema) == 0 {
-		return nil
-	}
-	errorsList := []string{}
-	if enumRaw, ok := schema["enum"].([]any); ok && len(enumRaw) > 0 {
-		matched := false
-		for _, candidate := range enumRaw {
-			if fmt.Sprint(candidate) == fmt.Sprint(value) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			errorsList = append(errorsList, fmt.Sprintf("%s must be one of the declared enum values", path))
-		}
-	}
-	if typ, ok := schema["type"]; ok && !valueMatchesSchemaType(value, typ) {
-		errorsList = append(errorsList, fmt.Sprintf("%s must be %s", path, schemaTypeDescription(typ)))
-		return errorsList
-	}
-	if value == nil && schemaTypeAllows(schema["type"], "null") {
-		return errorsList
-	}
-
-	objectValue, isObj := value.(map[string]any)
-	if isObj || schemaTypeAllows(schema["type"], "object") || schema["properties"] != nil || schema["required"] != nil {
-		if !isObj {
-			errorsList = append(errorsList, fmt.Sprintf("%s must be object", path))
-			return errorsList
-		}
-		for _, field := range schemaStringSlice(schema["required"]) {
-			if _, ok := objectValue[field]; !ok {
-				errorsList = append(errorsList, fmt.Sprintf("%s.%s is required", path, field))
-			}
-		}
-		properties := schemaObjectMap(schema["properties"])
-		for field, fieldSchema := range properties {
-			childValue, ok := objectValue[field]
-			if !ok {
-				continue
-			}
-			childSchema, ok := fieldSchema.(map[string]any)
-			if !ok {
-				continue
-			}
-			errorsList = append(errorsList, validateAgainstSchema(childValue, childSchema, path+"."+field)...)
-		}
-		if additional, ok := schema["additionalProperties"].(bool); ok && !additional && len(properties) > 0 {
-			for field := range objectValue {
-				if _, ok := properties[field]; !ok {
-					errorsList = append(errorsList, fmt.Sprintf("%s.%s is not allowed by output_schema", path, field))
-				}
-			}
-		}
-		return errorsList
-	}
-
-	arrayValue, isArray := value.([]any)
-	if isArray || schemaTypeAllows(schema["type"], "array") {
-		if !isArray {
-			errorsList = append(errorsList, fmt.Sprintf("%s must be array", path))
-			return errorsList
-		}
-		if itemSchema, ok := schema["items"].(map[string]any); ok {
-			for i, item := range arrayValue {
-				errorsList = append(errorsList, validateAgainstSchema(item, itemSchema, fmt.Sprintf("%s[%d]", path, i))...)
-			}
-		}
-	}
-	return errorsList
-}
-
-func valueMatchesSchemaType(value any, typ any) bool {
-	for _, t := range schemaTypeList(typ) {
-		switch t {
-		case "null":
-			if value == nil {
-				return true
-			}
-		case "string":
-			if _, ok := value.(string); ok {
-				return true
-			}
-		case "number":
-			switch value.(type) {
-			case float64, float32, int, int64, int32, uint64, uint32:
-				return true
-			}
-		case "integer":
-			switch v := value.(type) {
-			case float64:
-				return v == float64(int64(v))
-			case int, int64, int32, uint64, uint32:
-				return true
-			}
-		case "boolean":
-			if _, ok := value.(bool); ok {
-				return true
-			}
-		case "object":
-			if _, ok := value.(map[string]any); ok {
-				return true
-			}
-		case "array":
-			if _, ok := value.([]any); ok {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func schemaTypeAllows(typ any, want string) bool {
-	for _, t := range schemaTypeList(typ) {
-		if t == want {
-			return true
-		}
-	}
-	return false
-}
-
-func schemaTypeList(typ any) []string {
-	switch v := typ.(type) {
-	case string:
-		if strings.TrimSpace(v) == "" {
-			return nil
-		}
-		return []string{strings.TrimSpace(v)}
-	case []any:
-		out := make([]string, 0, len(v))
-		for _, item := range v {
-			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
-				out = append(out, strings.TrimSpace(s))
-			}
-		}
-		return out
-	case []string:
-		return v
-	default:
-		return nil
-	}
-}
-
-func schemaTypeDescription(typ any) string {
-	types := schemaTypeList(typ)
-	if len(types) == 0 {
-		return "declared JSON schema type"
-	}
-	return strings.Join(types, " or ")
-}
-
-func schemaStringSlice(raw any) []string {
-	switch v := raw.(type) {
-	case []any:
-		out := make([]string, 0, len(v))
-		for _, item := range v {
-			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
-				out = append(out, strings.TrimSpace(s))
-			}
-		}
-		return out
-	case []string:
-		return v
-	default:
-		return nil
-	}
-}
-
-func schemaObjectMap(raw any) map[string]any {
-	if m, ok := raw.(map[string]any); ok {
-		return m
-	}
-	return map[string]any{}
 }
 
 func schemaName(id string) string {
@@ -983,17 +844,16 @@ func schemaName(id string) string {
 	return name + "_output"
 }
 
-func toFloat(v any) float64 {
-	switch n := v.(type) {
-	case float64:
-		return n
-	case int:
-		return float64(n)
-	case int64:
-		return float64(n)
-	default:
+func providerUsageCount(value any) int {
+	number, ok := value.(json.Number)
+	if !ok {
 		return 0
 	}
+	count, err := number.Int64()
+	if err != nil {
+		return 0
+	}
+	return int(count)
 }
 
 // jobView projects a durable job row onto the consumer shape; request fields

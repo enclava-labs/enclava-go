@@ -98,6 +98,8 @@ type ResultView struct {
 	RawResponse          string         `json:"raw_response"`
 	ValidationErrors     []string       `json:"validation_errors"`
 	ValidationWarnings   []string       `json:"validation_warnings"`
+	SchemaVersion        string         `json:"schema_version"`
+	OutputSchema         map[string]any `json:"output_schema"`
 	PromptTokensUsed     int            `json:"prompt_tokens_used"`
 	CompletionTokensUsed int            `json:"completion_tokens_used"`
 	TokensUsed           int            `json:"tokens_used"`

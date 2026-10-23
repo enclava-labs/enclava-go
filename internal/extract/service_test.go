@@ -1,78 +1,65 @@
 package extract
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
-func TestParseJSONBody_CodeFence(t *testing.T) {
-	m, err := parseJSONBody("```json\n{\"a\":1}\n```")
+func TestParseJSONBodyCodeFencePreservesNumber(t *testing.T) {
+	got, err := parseJSONBody("```json\n{\"a\":9007199254740993.0001}\n```")
 	if err != nil {
 		t.Fatalf("parse fenced json: %v", err)
 	}
-	if m["a"].(float64) != 1 {
-		t.Fatalf("unexpected map: %v", m)
+	if got["a"] != json.Number("9007199254740993.0001") {
+		t.Fatalf("number was not preserved exactly: %#v", got["a"])
+	}
+}
+func TestParseProviderExtractionKeepsNumericPrecision(t *testing.T) {
+	data, _, usage, err := parseProviderExtraction([]byte(`{"usage":{"prompt_tokens":9007199254740993},"choices":[{"message":{"content":"{\"amount\":9007199254740993.0001}"}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.Prompt != 9007199254740993 {
+		t.Fatalf("provider usage was rounded: %d", usage.Prompt)
+	}
+	if data["amount"] != json.Number("9007199254740993.0001") {
+		t.Fatalf("provider output number was rounded: %#v", data["amount"])
 	}
 }
 
-func TestValidateContextValues_NestedRejected(t *testing.T) {
+func TestValidateContextValuesNestedRejected(t *testing.T) {
 	if err := validateContextValues(map[string]any{"ok": "v", "nested": map[string]any{"x": 1}}); err == nil {
 		t.Fatal("expected nested value rejection")
 	}
 }
 
-func TestValidateAgainstSchemaNullableObjectAndArrayAcceptNull(t *testing.T) {
-	schema := map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"obj": map[string]any{"type": []string{"object", "null"}, "properties": map[string]any{"x": map[string]any{"type": "string"}}},
-			"arr": map[string]any{"type": []string{"array", "null"}, "items": map[string]any{"type": "string"}},
+func TestExtractionOutputUsesLocalSchemaAndReportsAccuracyWarning(t *testing.T) {
+	service := &Service{}
+	template := Template{
+		ID: "custom",
+		OutputSchema: map[string]any{
+			"$schema": outputSchemaVersion,
+			"$defs": map[string]any{
+				"amount": map[string]any{"type": "integer"},
+			},
+			"type": "object",
+			"properties": map[string]any{
+				"amount": map[string]any{"$ref": "#/$defs/amount"},
+			},
+			"required":             []any{"amount"},
+			"additionalProperties": false,
 		},
 	}
-	errs := validateAgainstSchema(map[string]any{"obj": nil, "arr": nil}, schema, "$")
-	if len(errs) != 0 {
-		t.Fatalf("unexpected errors: %v", errs)
+	valid, warnings := service.validateOutput(map[string]any{"amount": json.Number("9007199254740993")}, template)
+	if len(valid) != 0 {
+		t.Fatalf("valid generated result rejected: %v", valid)
 	}
-}
-
-func TestValidateAgainstSchemaNonNullObjectAndArray(t *testing.T) {
-	schema := map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"obj": map[string]any{"type": "object", "properties": map[string]any{"x": map[string]any{"type": "string"}}},
-			"arr": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-		},
+	if len(warnings) != 1 || warnings[0] != "schema-valid output does not establish factual accuracy" {
+		t.Fatalf("expected explicit factual-accuracy warning, got %v", warnings)
 	}
-	errs := validateAgainstSchema(map[string]any{"obj": map[string]any{"x": "v"}, "arr": []any{"a"}}, schema, "$")
-	if len(errs) != 0 {
-		t.Fatalf("unexpected errors: %v", errs)
-	}
-}
-
-func TestValidateAgainstSchemaNullRejectedWhenNotNullable(t *testing.T) {
-	schema := map[string]any{
-		"type":       "object",
-		"properties": map[string]any{"obj": map[string]any{"type": "object"}},
-	}
-	errs := validateAgainstSchema(map[string]any{"obj": nil}, schema, "$")
-	if len(errs) == 0 {
-		t.Fatal("expected rejection for null object")
-	}
-}
-
-func TestValidateAgainstSchemaRequiredAndNullableProperty(t *testing.T) {
-	schema := map[string]any{
-		"type":     "object",
-		"required": []any{"req"},
-		"properties": map[string]any{
-			"req": map[string]any{"type": []string{"string", "null"}},
-		},
-	}
-	errs := validateAgainstSchema(map[string]any{}, schema, "$")
-	if len(errs) == 0 {
-		t.Fatal("expected required-field error")
-	}
-	errs = validateAgainstSchema(map[string]any{"req": nil}, schema, "$")
-	if len(errs) != 0 {
-		t.Fatalf("nullable field should accept null: %v", errs)
+	invalid, _ := service.validateOutput(map[string]any{"amount": "9007199254740993"}, template)
+	if len(invalid) == 0 || !strings.Contains(invalid[0], "/amount") {
+		t.Fatalf("schema-invalid generated result did not report the instance location: %v", invalid)
 	}
 }

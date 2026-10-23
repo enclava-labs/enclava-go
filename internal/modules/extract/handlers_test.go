@@ -180,7 +180,7 @@ func TestHandleProcessEnqueuesDurableJobAndSettlesUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get job: %v", err)
 	}
-	if detail.Result == nil || detail.Result.TokensUsed != 1500 || detail.Result.Data["total"] != 12.5 {
+	if detail.Result == nil || detail.Result.TokensUsed != 1500 || detail.Result.Data["total"] != json.Number("12.5") {
 		t.Fatalf("unexpected detail: %+v", detail.Result)
 	}
 }

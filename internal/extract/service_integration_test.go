@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -379,11 +380,83 @@ func TestAttemptPricedModelReservesAndSettles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get job: %v", err)
 	}
-	if detail.Result == nil || detail.Result.TokensUsed != 15 || detail.Result.Data["total"] != float64(1) {
+	if detail.Result == nil || detail.Result.TokensUsed != 15 || detail.Result.Data["total"] != json.Number("1") {
 		t.Fatalf("unexpected result: %+v", detail.Result)
 	}
 	if detail.Job.Status != jobs.StatusSucceeded {
 		t.Fatalf("job status=%s", detail.Job.Status)
+	}
+}
+func TestAttemptUsesSnapshotSchemaAndExactNumberValidation(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		content         string
+		wantValidation  bool
+		wantExactAmount bool
+	}{
+		{name: "valid numeric edge", content: `{"amount":9007199254740993.0001}`, wantExactAmount: true},
+		{name: "nested reference violation", content: `{"amount":"9007199254740993.0001"}`, wantValidation: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newFixture(t)
+			ctx := context.Background()
+			f.seedEndpoint(t, "priced-extract")
+			f.putPrice(t, "priced-extract", billing.UnitInput, 1000)
+			f.putPrice(t, "priced-extract", billing.UnitOutput, 2000)
+			f.upstream.response, _ = json.Marshal(map[string]any{
+				"id":      "c",
+				"usage":   map[string]any{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+				"choices": []any{map[string]any{"message": map[string]any{"content": test.content}}},
+			})
+			f.seedTemplate(t, extract.Template{
+				ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u",
+				DefaultModel: "priced-extract", Enabled: true,
+				OutputSchema: map[string]any{
+					"$schema": "https://json-schema.org/draft/2020-12/schema",
+					"$defs": map[string]any{
+						"amount": map[string]any{"type": "number", "minimum": int64(9007199254740993)},
+					},
+					"type":       "object",
+					"properties": map[string]any{"amount": map[string]any{"$ref": "#/$defs/amount"}},
+					"required":   []any{"amount"},
+				},
+			})
+			out, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
+				TemplateID: "invoice", FileName: "invoice.pdf", MimeType: "application/pdf", Bytes: []byte("%PDF-1.7 fixture"),
+			})
+			if err != nil {
+				t.Fatalf("process: %v", err)
+			}
+			claim := f.leaseClaim(t)
+			resultRef, err := f.svc.JobHandler()(ctx, claim, inputOpener(f, claim))
+			if err != nil {
+				t.Fatalf("attempt: %v", err)
+			}
+			if _, err := claim.Complete(ctx, resultRef); err != nil {
+				t.Fatalf("complete: %v", err)
+			}
+			detail, err := f.svc.GetJob(ctx, f.principal, out.JobID)
+			if err != nil || detail.Result == nil {
+				t.Fatalf("result readback: %+v, %v", detail, err)
+			}
+			if detail.Result.SchemaVersion != "https://json-schema.org/draft/2020-12/schema" {
+				t.Fatalf("schema version not retained: %q", detail.Result.SchemaVersion)
+			}
+			amountSchema := detail.Result.OutputSchema["$defs"].(map[string]any)["amount"].(map[string]any)
+			if amountSchema["minimum"] != json.Number("9007199254740993") {
+				t.Fatalf("persisted schema number was rounded: %#v", amountSchema["minimum"])
+			}
+			if test.wantValidation {
+				if len(detail.Result.ValidationErrors) == 0 || !strings.Contains(detail.Result.ValidationErrors[0], "/amount") {
+					t.Fatalf("nested schema violation not reported with instance location: %v", detail.Result.ValidationErrors)
+				}
+			} else if len(detail.Result.ValidationErrors) != 0 {
+				t.Fatalf("valid result rejected: %v", detail.Result.ValidationErrors)
+			}
+			if test.wantExactAmount && detail.Result.Data["amount"] != json.Number("9007199254740993.0001") {
+				t.Fatalf("result number was rounded: %#v", detail.Result.Data["amount"])
+			}
+		})
 	}
 }
 
