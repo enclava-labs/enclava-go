@@ -369,7 +369,13 @@ func parsePDFBBox(raw []byte) ([]parseBlock, error) {
 		case htmltoken.StartTagToken:
 			switch token.Data {
 			case "page":
-				page, _ = strconv.Atoi(tokenAttr(token, "number"))
+				// Poppler emits number= in some builds and only width/height
+				// in others; pages are sequential either way.
+				if n, err := strconv.Atoi(tokenAttr(token, "number")); err == nil && n >= 1 {
+					page = n
+				} else {
+					page++
+				}
 				if page < 1 {
 					return nil, errors.New("extract: malformed Poppler page number")
 				}
