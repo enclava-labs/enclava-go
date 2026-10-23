@@ -66,19 +66,38 @@ type Document struct {
 // chunk_profile_version_id; QdrantPointID is the row ID (Qdrant upserts are
 // keyed by it so stale generations cannot clobber a newer version's index).
 type DocumentChunk struct {
-	ID            string         `json:"id"`
-	DocumentID    string         `json:"document_id"`
-	CollectionID  string         `json:"collection_id"`
-	ChunkIndex    int            `json:"chunk_index"`
-	Content       string         `json:"content"`
-	TokenCount    int            `json:"token_count"`
-	QdrantPointID string         `json:"qdrant_point_id,omitempty"`
-	ByteStart     int            `json:"byte_start,omitempty"`
-	ByteEnd       int            `json:"byte_end,omitempty"`
-	SpanRefs      []source.Span  `json:"span_refs,omitempty"`
-	HeaderPath    string         `json:"header_path,omitempty"`
-	Metadata      map[string]any `json:"metadata,omitempty"`
-	CreatedAt     time.Time      `json:"created_at"`
+	ID               string         `json:"id"`
+	DocumentID       string         `json:"document_id"`
+	CollectionID     string         `json:"collection_id"`
+	Generation       int64          `json:"generation"`
+	ChunkIndex       int            `json:"chunk_index"`
+	ParentChunkIndex int            `json:"parent_chunk_index,omitempty"`
+	Content          string         `json:"content"`
+	TokenCount       int            `json:"token_count"`
+	QdrantPointID    string         `json:"qdrant_point_id,omitempty"`
+	ByteStart        int            `json:"byte_start,omitempty"`
+	ByteEnd          int            `json:"byte_end,omitempty"`
+	SpanRefs         []source.Span  `json:"span_refs,omitempty"`
+	HeaderPath       string         `json:"header_path,omitempty"`
+	Metadata         map[string]any `json:"metadata,omitempty"`
+	CreatedAt        time.Time      `json:"created_at"`
+}
+
+type IndexGeneration struct {
+	CollectionID     string
+	QdrantCollection string
+	ObjectID         string
+	ObjectVersionID  string
+	Generation       int64
+	State            string
+	Tombstoned       bool
+}
+
+type StoredResult struct {
+	Operation string
+	Status    string
+	InputRef  string
+	ResultRef string
 }
 
 type CreateCollectionInput struct {
@@ -103,13 +122,18 @@ type UpdateCollectionInput struct {
 }
 
 type UploadDocumentInput struct {
-	FileName   string         `json:"file_name"`
-	MimeType   string         `json:"mime_type"`
-	Bytes      []byte         `json:"-"`
-	SourceType string         `json:"source_type,omitempty"`
-	SourceID   string         `json:"source_id,omitempty"`
-	SourceURI  string         `json:"source_uri,omitempty"`
-	Metadata   map[string]any `json:"metadata,omitempty"`
+	FileName       string         `json:"file_name"`
+	MimeType       string         `json:"mime_type"`
+	Bytes          []byte         `json:"-"`
+	SourceType     string         `json:"source_type,omitempty"`
+	SourceID       string         `json:"source_id,omitempty"`
+	SourceURI      string         `json:"source_uri,omitempty"`
+	Metadata       map[string]any `json:"metadata,omitempty"`
+	ProvenanceKind string         `json:"-"`
+	InputArtifact  string         `json:"-"`
+	ResultJobID    string         `json:"-"`
+	ResultArtifact string         `json:"-"`
+	Audience       []string       `json:"-"`
 }
 
 type SearchInput struct {

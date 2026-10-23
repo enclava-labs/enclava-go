@@ -156,6 +156,27 @@ func (f *fakeVectorStore) DeleteDocumentPoints(ctx context.Context, collection, 
 	return nil
 }
 
+func (f *fakeVectorStore) DeleteGenerationPoints(ctx context.Context, collection, versionID string, generation int64) error {
+	kept := f.points[collection][:0]
+	for _, point := range f.points[collection] {
+		if point.Payload["object_version_id"] == versionID && point.Payload["generation"] == generation {
+			continue
+		}
+		kept = append(kept, point)
+	}
+	f.points[collection] = kept
+	return nil
+}
+
+func (f *fakeVectorStore) SetPayload(ctx context.Context, collection string, filter map[string]any, payload map[string]any) error {
+	for i := range f.points[collection] {
+		for key, value := range payload {
+			f.points[collection][i].Payload[key] = value
+		}
+	}
+	return nil
+}
+
 func (f *fakeVectorStore) DeleteCollection(ctx context.Context, collection string) error {
 	delete(f.points, collection)
 	return nil

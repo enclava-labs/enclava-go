@@ -46,8 +46,33 @@ func (c *QdrantClient) EnsureCollection(ctx context.Context, collection string, 
 	if vectorSize <= 0 {
 		return fmt.Errorf("vector size must be positive")
 	}
-	status, _, err := c.do(ctx, http.MethodGet, "/collections/"+url.PathEscape(collection), nil)
+	status, resp, err := c.do(ctx, http.MethodGet, "/collections/"+url.PathEscape(collection), nil)
 	if err == nil && status < 300 {
+		var envelope struct {
+			Result struct {
+				Config struct {
+					Params struct {
+						Vectors map[string]struct {
+							Size     int    `json:"size"`
+							Distance string `json:"distance"`
+						} `json:"vectors"`
+						SparseVectors map[string]json.RawMessage `json:"sparse_vectors"`
+					} `json:"params"`
+				} `json:"config"`
+			} `json:"result"`
+		}
+		if decodeErr := json.Unmarshal(resp, &envelope); decodeErr != nil {
+			return fmt.Errorf("decode existing qdrant schema: %w", decodeErr)
+		}
+		dense, hasDense := envelope.Result.Config.Params.Vectors["dense"]
+		sparse, hasSparse := envelope.Result.Config.Params.SparseVectors["text"]
+		var sparseConfig struct {
+			Modifier string `json:"modifier"`
+		}
+		_ = json.Unmarshal(sparse, &sparseConfig)
+		if !hasDense || dense.Size != vectorSize || dense.Distance != "Cosine" || !hasSparse || sparseConfig.Modifier != "idf" {
+			return fmt.Errorf("qdrant collection %q has incompatible dense/BM25 schema", collection)
+		}
 		return nil
 	}
 	if err != nil && status != http.StatusNotFound {
@@ -59,12 +84,12 @@ func (c *QdrantClient) EnsureCollection(ctx context.Context, collection string, 
 
 	body, err := json.Marshal(map[string]any{
 		"vectors":        map[string]any{"dense": map[string]any{"size": vectorSize, "distance": "Cosine"}},
-		"sparse_vectors": map[string]any{"text": map[string]any{}},
+		"sparse_vectors": map[string]any{"text": map[string]any{"modifier": "idf"}},
 	})
 	if err != nil {
 		return err
 	}
-	status, resp, err := c.do(ctx, http.MethodPut, "/collections/"+url.PathEscape(collection), body)
+	status, resp, err = c.do(ctx, http.MethodPut, "/collections/"+url.PathEscape(collection), body)
 	if err != nil {
 		return err
 	}
@@ -85,7 +110,11 @@ func (c *QdrantClient) UpsertPoints(ctx context.Context, collection string, poin
 		if namedDense {
 			named := map[string]any{"dense": point.Vector}
 			if hasSparse {
-				named["text"] = point.Sparse
+				if text, ok := point.Payload["content"].(string); ok {
+					named["text"] = map[string]any{"text": text, "model": "qdrant/bm25"}
+				} else {
+					named["text"] = point.Sparse
+				}
 			}
 			vectors = named
 		}
@@ -122,6 +151,40 @@ func (c *QdrantClient) DeleteDocumentPoints(ctx context.Context, collection, doc
 	}
 	if status >= 300 && status != http.StatusNotFound {
 		return fmt.Errorf("qdrant delete document points failed: status=%d body=%s", status, string(resp))
+	}
+	return nil
+}
+
+func (c *QdrantClient) DeleteGenerationPoints(ctx context.Context, collection, versionID string, generation int64) error {
+	filter := map[string]any{"must": []map[string]any{
+		{"key": "object_version_id", "match": map[string]any{"value": versionID}},
+		{"key": "generation", "match": map[string]any{"value": generation}},
+	}}
+	body, err := json.Marshal(map[string]any{"filter": filter})
+	if err != nil {
+		return err
+	}
+	status, resp, err := c.do(ctx, http.MethodPost, "/collections/"+url.PathEscape(collection)+"/points/delete?wait=true", body)
+	if err != nil {
+		return err
+	}
+	if status >= 300 && status != http.StatusNotFound {
+		return fmt.Errorf("qdrant delete generation points failed: status=%d body=%s", status, string(resp))
+	}
+	return nil
+}
+
+func (c *QdrantClient) SetPayload(ctx context.Context, collection string, filter map[string]any, payload map[string]any) error {
+	body, err := json.Marshal(map[string]any{"filter": filter, "payload": payload})
+	if err != nil {
+		return err
+	}
+	status, resp, err := c.do(ctx, http.MethodPost, "/collections/"+url.PathEscape(collection)+"/points/payload?wait=true", body)
+	if err != nil {
+		return err
+	}
+	if status >= 300 && status != http.StatusNotFound {
+		return fmt.Errorf("qdrant set payload failed: status=%d body=%s", status, string(resp))
 	}
 	return nil
 }

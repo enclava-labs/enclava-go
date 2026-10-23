@@ -237,7 +237,7 @@ func (s *Service) enqueueContent(ctx context.Context, principal auth.Principal, 
 			IdempotencyKey: OperationIngest + ":" + hex.EncodeToString(key[:]),
 			Subject:        jobs.Subject{ConnectionID: conn.ID, ObjectID: observation.ObjectRef.ObjectID, ObservedRevision: observation.ObjectRef.ObservedSeq},
 			InputRef:       observation.ArtifactRef.ID, InputHash: observation.ArtifactRef.SHA256,
-			Policy: map[string]any{"collection_id": conn.TargetCollectionID, "source_ref": observation.ObjectRef, "artifact_ref": observation.ArtifactRef, "source_kind": conn.Kind},
+			Policy: map[string]any{"collection_id": conn.TargetCollectionID, "source_ref": observation.ObjectRef, "artifact_ref": observation.ArtifactRef, "source_kind": conn.Kind, "observation_payload": json.RawMessage(observation.Payload)},
 		})
 		if err != nil {
 			return fmt.Errorf("enqueue rag.ingest: %w", err)

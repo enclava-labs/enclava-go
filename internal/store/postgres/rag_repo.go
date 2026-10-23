@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"time"
 
+	"enclava-go/internal/jobs"
 	"enclava-go/internal/rag"
 	"enclava-go/internal/source"
 )
@@ -578,52 +579,109 @@ func (r *RAGRepo) SaveParsedDocument(ctx context.Context, parserVersion string, 
 	})
 }
 
-// ReplaceVersionChunksAndStage is the single transactional publish boundary:
-// prior chunk rows for the version are replaced and the generation row is
-// upserted in 'staging' state, atomically. profileVersionID may be empty at
-// enqueue time (bound later by the attempt); chunk rows are skipped then.
+// ReplaceVersionChunksAndStage inserts generation-keyed chunk rows and stages
+// the generation atomically. Only its own still-staged rows may be retried.
 func (r *RAGRepo) ReplaceVersionChunksAndStage(ctx context.Context, tenantID, collectionID, objectID, versionID string, seq, generation int64, profileVersionID string, chunks []rag.DocumentChunk) error {
 	return WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
-		if profileVersionID != "" || len(chunks) > 0 {
-			if _, err := tx.ExecContext(ctx, `
-				DELETE FROM chunks c
-				USING index_generations g, chunk_profiles p
-				WHERE c.tenant_id = $1 AND c.object_version_id = $2
-				  AND g.tenant_id = c.tenant_id AND g.object_version_id = c.object_version_id
-				  AND g.collection_id = $3
-				  AND p.tenant_id = c.tenant_id AND p.id = c.chunk_profile_version_id
-				  AND p.profile_id = 'rag-' || g.collection_id || '-structured'`,
-				tenantID, versionID, collectionID); err != nil {
-				return fmt.Errorf("clear version chunks: %w", err)
-			}
-			for _, ch := range chunks {
-				spanRefs, err := json.Marshal(ch.SpanRefs)
-				if err != nil {
-					return fmt.Errorf("marshal chunk spans: %w", err)
-				}
-				start, end := ch.ByteStart, ch.ByteEnd
-				if len(ch.SpanRefs) == 0 && end == 0 {
-					end = len(ch.Content)
-				}
-				if _, err := tx.ExecContext(ctx, `
-					INSERT INTO chunks
-					    (tenant_id, id, object_version_id, chunk_profile_version_id,
-					     ordinal, text, byte_start, byte_end, span_refs, owner_actor_id)
-					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, NULL)`,
-					tenantID, ch.ID, versionID, profileVersionID, ch.ChunkIndex,
-					ch.Content, start, end, spanRefs); err != nil {
-					return fmt.Errorf("insert chunk: %w", err)
-				}
-			}
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO index_generations
+			    (tenant_id, id, collection_id, object_version_id, generation, state,
+			     chunk_profile_version_id, artifact_ref)
+			VALUES ($1, $2, $3, $4, $5, 'staging', NULLIF($6, ''), COALESCE(
+			    (SELECT artifact_ref FROM source_object_versions
+			     WHERE tenant_id=$1 AND id=$4), ''))
+			ON CONFLICT (tenant_id, collection_id, object_version_id, generation) DO NOTHING`,
+			tenantID, newPGID("idxgen"), collectionID, versionID, generation, profileVersionID)
+		if err != nil {
+			return fmt.Errorf("stage generation: %w", err)
+		}
+		var state string
+		if err := tx.QueryRowContext(ctx, `
+			SELECT state FROM index_generations
+			WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3 AND generation=$4
+			FOR UPDATE`, tenantID, collectionID, versionID, generation).Scan(&state); err != nil {
+			return fmt.Errorf("read staged generation: %w", err)
+		}
+		if state != "staging" {
+			return fmt.Errorf("generation %d is immutable in state %q", generation, state)
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO index_generations
-			    (tenant_id, id, collection_id, object_version_id, generation, state)
-			VALUES ($1, $2, $3, $4, $5, 'staging')
-			ON CONFLICT (tenant_id, collection_id, object_version_id, generation)
-			DO UPDATE SET state = EXCLUDED.state`,
-			tenantID, newPGID("idxgen"), collectionID, versionID, generation); err != nil {
-			return fmt.Errorf("stage generation: %w", err)
+			DELETE FROM chunks WHERE tenant_id=$1 AND collection_id=$2
+			  AND object_version_id=$3 AND generation=$4`,
+			tenantID, collectionID, versionID, generation); err != nil {
+			return fmt.Errorf("replace staged chunks: %w", err)
+		}
+		for _, ch := range chunks {
+			spanRefs, err := json.Marshal(ch.SpanRefs)
+			if err != nil {
+				return fmt.Errorf("marshal chunk spans: %w", err)
+			}
+			locator, err := json.Marshal(ch.Metadata)
+			if err != nil {
+				return fmt.Errorf("marshal chunk locator: %w", err)
+			}
+			start, end := ch.ByteStart, ch.ByteEnd
+			if len(ch.SpanRefs) == 0 && end == 0 {
+				end = len(ch.Content)
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO chunks
+				    (tenant_id, id, object_version_id, chunk_profile_version_id,
+				     ordinal, text, byte_start, byte_end, span_refs, owner_actor_id,
+				     collection_id, generation, block_path, locator, qdrant_point_id)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,NULL,$10,$11,$12,$13::jsonb,$14)`,
+				tenantID, ch.ID, versionID, profileVersionID, ch.ChunkIndex,
+				ch.Content, start, end, spanRefs, collectionID, generation, ch.HeaderPath, locator, ch.QdrantPointID); err != nil {
+				return fmt.Errorf("insert generation chunk: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+func (r *RAGRepo) PublishGenerationFenced(ctx context.Context, tenantID, collectionID, objectID, versionID string, generation int64, jobID, leaseOwner, attemptID string, fenceToken int64) error {
+	return WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
+		var state string
+		err := tx.QueryRowContext(ctx, `
+			SELECT g.state
+			FROM index_generations g
+			JOIN source_object_versions v ON v.tenant_id=g.tenant_id AND v.id=g.object_version_id
+			JOIN source_objects o ON o.tenant_id=v.tenant_id AND o.id=v.object_id
+			JOIN jobs j ON j.tenant_id=g.tenant_id
+			WHERE g.tenant_id=$1 AND g.collection_id=$2 AND g.object_version_id=$3
+			  AND g.generation=$4 AND o.id=$5 AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL
+			  AND o.observed_seq=v.observed_seq
+			  AND j.id=$6 AND j.status='running' AND j.lease_owner=$7
+			  AND j.fence_token=$8 AND j.dispatched_attempt_id=$9
+			  AND j.lease_expires_at > now()
+			FOR UPDATE OF g`, tenantID, collectionID, versionID, generation, objectID, jobID, leaseOwner, fenceToken, attemptID).Scan(&state)
+		if err != nil {
+			return fmt.Errorf("generation publication fence: %w", err)
+		}
+		if state != "staging" {
+			return fmt.Errorf("generation is not staged: %s", state)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE index_generations old SET state='superseded'
+			FROM source_object_versions ov
+			WHERE old.tenant_id=$1 AND old.collection_id=$2 AND old.state='published'
+			  AND ov.tenant_id=old.tenant_id AND ov.id=old.object_version_id
+			  AND ov.object_id=$3`, tenantID, collectionID, objectID); err != nil {
+			return fmt.Errorf("supersede previous generation: %w", err)
+		}
+		res, err := tx.ExecContext(ctx, `
+			UPDATE index_generations SET state='published', published_at=now(), lease_fence=$6
+			WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3 AND generation=$4
+			  AND state='staging' AND EXISTS (
+			    SELECT 1 FROM jobs WHERE tenant_id=$1 AND id=$5 AND status='running'
+			      AND lease_owner=$7 AND fence_token=$6 AND dispatched_attempt_id=$8
+			      AND lease_expires_at > now())`,
+			tenantID, collectionID, versionID, generation, jobID, fenceToken, leaseOwner, attemptID)
+		if err != nil {
+			return fmt.Errorf("publish generation: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return jobs.ErrStaleFence
 		}
 		return nil
 	})
@@ -657,12 +715,12 @@ func (r *RAGRepo) ChunkCountForVersion(ctx context.Context, tenantID, versionID 
 
 func (r *RAGRepo) ListChunks(ctx context.Context, tenantID, objectID, versionID string) ([]rag.DocumentChunk, error) {
 	rows, err := r.db.SQL.QueryContext(ctx, `
-		SELECT k.id, $2, ci.collection_id, k.ordinal, k.text, k.created_at,
-		       k.byte_start, k.byte_end, k.span_refs
+		SELECT k.id, v.object_id, ci.collection_id, k.ordinal, k.text, k.created_at,
+		       k.byte_start, k.byte_end, k.span_refs, k.generation, k.qdrant_point_id
 		FROM chunks k
 		JOIN source_object_versions v ON v.tenant_id = k.tenant_id AND v.id = k.object_version_id
 		JOIN collection_items ci ON ci.tenant_id = k.tenant_id AND ci.object_id = v.object_id
-		WHERE k.tenant_id = $1 AND k.object_version_id = $3
+		WHERE k.tenant_id = $1 AND k.object_version_id = $3 AND v.object_id=$2
 		ORDER BY k.ordinal`, tenantID, objectID, versionID)
 	if err != nil {
 		return nil, fmt.Errorf("list chunks: %w", err)
@@ -674,16 +732,101 @@ func (r *RAGRepo) ListChunks(ctx context.Context, tenantID, objectID, versionID 
 		var collectionID sql.NullString
 		var spans []byte
 		if err := rows.Scan(&ch.ID, &ch.DocumentID, &collectionID, &ch.ChunkIndex, &ch.Content, &ch.CreatedAt,
-			&ch.ByteStart, &ch.ByteEnd, &spans); err != nil {
+			&ch.ByteStart, &ch.ByteEnd, &spans, &ch.Generation, &ch.QdrantPointID); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal(spans, &ch.SpanRefs); err != nil {
 			return nil, fmt.Errorf("decode chunk spans: %w", err)
 		}
 		ch.CollectionID = collectionID.String
-		ch.QdrantPointID = ch.ID
 		ch.TokenCount = len(ch.Content) / 4
 		out = append(out, ch)
 	}
 	return out, rows.Err()
+}
+
+func (r *RAGRepo) ListGenerationsForConnection(ctx context.Context, tenantID, connectionID string) ([]rag.IndexGeneration, error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `
+		SELECT g.collection_id, c.qdrant_collection, o.id, v.id, g.generation,
+		       g.state, (o.deleted_at IS NOT NULL OR o.tombstoned_at IS NOT NULL)
+		FROM index_generations g
+		JOIN source_object_versions v ON v.tenant_id=g.tenant_id AND v.id=g.object_version_id
+		JOIN source_objects o ON o.tenant_id=v.tenant_id AND o.id=v.object_id
+		JOIN knowledge_collections c ON c.tenant_id=g.tenant_id AND c.id=g.collection_id
+		WHERE g.tenant_id=$1 AND o.connection_id=$2`, tenantID, connectionID)
+	if err != nil {
+		return nil, fmt.Errorf("list connection generations: %w", err)
+	}
+	defer rows.Close()
+	var result []rag.IndexGeneration
+	for rows.Next() {
+		var g rag.IndexGeneration
+		if err := rows.Scan(&g.CollectionID, &g.QdrantCollection, &g.ObjectID, &g.ObjectVersionID, &g.Generation, &g.State, &g.Tombstoned); err != nil {
+			return nil, fmt.Errorf("scan connection generation: %w", err)
+		}
+		result = append(result, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate connection generations: %w", err)
+	}
+	return result, nil
+}
+
+func (r *RAGRepo) FindArtifactObjectVersion(ctx context.Context, tenantID, artifactID string) (source.Object, source.ObjectVersion, error) {
+	var objectID string
+	var seq int64
+	err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT object_id, observed_seq FROM source_object_versions
+		WHERE tenant_id=$1 AND artifact_ref=$2 ORDER BY observed_seq DESC LIMIT 1`,
+		tenantID, artifactID).Scan(&objectID, &seq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return source.Object{}, source.ObjectVersion{}, source.ErrDenied
+	}
+	if err != nil {
+		return source.Object{}, source.ObjectVersion{}, fmt.Errorf("find artifact source: %w", err)
+	}
+	object, err := r.GetObject(ctx, tenantID, objectID)
+	if err != nil {
+		return source.Object{}, source.ObjectVersion{}, err
+	}
+	version, err := r.GetObjectVersion(ctx, tenantID, objectID, seq)
+	return object, version, err
+}
+
+func (r *RAGRepo) GetStoredResult(ctx context.Context, tenantID, jobID string) (rag.StoredResult, error) {
+	var result rag.StoredResult
+	err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT operation, status, COALESCE(input_ref,''), COALESCE(result_ref,'')
+		FROM jobs WHERE tenant_id=$1 AND id=$2 AND deleted_at IS NULL`,
+		tenantID, jobID).Scan(&result.Operation, &result.Status, &result.InputRef, &result.ResultRef)
+	if err != nil {
+		return rag.StoredResult{}, fmt.Errorf("read stored result: %w", err)
+	}
+	return result, nil
+}
+
+func (r *RAGRepo) GetKnowledgeImport(ctx context.Context, tenantID, collectionID, importRef string) (string, bool, error) {
+	var objectID string
+	err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT object_id FROM knowledge_imports
+		WHERE tenant_id=$1 AND collection_id=$2 AND import_ref=$3`,
+		tenantID, collectionID, importRef).Scan(&objectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("get knowledge import: %w", err)
+	}
+	return objectID, true, nil
+}
+
+func (r *RAGRepo) RecordKnowledgeImport(ctx context.Context, tenantID, collectionID, importRef, objectID, kind string) error {
+	_, err := r.db.SQL.ExecContext(ctx, `
+		INSERT INTO knowledge_imports (tenant_id, collection_id, import_ref, object_id, provenance_kind)
+		VALUES ($1,$2,$3,$4,$5) ON CONFLICT (tenant_id, collection_id, import_ref) DO NOTHING`,
+		tenantID, collectionID, importRef, objectID, kind)
+	if err != nil {
+		return fmt.Errorf("record knowledge import: %w", err)
+	}
+	return nil
 }

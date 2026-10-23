@@ -19,9 +19,11 @@ import (
 	"enclava-go/internal/source"
 )
 
-// OperationEmbed is the durable job operation that indexes one immutable
-// object version: parse → chunk → embed → stage chunks + publish generation.
-const OperationEmbed = "rag.embed"
+const (
+	OperationEmbed  = "rag.embed"
+	OperationIngest = "rag.ingest"
+	OperationAccess = "rag.access"
+)
 
 // Repository is the tenant-scoped persistence boundary for rag.Service over
 // the canonical source/object/version/domain schema. Implemented by
@@ -59,14 +61,20 @@ type Repository interface {
 	ReplaceVersionChunksAndStage(ctx context.Context, tenantID, collectionID, objectID, versionID string, seq, generation int64, profileVersionID string, chunks []DocumentChunk) error
 	MarkGenerationState(ctx context.Context, tenantID, collectionID, versionID string, generation int64, state string) error
 	NextGeneration(ctx context.Context, tenantID, collectionID, versionID string) (int64, error)
-	ChunkCountForVersion(ctx context.Context, tenantID, versionID string) (int, error)
-	ListChunks(ctx context.Context, tenantID, objectID, versionID string) ([]DocumentChunk, error)
+	FindArtifactObjectVersion(ctx context.Context, tenantID, artifactID string) (source.Object, source.ObjectVersion, error)
+	ListGenerationsForConnection(ctx context.Context, tenantID, connectionID string) ([]IndexGeneration, error)
+	GetKnowledgeImport(ctx context.Context, tenantID, collectionID, importRef string) (string, bool, error)
+	RecordKnowledgeImport(ctx context.Context, tenantID, collectionID, importRef, objectID, kind string) error
+	GetStoredResult(ctx context.Context, tenantID, jobID string) (StoredResult, error)
+	PublishGenerationFenced(ctx context.Context, tenantID, collectionID, objectID, versionID string, generation int64, jobID, leaseOwner, attemptID string, fenceToken int64) error
 }
 
 type VectorStore interface {
 	EnsureCollection(ctx context.Context, collection string, vectorSize int) error
 	UpsertPoints(ctx context.Context, collection string, points []QdrantPoint) error
 	DeleteDocumentPoints(ctx context.Context, collection, documentID string) error
+	DeleteGenerationPoints(ctx context.Context, collection, versionID string, generation int64) error
+	SetPayload(ctx context.Context, collection string, filter map[string]any, payload map[string]any) error
 	DeleteCollection(ctx context.Context, collection string) error
 	SearchHybrid(ctx context.Context, collection string, vector []float64, sparse SparseVector, limit int, filter map[string]any) ([]QdrantSearchPoint, error)
 }
@@ -568,6 +576,9 @@ func (s *Service) processNewDocument(ctx context.Context, p auth.Principal, c Co
 	// Audience-mode object: the uploader plus the collection's audience can
 	// read; collection manage rights gate mutation.
 	audience := append([]string{p.ActorID}, c.Audience...)
+	if len(input.Audience) > 0 {
+		audience = input.Audience
+	}
 	obj, err := s.repo.UpsertObject(ctx, source.Object{
 		TenantID:          p.TenantID,
 		ID:                newID("ragdoc"),
@@ -582,8 +593,14 @@ func (s *Service) processNewDocument(ctx context.Context, p auth.Principal, c Co
 		return UploadDocumentOutput{}, err
 	}
 
+	provenanceKind := input.ProvenanceKind
+	if provenanceKind == "" {
+		provenanceKind = "upload"
+	}
 	sum := sha256.Sum256(input.Bytes)
 	prov, _ := json.Marshal(map[string]any{
+		"kind": provenanceKind, "input_artifact_ref": input.InputArtifact,
+		"result_job_id": input.ResultJobID, "result_artifact_ref": input.ResultArtifact,
 		"source_uri": strings.TrimSpace(input.SourceURI),
 		"metadata":   nonNilMap(input.Metadata),
 	})
@@ -703,7 +720,13 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		_ = s.repo.MarkGenerationState(ctx, job.TenantID, collectionID, versionRowID(ver), generation, "superseded")
 		return versionRowID(ver), nil // complete: nothing to index
 	}
-
+	accessRevision := int64(0)
+	if obj.ConnectionID != "" {
+		accessRevision, _, err = s.repo.LatestCompleteRevision(ctx, job.TenantID, obj.ConnectionID, source.SnapshotGrants)
+		if err != nil {
+			return "", err
+		}
+	}
 	ref := artifacts.Ref{TenantID: job.TenantID, ID: ver.ArtifactRef, Kind: artifacts.KindOriginal}
 	objectRef := source.ObjectRef{TenantID: job.TenantID, ObjectID: objectID, ObservedSeq: seq}
 	document, err := s.parser.Parse(ctx, ref, extract.ParseOptions{
@@ -775,17 +798,19 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		chunkID := newID("ragchunk")
 		pointID := newPointID()
 		chunk := DocumentChunk{
-			ID: chunkID, DocumentID: obj.ID, CollectionID: c.ID,
+			ID: chunkID, DocumentID: obj.ID, CollectionID: c.ID, Generation: generation,
 			ChunkIndex: i, Content: chunkText, TokenCount: tokenEstimate(chunkText),
 			QdrantPointID: pointID, Metadata: map[string]any{"file_name": ver.OriginalFilename},
 		}
 		payload := map[string]any{
-			"collection_id": c.ID, "document_id": obj.ID,
+			"tenant_id":     job.TenantID,
+			"object_ref":    map[string]any{"tenant_id": job.TenantID, "connection_id": obj.ConnectionID, "object_id": obj.ID, "observed_seq": seq},
+			"collection_id": c.ID, "document_id": obj.ID, "connection_id": obj.ConnectionID,
 			"object_version_id": versionRowID(ver), "observed_seq": seq,
 			"generation": generation, "chunk_id": chunkID, "chunk_index": i,
 			"content": chunkText, "file_name": ver.OriginalFilename,
 			"source_type": obj.Kind, "source_id": obj.NativeID, "source_uri": sourceURI,
-			"metadata": docMetadata,
+			"metadata": docMetadata, "access_revision": accessRevision, "access_enabled": true,
 		}
 		spanPayload := make([]map[string]any, 0, len(structuredChunks[i].Spans))
 		for _, span := range structuredChunks[i].Spans {
@@ -822,7 +847,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		return "", err
 	}
 	// Publish only after the durable chunks and index writes exist.
-	if err := s.repo.MarkGenerationState(ctx, job.TenantID, c.ID, versionRowID(ver), generation, "published"); err != nil {
+	if err := s.repo.PublishGenerationFenced(ctx, job.TenantID, c.ID, obj.ID, versionRowID(ver), generation, claim.JobID, claim.Owner, claim.AttemptID(), claim.FenceToken); err != nil {
 		return "", err
 	}
 	return versionRowID(ver), nil
