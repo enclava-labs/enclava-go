@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"enclava-go/internal/extract"
 	"enclava-go/internal/jobs"
 )
 
@@ -624,6 +625,52 @@ func (r *JobsRepo) DeleteJob(ctx context.Context, tenantID, jobID string) error 
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return jobs.ErrJobNotFound
+	}
+	return nil
+}
+
+func (r *JobsRepo) CountActivePreviews(ctx context.Context, tenantID string) (int, error) {
+	var count int
+	err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT count(*) FROM jobs
+		WHERE tenant_id = $1 AND operation = $2 AND deleted_at IS NULL
+		  AND status IN ('queued','running')`, tenantID, extract.OperationPreview).Scan(&count)
+	return count, err
+}
+
+func (r *JobsRepo) ExpiredPreviewJobs(ctx context.Context, before time.Time, limit int) ([]extract.ExpiredPreview, error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `
+		SELECT tenant_id::text, id, COALESCE(input_ref,''), COALESCE(result_ref,''),
+		       COALESCE((policy->>'upload_owned')::boolean, false)
+		FROM jobs
+		WHERE operation = $1 AND deleted_at IS NULL
+		  AND status IN ('succeeded','failed','cancelled','unknown')
+		  AND finished_at < $2
+		ORDER BY finished_at LIMIT $3`, extract.OperationPreview, before, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var expired []extract.ExpiredPreview
+	for rows.Next() {
+		var row extract.ExpiredPreview
+		if err := rows.Scan(&row.TenantID, &row.ID, &row.InputRef, &row.ResultRef, &row.UploadOwned); err != nil {
+			return nil, err
+		}
+		expired = append(expired, row)
+	}
+	return expired, rows.Err()
+}
+
+func (r *JobsRepo) DeleteExpiredPreviewJobs(ctx context.Context, ids []string) error {
+	for _, id := range ids {
+		if _, err := r.db.SQL.ExecContext(ctx, `
+			UPDATE jobs SET status = 'deleted', deleted_at = now()
+			WHERE id = $1 AND operation = $2 AND deleted_at IS NULL
+			  AND status IN ('succeeded','failed','cancelled','unknown')`,
+			id, extract.OperationPreview); err != nil {
+			return err
+		}
 	}
 	return nil
 }

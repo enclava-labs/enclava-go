@@ -243,6 +243,10 @@ func writePreviewError(w http.ResponseWriter, err error) {
 		WriteOpenAIError(w, http.StatusNotFound, "document profile or artifact not found", "invalid_request_error", "not_found")
 		return
 	}
+	if errors.Is(err, extract.ErrPreviewAdmissionLimited) {
+		WriteOpenAIError(w, http.StatusTooManyRequests, err.Error(), "rate_limit_error", "preview_admission_limited")
+		return
+	}
 	if errors.Is(err, artifacts.ErrOverLimit) || errors.Is(err, extract.ErrDocumentTooLarge) {
 		WriteOpenAIError(w, http.StatusRequestEntityTooLarge, "document exceeds the upload limit", "invalid_request_error", "document_too_large")
 		return

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"path/filepath"
 	"strings"
 	"time"
@@ -17,6 +18,17 @@ import (
 )
 
 const OperationPreview = "document.preview"
+
+// Non-terminal previews are deliberately capped per tenant; concurrent submissions may race this best-effort check.
+const previewAdmissionLimit = 25
+
+var ErrPreviewAdmissionLimited = errors.New("extract: preview admission limit reached")
+
+type PreviewMaintenance interface {
+	CountActivePreviews(ctx context.Context, tenantID string) (int, error)
+	ExpiredPreviewJobs(ctx context.Context, before time.Time, limit int) ([]ExpiredPreview, error)
+	DeleteExpiredPreviewJobs(ctx context.Context, ids []string) error
+}
 
 // ChunkProfiles reads immutable profile versions in the caller's tenant.
 type ChunkProfiles interface {
@@ -30,21 +42,22 @@ type PreviewSource interface {
 }
 
 type PreviewService struct {
-	profiles   ChunkProfiles
-	jobRows    JobReader
-	jobs       *jobs.Service
-	artifacts  *artifacts.Store
-	parser     *Parser
-	source     PreviewSource
-	authorizer *source.Authorizer
-	maxBytes   int64
+	profiles    ChunkProfiles
+	jobRows     JobReader
+	maintenance PreviewMaintenance
+	jobs        *jobs.Service
+	artifacts   *artifacts.Store
+	parser      *Parser
+	source      PreviewSource
+	authorizer  *source.Authorizer
+	maxBytes    int64
 }
 
 func NewPreviewService(profiles ChunkProfiles, jobRows JobReader, jobSvc *jobs.Service, store *artifacts.Store, sourceRepo PreviewSource, maxUploadMB int64) *PreviewService {
 	if maxUploadMB <= 0 {
 		maxUploadMB = 32
 	}
-	return &PreviewService{profiles: profiles, jobRows: jobRows, jobs: jobSvc, artifacts: store, parser: NewParser(store), source: sourceRepo, authorizer: source.NewAuthorizer(sourceRepo, 0), maxBytes: maxUploadMB * 1024 * 1024}
+	return &PreviewService{profiles: profiles, jobRows: jobRows, maintenance: jobRows.(PreviewMaintenance), jobs: jobSvc, artifacts: store, parser: NewParser(store), source: sourceRepo, authorizer: source.NewAuthorizer(sourceRepo, 0), maxBytes: maxUploadMB * 1024 * 1024}
 }
 
 func (s *PreviewService) ListProfiles(ctx context.Context, p auth.Principal) ([]source.ChunkProfile, error) {
@@ -131,6 +144,13 @@ func (s *PreviewService) SubmitOwnedArtifact(ctx context.Context, p auth.Princip
 }
 
 func (s *PreviewService) enqueue(ctx context.Context, p auth.Principal, ref artifacts.Ref, filename, mimeType string, profile source.ChunkProfile, objectRef source.ObjectRef, uploadOwned bool) (jobs.Job, error) {
+	active, err := s.maintenance.CountActivePreviews(ctx, p.TenantID)
+	if err != nil {
+		return jobs.Job{}, fmt.Errorf("count active previews: %w", err)
+	}
+	if active >= previewAdmissionLimit {
+		return jobs.Job{}, ErrPreviewAdmissionLimited
+	}
 	job, _, err := s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
 		TenantID: p.TenantID, Operation: OperationPreview,
 		IdempotencyKey: "preview:" + ref.ID + ":" + profile.ID,
@@ -142,6 +162,59 @@ func (s *PreviewService) enqueue(ctx context.Context, p auth.Principal, ref arti
 		return jobs.Job{}, fmt.Errorf("enqueue preview: %w", err)
 	}
 	return job, nil
+}
+
+// RunRetentionSweep removes terminal preview jobs older than seven days and their owned artifacts.
+func (s *PreviewService) RunRetentionSweep(ctx context.Context) {
+	rows, err := s.maintenance.ExpiredPreviewJobs(ctx, time.Now().UTC().Add(-7*24*time.Hour), 200)
+	if err != nil {
+		log.Printf("preview retention: list expired jobs: %v", err)
+		return
+	}
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		cleaned := true
+		if row.ResultRef != "" {
+			if err := s.artifacts.Delete(ctx, artifacts.Ref{TenantID: row.TenantID, ID: row.ResultRef}); err != nil {
+				log.Printf("preview retention: delete result artifact %s: %v", row.ResultRef, err)
+				cleaned = false
+			}
+		}
+		if row.UploadOwned && row.InputRef != "" {
+			if err := s.artifacts.Delete(ctx, artifacts.Ref{TenantID: row.TenantID, ID: row.InputRef}); err != nil {
+				log.Printf("preview retention: delete input artifact %s: %v", row.InputRef, err)
+				cleaned = false
+			}
+		}
+		if cleaned {
+			ids = append(ids, row.ID)
+		}
+	}
+	if len(ids) > 0 {
+		if err := s.maintenance.DeleteExpiredPreviewJobs(ctx, ids); err != nil {
+			log.Printf("preview retention: delete expired jobs: %v", err)
+		}
+	}
+	log.Printf("preview retention: processed %d terminal jobs", len(rows))
+}
+
+func (s *PreviewService) RunRetention(ctx context.Context) {
+	s.RunRetentionSweep(ctx)
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.RunRetentionSweep(ctx)
+		}
+	}
+}
+
+type ExpiredPreview struct {
+	TenantID, ID, InputRef, ResultRef string
+	UploadOwned                       bool
 }
 
 func (s *PreviewService) JobHandler() jobs.HandlerFunc {

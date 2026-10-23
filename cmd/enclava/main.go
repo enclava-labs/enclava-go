@@ -201,6 +201,7 @@ func main() {
 		connectors.OperationSync: connectorSvc.JobHandler(),
 	}, jobs.RunnerConfig{})
 	runnerCtx, stopRunner := context.WithCancel(context.Background())
+	go previewSvc.RunRetention(runnerCtx)
 	runnerDone := make(chan struct{})
 	go func() {
 		defer close(runnerDone)
