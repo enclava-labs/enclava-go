@@ -25,6 +25,19 @@ func (s stubResolver) Read(_ context.Context, _ artifacts.Ref) (io.ReadCloser, e
 	return io.NopCloser(strings.NewReader(s.body)), nil
 }
 
+type deleteTrackingResolver struct {
+	deleted chan artifacts.Ref
+}
+
+func (r deleteTrackingResolver) Read(context.Context, artifacts.Ref) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
+func (r deleteTrackingResolver) Delete(_ context.Context, ref artifacts.Ref) error {
+	r.deleted <- ref
+	return nil
+}
+
 func runnerSetup(t *testing.T) (*jobs.Service, *postgres.DB, string) {
 	t.Helper()
 	db := testdb.New(t)
@@ -87,6 +100,34 @@ func TestRunnerExecutesAndCompletes(t *testing.T) {
 		tenant, job.ID).Scan(&resultRef); err != nil || resultRef != "result-art-1" {
 		t.Fatalf("result_ref = %q err=%v", resultRef, err)
 	}
+}
+func TestRunnerDeletesResultAfterStaleCompletion(t *testing.T) {
+	svc, _, tenant := runnerSetup(t)
+	ctx := context.Background()
+	p := principal(tenant, "a", "c")
+	job := enqueue(t, svc, p, req(tenant, "stale-output", "op.stale", "h", 1))
+	resolver := deleteTrackingResolver{deleted: make(chan artifacts.Ref, 1)}
+	r := jobs.NewRunner(svc, resolver, map[string]jobs.HandlerFunc{
+		"op.stale": func(ctx context.Context, _ *jobs.Claim, _ jobs.InputFunc) (string, error) {
+			if err := svc.Delete(ctx, p, job.ID); err != nil {
+				return "", err
+			}
+			return "orphan-result", nil
+		},
+	}, jobs.RunnerConfig{PollInterval: 10 * time.Millisecond, LeaseTTL: 2 * time.Second})
+	rctx, stop := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- r.Run(rctx) }()
+	select {
+	case ref := <-resolver.deleted:
+		if ref.TenantID != tenant || ref.ID != "orphan-result" {
+			t.Fatalf("deleted result ref = %+v", ref)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("stale completion result was not cleaned up")
+	}
+	stop()
+	<-done
 }
 
 func TestRunnerRequeuesRetryableThenSucceeds(t *testing.T) {

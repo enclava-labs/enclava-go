@@ -192,7 +192,14 @@ func (r *Runner) translate(ctx context.Context, claim *Claim, resultRef string, 
 	ctx = context.WithoutCancel(ctx)
 	switch {
 	case err == nil:
-		_, _ = claim.Complete(ctx, resultRef)
+		_, completeErr := claim.Complete(ctx, resultRef)
+		if errors.Is(completeErr, ErrStaleFence) && resultRef != "" && resultRef != claim.Job().InputRef {
+			if deleter, ok := r.resolver.(interface {
+				Delete(context.Context, artifacts.Ref) error
+			}); ok {
+				_ = deleter.Delete(ctx, artifacts.Ref{TenantID: claim.Job().TenantID, ID: resultRef})
+			}
+		}
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		if wanted, werr := claim.CancelRequested(ctx); werr == nil && wanted {
 			// Owner cancelled: flip to cancelled via the fenced write.
