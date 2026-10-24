@@ -12,7 +12,9 @@ import (
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/billing"
+	"enclava-go/internal/extract"
 	"enclava-go/internal/inference"
+	"enclava-go/internal/jobs"
 	"enclava-go/internal/llm"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
@@ -32,6 +34,31 @@ type Repository interface {
 	CreateConversation(ctx context.Context, c Conversation) error
 	GetConversation(ctx context.Context, tenantID, id string) (Conversation, error)
 	AddMessage(ctx context.Context, m Message) error
+	ListMessages(ctx context.Context, tenantID, conversationID string) ([]Message, error)
+}
+
+type RunRepository interface {
+	CreateRun(ctx context.Context, run AssistantRun) error
+	GetRun(ctx context.Context, tenantID, id string) (AssistantRun, error)
+	UpdateRun(ctx context.Context, run AssistantRun) error
+	UpdateRunFenced(ctx context.Context, run AssistantRun, owner string, fence int64) error
+	AddRunAttempt(ctx context.Context, attempt AssistantRunAttempt, owner string, fence int64) error
+	UpdateRunAttempt(ctx context.Context, attempt AssistantRunAttempt, owner string, fence int64) error
+	ListRunAttempts(ctx context.Context, tenantID, runID string) ([]AssistantRunAttempt, error)
+	AddRunMessage(ctx context.Context, message Message, jobID, owner string, fence int64) error
+}
+
+type RunPrincipalResolver interface {
+	CurrentPrincipal(ctx context.Context, frozen auth.Principal) (auth.Principal, error)
+}
+
+type EvidenceResolver interface {
+	ResolveEvidence(ctx context.Context, p auth.Principal, ids []string) ([]rag.EvidenceResolution, error)
+}
+
+type Extractor interface {
+	Process(ctx context.Context, p auth.Principal, input extract.ProcessInput) (extract.ProcessOutput, error)
+	GetJob(ctx context.Context, p auth.Principal, jobID string) (extract.JobDetail, error)
 }
 
 type PromptRepository interface {
@@ -55,19 +82,23 @@ type Executor interface {
 }
 
 type Service struct {
-	repo     Repository
-	prompts  PromptRepository
-	rag      RAGSearcher
-	executor Executor
+	repo              Repository
+	prompts           PromptRepository
+	rag               RAGSearcher
+	executor          Executor
+	runRepo           RunRepository
+	jobSvc            *jobs.Service
+	extractor         Extractor
+	principalResolver RunPrincipalResolver
 }
 
 func NewService(repo Repository, promptRepo PromptRepository, ragSvc RAGSearcher, executor Executor) *Service {
-	return &Service{
-		repo:     repo,
-		prompts:  promptRepo,
-		rag:      ragSvc,
-		executor: executor,
-	}
+	return &Service{repo: repo, prompts: promptRepo, rag: ragSvc, executor: executor}
+}
+
+// ConfigureRuns connects chatbot runs to durable jobs and current caller authority.
+func (s *Service) ConfigureRuns(repo RunRepository, jobSvc *jobs.Service, extractor Extractor, resolver RunPrincipalResolver) {
+	s.runRepo, s.jobSvc, s.extractor, s.principalResolver = repo, jobSvc, extractor, resolver
 }
 
 // maxOutputEstimate is the declared upper bound for generated units; it
@@ -91,7 +122,10 @@ func chatbotAllowed(p auth.Principal, bot Instance) bool {
 	if ext := strings.TrimSpace(bot.ExternalID); ext != "" {
 		ids = append(ids, ext)
 	}
-	return auth.ChatbotAllowed(p, ids...) || auth.AgentAllowed(p, ids...)
+	return auth.ChatbotAllowed(p, ids...) || auth.AgentAllowed(p, ids...) || chatbotOwnerAllowed(p, bot)
+}
+func chatbotOwnerAllowed(p auth.Principal, bot Instance) bool {
+	return auth.HasScope(p, "platform.admin") || bot.OwnerActorID != "" && bot.OwnerActorID == actorKey(p)
 }
 
 // VisiblePromptTemplateIDs implements prompts.VisibleTemplateIDs: the set of
@@ -121,6 +155,9 @@ func (s *Service) Create(ctx context.Context, p auth.Principal, input CreateChat
 	model := strings.TrimSpace(input.Model)
 	if model == "" {
 		return Instance{}, errors.New("model is required")
+	}
+	if !auth.ModelAllowed(p, model) {
+		return Instance{}, ErrModelNotAllowed
 	}
 	id := newID("chatbot")
 	externalID, err := normalizeExternalID(input.ExternalID, id)
@@ -192,6 +229,9 @@ func (s *Service) Update(ctx context.Context, p auth.Principal, id string, input
 	if err != nil {
 		return Instance{}, err
 	}
+	if !chatbotOwnerAllowed(p, b) {
+		return Instance{}, sql.ErrNoRows
+	}
 	if input.Name != nil {
 		b.Name = strings.TrimSpace(*input.Name)
 	}
@@ -212,6 +252,9 @@ func (s *Service) Update(ctx context.Context, p auth.Principal, id string, input
 	}
 	if b.Model == "" {
 		return Instance{}, errors.New("model is required")
+	}
+	if !auth.ModelAllowed(p, b.Model) {
+		return Instance{}, ErrModelNotAllowed
 	}
 	if input.RAGCollectionIDs != nil {
 		b.RAGCollectionIDs = normalizeStringList(input.RAGCollectionIDs)
@@ -239,7 +282,14 @@ func (s *Service) Delete(ctx context.Context, p auth.Principal, id string) error
 	if err := requireTenant(p); err != nil {
 		return err
 	}
-	return s.repo.Delete(ctx, p.TenantID, strings.TrimSpace(id))
+	b, err := s.repo.GetByID(ctx, p.TenantID, strings.TrimSpace(id))
+	if err != nil {
+		return err
+	}
+	if !chatbotOwnerAllowed(p, b) {
+		return sql.ErrNoRows
+	}
+	return s.repo.Delete(ctx, p.TenantID, b.ID)
 }
 
 func (s *Service) ExternalModels(ctx context.Context, p auth.Principal, chatbotRef string) (llm.ModelsResponse, error) {
@@ -311,7 +361,6 @@ func (s *Service) PrepareChatCompletion(ctx context.Context, p auth.Principal, c
 	if !auth.ModelAllowed(p, bot.Model) {
 		return PreparedCompletion{}, ErrModelNotAllowed
 	}
-
 	var payload map[string]any
 	if err := json.Unmarshal(rawRequest, &payload); err != nil {
 		return PreparedCompletion{}, invalidInput(fmt.Errorf("invalid JSON payload: %w", err))
@@ -323,11 +372,28 @@ func (s *Service) PrepareChatCompletion(ctx context.Context, p auth.Principal, c
 	if len(req.Messages) == 0 {
 		return PreparedCompletion{}, invalidInput(errors.New("messages are required"))
 	}
-	originalMessages := cloneMessages(req.Messages)
 	userInput, userIndex := latestUserInput(req.Messages)
 	if strings.TrimSpace(userInput) == "" || userIndex < 0 {
 		return PreparedCompletion{}, invalidInput(errors.New("at least one user message is required"))
 	}
+	userMessage := map[string]any{"role": "user", "content": contentToString(req.Messages[userIndex]["content"])}
+	conversation, err := s.ensureConversation(ctx, p, bot, req)
+	if err != nil {
+		return PreparedCompletion{}, err
+	}
+	historyMessages, historyRefs, historyEvidenceIDs, err := s.authorizedHistory(ctx, p, conversation.ID)
+	if err != nil {
+		return PreparedCompletion{}, err
+	}
+	history := make([]map[string]any, 0, len(historyMessages))
+	for _, message := range historyMessages {
+		history = append(history, map[string]any{"role": message.Role, "content": message.Content})
+	}
+	if err != nil {
+		return PreparedCompletion{}, err
+	}
+	messages := append(history, userMessage)
+	userIndex = len(messages) - 1
 
 	ragResults, ragContext, err := s.retrieveRAG(ctx, p, bot, userInput)
 	if err != nil {
@@ -337,7 +403,7 @@ func (s *Service) PrepareChatCompletion(ctx context.Context, p auth.Principal, c
 	if err != nil {
 		return PreparedCompletion{}, err
 	}
-	providerMessages := applyRenderedPrompt(req.Messages, userIndex, rendered)
+	providerMessages := applyRenderedPrompt(messages, userIndex, rendered)
 	payload["model"] = bot.Model
 	payload["messages"] = providerMessages
 	payload["stream"] = stream
@@ -348,28 +414,22 @@ func (s *Service) PrepareChatCompletion(ctx context.Context, p auth.Principal, c
 	if err != nil {
 		return PreparedCompletion{}, fmt.Errorf("marshal upstream chat request: %w", err)
 	}
-
-	conversation, err := s.ensureConversation(ctx, p, bot, req)
-	if err != nil {
+	if err := s.repo.AddMessage(ctx, Message{
+		TenantID: p.TenantID, ID: newID("chatmsg"), ConversationID: conversation.ID,
+		Role: "user", Content: userMessage["content"].(string), OwnerActorID: p.ActorID,
+	}); err != nil {
 		return PreparedCompletion{}, err
 	}
-	if err := s.recordRequestMessages(ctx, p, conversation.ID, originalMessages); err != nil {
-		return PreparedCompletion{}, err
-	}
+	inputRefs := mergeObjectRefs(historyRefs, ragInputs(ragResults))
+	evidenceIDs := mergeStrings(historyEvidenceIDs, evidenceIDsForResults(ragResults))
 	return PreparedCompletion{
 		Request: inference.Request{
-			Capability: inference.CapabilityChat,
-			Model:      bot.Model,
-			EndpointID: strings.TrimSpace(bot.ProviderID),
-			Payload:    upstreamRequest,
-			Stream:     stream,
-			Inputs:     ragInputs(ragResults),
-			Estimate:   completionEstimate(upstreamRequest),
+			Capability: inference.CapabilityChat, Model: bot.Model,
+			EndpointID: strings.TrimSpace(bot.ProviderID), Payload: upstreamRequest,
+			Stream: stream, Inputs: inputRefs, Estimate: completionEstimate(upstreamRequest),
 		},
-		Conversation:   conversation,
-		Chatbot:        bot,
-		Model:          bot.Model,
-		RAGResultCount: len(ragResults),
+		Conversation: conversation, Chatbot: bot, Model: bot.Model,
+		RAGResultCount: len(ragResults), EvidenceIDs: evidenceIDs, InputRefs: inputRefs,
 	}, nil
 }
 
@@ -395,13 +455,115 @@ func (s *Service) PersistAssistantMessage(ctx context.Context, p auth.Principal,
 		return nil
 	}
 	return s.repo.AddMessage(ctx, Message{
-		TenantID:       p.TenantID,
-		ID:             newID("chatmsg"),
-		ConversationID: prepared.Conversation.ID,
-		Role:           "assistant",
-		Content:        assistantContent,
-		OwnerActorID:   p.ActorID,
+		TenantID: p.TenantID, ID: newID("chatmsg"), ConversationID: prepared.Conversation.ID,
+		Role: "assistant", Content: assistantContent, OwnerActorID: p.ActorID,
+		EvidenceIDs: prepared.EvidenceIDs, InputRefs: prepared.InputRefs,
 	})
+}
+
+// ListConversation filters stored source-derived text against current evidence access.
+func (s *Service) ListConversation(ctx context.Context, p auth.Principal, conversationID string) (ConversationView, error) {
+	if err := requireTenant(p); err != nil {
+		return ConversationView{}, err
+	}
+	conversation, err := s.repo.GetConversation(ctx, p.TenantID, strings.TrimSpace(conversationID))
+	if err != nil {
+		return ConversationView{}, err
+	}
+	if !auth.HasScope(p, "platform.admin") && conversation.OwnerActorID != actorKey(p) {
+		return ConversationView{}, sql.ErrNoRows
+	}
+	bot, err := s.repo.GetByID(ctx, p.TenantID, conversation.ChatbotID)
+	if err != nil || !chatbotAllowed(p, bot) {
+		return ConversationView{}, sql.ErrNoRows
+	}
+	messages, _, _, err := s.authorizedHistory(ctx, p, conversation.ID)
+	if err != nil {
+		return ConversationView{}, err
+	}
+	return ConversationView{Conversation: conversation, Messages: messages}, nil
+}
+
+func (s *Service) authorizedHistory(ctx context.Context, p auth.Principal, conversationID string) ([]Message, []source.ObjectRef, []string, error) {
+	stored, err := s.repo.ListMessages(ctx, p.TenantID, conversationID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var visible []Message
+	var refs []source.ObjectRef
+	var evidenceIDs []string
+	for _, msg := range stored {
+		if msg.Role != "user" && msg.Role != "assistant" {
+			continue
+		}
+		if len(msg.InputRefs) > 0 && len(msg.EvidenceIDs) == 0 {
+			continue
+		}
+		if len(msg.EvidenceIDs) > 0 {
+			resolver, ok := s.rag.(EvidenceResolver)
+			if !ok {
+				continue
+			}
+			if _, err := resolver.ResolveEvidence(ctx, p, msg.EvidenceIDs); err != nil {
+				if errors.Is(err, source.ErrDenied) {
+					continue
+				}
+				return nil, nil, nil, err
+			}
+		}
+		visible = append(visible, msg)
+		refs = mergeObjectRefs(refs, msg.InputRefs)
+		evidenceIDs = mergeStrings(evidenceIDs, msg.EvidenceIDs)
+	}
+	return visible, refs, evidenceIDs, nil
+}
+
+func evidenceIDsForResults(results []rag.SearchResult) []string {
+	var ids []string
+	for _, result := range results {
+		if id := strings.TrimSpace(result.EvidenceID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return mergeStrings(nil, ids)
+}
+
+func mergeStrings(groups ...[]string) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, group := range groups {
+		for _, value := range group {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			if _, ok := seen[value]; ok {
+				continue
+			}
+			seen[value] = struct{}{}
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func mergeObjectRefs(groups ...[]source.ObjectRef) []source.ObjectRef {
+	seen := make(map[string]struct{})
+	var out []source.ObjectRef
+	for _, group := range groups {
+		for _, ref := range group {
+			key := ref.TenantID + "\x00" + ref.ObjectID + "\x00" + fmt.Sprint(ref.ObservedSeq)
+			if ref.ObjectID == "" {
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, ref)
+		}
+	}
+	return out
 }
 
 // ragInputs converts retrieved evidence into the immutable object refs the
@@ -445,13 +607,13 @@ func (s *Service) getByRef(ctx context.Context, p auth.Principal, ref string) (I
 		return Instance{}, sql.ErrNoRows
 	}
 	bot, err := s.repo.GetByID(ctx, p.TenantID, ref)
-	if err == nil {
-		return bot, nil
+	if errors.Is(err, sql.ErrNoRows) {
+		bot, err = s.repo.GetByExternalID(ctx, p.TenantID, ref)
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	if err != nil {
 		return Instance{}, err
 	}
-	return s.repo.GetByExternalID(ctx, p.TenantID, ref)
+	return bot, nil
 }
 
 func (s *Service) renderPrompt(ctx context.Context, p auth.Principal, bot Instance, userInput, ragContext string, metadata map[string]any) (prompts.RenderedPrompt, error) {
@@ -641,7 +803,6 @@ func latestUserInput(messages []map[string]any) (string, int) {
 	}
 	return "", -1
 }
-
 
 func cloneMessages(messages []map[string]any) []map[string]any {
 	out := make([]map[string]any, len(messages))

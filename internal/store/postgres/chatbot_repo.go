@@ -9,6 +9,7 @@ import (
 
 	"enclava-go/internal/chatbot"
 	"enclava-go/internal/inference"
+	"enclava-go/internal/source"
 )
 
 // ChatbotRepo implements chatbot.Repository over the tenant-scoped chatbots,
@@ -195,25 +196,40 @@ func (r *ChatbotRepo) GetConversation(ctx context.Context, tenantID, id string) 
 }
 
 func (r *ChatbotRepo) AddMessage(ctx context.Context, m chatbot.Message) error {
-	_, err := r.db.SQL.ExecContext(ctx, `
-		INSERT INTO messages (tenant_id, id, conversation_id, role, content, owner_actor_id)
-		VALUES ($1, $2, $3, $4, $5, $6)`,
-		m.TenantID, m.ID, m.ConversationID, m.Role, m.Content, nullableText(m.OwnerActorID))
+	if m.EvidenceIDs == nil {
+		m.EvidenceIDs = []string{}
+	}
+	if m.InputRefs == nil {
+		m.InputRefs = []source.ObjectRef{}
+	}
+	evidenceIDs, err := json.Marshal(m.EvidenceIDs)
+	if err != nil {
+		return fmt.Errorf("marshal message evidence ids: %w", err)
+	}
+	inputRefs, err := json.Marshal(m.InputRefs)
+	if err != nil {
+		return fmt.Errorf("marshal message input refs: %w", err)
+	}
+	_, err = r.db.SQL.ExecContext(ctx, `
+		INSERT INTO messages (tenant_id, id, conversation_id, role, content, owner_actor_id, evidence_ids, input_refs)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		m.TenantID, m.ID, m.ConversationID, m.Role, m.Content,
+		nullableText(m.OwnerActorID), evidenceIDs, inputRefs)
 	if err != nil {
 		return fmt.Errorf("add message: %w", err)
 	}
 	return nil
 }
 
-// ListMessages is a repo-level read for tests and replay surfaces; the
-// service authorizes via the owning conversation.
+// ListMessages returns tenant-owned conversation messages in creation order;
+// the service reauthorizes evidence references before replay or display.
 func (r *ChatbotRepo) ListMessages(ctx context.Context, tenantID, conversationID string) ([]chatbot.Message, error) {
 	rows, err := r.db.SQL.QueryContext(ctx, `
 		SELECT tenant_id::text, id, conversation_id, role, content,
-		       COALESCE(owner_actor_id, ''), created_at
+		       COALESCE(owner_actor_id, ''), evidence_ids, input_refs, created_at
 		FROM messages
 		WHERE tenant_id = $1 AND conversation_id = $2
-		ORDER BY created_at ASC`, tenantID, conversationID)
+		ORDER BY created_at ASC, id ASC`, tenantID, conversationID)
 	if err != nil {
 		return nil, fmt.Errorf("list messages: %w", err)
 	}
@@ -222,9 +238,13 @@ func (r *ChatbotRepo) ListMessages(ctx context.Context, tenantID, conversationID
 	out := []chatbot.Message{}
 	for rows.Next() {
 		var m chatbot.Message
-		if err := rows.Scan(&m.TenantID, &m.ID, &m.ConversationID, &m.Role, &m.Content, &m.OwnerActorID, &m.CreatedAt); err != nil {
+		var evidenceIDs, inputRefs []byte
+		if err := rows.Scan(&m.TenantID, &m.ID, &m.ConversationID, &m.Role, &m.Content,
+			&m.OwnerActorID, &evidenceIDs, &inputRefs, &m.CreatedAt); err != nil {
 			return nil, err
 		}
+		_ = json.Unmarshal(evidenceIDs, &m.EvidenceIDs)
+		_ = json.Unmarshal(inputRefs, &m.InputRefs)
 		out = append(out, m)
 	}
 	if err := rows.Err(); err != nil {

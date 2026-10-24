@@ -1,11 +1,13 @@
 package chatbot
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 
 	"enclava-go/internal/billing"
 	"enclava-go/internal/inference"
+	"enclava-go/internal/source"
 )
 
 var (
@@ -49,13 +51,68 @@ type Conversation struct {
 // Message is a tenant-scoped messages row. Token accounting lives on the
 // usage record, not the message row.
 type Message struct {
-	TenantID       string    `json:"-"`
-	ID             string    `json:"id"`
-	ConversationID string    `json:"conversation_id"`
-	Role           string    `json:"role"`
-	Content        string    `json:"content"`
-	OwnerActorID   string    `json:"-"`
-	CreatedAt      time.Time `json:"created_at"`
+	TenantID       string             `json:"-"`
+	ID             string             `json:"id"`
+	ConversationID string             `json:"conversation_id"`
+	Role           string             `json:"role"`
+	Content        string             `json:"content"`
+	OwnerActorID   string             `json:"-"`
+	EvidenceIDs    []string           `json:"evidence_ids,omitempty"`
+	InputRefs      []source.ObjectRef `json:"-"`
+	CreatedAt      time.Time          `json:"created_at"`
+}
+
+// InputRef links generated conversation text to the evidence whose current
+// authorization must still hold before that text can be reused.
+type InputRef struct {
+	EvidenceID string           `json:"evidence_id"`
+	ObjectRef  source.ObjectRef `json:"object_ref"`
+}
+
+type ConversationView struct {
+	Conversation Conversation `json:"conversation"`
+	Messages     []Message    `json:"messages"`
+}
+
+type AssistantRunInput struct {
+	ConversationID string `json:"conversation_id,omitempty"`
+	Input          string `json:"input"`
+}
+
+type AssistantRun struct {
+	ID                    string                     `json:"id"`
+	TenantID              string                     `json:"-"`
+	JobID                 string                     `json:"job_id,omitempty"`
+	OwnerActorID          string                     `json:"-"`
+	ChatbotID             string                     `json:"chatbot_id"`
+	ConversationID        string                     `json:"conversation_id"`
+	Status                string                     `json:"status"`
+	Input                 string                     `json:"input"`
+	Output                string                     `json:"output,omitempty"`
+	Error                 string                     `json:"error,omitempty"`
+	ConfigSnapshot        json.RawMessage            `json:"-"`
+	PromptTemplateID      string                     `json:"prompt_template_id,omitempty"`
+	PromptTemplateVersion int                        `json:"prompt_template_version,omitempty"`
+	EvidenceIDs           []string                   `json:"evidence_ids,omitempty"`
+	InputRefs             []source.ObjectRef         `json:"-"`
+	Restrictions          []source.SourceRestriction `json:"-"`
+	FenceToken            int64                      `json:"-"`
+	CreatedAt             time.Time                  `json:"created_at"`
+	UpdatedAt             time.Time                  `json:"updated_at"`
+}
+
+type AssistantRunAttempt struct {
+	TenantID  string    `json:"-"`
+	RunID     string    `json:"run_id"`
+	Number    int       `json:"number"`
+	Kind      string    `json:"kind"`
+	Name      string    `json:"name"`
+	Status    string    `json:"status"`
+	Input     string    `json:"input,omitempty"`
+	Output    string    `json:"output,omitempty"`
+	Error     string    `json:"error,omitempty"`
+	StartedAt time.Time `json:"started_at"`
+	EndedAt   time.Time `json:"ended_at,omitempty"`
 }
 
 type CreateChatbotInput struct {
@@ -98,4 +155,6 @@ type PreparedCompletion struct {
 	Chatbot        Instance
 	Model          string
 	RAGResultCount int
+	EvidenceIDs    []string
+	InputRefs      []source.ObjectRef
 }

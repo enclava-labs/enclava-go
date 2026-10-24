@@ -62,6 +62,65 @@ func (s *Service) ResolveEvidence(ctx context.Context, p auth.Principal, ids []s
 	return results, nil
 }
 
+type EvidenceText struct {
+	EvidenceID   string        `json:"evidence_id"`
+	DocumentID   string        `json:"document_id"`
+	CollectionID string        `json:"collection_id"`
+	Content      string        `json:"content"`
+	Spans        []source.Span `json:"spans,omitempty"`
+}
+
+// ReadEvidence returns one chunk only while its exact published version and
+// source authorization remain current.
+func (s *Service) ReadEvidence(ctx context.Context, p auth.Principal, id string) (EvidenceText, error) {
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(p.TenantID) == "" {
+		return EvidenceText{}, source.ErrDenied
+	}
+	record, err := s.repo.GetEvidence(ctx, p.TenantID, strings.TrimSpace(id))
+	if denied, failure := deniedOrFailed(err); denied {
+		return EvidenceText{}, source.ErrDenied
+	} else if failure != nil {
+		return EvidenceText{}, failure
+	}
+	if _, _, err := s.authorizedEvidenceSource(ctx, p, record); err != nil {
+		if errors.Is(err, source.ErrDenied) {
+			return EvidenceText{}, source.ErrDenied
+		}
+		return EvidenceText{}, err
+	}
+	generations, err := s.repo.ListPublishedGenerations(ctx, p.TenantID, record.CollectionID)
+	if err != nil {
+		return EvidenceText{}, err
+	}
+	current := false
+	for _, generation := range generations {
+		if generation.ObjectID == record.ObjectID &&
+			generation.ObjectVersionID == record.ObjectVersionID &&
+			generation.Generation == record.Generation &&
+			generation.State == "published" && !generation.Tombstoned {
+			current = true
+			break
+		}
+	}
+	if !current {
+		return EvidenceText{}, source.ErrDenied
+	}
+	chunks, err := s.repo.ListGenerationChunks(ctx, p.TenantID, record.CollectionID, record.ObjectVersionID, record.Generation)
+	if err != nil {
+		return EvidenceText{}, err
+	}
+	for _, chunk := range chunks {
+		if chunk.ID != record.ChunkID || chunk.DocumentID != record.ObjectID {
+			continue
+		}
+		return EvidenceText{
+			EvidenceID: record.ID, DocumentID: record.ObjectID,
+			CollectionID: record.CollectionID, Content: chunk.Content, Spans: record.SpanRefs,
+		}, nil
+	}
+	return EvidenceText{}, source.ErrDenied
+}
+
 func (s *Service) authorizedEvidenceSource(ctx context.Context, p auth.Principal, record EvidenceRecord) (source.Object, source.ObjectVersion, error) {
 	if _, err := s.GetCollection(ctx, p, record.CollectionID); err != nil {
 		if errors.Is(err, source.ErrDenied) {
