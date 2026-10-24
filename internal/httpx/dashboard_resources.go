@@ -140,7 +140,14 @@ func (a *App) handleDashboardPageRAG(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleDashboardPageChatbots(w http.ResponseWriter, r *http.Request) {
-	a.renderDashboardResourcePage(w, r, "chatbots", "Chatbots", "External chatbot endpoints and model bindings", "/dashboard/partials/chatbots", "dashboard-chatbots", "Loading chatbots...")
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	if err := dashboardTemplates.ExecuteTemplate(w, "page-agents", a.dashboardPageData(r, "chatbots", "Assistants")); err != nil {
+		log.Printf("failed to render assistant dashboard: %v", err)
+		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_agents_page_failed")
+	}
 }
 
 func (a *App) handleDashboardPagePromptTemplates(w http.ResponseWriter, r *http.Request) {
@@ -633,6 +640,13 @@ func (a *App) handleDashboardChatbotAction(r *http.Request, p auth.Principal) (s
 		settings, err := dashboardJSONMap(r.FormValue("settings_json"))
 		if err != nil {
 			return "", "Settings must be valid JSON"
+		}
+		if toolsRaw := strings.TrimSpace(r.FormValue("tools_json")); toolsRaw != "" {
+			var tools []string
+			if err := json.Unmarshal([]byte(toolsRaw), &tools); err != nil {
+				return "", "Tool IDs must be a JSON array of strings"
+			}
+			settings["tools"] = tools
 		}
 		if _, err := a.chatbotSvc.Create(r.Context(), p, chatbot.CreateChatbotInput{
 			Name:             r.FormValue("name"),

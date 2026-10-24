@@ -4,35 +4,17 @@
 {{if .Error}}<div class="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800 dark:border-red-900/40 dark:bg-red-950/30 dark:text-red-200">{{.Error}}</div>{{end}}
 
 <div class="rounded-lg border bg-card p-5">
-  <form class="grid gap-4 md:grid-cols-6" hx-post="/dashboard/partials/chatbots" hx-target="#dashboard-chatbots" hx-swap="innerHTML">
+  <form class="grid gap-4 md:grid-cols-3" hx-post="/dashboard/partials/chatbots" hx-target="#dashboard-chatbots" hx-swap="innerHTML">
     <input type="hidden" name="action" value="create_chatbot">
-    <label class="space-y-1 text-sm font-medium">
-      <span>Name</span>
-      <input class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="name" required>
-    </label>
-    <label class="space-y-1 text-sm font-medium">
-      <span>Model</span>
-      <input class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="model" required>
-    </label>
-    <label class="space-y-1 text-sm font-medium">
-      <span>Prompt template</span>
-      <select class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="prompt_template_id">
-        <option value="">Use service default</option>
-        {{range .PromptTemplates}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
-      </select>
-    </label>
-    <label class="space-y-1 text-sm font-medium">
-      <span>RAG collection</span>
-      <select class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="rag_collection_id">
-        <option value="">Do not attach collection</option>
-        {{range .Collections}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
-      </select>
-    </label>
-    <label class="space-y-1 text-sm font-medium">
-      <span>External ID</span>
-      <input class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="external_id">
-    </label>
-    <button class="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground" type="submit">Create</button>
+    <label class="space-y-1 text-sm font-medium"><span>Name</span><input class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="name" required></label>
+    <label class="space-y-1 text-sm font-medium"><span>Model</span><input class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="model" required></label>
+    <label class="space-y-1 text-sm font-medium"><span>Provider route (optional)</span><input class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="provider_id"></label>
+    <label class="space-y-1 text-sm font-medium"><span>Prompt template / instructions</span><select class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="prompt_template_id"><option value="">Use service default</option>{{range .PromptTemplates}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select></label>
+    <label class="space-y-1 text-sm font-medium"><span>Permitted knowledge collection</span><select class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="rag_collection_id"><option value="">Do not attach collection</option>{{range .Collections}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select></label>
+    <label class="space-y-1 text-sm font-medium"><span>External ID</span><input class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="external_id"></label>
+    <label class="space-y-1 text-sm font-medium md:col-span-3"><span>Description</span><input class="w-full rounded-md border bg-background px-3 py-2 text-sm font-normal" name="description"></label>
+    <label class="space-y-1 text-sm font-medium md:col-span-2"><span>Enabled tool IDs (JSON array)</span><input class="w-full rounded-md border bg-background px-3 py-2 text-sm font-mono font-normal" name="tools_json" placeholder='["knowledge.search","evidence.read"]'><span class="block text-xs text-muted-foreground">Built-ins: knowledge.search, evidence.read, extract.submit, extract.status. MCP IDs work only after administrator approval.</span></label>
+    <button class="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground" type="submit">Create assistant</button>
   </form>
 </div>
 
