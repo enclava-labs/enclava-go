@@ -60,9 +60,13 @@ func (a *App) handleChatbotByID(w http.ResponseWriter, r *http.Request, principa
 		WriteOpenAIError(w, http.StatusNotImplemented, "chatbots are not configured", "server_error", "not_configured")
 		return
 	}
-	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/chatbots/"), "/")
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/chatbots/")
+	if path == r.URL.Path {
+		path = strings.TrimPrefix(r.URL.Path, "/api/v1/agents/")
+	}
+	id := strings.Trim(path, "/")
 	if id == "" {
-		WriteOpenAIError(w, http.StatusBadRequest, "chatbot id is required", "invalid_request_error", "missing_chatbot")
+		WriteOpenAIError(w, http.StatusBadRequest, "agent id is required", "invalid_request_error", "missing_agent")
 		return
 	}
 	switch r.Method {
@@ -406,4 +410,72 @@ func writeChatbotNotFoundOrError(w http.ResponseWriter, err error, code string) 
 	}
 	log.Printf("chatbot error: %v", err)
 	WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", code)
+}
+
+func (a *App) handleAgentRuns(w http.ResponseWriter, r *http.Request, p auth.Principal) {
+	if a.chatbotSvc == nil {
+		WriteOpenAIError(w, http.StatusNotImplemented, "agent runs are not configured", "server_error", "not_configured")
+		return
+	}
+	if r.Method != http.MethodPost {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	var input struct {
+		AssistantID string `json:"assistant_id"`
+		chatbot.AssistantRunInput
+	}
+	if err := DecodeJSON(r, &input); err != nil {
+		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
+		return
+	}
+	run, err := a.chatbotSvc.StartRun(r.Context(), p, input.AssistantID, input.AssistantRunInput)
+	if err != nil {
+		writeChatbotNotFoundOrError(w, err, "agent_run_start_failed")
+		return
+	}
+	WriteJSON(w, http.StatusAccepted, run)
+}
+
+func (a *App) handleAgentRunByID(w http.ResponseWriter, r *http.Request, p auth.Principal) {
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/agent-runs/"), "/")
+	if id == "" || a.chatbotSvc == nil {
+		http.NotFound(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		run, err := a.chatbotSvc.GetRun(r.Context(), p, id)
+		if err != nil {
+			writeChatbotNotFoundOrError(w, err, "agent_run_fetch_failed")
+			return
+		}
+		WriteJSON(w, http.StatusOK, run)
+	case http.MethodDelete:
+		if err := a.chatbotSvc.CancelRun(r.Context(), p, id); err != nil {
+			writeChatbotNotFoundOrError(w, err, "agent_run_cancel_failed")
+			return
+		}
+		WriteJSON(w, http.StatusOK, map[string]any{"cancelled": true, "id": id})
+	default:
+		WriteMethodNotAllowed(w)
+	}
+}
+
+func (a *App) handleConversationByID(w http.ResponseWriter, r *http.Request, p auth.Principal) {
+	if a.chatbotSvc == nil {
+		WriteOpenAIError(w, http.StatusNotImplemented, "chatbot service is not configured", "server_error", "not_configured")
+		return
+	}
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/conversations/"), "/")
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	view, err := a.chatbotSvc.ListConversation(r.Context(), p, id)
+	if err != nil {
+		writeChatbotNotFoundOrError(w, err, "conversation_fetch_failed")
+		return
+	}
+	WriteJSON(w, http.StatusOK, view)
 }

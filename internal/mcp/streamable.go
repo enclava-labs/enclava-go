@@ -218,6 +218,139 @@ func (t *StreamableHTTP) Call(ctx context.Context, s Server, a Approval, remote 
 	return payload, nil
 }
 
+type DiscoveredTool struct {
+	Name         string          `json:"name"`
+	InputSchema  json.RawMessage `json:"inputSchema"`
+	OutputSchema json.RawMessage `json:"outputSchema"`
+}
+
+// Discover lists a bounded snapshot without approving or enabling any tool.
+func (t *StreamableHTTP) Discover(ctx context.Context, s Server) ([]DiscoveredTool, error) {
+	if t == nil || !s.Enabled {
+		return nil, ErrDenied
+	}
+	origin, err := ValidateOrigin(s.Origin, s.AuthorizedPrivate)
+	if err != nil {
+		return nil, err
+	}
+	path, err := ValidateEndpointPath(s.EndpointPath)
+	if err != nil {
+		return nil, err
+	}
+	u, err := url.Parse(origin + path)
+	if err != nil {
+		return nil, ErrDenied
+	}
+	t.once.Do(func() { t.slots = make(chan struct{}, maxConcurrentCalls) })
+	select {
+	case t.slots <- struct{}{}:
+		defer func() { <-t.slots }()
+	default:
+		return nil, ErrOverloaded
+	}
+	client := t.httpClient(s.AuthorizedPrivate)
+	cred := ""
+	if s.CredentialRef != "" {
+		if t.Credential == nil {
+			return nil, ErrDenied
+		}
+		cred, err = t.Credential.Resolve(s.TenantID, "mcp", origin, s.CredentialRef)
+		if err != nil {
+			return nil, ErrDenied
+		}
+	}
+	callCtx, cancel := context.WithTimeout(ctx, maxCallDuration)
+	defer cancel()
+	id := t.next.Add(1)
+	init, err := t.post(callCtx, client, u, cred, "", rpcRequest{
+		JSONRPC: "2.0", ID: id, Method: "initialize",
+		Params: map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]string{"name": "enclava", "version": "1"}},
+	}, maxProtocolBody)
+	if err != nil {
+		return nil, err
+	}
+	session := init.Header.Get("Mcp-Session-Id")
+	defer func() {
+		if session == "" {
+			return
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cleanupCancel()
+		req, err := http.NewRequestWithContext(cleanupCtx, http.MethodDelete, u.String(), nil)
+		if err == nil {
+			req.Header.Set("Mcp-Session-Id", session)
+			if cred != "" {
+				req.Header.Set("Authorization", "Bearer "+cred)
+			}
+			if resp, err := client.Do(req); err == nil {
+				_ = resp.Body.Close()
+			}
+		}
+	}()
+	initBody, readErr := readBounded(init.Body, maxProtocolBody)
+	_ = init.Body.Close()
+	if readErr != nil || validRPC(initBody, id) != nil {
+		return nil, ErrDenied
+	}
+	var initialized struct {
+		Result struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(initBody, &initialized) != nil || initialized.Result.ProtocolVersion == "" {
+		return nil, ErrDenied
+	}
+	if err = t.postNotify(callCtx, client, u, cred, session, "notifications/initialized", nil); err != nil {
+		return nil, err
+	}
+	listID := t.next.Add(1)
+	list, err := t.post(callCtx, client, u, cred, session, rpcRequest{JSONRPC: "2.0", ID: listID, Method: "tools/list", Params: map[string]any{"limit": maxDiscoveryTools}}, maxProtocolBody)
+	if err != nil {
+		return nil, err
+	}
+	defer list.Body.Close()
+	if session != "" && list.Header.Get("Mcp-Session-Id") != "" && list.Header.Get("Mcp-Session-Id") != session {
+		return nil, ErrDenied
+	}
+	body, err := readBounded(list.Body, maxProtocolBody)
+	if err != nil || validRPC(body, listID) != nil {
+		return nil, ErrDenied
+	}
+	var response struct {
+		Result struct {
+			Tools      []DiscoveredTool `json:"tools"`
+			NextCursor string           `json:"nextCursor"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(body, &response) != nil || response.Result.NextCursor != "" || len(response.Result.Tools) > maxDiscoveryTools {
+		return nil, ErrDenied
+	}
+	seen := make(map[string]struct{}, len(response.Result.Tools))
+	for i := range response.Result.Tools {
+		tool := &response.Result.Tools[i]
+		if tool.Name == "" || !json.Valid(tool.InputSchema) {
+			return nil, ErrDenied
+		}
+		if len(tool.OutputSchema) == 0 {
+			tool.OutputSchema = json.RawMessage(`{}`)
+		}
+		if !json.Valid(tool.OutputSchema) {
+			return nil, ErrDenied
+		}
+		if _, ok := seen[tool.Name]; ok {
+			return nil, ErrDenied
+		}
+		seen[tool.Name] = struct{}{}
+		if _, err := CompileSchema(tool.InputSchema); err != nil {
+			return nil, ErrDenied
+		}
+		if _, err := CompileSchema(tool.OutputSchema); err != nil {
+			return nil, ErrDenied
+		}
+	}
+	return response.Result.Tools, nil
+}
+
 func (t *StreamableHTTP) postNotify(ctx context.Context, c *http.Client, u *url.URL, cred, session, method string, params any) error {
 	req := rpcRequest{JSONRPC: "2.0", Method: method, Params: params}
 	_, err := t.post(ctx, c, u, cred, session, req, maxProtocolBody)

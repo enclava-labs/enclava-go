@@ -36,6 +36,7 @@ type Approval struct {
 }
 type Repository interface {
 	GetServer(context.Context, string, string) (Server, error)
+	ListServers(context.Context, string) ([]Server, error)
 	GetApproval(context.Context, string, string, string) (Approval, error)
 	ListApprovals(context.Context, string, string) ([]Approval, error)
 }

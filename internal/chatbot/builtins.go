@@ -41,9 +41,16 @@ type Builtins struct {
 }
 
 func BuiltinToolDefinitions(bot Instance) ([]map[string]any, error) {
+	return builtinToolDefinitions(bot, nil)
+}
+
+func builtinToolDefinitions(bot Instance, allowedMCP map[string]struct{}) ([]map[string]any, error) {
 	ids := configuredToolIDs(bot)
 	tools := make([]map[string]any, 0, len(ids))
 	for _, id := range ids {
+		if _, ok := allowedMCP[id]; ok {
+			continue
+		}
 		schema, ok := builtinSchemas[id]
 		if !ok {
 			return nil, fmt.Errorf("chatbot: unknown built-in tool %q", id)

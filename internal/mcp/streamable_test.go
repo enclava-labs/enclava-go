@@ -73,6 +73,14 @@ func TestStreamableHTTPCallChecksApprovedSchemaAndUsesSession(t *testing.T) {
 	if strings.Join(methods, ",") != "initialize,notifications/initialized,tools/list,tools/call" {
 		t.Fatalf("methods=%v", methods)
 	}
+	methods = nil
+	discovered, err := (&StreamableHTTP{}).Discover(context.Background(), Server{TenantID: "t", Origin: srv.URL, EndpointPath: "/mcp", AuthorizedPrivate: true, Enabled: true})
+	if err != nil || len(discovered) != 1 || discovered[0].Name != "remote" {
+		t.Fatalf("discovery=%v err=%v", discovered, err)
+	}
+	if strings.Join(methods, ",") != "initialize,notifications/initialized,tools/list" {
+		t.Fatalf("discovery methods=%v", methods)
+	}
 }
 func TestStreamableHTTPDoesNotFollowRedirect(t *testing.T) {
 	var targetCalls int

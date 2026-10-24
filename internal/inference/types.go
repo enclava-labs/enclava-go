@@ -27,6 +27,7 @@ const (
 	CapabilityVision     = "vision"
 	CapabilityResponses  = "responses"
 	CapabilityCompact    = "responses/compact"
+	CapabilityMCP        = "mcp"
 )
 
 // Capability prefix that binds an approved model alias to an upstream model

@@ -94,6 +94,34 @@ func TestRevokedKeyDeniesImmediately(t *testing.T) {
 	}
 }
 
+func TestCurrentPrincipalReloadsAPIKeyGrantsAndRevocation(t *testing.T) {
+	db, repo, svc, tenant := seedEnv(t)
+	user := testdb.SeedUser(t, db, tenant, "worker@example.com", nil)
+	key, record := testdb.SeedAPIKey(t, db, tenant, testdb.SeedKeySpec{Name: "worker", OwnerUserID: user.ID, Scopes: []string{"chatbot"}})
+	frozen, err := svc.Authenticate(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := repo.GetAPIKey(context.Background(), tenant, record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored.Scopes = json.RawMessage(`{"mode":"list","items":["mcp.use"]}`)
+	if err := repo.UpdateAPIKey(context.Background(), tenant, stored); err != nil {
+		t.Fatal(err)
+	}
+	current, err := svc.CurrentPrincipal(context.Background(), frozen)
+	if err != nil || auth.HasScope(current, "chatbot") || !auth.HasScope(current, "mcp.use") {
+		t.Fatalf("refreshed scopes=%v err=%v", current.Scopes, err)
+	}
+	if err := repo.RevokeAPIKey(context.Background(), tenant, record.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CurrentPrincipal(context.Background(), frozen); err == nil {
+		t.Fatal("revoked key remained valid for worker")
+	}
+}
+
 func TestExpiredKeyDenied(t *testing.T) {
 	db, _, svc, tenant := seedEnv(t)
 	user := testdb.SeedUser(t, db, tenant, "u@example.com", nil)

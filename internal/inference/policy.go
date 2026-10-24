@@ -507,6 +507,22 @@ func (s *Service) AuthorizeDestination(ctx context.Context, p auth.Principal, re
 	return s.evaluate(ctx, p, req, dest, capability)
 }
 
+// AuthorizeMCPInput reauthorizes retained source inputs and applies their
+// current processing restrictions before an approved external MCP side effect.
+func (s *Service) AuthorizeMCPInput(ctx context.Context, p auth.Principal, inputs []source.ObjectRef) error {
+	if p.TenantID == "" {
+		return ErrDenied
+	}
+	effective, err := s.resolveInputs(ctx, p, Request{Inputs: inputs})
+	if err != nil {
+		return err
+	}
+	if restrictionDenies(effective, CapabilityMCP) || restrictionDenies(effective, "remote_mcp") {
+		return ErrDenied
+	}
+	return nil
+}
+
 // evaluate checks one candidate endpoint for one request after payload
 // analysis: enablement, actor endpoint/model allowlists, the approved model
 // alias binding, advertised capability, the merged input/tenant/request

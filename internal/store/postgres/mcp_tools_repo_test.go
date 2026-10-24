@@ -63,8 +63,8 @@ func TestMCPApprovalTenantSchemaRevisionAndRevocation(t *testing.T) {
 	if err = db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM mcp_tool_approval_history WHERE tenant_id=$1::uuid AND server_id='srv' AND tool_id='tool1'`, idTenantA).Scan(&revisions); err != nil {
 		t.Fatal(err)
 	}
-	if revisions != 2 {
-		t.Fatalf("history revisions=%d want 2", revisions)
+	if revisions != 3 {
+		t.Fatalf("history revisions=%d want 3", revisions)
 	}
 }
 

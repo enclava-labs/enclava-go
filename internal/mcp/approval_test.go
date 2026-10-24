@@ -52,6 +52,7 @@ func (r testRepo) GetServer(_ context.Context, tenant, id string) (Server, error
 	}
 	return r.s, nil
 }
+func (r testRepo) ListServers(context.Context, string) ([]Server, error) { return []Server{r.s}, nil }
 func (r testRepo) GetApproval(_ context.Context, tenant, server, tool string) (Approval, error) {
 	if tenant != r.a.TenantID || server != r.a.ServerID || tool != r.a.ToolID || !r.a.Enabled {
 		return Approval{}, errors.New("not found")

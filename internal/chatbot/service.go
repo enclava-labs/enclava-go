@@ -48,6 +48,15 @@ type RunRepository interface {
 	AddRunMessage(ctx context.Context, message Message, jobID, owner string, fence int64) error
 }
 
+type MCPInputAuthorizer interface {
+	AuthorizeMCPInput(context.Context, auth.Principal, []source.ObjectRef) error
+}
+
+type MCPToolDispatcher interface {
+	Definitions(context.Context, auth.Principal, Instance) ([]map[string]any, error)
+	Invoke(context.Context, auth.Principal, Instance, string, json.RawMessage, []source.ObjectRef) (BuiltinResult, error)
+}
+
 type RunPrincipalResolver interface {
 	CurrentPrincipal(ctx context.Context, frozen auth.Principal) (auth.Principal, error)
 }
@@ -86,11 +95,14 @@ type Service struct {
 	prompts           PromptRepository
 	rag               RAGSearcher
 	executor          Executor
+	mcpTools          MCPToolDispatcher
 	runRepo           RunRepository
 	jobSvc            *jobs.Service
 	extractor         Extractor
 	principalResolver RunPrincipalResolver
 }
+
+func (s *Service) ConfigureMCP(dispatcher MCPToolDispatcher) { s.mcpTools = dispatcher }
 
 func NewService(repo Repository, promptRepo PromptRepository, ragSvc RAGSearcher, executor Executor) *Service {
 	return &Service{repo: repo, prompts: promptRepo, rag: ragSvc, executor: executor}

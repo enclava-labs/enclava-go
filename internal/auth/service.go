@@ -130,6 +130,39 @@ func (s *Service) Authenticate(ctx context.Context, plaintext string) (Principal
 	return Principal{}, errInvalidCredential
 }
 
+// CurrentPrincipal reloads credential and actor grants for a durable operation.
+func (s *Service) CurrentPrincipal(ctx context.Context, frozen Principal) (Principal, error) {
+	if frozen.TenantID == "" || frozen.CredentialID == "" {
+		return Principal{}, errInvalidCredential
+	}
+	switch frozen.CredentialKind {
+	case CredentialKindAPIKey:
+		key, err := s.repo.GetAPIKey(ctx, frozen.TenantID, frozen.CredentialID)
+		if err != nil || !key.IsActive || key.RevokedAt != nil || key.ExpiresAt != nil && time.Now().After(*key.ExpiresAt) {
+			return Principal{}, errInvalidCredential
+		}
+		return s.principalFromKey(ctx, key)
+	case CredentialKindSession:
+		session, err := s.repo.GetSession(ctx, frozen.TenantID, frozen.CredentialID)
+		now := time.Now().UTC()
+		if err != nil || session.RevokedAt != nil || now.After(session.ExpiresAt) || now.After(session.IdleExpiresAt) {
+			return Principal{}, errInvalidCredential
+		}
+		user, err := s.repo.GetUser(ctx, frozen.TenantID, session.UserID)
+		if err != nil || user.Status != "active" {
+			return Principal{}, errInvalidCredential
+		}
+		principal, err := s.principalForUser(ctx, user)
+		if err != nil {
+			return Principal{}, err
+		}
+		principal.CredentialID, principal.CredentialKind, principal.SessionID = session.ID, CredentialKindSession, session.ID
+		return principal, nil
+	default:
+		return Principal{}, errInvalidCredential
+	}
+}
+
 func (s *Service) principalFromKey(ctx context.Context, key APIKeyRecord) (Principal, error) {
 	tenantID := key.TenantID
 	principal := Principal{

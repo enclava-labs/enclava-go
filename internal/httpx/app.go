@@ -17,6 +17,7 @@ import (
 	"enclava-go/internal/extract"
 	"enclava-go/internal/inference"
 	"enclava-go/internal/llm"
+	"enclava-go/internal/mcp"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
 	"enclava-go/internal/store/postgres"
@@ -47,6 +48,8 @@ type App struct {
 	bindings     *postgres.ResponseBindingsRepo
 	sourceRepo   *postgres.SourceRepo
 	artifactRepo *postgres.ArtifactRepo
+	mcpRepo      *postgres.MCPToolsRepo
+	mcpTransport *mcp.StreamableHTTP
 	rl           *RateLimiter
 	gate         *inferenceGate
 	mux          *http.ServeMux
@@ -169,6 +172,11 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/api/v1/prompt-templates/", a.authenticated("chatbot", a.handlePromptTemplateByID))
 	a.mux.HandleFunc("/api/v1/chatbots", a.authenticated("chatbot", a.handleChatbots))
 	a.mux.HandleFunc("/api/v1/chatbots/", a.authenticated("chatbot", a.handleChatbotByID))
+	a.mux.HandleFunc("/api/v1/agents", a.authenticated("chatbot", a.handleChatbots))
+	a.mux.HandleFunc("/api/v1/agents/", a.authenticated("chatbot", a.handleChatbotByID))
+	a.mux.HandleFunc("/api/v1/agent-runs", a.authenticated("chatbot", a.handleAgentRuns))
+	a.mux.HandleFunc("/api/v1/agent-runs/", a.authenticated("chatbot", a.handleAgentRunByID))
+	a.mux.HandleFunc("/api/v1/conversations/", a.authenticated("chatbot", a.handleConversationByID))
 
 	a.mux.HandleFunc("/api/v1/connectors/sources", a.authenticated("connectors.manage", a.handleConnectorSources))
 	// 01-29: the selected public OpenAI core API — model-alias metadata plus

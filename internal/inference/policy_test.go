@@ -55,6 +55,24 @@ func TestInputRestrictionDeniesCapability(t *testing.T) {
 	}
 }
 
+func TestAuthorizeMCPInputRechecksSourcesAndRestrictions(t *testing.T) {
+	f := newFx(t)
+	f.obj(t, "doc-mcp")
+	inputs := []source.ObjectRef{{ObjectID: "doc-mcp", ObservedSeq: 1}}
+	if err := f.svc.AuthorizeMCPInput(f.ctx, f.principal, inputs); err != nil {
+		t.Fatalf("authorized MCP input denied: %v", err)
+	}
+	if err := f.sources.SetRestriction(f.ctx, source.SourceRestriction{
+		TenantID: f.tenant, SubjectKind: source.RestrictionObject, SubjectID: "doc-mcp",
+		DeniedCapabilities: []string{inference.CapabilityMCP},
+	}); err != nil {
+		t.Fatalf("set MCP restriction: %v", err)
+	}
+	if err := f.svc.AuthorizeMCPInput(f.ctx, f.principal, inputs); !errors.Is(err, inference.ErrDenied) {
+		t.Fatalf("restricted MCP input error=%v", err)
+	}
+}
+
 func TestNarrowingCanTightenNeverWiden(t *testing.T) {
 	f := newFx(t)
 	f.mkEndpoint(t)

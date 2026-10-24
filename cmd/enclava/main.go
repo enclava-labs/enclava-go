@@ -23,6 +23,7 @@ import (
 	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
 	"enclava-go/internal/llm"
+	"enclava-go/internal/mcp"
 	extractmodule "enclava-go/internal/modules/extract"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
@@ -73,6 +74,7 @@ func main() {
 	chunkProfilesRepo := postgres.NewChunkProfilesRepo(pgDB)
 	ragRepo := postgres.NewRAGRepo(pgDB)
 	bindingsRepo := postgres.NewResponseBindingsRepo(pgDB)
+	mcpRepo := postgres.NewMCPToolsRepo(pgDB)
 	sourceRepo := postgres.NewSourceRepo(pgDB)
 
 	// Durable artifacts under <data>/artifacts, scratch under <data>/scratch —
@@ -130,6 +132,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("secret binding error: %v", err)
 	}
+	mcpTransport := &mcp.StreamableHTTP{Credential: secretResolver, ClientName: "enclava", ClientVersion: "1"}
+	mcpExecutor := &mcp.Executor{Repository: mcpRepo, Caller: chatbot.MCPCaller{}, Transport: mcpTransport}
 	inferenceSvc, err := inference.NewService(inference.Deps{
 		Endpoints:     endpointsRepo,
 		Sources:       sourceRepo,
@@ -216,6 +220,10 @@ func main() {
 	}
 	connectorSvc.SetSyncDependencies(adapterFactories, postgres.NewConnectorObservationsRepo(pgDB), artifactStore, sourceRepo)
 
+	chatbotSvc := chatbot.NewService(chatbotRepo, promptRepo, ragSvc, inferenceSvc)
+	chatbotSvc.ConfigureRuns(postgres.NewChatbotRunsRepo(pgDB), jobsSvc, extractSvc, authSvc)
+	chatbotSvc.ConfigureMCP(chatbot.MCPRunTools{Executor: mcpExecutor, Authorizer: inferenceSvc})
+
 	// Worker: extract, preview and embed jobs use the same durable runner.
 	jobsRunner := jobs.NewRunner(jobsSvc, artifactStore, map[string]jobs.HandlerFunc{
 		extract.OperationProcess: extractSvc.JobHandler(),
@@ -225,6 +233,7 @@ func main() {
 		rag.OperationIngest:      ragSvc.IngestJobHandler(),
 		rag.OperationAccess:      ragSvc.AccessJobHandler(),
 		connectors.OperationSync: connectorSvc.JobHandler(),
+		chatbot.RunOperation:     chatbotSvc.JobHandler(),
 	}, jobs.RunnerConfig{})
 	runnerCtx, stopRunner := context.WithCancel(context.Background())
 	go previewSvc.RunRetention(runnerCtx)
@@ -244,7 +253,6 @@ func main() {
 		connectors.NewScheduler(connectorSvc).Run(runnerCtx)
 	}()
 
-	chatbotSvc := chatbot.NewService(chatbotRepo, promptRepo, ragSvc, inferenceSvc)
 	promptSvc := prompts.NewService(promptRepo, chatbotSvc)
 
 	// Browser dashboard login runs on the server-session handlers from 01-12;
@@ -282,6 +290,7 @@ func main() {
 		sourceRepo,
 		artifactRepo,
 	)
+	app.ConfigureMCP(mcpRepo, mcpTransport)
 
 	// The extract module mounts its API routes on the app's mux — every
 	// processing call it makes funnels through the shared executor.

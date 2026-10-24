@@ -300,9 +300,40 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 	inputRefs := mergeObjectRefs(historyRefs, ragInputs(ragResults))
 	evidenceIDs := mergeStrings(historyEvidence, evidenceIDsForResults(ragResults))
 	payload := map[string]any{"model": bot.Model, "messages": messages, "stream": false}
-	definitions, err := BuiltinToolDefinitions(bot)
+	var definitions []map[string]any
+	var mcpDefinitions []map[string]any
+	if s.mcpTools != nil {
+		mcpDefinitions, err = s.mcpTools.Definitions(ctx, p, bot)
+	}
 	if err != nil {
 		return "", err
+	}
+	if len(mcpDefinitions) > 0 {
+		approved := make(map[string]struct{}, len(mcpDefinitions))
+		for _, tool := range mcpDefinitions {
+			function, _ := tool["function"].(map[string]any)
+			name, _ := function["name"].(string)
+			approved[name] = struct{}{}
+		}
+		for _, id := range configuredToolIDs(bot) {
+			if _, builtin := builtinSchemas[id]; builtin {
+				continue
+			}
+			if _, ok := approved[id]; !ok {
+				return "", ErrInvalidInput
+			}
+		}
+		definitions, err = builtinToolDefinitions(bot, approved)
+		if err != nil {
+			return "", err
+		}
+		definitions = append(definitions, mcpDefinitions...)
+	}
+	if len(mcpDefinitions) == 0 {
+		definitions, err = BuiltinToolDefinitions(bot)
+		if err != nil {
+			return "", err
+		}
 	}
 	if len(definitions) > 0 {
 		payload["tools"] = definitions
@@ -447,7 +478,15 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 				}
 				dispatched = true
 			}
-			toolResult, invokeErr := builtins.Invoke(ctx, p, bot, call.Name, call.Arguments, inputRefs)
+			var toolResult BuiltinResult
+			var invokeErr error
+			if _, isBuiltin := builtinSchemas[call.Name]; isBuiltin {
+				toolResult, invokeErr = builtins.Invoke(ctx, p, bot, call.Name, call.Arguments, inputRefs)
+			} else if s.mcpTools != nil {
+				toolResult, invokeErr = s.mcpTools.Invoke(ctx, p, bot, call.Name, call.Arguments, inputRefs)
+			} else {
+				invokeErr = ErrInvalidInput
+			}
 			if invokeErr != nil {
 				toolAttempt.Status = "failed"
 				toolAttempt.Error = invokeErr.Error()

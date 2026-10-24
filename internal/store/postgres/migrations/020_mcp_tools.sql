@@ -10,7 +10,7 @@ CREATE TABLE mcp_servers (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, id),
-    CHECK (base_origin ~ '^https://[^/@?#]+$' OR (authorized_private AND base_origin ~ '^http://(localhost|127\\.0\\.0\\.1|\\[::1\\])(:[0-9]+)?$'))
+    CHECK (base_origin ~ '^https://[^/@?#]+$' OR (authorized_private AND base_origin ~ '^http://(localhost|127[.]0[.]0[.]1|\\[::1\\])(:[0-9]+)?$'))
 );
 
 CREATE TABLE mcp_tool_approvals (

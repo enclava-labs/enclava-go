@@ -71,6 +71,20 @@ func (r *MCPToolsRepo) Approve(ctx context.Context, a MCPToolApproval) error {
 	if a.TenantID == "" || a.ServerID == "" || a.ToolID == "" || a.ModelName == "" || a.RemoteName == "" || a.SchemaVersion < 1 || !json.Valid(a.InputSchema) || !json.Valid(a.OutputSchema) || !validScopes(a.CallerScopes) {
 		return fmt.Errorf("postgres: invalid MCP approval")
 	}
+	if _, err := mcp.CompileSchema(a.InputSchema); err != nil {
+		return fmt.Errorf("postgres: invalid MCP input schema: %w", err)
+	}
+	if _, err := mcp.CompileSchema(a.OutputSchema); err != nil {
+		return fmt.Errorf("postgres: invalid MCP output schema: %w", err)
+	}
+	if len(a.ModelName) > 64 || strings.TrimSpace(a.ModelName) != a.ModelName {
+		return fmt.Errorf("postgres: invalid MCP model name")
+	}
+	for _, c := range a.ModelName {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-' || c == '.') {
+			return fmt.Errorf("postgres: invalid MCP model name")
+		}
+	}
 	ih, oh := schemaDigest(a.InputSchema), schemaDigest(a.OutputSchema)
 	if a.InputSchemaHash != "" && a.InputSchemaHash != ih || a.OutputSchemaHash != "" && a.OutputSchemaHash != oh {
 		return fmt.Errorf("postgres: MCP schema hash mismatch")
@@ -145,16 +159,105 @@ func (r *MCPToolsRepo) ListApprovals(ctx context.Context, tenantID, serverID str
 	return out, rows.Err()
 }
 
-func (r *MCPToolsRepo) Revoke(ctx context.Context, tenantID, serverID, toolID string) error {
-	res, err := r.db.SQL.ExecContext(ctx, `UPDATE mcp_tool_approvals SET enabled=FALSE,revision=revision+1,updated_at=now() WHERE tenant_id=$1::uuid AND server_id=$2 AND tool_id=$3 AND enabled`, tenantID, serverID, toolID)
+func (r *MCPToolsRepo) ListServers(ctx context.Context, tenantID string) ([]MCPServer, error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `SELECT id FROM mcp_servers WHERE tenant_id=$1::uuid ORDER BY id`, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MCPServer
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		server, err := r.GetServer(ctx, tenantID, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, server)
+	}
+	return out, rows.Err()
+}
+
+func (r *MCPToolsRepo) ListAllApprovals(ctx context.Context, tenantID, serverID string) ([]MCPToolApproval, error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `SELECT tool_id FROM mcp_tool_approvals WHERE tenant_id=$1::uuid AND server_id=$2 ORDER BY tool_id`, tenantID, serverID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MCPToolApproval
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		a, err := r.getApproval(ctx, tenantID, serverID, id, false)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (r *MCPToolsRepo) DeleteServer(ctx context.Context, tenantID, id string) error {
+	res, err := r.db.SQL.ExecContext(ctx, `DELETE FROM mcp_servers WHERE tenant_id=$1::uuid AND id=$2`, tenantID, id)
 	if err != nil {
 		return err
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
 	if n == 0 {
 		return ErrMCPApprovalNotFound
 	}
 	return nil
+}
+
+func (r *MCPToolsRepo) SetServerEnabled(ctx context.Context, tenantID, id string, enabled bool) error {
+	res, err := r.db.SQL.ExecContext(ctx, `UPDATE mcp_servers SET enabled=$3,updated_at=now() WHERE tenant_id=$1::uuid AND id=$2`, tenantID, id, enabled)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrMCPApprovalNotFound
+	}
+	return nil
+}
+
+func (r *MCPToolsRepo) GetApprovalAny(ctx context.Context, tenantID, serverID, toolID string) (MCPToolApproval, error) {
+	return r.getApproval(ctx, tenantID, serverID, toolID, false)
+}
+func (r *MCPToolsRepo) Revoke(ctx context.Context, tenantID, serverID, toolID string) error {
+	tx, err := r.db.SQL.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var a MCPToolApproval
+	var scopes []byte
+	err = tx.QueryRowContext(ctx, `UPDATE mcp_tool_approvals SET enabled=FALSE,revision=revision+1,updated_at=now() WHERE tenant_id=$1::uuid AND server_id=$2 AND tool_id=$3 AND enabled RETURNING tenant_id::text,server_id,tool_id,remote_name,input_schema,output_schema,input_schema_hash,output_schema_hash,schema_version,revision,caller_scopes,enabled`, tenantID, serverID, toolID).Scan(
+		&a.TenantID, &a.ServerID, &a.ToolID, &a.RemoteName, &a.InputSchema, &a.OutputSchema, &a.InputSchemaHash, &a.OutputSchemaHash, &a.SchemaVersion, &a.Revision, &scopes, &a.Enabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrMCPApprovalNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(scopes, &a.CallerScopes); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO mcp_tool_approval_history(tenant_id,server_id,tool_id,revision,remote_name,input_schema,output_schema,input_schema_hash,output_schema_hash,schema_version,caller_scopes,enabled) VALUES($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		a.TenantID, a.ServerID, a.ToolID, a.Revision, a.RemoteName, string(a.InputSchema), string(a.OutputSchema), a.InputSchemaHash, a.OutputSchemaHash, a.SchemaVersion, string(scopes), a.Enabled); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func schemaDigest(b []byte) string { sum := sha256.Sum256(b); return hex.EncodeToString(sum[:]) }
 func validScopes(v []string) bool {
