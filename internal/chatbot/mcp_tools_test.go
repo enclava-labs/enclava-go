@@ -73,22 +73,29 @@ func TestApprovedMCPToolRunsUnderConfiguredAssistantAndCurrentApproval(t *testin
 	dispatcher := MCPRunTools{Executor: &mcp.Executor{Repository: repo, Caller: MCPCaller{}, Transport: transport}, Authorizer: runMCPInputAuth{}}
 	p := auth.Principal{TenantID: "tenant", Scopes: map[string]struct{}{"assistant.use": {}, "mcp.use": {}}}
 	bot := Instance{Settings: map[string]any{"tools": []any{"approved.lookup"}}}
-	defs, err := dispatcher.Definitions(context.Background(), p, bot)
+	defs, err := dispatcher.Definitions(context.Background(), p, p, bot)
 	if err != nil || len(defs) != 1 {
 		t.Fatalf("tool definitions=%v err=%v", defs, err)
 	}
-	got, err := dispatcher.Invoke(context.Background(), p, bot, "approved.lookup", json.RawMessage(`{}`), nil)
+	got, err := dispatcher.Invoke(context.Background(), p, p, bot, "approved.lookup", json.RawMessage(`{}`), nil)
 	if err != nil || string(got.Value) != `{"ok":true}` {
 		t.Fatalf("tool result=%s err=%v", got.Value, err)
+	}
+	ownerWithoutToolScope := auth.Principal{TenantID: "tenant", Scopes: map[string]struct{}{"assistant.use": {}}}
+	if _, err := dispatcher.Invoke(context.Background(), p, ownerWithoutToolScope, bot, "approved.lookup", json.RawMessage(`{}`), nil); !errors.Is(err, mcp.ErrDenied) {
+		t.Fatalf("owner without tool scope was allowed: %v", err)
+	}
+	if defs, err := dispatcher.Definitions(context.Background(), p, ownerWithoutToolScope, bot); err != nil || len(defs) != 0 {
+		t.Fatalf("owner without tool scope exposed definitions: defs=%v err=%v", defs, err)
 	}
 	if transport.calls != 1 || transport.bound != mcp.MaxToolOutputBytes {
 		t.Fatalf("calls=%d bound=%d", transport.calls, transport.bound)
 	}
-	if _, err := dispatcher.Invoke(context.Background(), p, Instance{}, "approved.lookup", json.RawMessage(`{}`), nil); !errors.Is(err, mcp.ErrDenied) {
+	if _, err := dispatcher.Invoke(context.Background(), p, p, Instance{}, "approved.lookup", json.RawMessage(`{}`), nil); !errors.Is(err, mcp.ErrDenied) {
 		t.Fatalf("assistant-unconfigured tool error=%v", err)
 	}
 	dispatcher.Authorizer = runMCPInputAuth{err: source.ErrDenied}
-	if _, err := dispatcher.Invoke(context.Background(), p, bot, "approved.lookup", json.RawMessage(`{}`), []source.ObjectRef{{ObjectID: "doc"}}); !errors.Is(err, source.ErrDenied) {
+	if _, err := dispatcher.Invoke(context.Background(), p, p, bot, "approved.lookup", json.RawMessage(`{}`), []source.ObjectRef{{ObjectID: "doc"}}); !errors.Is(err, source.ErrDenied) {
 		t.Fatalf("restricted MCP input error=%v", err)
 	}
 	if transport.calls != 1 {
@@ -99,7 +106,7 @@ func TestApprovedMCPToolRunsUnderConfiguredAssistantAndCurrentApproval(t *testin
 		t.Fatalf("unconfigured tool dispatched; calls=%d", transport.calls)
 	}
 	repo.approvals[0].Enabled = false
-	if _, err := dispatcher.Invoke(context.Background(), p, bot, "approved.lookup", json.RawMessage(`{}`), nil); !errors.Is(err, mcp.ErrDenied) {
+	if _, err := dispatcher.Invoke(context.Background(), p, p, bot, "approved.lookup", json.RawMessage(`{}`), nil); !errors.Is(err, mcp.ErrDenied) {
 		t.Fatalf("revoked tool error=%v", err)
 	}
 	if transport.calls != 1 {
@@ -118,7 +125,7 @@ func TestChangedMCPApprovalSchemaCannotReachTransport(t *testing.T) {
 	dispatcher := MCPRunTools{Executor: &mcp.Executor{Repository: repo, Caller: MCPCaller{}, Transport: transport}, Authorizer: runMCPInputAuth{}}
 	p := auth.Principal{TenantID: "tenant", Scopes: map[string]struct{}{"assistant.use": {}, "mcp.use": {}}}
 	bot := Instance{Settings: map[string]any{"tools": []any{"approved.lookup"}}}
-	if _, err := dispatcher.Invoke(context.Background(), p, bot, "approved.lookup", json.RawMessage(`{}`), nil); !errors.Is(err, mcp.ErrDenied) {
+	if _, err := dispatcher.Invoke(context.Background(), p, p, bot, "approved.lookup", json.RawMessage(`{}`), nil); !errors.Is(err, mcp.ErrDenied) {
 		t.Fatalf("changed schema error=%v", err)
 	}
 	if transport.calls != 0 {

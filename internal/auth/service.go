@@ -163,6 +163,18 @@ func (s *Service) CurrentPrincipal(ctx context.Context, frozen Principal) (Princ
 	}
 }
 
+// PrincipalForActor reloads the current grants for an assistant owner.
+func (s *Service) PrincipalForActor(ctx context.Context, tenantID, actorID string) (Principal, error) {
+	if tenantID == "" || actorID == "" {
+		return Principal{}, errInvalidCredential
+	}
+	user, err := s.repo.GetUser(ctx, tenantID, actorID)
+	if err != nil || user.Status != "active" {
+		return Principal{}, errInvalidCredential
+	}
+	return s.principalForUser(ctx, user)
+}
+
 func (s *Service) principalFromKey(ctx context.Context, key APIKeyRecord) (Principal, error) {
 	tenantID := key.TenantID
 	principal := Principal{

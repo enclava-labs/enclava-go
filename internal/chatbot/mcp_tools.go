@@ -28,7 +28,7 @@ func (MCPCaller) Authorize(_ context.Context, p auth.Principal, server mcp.Serve
 	return nil
 }
 
-func (d MCPRunTools) Definitions(ctx context.Context, p auth.Principal, bot Instance) ([]map[string]any, error) {
+func (d MCPRunTools) Definitions(ctx context.Context, p, owner auth.Principal, bot Instance) ([]map[string]any, error) {
 	if d.Executor == nil || d.Executor.Repository == nil {
 		return nil, nil
 	}
@@ -48,7 +48,8 @@ func (d MCPRunTools) Definitions(ctx context.Context, p auth.Principal, bot Inst
 		}
 		for _, approval := range approvals {
 			if !contains(configured, approval.ModelName) || !mcpModelName.MatchString(approval.ModelName) ||
-				!mcp.HasScopes(p, server.AudienceScopes, approval.CallerScopes) {
+				(!mcp.HasScopes(p, server.AudienceScopes, approval.CallerScopes) ||
+					!mcp.HasScopes(owner, server.AudienceScopes, approval.CallerScopes)) {
 				continue
 			}
 			var schema map[string]any
@@ -63,7 +64,7 @@ func (d MCPRunTools) Definitions(ctx context.Context, p auth.Principal, bot Inst
 	return tools, nil
 }
 
-func (d MCPRunTools) Invoke(ctx context.Context, p auth.Principal, bot Instance, modelName string, args json.RawMessage, inputs []source.ObjectRef) (BuiltinResult, error) {
+func (d MCPRunTools) Invoke(ctx context.Context, p, owner auth.Principal, bot Instance, modelName string, args json.RawMessage, inputs []source.ObjectRef) (BuiltinResult, error) {
 	if d.Executor == nil || d.Executor.Repository == nil || d.Authorizer == nil || !toolEnabled(bot, modelName) || !mcpModelName.MatchString(modelName) {
 		return BuiltinResult{}, mcp.ErrDenied
 	}
@@ -83,7 +84,8 @@ func (d MCPRunTools) Invoke(ctx context.Context, p auth.Principal, bot Instance,
 			return BuiltinResult{}, err
 		}
 		for _, approval := range approvals {
-			if approval.ModelName != modelName || !mcp.HasScopes(p, server.AudienceScopes, approval.CallerScopes) {
+			if approval.ModelName != modelName || !mcp.HasScopes(p, server.AudienceScopes, approval.CallerScopes) ||
+				!mcp.HasScopes(owner, server.AudienceScopes, approval.CallerScopes) {
 				continue
 			}
 			value, err := d.Executor.Invoke(ctx, p, server.ID, approval.ToolID, args)

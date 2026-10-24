@@ -68,12 +68,13 @@ func (f *fakeChatUpstream) DoResponsesStream(ctx context.Context, method, path s
 }
 
 type fakeRAGSearcher struct {
-	inputs     []rag.SearchInput
-	principals []auth.Principal
-	err        error
-	evidenceID string
-	revoked    bool
-	emptyDoc   bool
+	inputs             []rag.SearchInput
+	principals         []auth.Principal
+	err                error
+	evidenceID         string
+	revoked            bool
+	emptyDoc           bool
+	deniedCollectionFor map[string]bool
 }
 
 func (f *fakeRAGSearcher) Search(ctx context.Context, p auth.Principal, input rag.SearchInput) ([]rag.SearchResult, error) {
@@ -100,6 +101,13 @@ func (f *fakeRAGSearcher) Search(ctx context.Context, p auth.Principal, input ra
 		},
 	}, nil
 }
+
+func (f *fakeRAGSearcher) ListCollections(_ context.Context, p auth.Principal) ([]rag.Collection, error) {
+	if f.deniedCollectionFor[p.ActorID] {
+		return []rag.Collection{{ID: "ragcol_missing"}}, nil
+	}
+	return []rag.Collection{{ID: "ragcol_test"}, {ID: "ragcol_missing"}}, nil
+}
 func (f *fakeRAGSearcher) BuildContext(_ context.Context, _ auth.Principal, candidates []rag.SearchResult, limit int) (rag.ContextResult, error) {
 	return rag.ContextResult{Text: rag.BuildContext(context.Background(), auth.Principal{}, candidates, limit, allowContext{}).Text}, nil
 }
@@ -110,6 +118,7 @@ func (f *fakeRAGSearcher) ResolveEvidence(_ context.Context, _ auth.Principal, i
 	}
 	return []rag.EvidenceResolution{{ID: f.evidenceID, Status: "current"}}, nil
 }
+
 
 type allowContext struct{}
 

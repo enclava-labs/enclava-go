@@ -232,7 +232,11 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 		return "", fmt.Errorf("decode run configuration: %w", err)
 	}
 	bot := frozen.Assistant
-	bot.TenantID, bot.OwnerActorID = p.TenantID, run.OwnerActorID
+	currentBot, err := s.repo.GetByID(ctx, p.TenantID, run.ChatbotID)
+	if err != nil {
+		return "", ErrChatbotNotAllowed
+	}
+	bot.TenantID, bot.OwnerActorID = p.TenantID, currentBot.OwnerActorID
 	if !bot.IsEnabled || !chatbotAllowed(p, bot) {
 		return "", ErrChatbotNotAllowed
 	}
@@ -287,7 +291,11 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 	if userIndex < 0 {
 		return "", source.ErrDenied
 	}
-	ragResults, ragContext, err := s.retrieveRAG(ctx, p, bot, run.Input)
+	owner, err := s.ownerPrincipal(ctx, p, bot)
+	if err != nil {
+		return "", err
+	}
+	ragResults, ragContext, err := s.retrieveRAG(ctx, p, owner, bot, run.Input)
 	if err != nil {
 		return "", err
 	}
@@ -303,7 +311,7 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 	var definitions []map[string]any
 	var mcpDefinitions []map[string]any
 	if s.mcpTools != nil {
-		mcpDefinitions, err = s.mcpTools.Definitions(ctx, p, bot)
+		mcpDefinitions, err = s.mcpTools.Definitions(ctx, p, owner, bot)
 	}
 	if err != nil {
 		return "", err
@@ -483,7 +491,12 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 			if _, isBuiltin := builtinSchemas[call.Name]; isBuiltin {
 				toolResult, invokeErr = builtins.Invoke(ctx, p, bot, call.Name, call.Arguments, inputRefs)
 			} else if s.mcpTools != nil {
-				toolResult, invokeErr = s.mcpTools.Invoke(ctx, p, bot, call.Name, call.Arguments, inputRefs)
+				ownerNow, ownerErr := s.ownerPrincipal(ctx, p, bot)
+				if ownerErr != nil {
+					invokeErr = ownerErr
+				} else {
+					toolResult, invokeErr = s.mcpTools.Invoke(ctx, p, ownerNow, bot, call.Name, call.Arguments, inputRefs)
+				}
 			} else {
 				invokeErr = ErrInvalidInput
 			}

@@ -53,12 +53,13 @@ type MCPInputAuthorizer interface {
 }
 
 type MCPToolDispatcher interface {
-	Definitions(context.Context, auth.Principal, Instance) ([]map[string]any, error)
-	Invoke(context.Context, auth.Principal, Instance, string, json.RawMessage, []source.ObjectRef) (BuiltinResult, error)
+	Definitions(context.Context, auth.Principal, auth.Principal, Instance) ([]map[string]any, error)
+	Invoke(context.Context, auth.Principal, auth.Principal, Instance, string, json.RawMessage, []source.ObjectRef) (BuiltinResult, error)
 }
 
 type RunPrincipalResolver interface {
 	CurrentPrincipal(ctx context.Context, frozen auth.Principal) (auth.Principal, error)
+	PrincipalForActor(ctx context.Context, tenantID, actorID string) (auth.Principal, error)
 }
 
 type EvidenceResolver interface {
@@ -80,6 +81,10 @@ type PromptRepository interface {
 type RAGSearcher interface {
 	Search(ctx context.Context, p auth.Principal, input rag.SearchInput) ([]rag.SearchResult, error)
 	BuildContext(ctx context.Context, p auth.Principal, candidates []rag.SearchResult, characterLimit int) (rag.ContextResult, error)
+}
+
+type ragCollectionLister interface {
+	ListCollections(context.Context, auth.Principal) ([]rag.Collection, error)
 }
 
 // Executor is the single authorized priced model-dispatch boundary;
@@ -138,6 +143,20 @@ func chatbotAllowed(p auth.Principal, bot Instance) bool {
 }
 func chatbotOwnerAllowed(p auth.Principal, bot Instance) bool {
 	return auth.HasScope(p, "platform.admin") || bot.OwnerActorID != "" && bot.OwnerActorID == actorKey(p)
+}
+
+func (s *Service) ownerPrincipal(ctx context.Context, p auth.Principal, bot Instance) (auth.Principal, error) {
+	if auth.HasScope(p, "platform.admin") || actorKey(p) == bot.OwnerActorID {
+		return p, nil
+	}
+	if s.principalResolver == nil {
+		return auth.Principal{}, source.ErrDenied
+	}
+	owner, err := s.principalResolver.PrincipalForActor(ctx, p.TenantID, bot.OwnerActorID)
+	if err != nil || owner.TenantID != p.TenantID || actorKey(owner) != bot.OwnerActorID {
+		return auth.Principal{}, source.ErrDenied
+	}
+	return owner, nil
 }
 
 // VisiblePromptTemplateIDs implements prompts.VisibleTemplateIDs: the set of
@@ -407,7 +426,14 @@ func (s *Service) PrepareChatCompletion(ctx context.Context, p auth.Principal, c
 	messages := append(history, userMessage)
 	userIndex = len(messages) - 1
 
-	ragResults, ragContext, err := s.retrieveRAG(ctx, p, bot, userInput)
+	owner := p
+	if s.rag != nil && len(bot.RAGCollectionIDs) > 0 {
+		owner, err = s.ownerPrincipal(ctx, p, bot)
+		if err != nil {
+			return PreparedCompletion{}, err
+		}
+	}
+	ragResults, ragContext, err := s.retrieveRAG(ctx, p, owner, bot, userInput)
 	if err != nil {
 		return PreparedCompletion{}, err
 	}
@@ -668,16 +694,40 @@ func (s *Service) promptTemplate(ctx context.Context, p auth.Principal, bot Inst
 	return defaults[0], nil
 }
 
-func (s *Service) retrieveRAG(ctx context.Context, p auth.Principal, bot Instance, query string) ([]rag.SearchResult, string, error) {
+func (s *Service) retrieveRAG(ctx context.Context, p, owner auth.Principal, bot Instance, query string) ([]rag.SearchResult, string, error) {
 	if s.rag == nil || len(bot.RAGCollectionIDs) == 0 {
 		return nil, "", nil
 	}
 	limit := settingInt(bot.Settings, "rag_limit", 4, 1, 20)
 	maxChars := settingInt(bot.Settings, "rag_context_max_chars", 6000, 500, 50000)
+	allowed := make(map[string]bool)
+	lister, ok := s.rag.(ragCollectionLister)
+	if !ok {
+		return nil, "", source.ErrDenied
+	}
+	for index, principal := range []auth.Principal{p, owner} {
+		collections, err := lister.ListCollections(ctx, principal)
+		if err != nil {
+			return nil, "", err
+		}
+		readable := make(map[string]bool, len(collections))
+		for _, collection := range collections {
+			readable[collection.ID] = true
+		}
+		if index == 0 {
+			allowed = readable
+		} else {
+			for id := range allowed {
+				if !readable[id] {
+					delete(allowed, id)
+				}
+			}
+		}
+	}
 	results := []rag.SearchResult{}
 	for _, collectionID := range bot.RAGCollectionIDs {
 		collectionID = strings.TrimSpace(collectionID)
-		if collectionID == "" {
+		if collectionID == "" || !allowed[collectionID] {
 			continue
 		}
 		found, err := s.rag.Search(ctx, p, rag.SearchInput{
