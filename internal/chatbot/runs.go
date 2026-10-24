@@ -346,7 +346,7 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 	if len(definitions) > 0 {
 		payload["tools"] = definitions
 	}
-	builtins := Builtins{RAG: s.rag, Extractor: s.extractor}
+	builtins := Builtins{RAG: s.rag, Extractor: s.extractor, Owners: s.principalResolver}
 	if reader, ok := s.rag.(EvidenceReader); ok {
 		builtins.Evidence = reader
 	}

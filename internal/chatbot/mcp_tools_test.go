@@ -132,3 +132,23 @@ func TestChangedMCPApprovalSchemaCannotReachTransport(t *testing.T) {
 		t.Fatalf("schema-changed tool dispatched; calls=%d", transport.calls)
 	}
 }
+
+func TestMCPDefinitionsSuppressDuplicateAndBuiltinNames(t *testing.T) {
+	input := json.RawMessage(`{"type":"object"}`)
+	output := json.RawMessage(`{"type":"object"}`)
+	repo := &runMCPRepo{
+		server: mcp.Server{TenantID: "tenant", ID: "server", Enabled: true, AudienceScopes: []string{"assistant.use"}},
+		approvals: []mcp.Approval{
+			{TenantID: "tenant", ServerID: "server", ToolID: "one", ModelName: "duplicate", InputSchema: input, Enabled: true, CallerScopes: []string{"mcp.use"}},
+			{TenantID: "tenant", ServerID: "server", ToolID: "two", ModelName: "duplicate", InputSchema: input, Enabled: true, CallerScopes: []string{"mcp.use"}},
+			{TenantID: "tenant", ServerID: "server", ToolID: "builtin", ModelName: "knowledge.search", InputSchema: input, OutputSchema: output, Enabled: true, CallerScopes: []string{"mcp.use"}},
+		},
+	}
+	dispatcher := MCPRunTools{Executor: &mcp.Executor{Repository: repo}}
+	p := auth.Principal{TenantID: "tenant", Scopes: map[string]struct{}{"assistant.use": {}, "mcp.use": {}}}
+	bot := Instance{Settings: map[string]any{"tools": []any{"duplicate", "knowledge.search"}}}
+	defs, err := dispatcher.Definitions(context.Background(), p, p, bot)
+	if err != nil || len(defs) != 1 {
+		t.Fatalf("duplicate/builtin model names advertised: defs=%v err=%v", defs, err)
+	}
+}

@@ -139,7 +139,14 @@ func chatbotAllowed(p auth.Principal, bot Instance) bool {
 	if ext := strings.TrimSpace(bot.ExternalID); ext != "" {
 		ids = append(ids, ext)
 	}
-	return auth.ChatbotAllowed(p, ids...) || auth.AgentAllowed(p, ids...) || chatbotOwnerAllowed(p, bot)
+	allowed := auth.ChatbotAllowed(p, ids...) || auth.AgentAllowed(p, ids...)
+	if allowed {
+		return true
+	}
+	if p.CredentialKind != auth.CredentialKindSession && !auth.HasScope(p, "platform.admin") {
+		return false
+	}
+	return chatbotOwnerAllowed(p, bot)
 }
 func chatbotOwnerAllowed(p auth.Principal, bot Instance) bool {
 	return auth.HasScope(p, "platform.admin") || bot.OwnerActorID != "" && bot.OwnerActorID == actorKey(p)
@@ -154,7 +161,7 @@ func (s *Service) ownerPrincipal(ctx context.Context, p auth.Principal, bot Inst
 	}
 	owner, err := s.principalResolver.PrincipalForActor(ctx, p.TenantID, bot.OwnerActorID)
 	if err != nil || owner.TenantID != p.TenantID || actorKey(owner) != bot.OwnerActorID {
-		return auth.Principal{}, source.ErrDenied
+		return auth.Principal{}, fmt.Errorf("chatbot: assistant owner authority is unavailable: %w", source.ErrDenied)
 	}
 	return owner, nil
 }

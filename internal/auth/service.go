@@ -164,13 +164,15 @@ func (s *Service) CurrentPrincipal(ctx context.Context, frozen Principal) (Princ
 }
 
 // PrincipalForActor reloads the current grants for an assistant owner.
+// PrincipalForActor reloads current user authority. Service-account owner grants
+// are credential-scoped, so an actor ID alone cannot safely reconstruct them.
 func (s *Service) PrincipalForActor(ctx context.Context, tenantID, actorID string) (Principal, error) {
 	if tenantID == "" || actorID == "" {
 		return Principal{}, errInvalidCredential
 	}
 	user, err := s.repo.GetUser(ctx, tenantID, actorID)
 	if err != nil || user.Status != "active" {
-		return Principal{}, errInvalidCredential
+		return Principal{}, fmt.Errorf("auth: owner actor %q has no resolvable user principal", actorID)
 	}
 	return s.principalForUser(ctx, user)
 }

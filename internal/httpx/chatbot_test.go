@@ -498,3 +498,20 @@ func sameIDs(got, want []string) bool {
 	}
 	return true
 }
+
+func TestAgentRunErrorsMapToClientStatuses(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		code int
+	}{
+		{chatbot.ErrRunNotFound, http.StatusNotFound},
+		{chatbot.ErrInvalidInput, http.StatusBadRequest},
+		{chatbot.ErrChatbotNotAllowed, http.StatusForbidden},
+	} {
+		rec := httptest.NewRecorder()
+		writeChatbotNotFoundOrError(rec, tc.err, "agent_run_failed")
+		if rec.Code != tc.code {
+			t.Errorf("%v status=%d, want %d", tc.err, rec.Code, tc.code)
+		}
+	}
+}

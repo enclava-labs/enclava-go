@@ -146,3 +146,10 @@ func TestMCPDashboardIsAdminOnlyAndUsesPublicAPIs(t *testing.T) {
 		t.Fatalf("admin partial status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestMCPScopesAreTrimmedAtHTTPBoundary(t *testing.T) {
+	got := normalizeMCPScopeList([]string{" mcp.use ", "assistant.use "})
+	if len(got) != 2 || got[0] != "mcp.use" || got[1] != "assistant.use" {
+		t.Fatalf("normalized scopes = %#v", got)
+	}
+}

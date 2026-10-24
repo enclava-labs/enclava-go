@@ -18,6 +18,7 @@ func TestOriginBindingAndSchemaValidation(t *testing.T) {
 	}{
 		{"https://Example.com:443", false, "https://example.com", false},
 		{"http://127.0.0.1:8080", true, "http://127.0.0.1:8080", false},
+		{"http://[::1]", true, "http://[::1]", false},
 		{"http://10.0.0.1", true, "", true}, {"https://user@host", false, "", true},
 		{"https://host/path", false, "", true}, {"file:///tmp", true, "", true},
 	} {

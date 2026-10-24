@@ -38,6 +38,9 @@ type Builtins struct {
 	RAG       RAGSearcher
 	Evidence  EvidenceReader
 	Extractor Extractor
+	Owners    interface {
+		PrincipalForActor(context.Context, string, string) (auth.Principal, error)
+	}
 }
 
 func BuiltinToolDefinitions(bot Instance) ([]map[string]any, error) {
@@ -95,6 +98,38 @@ func (b Builtins) Invoke(ctx context.Context, p auth.Principal, bot Instance, to
 		}
 		if !contains(bot.RAGCollectionIDs, in.CollectionID) {
 			return BuiltinResult{}, source.ErrDenied
+		}
+		lister, ok := b.RAG.(interface {
+			ListCollections(context.Context, auth.Principal) ([]rag.Collection, error)
+		})
+		if !ok {
+			return BuiltinResult{}, source.ErrDenied
+		}
+		owner := p
+		if bot.OwnerActorID != "" && bot.OwnerActorID != strings.TrimSpace(p.ActorID) {
+			if b.Owners == nil {
+				return BuiltinResult{}, source.ErrDenied
+			}
+			owner, err = b.Owners.PrincipalForActor(ctx, p.TenantID, bot.OwnerActorID)
+			if err != nil {
+				return BuiltinResult{}, fmt.Errorf("resolve assistant owner authority: %w", source.ErrDenied)
+			}
+		}
+		for _, actor := range []auth.Principal{p, owner} {
+			collections, err := lister.ListCollections(ctx, actor)
+			if err != nil {
+				return BuiltinResult{}, err
+			}
+			readable := false
+			for _, collection := range collections {
+				if collection.ID == in.CollectionID {
+					readable = true
+					break
+				}
+			}
+			if !readable {
+				return BuiltinResult{}, source.ErrDenied
+			}
 		}
 		results, err := b.RAG.Search(ctx, p, rag.SearchInput{CollectionID: in.CollectionID, Query: in.Query, Limit: 5})
 		if err != nil {

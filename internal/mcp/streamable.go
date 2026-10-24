@@ -32,7 +32,7 @@ type StreamableHTTP struct {
 }
 type rpcRequest struct {
 	JSONRPC string `json:"jsonrpc"`
-	ID      int64  `json:"id"`
+	ID      int64  `json:"id,omitempty"`
 	Method  string `json:"method"`
 	Params  any    `json:"params,omitempty"`
 }
@@ -173,7 +173,11 @@ func (t *StreamableHTTP) Call(ctx context.Context, s Server, a Approval, remote 
 	}
 	found := false
 	for _, tool := range lr.Result.Tools {
-		if tool.Name == remote && SchemaHash(tool.InputSchema) == a.InputSchemaHash && SchemaHash(tool.OutputSchema) == a.OutputSchemaHash {
+		outputSchema := tool.OutputSchema
+		if len(outputSchema) == 0 {
+			outputSchema = json.RawMessage(`{}`)
+		}
+		if tool.Name == remote && SchemaHash(tool.InputSchema) == a.InputSchemaHash && SchemaHash(outputSchema) == a.OutputSchemaHash {
 			found = true
 			break
 		}
@@ -212,8 +216,12 @@ func (t *StreamableHTTP) Call(ctx context.Context, s Server, a Approval, remote 
 	if err != nil || len(payload) > int(maxBytes) {
 		return nil, ErrDenied
 	}
-	if err = json.Unmarshal(payload, &map[string]any{}); err != nil {
-		return nil, ErrDenied
+	// An omitted schema approves any JSON shape, including the content array.
+	if len(a.OutputSchema) != 0 && string(a.OutputSchema) != `{}` {
+		compiled, compileErr := CompileSchema(a.OutputSchema)
+		if compileErr != nil || ValidateJSON(compiled, payload) != nil {
+			return nil, ErrDenied
+		}
 	}
 	return payload, nil
 }
@@ -454,7 +462,7 @@ func (t *StreamableHTTP) httpClient(allowPrivate bool) *http.Client {
 			return nil, err
 		}
 		for _, ip := range ips {
-			if !ip.IP.IsGlobalUnicast() && !(allowPrivate && (ip.IP.IsPrivate() || ip.IP.IsLoopback())) {
+			if !allowedDialIP(ip.IP, allowPrivate) {
 				continue
 			}
 			d := net.Dialer{Timeout: 5 * time.Second}
@@ -462,4 +470,7 @@ func (t *StreamableHTTP) httpClient(allowPrivate bool) *http.Client {
 		}
 		return nil, errors.New("mcp: destination address denied")
 	}}}
+}
+func allowedDialIP(ip net.IP, allowPrivate bool) bool {
+	return allowPrivate && (ip.IsPrivate() || ip.IsLoopback()) || ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast()
 }

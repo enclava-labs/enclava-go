@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -15,6 +16,7 @@ func TestStreamableHTTPCallChecksApprovedSchemaAndUsesSession(t *testing.T) {
 	in := json.RawMessage(`{"type":"object","properties":{"q":{"type":"string"}},"required":["q"],"additionalProperties":false}`)
 	out := json.RawMessage(`{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}`)
 	var methods []string
+	contentOnly := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/mcp" {
 			t.Errorf("endpoint path = %q", r.URL.Path)
@@ -49,12 +51,20 @@ func TestStreamableHTTPCallChecksApprovedSchemaAndUsesSession(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch req.Method {
 		case "tools/list":
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + stringInt(req.ID) + `,"result":{"tools":[{"name":"remote","inputSchema":` + string(in) + `,"outputSchema":` + string(out) + `,"annotations":{"readOnlyHint":true}}]}}`))
+			outputSchema := ""
+			if len(out) > 0 {
+				outputSchema = `,"outputSchema":` + string(out)
+			}
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + stringInt(req.ID) + `,"result":{"tools":[{"name":"remote","inputSchema":` + string(in) + outputSchema + `,"annotations":{"readOnlyHint":true}}]}}`))
 		case "tools/call":
 			if req.Params.Name != "remote" {
 				t.Errorf("called name=%q", req.Params.Name)
 			}
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + stringInt(req.ID) + `,"result":{"structuredContent":{"ok":true}}}`))
+			if contentOnly {
+				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + stringInt(req.ID) + `,"result":{"content":[{"type":"text","text":"ok"}]}}`))
+			} else {
+				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + stringInt(req.ID) + `,"result":{"structuredContent":{"ok":true}}}`))
+			}
 		case http.MethodDelete:
 			w.WriteHeader(http.StatusAccepted)
 		default:
@@ -81,6 +91,13 @@ func TestStreamableHTTPCallChecksApprovedSchemaAndUsesSession(t *testing.T) {
 	if strings.Join(methods, ",") != "initialize,notifications/initialized,tools/list" {
 		t.Fatalf("discovery methods=%v", methods)
 	}
+	out = json.RawMessage(`{}`)
+	contentOnly = true
+	a.OutputSchema, a.OutputSchemaHash = out, SchemaHash(out)
+	got, err = (&StreamableHTTP{}).Call(context.Background(), Server{TenantID: "t", Origin: srv.URL, EndpointPath: "/mcp", AuthorizedPrivate: true}, a, "remote", json.RawMessage(`{"q":"x"}`), 1024)
+	if err != nil || !strings.HasPrefix(string(got), `[`) {
+		t.Fatalf("content-only result with omitted schema = %s err=%v", got, err)
+	}
 }
 func TestStreamableHTTPDoesNotFollowRedirect(t *testing.T) {
 	var targetCalls int
@@ -96,6 +113,27 @@ func TestStreamableHTTPDoesNotFollowRedirect(t *testing.T) {
 	}
 	if targetCalls != 0 {
 		t.Fatalf("redirect target received %d requests", targetCalls)
+	}
+}
+
+func TestInitializedNotificationOmitsID(t *testing.T) {
+	body, err := json.Marshal(rpcRequest{JSONRPC: "2.0", Method: "notifications/initialized"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), `"id"`) {
+		t.Fatalf("notification contains request ID: %s", body)
+	}
+}
+
+func TestDialFilterRequiresPrivateOptIn(t *testing.T) {
+	for _, raw := range []string{"10.0.0.1", "172.16.0.1", "192.168.1.1", "fc00::1", "127.0.0.1", "::1"} {
+		if allowedDialIP(net.ParseIP(raw), false) {
+			t.Errorf("private address %s passed without opt-in", raw)
+		}
+		if !allowedDialIP(net.ParseIP(raw), true) {
+			t.Errorf("private address %s failed with opt-in", raw)
+		}
 	}
 }
 func stringInt(v int64) string { return strconv.FormatInt(v, 10) }

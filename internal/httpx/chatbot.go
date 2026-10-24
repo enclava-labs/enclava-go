@@ -18,6 +18,7 @@ import (
 	"enclava-go/internal/chatbot"
 	"enclava-go/internal/inference"
 	"enclava-go/internal/llm"
+	"enclava-go/internal/source"
 )
 
 func (a *App) handleChatbots(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
@@ -404,12 +405,19 @@ func isChatbotProviderDialError(err error) bool {
 }
 
 func writeChatbotNotFoundOrError(w http.ResponseWriter, err error, code string) {
-	if errors.Is(err, sql.ErrNoRows) {
+	switch {
+	case errors.Is(err, sql.ErrNoRows), errors.Is(err, chatbot.ErrRunNotFound):
 		WriteOpenAIError(w, http.StatusNotFound, "chatbot not found", "invalid_request_error", "not_found")
-		return
+	case errors.Is(err, chatbot.ErrInvalidInput):
+		WriteOpenAIError(w, http.StatusBadRequest, "invalid agent run request", "invalid_request_error", "invalid_agent_run")
+	case errors.Is(err, chatbot.ErrDisabled), errors.Is(err, chatbot.ErrChatbotNotAllowed), errors.Is(err, chatbot.ErrModelNotAllowed):
+		WriteOpenAIError(w, http.StatusForbidden, "agent run is not permitted", "invalid_request_error", "agent_run_denied")
+	case errors.Is(err, source.ErrDenied):
+		WriteOpenAIError(w, http.StatusForbidden, "agent run is not permitted", "invalid_request_error", "agent_run_denied")
+	default:
+		log.Printf("chatbot error: %v", err)
+		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", code)
 	}
-	log.Printf("chatbot error: %v", err)
-	WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", code)
 }
 
 func (a *App) handleAgentRuns(w http.ResponseWriter, r *http.Request, p auth.Principal) {

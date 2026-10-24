@@ -50,7 +50,24 @@ func (in mcpServerInput) server(tenantID, id string) mcp.Server {
 	if id == "" {
 		id = in.ID
 	}
-	return mcp.Server{TenantID: tenantID, ID: id, Origin: in.Origin, EndpointPath: in.EndpointPath, CredentialRef: in.CredentialRef, AuthorizedPrivate: in.AuthorizedPrivate, AudienceScopes: in.AudienceScopes, Enabled: in.Enabled}
+	scopes := normalizeMCPScopeList(in.AudienceScopes)
+	return mcp.Server{TenantID: tenantID, ID: id, Origin: in.Origin, EndpointPath: in.EndpointPath, CredentialRef: in.CredentialRef, AuthorizedPrivate: in.AuthorizedPrivate, AudienceScopes: scopes, Enabled: in.Enabled}
+}
+
+func normalizeMCPScopeList(scopes []string) []string {
+	out := make([]string, 0, len(scopes))
+	for _, scope := range scopes {
+		out = append(out, strings.TrimSpace(scope))
+	}
+	return out
+}
+func mcpBuiltinName(name string) bool {
+	switch name {
+	case "knowledge.search", "evidence.read", "extract.submit", "extract.status":
+		return true
+	default:
+		return false
+	}
 }
 
 func mcpServerJSON(server mcp.Server) mcpServerResponse {
@@ -225,8 +242,13 @@ func (a *App) handleMCPServerByID(w http.ResponseWriter, r *http.Request, p auth
 				ModelName    string   `json:"model_name"`
 				CallerScopes []string `json:"caller_scopes"`
 			}
-			if err := DecodeJSON(r, &input); err != nil || strings.TrimSpace(input.ModelName) == "" || len(input.CallerScopes) == 0 {
-				WriteOpenAIError(w, http.StatusBadRequest, "model_name and caller_scopes are required", "invalid_request_error", "invalid_mcp_approval")
+			if err := DecodeJSON(r, &input); err != nil {
+				WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_mcp_approval")
+				return
+			}
+			input.CallerScopes = normalizeMCPScopeList(input.CallerScopes)
+			if mcpBuiltinName(strings.TrimSpace(input.ModelName)) {
+				WriteOpenAIError(w, http.StatusBadRequest, "model_name conflicts with a built-in tool", "invalid_request_error", "invalid_mcp_approval")
 				return
 			}
 			server, err := a.mcpRepo.GetServer(r.Context(), p.TenantID, serverID)

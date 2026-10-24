@@ -37,6 +37,7 @@ func (d MCPRunTools) Definitions(ctx context.Context, p, owner auth.Principal, b
 	if err != nil {
 		return nil, err
 	}
+	seen := make(map[string]struct{})
 	var tools []map[string]any
 	for _, server := range servers {
 		if !server.Enabled {
@@ -47,15 +48,18 @@ func (d MCPRunTools) Definitions(ctx context.Context, p, owner auth.Principal, b
 			return nil, err
 		}
 		for _, approval := range approvals {
-			if !contains(configured, approval.ModelName) || !mcpModelName.MatchString(approval.ModelName) ||
-				(!mcp.HasScopes(p, server.AudienceScopes, approval.CallerScopes) ||
-					!mcp.HasScopes(owner, server.AudienceScopes, approval.CallerScopes)) {
+			_, builtinCollision := builtinSchemas[approval.ModelName]
+			_, duplicate := seen[approval.ModelName]
+			if !contains(configured, approval.ModelName) || !mcpModelName.MatchString(approval.ModelName) || builtinCollision || duplicate ||
+				!mcp.HasScopes(p, server.AudienceScopes, approval.CallerScopes) ||
+				!mcp.HasScopes(owner, server.AudienceScopes, approval.CallerScopes) {
 				continue
 			}
 			var schema map[string]any
 			if err := json.Unmarshal(approval.InputSchema, &schema); err != nil {
 				return nil, mcp.ErrDenied
 			}
+			seen[approval.ModelName] = struct{}{}
 			tools = append(tools, map[string]any{"type": "function", "function": map[string]any{
 				"name": approval.ModelName, "description": "Invoke an explicitly approved MCP tool.", "parameters": schema,
 			}})
