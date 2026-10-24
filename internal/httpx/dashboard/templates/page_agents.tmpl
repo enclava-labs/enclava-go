@@ -1,0 +1,22 @@
+{{define "page-agents"}}
+{{template "layout-head" .}}
+{{template "layout-nav" .}}
+<main class="pt-16 min-h-screen"><div class="max-w-7xl mx-auto px-4 sm:px-6 py-8 space-y-6">
+  <div><h1 class="text-3xl font-display font-bold">Assistants</h1><p class="mt-1 text-muted-foreground">Configure assistants and run authorized conversations.</p></div>
+  <div id="dashboard-message" class="min-h-[1.5rem] text-sm" aria-live="polite"></div>
+  <section id="dashboard-chatbots" hx-get="/dashboard/partials/chatbots" hx-trigger="load" hx-target="this" hx-swap="innerHTML"><p class="text-sm text-muted-foreground">Loading assistants…</p></section>
+  <section class="rounded-lg border bg-card p-5 space-y-4" aria-labelledby="agent-chat-heading">
+    <h2 id="agent-chat-heading" class="text-xl font-semibold">Conversation</h2>
+    <div class="grid gap-3 sm:grid-cols-2">
+      <label class="space-y-1 text-sm font-medium" for="agent-select">Assistant<select id="agent-select" class="w-full rounded-md border bg-background px-3 py-2" required><option value="">Loading assistants…</option></select></label>
+      <label class="space-y-1 text-sm font-medium" for="conversation-id">Resume conversation ID (optional)<input id="conversation-id" class="w-full rounded-md border bg-background px-3 py-2 font-mono" autocomplete="off"></label>
+    </div>
+    <div id="agent-messages" class="max-h-96 overflow-y-auto space-y-3 rounded-md border p-3" aria-live="polite"><p class="text-sm text-muted-foreground">Choose an assistant and send a message to start.</p></div>
+    <form id="agent-run-form" class="space-y-3"><label for="agent-input" class="text-sm font-medium">Message</label><textarea id="agent-input" rows="3" maxlength="32768" required class="w-full rounded-md border bg-background px-3 py-2" placeholder="Ask about authorized company knowledge…"></textarea><div class="flex flex-wrap gap-2"><button id="agent-send" type="submit" class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground">Send message</button><button id="agent-cancel" type="button" disabled class="rounded-md border px-4 py-2 text-sm disabled:opacity-50">Cancel run</button></div></form>
+    <p id="agent-status" class="text-sm" role="status" aria-live="polite"></p>
+  </section>
+  <p class="text-sm text-muted-foreground">Approved external tools are configured by an administrator on the <a href="/dashboard/mcp" class="underline">MCP tools page</a>; discovery alone does not authorize a tool.</p>
+</div></main>
+{{template "layout-toast" .}}
+<script src="/dashboard/static/agents.js" defer></script>
+{{end}}
