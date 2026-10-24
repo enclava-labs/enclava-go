@@ -9,6 +9,7 @@
           <a href="/dashboard/documents" class="dashboard-nav-link{{if eq .ActivePage "documents"}} active{{end}}">Documents</a>
           {{if .KnowledgeReadable}}<a href="/dashboard/rag" class="dashboard-nav-link{{if eq .ActivePage "rag"}} active{{end}}">Knowledge</a>{{end}}
           <a href="/dashboard/chatbots" class="dashboard-nav-link{{if eq .ActivePage "chatbots"}} active{{end}}">Chatbots</a>
+          {{if .PlatformAdmin}}<a href="/dashboard/mcp" class="dashboard-nav-link{{if eq .ActivePage "mcp"}} active{{end}}">MCP</a>{{end}}
           {{if .ConnectorsManage}}<a href="/dashboard/connectors" class="dashboard-nav-link{{if eq .ActivePage "connectors"}} active{{end}}">Sources</a>{{end}}
             <summary class="dashboard-nav-link{{if eq .ActivePage "keys"}} active{{end}}{{if eq .ActivePage "budgets"}} active{{end}}" title="API Keys menu">
               API Keys
@@ -44,6 +45,7 @@
             <a href="/dashboard/documents" class="dashboard-menu-item{{if eq .ActivePage "documents"}} active{{end}}">Documents</a>
             {{if .KnowledgeReadable}}<a href="/dashboard/rag" class="dashboard-menu-item{{if eq .ActivePage "rag"}} active{{end}}">Knowledge</a>{{end}}
             {{if .ConnectorsManage}}<a href="/dashboard/connectors" class="dashboard-menu-item{{if eq .ActivePage "connectors"}} active{{end}}">Sources</a>{{end}}
+            {{if .PlatformAdmin}}<a href="/dashboard/mcp" class="dashboard-menu-item{{if eq .ActivePage "mcp"}} active{{end}}">MCP Tools</a>{{end}}
             <a href="/dashboard/keys" class="dashboard-menu-item{{if eq .ActivePage "keys"}} active{{end}}">API Keys</a>
             <a href="/dashboard/budgets" class="dashboard-menu-item{{if eq .ActivePage "budgets"}} active{{end}}">Budgets</a>
             <a href="/dashboard/analytics" class="dashboard-menu-item{{if eq .ActivePage "analytics"}} active{{end}}">Analytics</a>

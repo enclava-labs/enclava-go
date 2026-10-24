@@ -57,14 +57,21 @@ func TestMCPAdministrationDiscoveryApprovalRevisionAndRevocation(t *testing.T) {
 	}
 	app := &App{mcpRepo: repo, mcpTransport: &mcp.StreamableHTTP{}}
 	admin := auth.Principal{TenantID: tenant, Scopes: map[string]struct{}{"platform.admin": {}}}
+	serverRequest := httptest.NewRequest(http.MethodPost, "/api/v1/mcp/servers", strings.NewReader(`{"id":"server","origin":"`+server.URL+`","endpoint_path":"/mcp","authorized_private":true,"audience_scopes":["assistant.use"],"enabled":true}`))
+	serverResponse := httptest.NewRecorder()
+	app.handleMCPServers(serverResponse, serverRequest, admin)
+	if serverResponse.Code != http.StatusCreated || !strings.Contains(serverResponse.Body.String(), `"endpoint_path":"/mcp"`) {
+		t.Fatalf("server registration status=%d body=%s", serverResponse.Code, serverResponse.Body.String())
+	}
 	call := func(method, path, body string) *httptest.ResponseRecorder {
 		request := httptest.NewRequest(method, path, strings.NewReader(body))
 		recorder := httptest.NewRecorder()
 		app.handleMCPServerByID(recorder, request, admin)
 		return recorder
 	}
-	if got := call(http.MethodPost, "/api/v1/mcp/servers/server/discovery", ""); got.Code != http.StatusOK {
-		t.Fatalf("discovery status=%d body=%s", got.Code, got.Body.String())
+	discovery := call(http.MethodPost, "/api/v1/mcp/servers/server/discovery", "")
+	if discovery.Code != http.StatusOK || !strings.Contains(discovery.Body.String(), `"input_schema"`) {
+		t.Fatalf("discovery status=%d body=%s", discovery.Code, discovery.Body.String())
 	}
 	if approvals, err := repo.ListAllApprovals(context.Background(), tenant, "server"); err != nil || len(approvals) != 0 {
 		t.Fatalf("discovery auto-approved tools=%v err=%v", approvals, err)
@@ -72,6 +79,10 @@ func TestMCPAdministrationDiscoveryApprovalRevisionAndRevocation(t *testing.T) {
 	approve := `{"model_name":"approved.lookup","caller_scopes":["mcp.use"]}`
 	if got := call(http.MethodPut, "/api/v1/mcp/servers/server/tools/remote", approve); got.Code != http.StatusOK {
 		t.Fatalf("approval status=%d body=%s", got.Code, got.Body.String())
+	}
+	approvalList := call(http.MethodGet, "/api/v1/mcp/servers/server/tools", "")
+	if approvalList.Code != http.StatusOK || !strings.Contains(approvalList.Body.String(), `"model_name":"approved.lookup"`) || !strings.Contains(approvalList.Body.String(), `"input_schema"`) {
+		t.Fatalf("approval list status=%d body=%s", approvalList.Code, approvalList.Body.String())
 	}
 	current, err := repo.GetApproval(context.Background(), tenant, "server", "remote")
 	if err != nil || current.SchemaVersion != 1 {
@@ -115,5 +126,23 @@ func TestMCPAdministrationRejectsNonAdminBeforeRepositoryAccess(t *testing.T) {
 		if rec.Code != http.StatusForbidden {
 			t.Fatalf("%s status=%d body=%s", path, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+func TestMCPDashboardIsAdminOnlyAndUsesPublicAPIs(t *testing.T) {
+	app := &App{}
+	nonAdmin := httptest.NewRequest(http.MethodGet, "/dashboard/partials/mcp", nil)
+	nonAdminRec := httptest.NewRecorder()
+	app.handleDashboardMCP(nonAdminRec, nonAdmin)
+	if nonAdminRec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin partial status=%d", nonAdminRec.Code)
+	}
+	admin := auth.Principal{TenantID: "tenant", Scopes: map[string]struct{}{"platform.admin": {}}}
+	request := httptest.NewRequest(http.MethodGet, "/dashboard/partials/mcp", nil)
+	request = request.WithContext(auth.WithPrincipal(request.Context(), admin))
+	rec := httptest.NewRecorder()
+	app.handleDashboardMCP(rec, request)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "mcp-server-form") || !strings.Contains(rec.Body.String(), "/dashboard/static/mcp.js") {
+		t.Fatalf("admin partial status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }

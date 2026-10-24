@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -9,6 +10,60 @@ import (
 	"enclava-go/internal/mcp"
 	"enclava-go/internal/store/postgres"
 )
+
+type mcpServerInput struct {
+	ID                string   `json:"id"`
+	Origin            string   `json:"origin"`
+	EndpointPath      string   `json:"endpoint_path"`
+	CredentialRef     string   `json:"credential_ref"`
+	AuthorizedPrivate bool     `json:"authorized_private"`
+	AudienceScopes    []string `json:"audience_scopes"`
+	Enabled           bool     `json:"enabled"`
+}
+
+type mcpServerResponse struct {
+	ID                string   `json:"id"`
+	Origin            string   `json:"origin"`
+	EndpointPath      string   `json:"endpoint_path"`
+	CredentialRef     string   `json:"credential_ref,omitempty"`
+	AuthorizedPrivate bool     `json:"authorized_private"`
+	AudienceScopes    []string `json:"audience_scopes"`
+	Enabled           bool     `json:"enabled"`
+}
+
+type mcpApprovalResponse struct {
+	ServerID         string          `json:"server_id"`
+	ToolID           string          `json:"tool_id"`
+	ModelName        string          `json:"model_name"`
+	RemoteName       string          `json:"remote_name"`
+	InputSchema      json.RawMessage `json:"input_schema"`
+	OutputSchema     json.RawMessage `json:"output_schema"`
+	InputSchemaHash  string          `json:"input_schema_hash"`
+	OutputSchemaHash string          `json:"output_schema_hash"`
+	SchemaVersion    int64           `json:"schema_version"`
+	Revision         int64           `json:"revision"`
+	CallerScopes     []string        `json:"caller_scopes"`
+	Enabled          bool            `json:"enabled"`
+}
+
+func (in mcpServerInput) server(tenantID, id string) mcp.Server {
+	if id == "" {
+		id = in.ID
+	}
+	return mcp.Server{TenantID: tenantID, ID: id, Origin: in.Origin, EndpointPath: in.EndpointPath, CredentialRef: in.CredentialRef, AuthorizedPrivate: in.AuthorizedPrivate, AudienceScopes: in.AudienceScopes, Enabled: in.Enabled}
+}
+
+func mcpServerJSON(server mcp.Server) mcpServerResponse {
+	return mcpServerResponse{ID: server.ID, Origin: server.Origin, EndpointPath: server.EndpointPath, CredentialRef: server.CredentialRef, AuthorizedPrivate: server.AuthorizedPrivate, AudienceScopes: server.AudienceScopes, Enabled: server.Enabled}
+}
+
+func mcpApprovalJSON(approval postgres.MCPToolApproval) mcpApprovalResponse {
+	return mcpApprovalResponse{ServerID: approval.ServerID, ToolID: approval.ToolID, ModelName: approval.ModelName, RemoteName: approval.RemoteName, InputSchema: approval.InputSchema, OutputSchema: approval.OutputSchema, InputSchemaHash: approval.InputSchemaHash, OutputSchemaHash: approval.OutputSchemaHash, SchemaVersion: approval.SchemaVersion, Revision: approval.Revision, CallerScopes: approval.CallerScopes, Enabled: approval.Enabled}
+}
+
+func mcpToolJSON(tool mcp.DiscoveredTool) map[string]any {
+	return map[string]any{"name": tool.Name, "input_schema": tool.InputSchema, "output_schema": tool.OutputSchema}
+}
 
 func (a *App) ConfigureMCP(repo *postgres.MCPToolsRepo, transport *mcp.StreamableHTTP) {
 	a.mcpRepo, a.mcpTransport = repo, transport
@@ -28,14 +83,18 @@ func (a *App) handleMCPServers(w http.ResponseWriter, r *http.Request, p auth.Pr
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "mcp_server_list_failed")
 			return
 		}
-		WriteJSON(w, http.StatusOK, map[string]any{"servers": servers})
+		response := make([]mcpServerResponse, 0, len(servers))
+		for _, server := range servers {
+			response = append(response, mcpServerJSON(server))
+		}
+		WriteJSON(w, http.StatusOK, map[string]any{"servers": response})
 	case http.MethodPost:
-		var server mcp.Server
-		if err := DecodeJSON(r, &server); err != nil {
+		var input mcpServerInput
+		if err := DecodeJSON(r, &input); err != nil {
 			WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 			return
 		}
-		server.TenantID = p.TenantID
+		server := input.server(p.TenantID, "")
 		if server.ID == "" {
 			WriteOpenAIError(w, http.StatusBadRequest, "server id is required", "invalid_request_error", "invalid_mcp_server")
 			return
@@ -44,7 +103,7 @@ func (a *App) handleMCPServers(w http.ResponseWriter, r *http.Request, p auth.Pr
 			WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_mcp_server")
 			return
 		}
-		WriteJSON(w, http.StatusCreated, server)
+		WriteJSON(w, http.StatusCreated, mcpServerJSON(server))
 	default:
 		WriteMethodNotAllowed(w)
 	}
@@ -70,19 +129,19 @@ func (a *App) handleMCPServerByID(w http.ResponseWriter, r *http.Request, p auth
 				http.NotFound(w, r)
 				return
 			}
-			WriteJSON(w, http.StatusOK, server)
+			WriteJSON(w, http.StatusOK, mcpServerJSON(server))
 		case http.MethodPut:
-			var server mcp.Server
-			if err := DecodeJSON(r, &server); err != nil {
+			var input mcpServerInput
+			if err := DecodeJSON(r, &input); err != nil {
 				WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 				return
 			}
-			server.TenantID, server.ID = p.TenantID, serverID
+			server := input.server(p.TenantID, serverID)
 			if err := a.mcpRepo.PutServer(r.Context(), server); err != nil {
 				WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_mcp_server")
 				return
 			}
-			WriteJSON(w, http.StatusOK, server)
+			WriteJSON(w, http.StatusOK, mcpServerJSON(server))
 		case http.MethodDelete:
 			if err := a.mcpRepo.DeleteServer(r.Context(), p.TenantID, serverID); err != nil {
 				http.NotFound(w, r)
@@ -128,7 +187,11 @@ func (a *App) handleMCPServerByID(w http.ResponseWriter, r *http.Request, p auth
 				}
 			}
 		}
-		WriteJSON(w, http.StatusOK, map[string]any{"tools": tools})
+		publicTools := make([]map[string]any, 0, len(tools))
+		for _, tool := range tools {
+			publicTools = append(publicTools, mcpToolJSON(tool))
+		}
+		WriteJSON(w, http.StatusOK, map[string]any{"tools": publicTools})
 		return
 	}
 	if len(parts) == 2 && parts[1] == "tools" && r.Method == http.MethodGet {
@@ -137,7 +200,11 @@ func (a *App) handleMCPServerByID(w http.ResponseWriter, r *http.Request, p auth
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "mcp_tools_list_failed")
 			return
 		}
-		WriteJSON(w, http.StatusOK, map[string]any{"tools": approvals})
+		response := make([]mcpApprovalResponse, 0, len(approvals))
+		for _, approval := range approvals {
+			response = append(response, mcpApprovalJSON(approval))
+		}
+		WriteJSON(w, http.StatusOK, map[string]any{"tools": response})
 		return
 	}
 	if len(parts) == 3 && parts[1] == "tools" {

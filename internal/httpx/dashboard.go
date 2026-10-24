@@ -118,6 +118,7 @@ type dashboardPageCommon struct {
 	DefaultScopes     string
 	KnowledgeReadable bool
 	ConnectorsManage  bool
+	PlatformAdmin     bool
 }
 
 // dashboardIdentityData feeds page_identity: the signed-in account plus the
@@ -180,6 +181,7 @@ func (a *App) registerDashboardRoutes() {
 	a.mux.HandleFunc("/dashboard/partials/rag", a.sessionAuth.RequireSession(a.handleDashboardRAG))
 	a.mux.HandleFunc("/dashboard/partials/chatbots", a.sessionAuth.RequireSession(a.handleDashboardChatbots))
 	a.mux.HandleFunc("/dashboard/partials/prompt-templates", a.sessionAuth.RequireSession(a.handleDashboardPromptTemplates))
+	a.mux.HandleFunc("/dashboard/partials/mcp", a.sessionAuth.RequireSession(a.handleDashboardMCP))
 	a.mux.HandleFunc("/dashboard/partials/connectors", a.sessionAuth.RequireSession(a.handleDashboardConnectors))
 	a.mux.HandleFunc("/dashboard/rag/documents/", a.sessionAuth.RequireSession(a.handleDashboardRAGDocumentDownload))
 	a.mux.HandleFunc("/dashboard/documents", a.sessionAuth.RequireSession(a.handleDashboardPageDocuments))
@@ -194,6 +196,7 @@ func (a *App) registerDashboardRoutes() {
 	a.mux.HandleFunc("/dashboard/chatbots", a.sessionAuth.RequireSession(a.handleDashboardPageChatbots))
 	a.mux.HandleFunc("/dashboard/prompt-templates", a.sessionAuth.RequireSession(a.handleDashboardPagePromptTemplates))
 	a.mux.HandleFunc("/dashboard/connectors", a.sessionAuth.RequireSession(a.handleDashboardPageConnectors))
+	a.mux.HandleFunc("/dashboard/mcp", a.sessionAuth.RequireSession(a.handleDashboardPageMCP))
 	a.mux.HandleFunc("/dashboard/identity", a.sessionAuth.RequireSession(a.handleDashboardPageIdentity))
 	a.mux.HandleFunc("/dashboard", a.sessionAuth.RequireSession(a.handleDashboardPage))
 	a.mux.HandleFunc("/dashboard/", a.sessionAuth.RequireSession(a.handleDashboardPage))
@@ -209,6 +212,7 @@ func (a *App) dashboardPageData(r *http.Request, activePage, pageTitle string) d
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
 		data.KnowledgeReadable = auth.HasScope(principal, "rag") || auth.HasScope(principal, "connectors.manage")
 		data.ConnectorsManage = auth.HasScope(principal, "connectors.manage")
+		data.PlatformAdmin = auth.HasScope(principal, "platform.admin")
 	}
 	// The principal is session-verified; the email renders in the account
 	// menu so the operator sees which employee account holds the session.

@@ -151,6 +151,30 @@ func (a *App) handleDashboardPageConnectors(w http.ResponseWriter, r *http.Reque
 	a.renderDashboardResourcePage(w, r, "connectors", "Connectors", "First-party source sync and RAG ingestion", "/dashboard/partials/connectors", "dashboard-connectors", "Loading connectors...")
 }
 
+func (a *App) handleDashboardPageMCP(w http.ResponseWriter, r *http.Request) {
+	if p, ok := auth.PrincipalFromContext(r.Context()); !ok || !auth.HasScope(p, "platform.admin") {
+		WriteForbidden(w, "tenant administrator access required")
+		return
+	}
+	a.renderDashboardResourcePage(w, r, "mcp", "MCP Tools", "Manage approved outbound MCP servers and tool schemas", "/dashboard/partials/mcp", "dashboard-mcp", "Loading MCP servers...")
+}
+
+func (a *App) handleDashboardMCP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	if p, ok := auth.PrincipalFromContext(r.Context()); !ok || !auth.HasScope(p, "platform.admin") {
+		WriteForbidden(w, "tenant administrator access required")
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := dashboardTemplates.ExecuteTemplate(w, "partial-mcp", nil); err != nil {
+		log.Printf("failed to render MCP dashboard partial: %v", err)
+		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_mcp_partial_failed")
+	}
+}
+
 func (a *App) renderDashboardResourcePage(w http.ResponseWriter, r *http.Request, activePage, pageTitle, description, partialPath, mountID, loadingText string) {
 	if r.Method != http.MethodGet {
 		WriteMethodNotAllowed(w)
