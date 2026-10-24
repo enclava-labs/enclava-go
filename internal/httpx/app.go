@@ -173,6 +173,7 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/api/v1/chatbots", a.authenticated("chatbot", a.handleChatbots))
 	a.mux.HandleFunc("/api/v1/chatbots/", a.authenticated("chatbot", a.handleChatbotByID))
 	a.mux.HandleFunc("/api/v1/agents", a.authenticated("chatbot", a.handleChatbots))
+	a.mux.HandleFunc("/api/v1/chatbot/external/", a.authenticated("chatbot", a.handleExternalChatbot))
 	a.mux.HandleFunc("/api/v1/agents/", a.authenticated("chatbot", a.handleChatbotByID))
 	a.mux.HandleFunc("/api/v1/agent-runs", a.authenticated("chatbot", a.handleAgentRuns))
 	a.mux.HandleFunc("/api/v1/agent-runs/", a.authenticated("chatbot", a.handleAgentRunByID))
