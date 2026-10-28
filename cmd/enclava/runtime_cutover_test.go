@@ -40,7 +40,7 @@ func TestApplicationRuntimeCutover(t *testing.T) {
 		t.Fatal("built binary is empty")
 	}
 
-	if _, err := httpx.DashboardTemplates().Parse("{{define \"embedded-smoke\"}}ok{{end}}"); err != nil {
+	if _, err := httpx.DashboardAuthTemplates().Parse("{{define \"embedded-smoke\"}}ok{{end}}"); err != nil {
 		t.Fatalf("embedded dashboard templates unavailable: %v", err)
 	}
 }
