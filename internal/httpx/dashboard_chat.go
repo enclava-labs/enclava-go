@@ -10,7 +10,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -19,7 +18,6 @@ import (
 	"enclava-go/internal/auth"
 	"enclava-go/internal/chatbot"
 	"enclava-go/internal/inference"
-	"enclava-go/internal/jobs"
 	"enclava-go/internal/source"
 )
 
@@ -50,6 +48,10 @@ type chatViewData struct {
 	EvidenceIDsAttr   string
 	History           chatHistoryData
 	Thread            *chatThreadData
+	// Shared empty states (caller-gated in fillEmptyStates).
+	HistoryEmpty    dashboardEmpty
+	AssistantsEmpty dashboardEmpty
+	ThreadEmpty     dashboardEmpty
 }
 
 func (d chatViewData) DashboardTitle() string  { return "Chat" }
@@ -84,6 +86,7 @@ type chatThreadData struct {
 	ConfText       string // "" → no chip; the chip is never inferred
 	ConfWarn       bool
 	Messages       []chatThreadMessage
+	Live           bool // any non-terminal run → the thread fragment polls
 }
 
 type chatThreadMessage struct {
@@ -101,6 +104,22 @@ type chatThreadMessage struct {
 }
 
 const chatHistoryPageSize = 20
+
+// fillEmptyStates sets the shared dashboardEmpty values; the start-a-chat
+// assistant picker distinguishes "none exist" (manager cap) from "none
+// granted to you" (member, D-25) via the caller's caps.
+func (d *chatViewData) fillEmptyStates(caps dashboardCaps) {
+	d.HistoryEmpty = dashboardEmpty{Icon: "chat", Text: "No conversations yet.",
+		ActionLabel: "New chat", ActionHref: "/dashboard/chat"}
+	d.AssistantsEmpty = dashboardEmpty{Icon: "assistant",
+		Text: "No assistants you can use yet — ask an admin to grant access."}
+	if caps.AssistantsManage {
+		d.AssistantsEmpty.Text = "No assistants yet."
+		d.AssistantsEmpty.ActionLabel, d.AssistantsEmpty.ActionHref = "New assistant", "/dashboard/assistants?new=1"
+	}
+	d.ThreadEmpty = dashboardEmpty{Icon: "chat",
+		Text: "No conversation open yet — pick an assistant and ask your first question."}
+}
 
 // listAssistants returns the audience- AND grant-enforced assistant list
 // (chatbotSvc.List verbatim, D-25). An empty result is the truthful deny
@@ -158,6 +177,7 @@ func (a *App) buildChatHistory(ctx context.Context, p auth.Principal, cursor, co
 // thread state; ?assistant= preselects, ?evidence= preloads composer ids.
 func (a *App) handleDashboardChatPage(w http.ResponseWriter, r *http.Request) {
 	p, _ := auth.PrincipalFromContext(r.Context())
+	caps, _ := capsFromContext(r.Context())
 	q := r.URL.Query()
 	data := chatViewData{
 		Assistants:        a.listAssistants(r.Context(), p),
@@ -165,6 +185,7 @@ func (a *App) handleDashboardChatPage(w http.ResponseWriter, r *http.Request) {
 		EvidenceIDsAttr:   chatEvidenceAttr(q.Get("evidence")),
 		History:           a.buildChatHistory(r.Context(), p, "", ""),
 	}
+	data.fillEmptyStates(caps)
 	a.renderDashboard(w, r, "chat", data)
 }
 
@@ -173,12 +194,14 @@ func (a *App) handleDashboardChatPage(w http.ResponseWriter, r *http.Request) {
 // page — never a rendered fake thread.
 func (a *App) handleDashboardChatConversation(w http.ResponseWriter, r *http.Request) {
 	p, _ := auth.PrincipalFromContext(r.Context())
+	caps, _ := capsFromContext(r.Context())
 	id := strings.TrimSpace(r.PathValue("conversationID"))
 	data := chatViewData{
 		ConversationID: id,
 		Assistants:     a.listAssistants(r.Context(), p),
 		History:        a.buildChatHistory(r.Context(), p, "", id),
 	}
+	data.fillEmptyStates(caps)
 	if !a.appendChatThread(w, r, &data) {
 		return // the 404/500 response is already committed
 	}
@@ -189,19 +212,23 @@ func (a *App) handleDashboardChatConversation(w http.ResponseWriter, r *http.Req
 // keyset pages, ?c= to mark the open conversation).
 func (a *App) handleDashboardChatHistory(w http.ResponseWriter, r *http.Request) {
 	p, _ := auth.PrincipalFromContext(r.Context())
+	caps, _ := capsFromContext(r.Context())
 	q := r.URL.Query()
 	conversationID := strings.TrimSpace(q.Get("c"))
 	data := chatViewData{
 		ConversationID: conversationID,
 		History:        a.buildChatHistory(r.Context(), p, strings.TrimSpace(q.Get("cursor")), conversationID),
 	}
+	data.fillEmptyStates(caps)
 	a.renderDashboardFragment(w, r, "chat", "chat-history", data)
 }
 
 // handleDashboardChatThread re-renders the thread body for ?c={id}; without
 // a conversation id it renders the empty state the composer resets into.
 func (a *App) handleDashboardChatThread(w http.ResponseWriter, r *http.Request) {
+	caps, _ := capsFromContext(r.Context())
 	data := chatViewData{ConversationID: strings.TrimSpace(r.URL.Query().Get("c"))}
+	data.fillEmptyStates(caps)
 	if data.ConversationID != "" && !a.appendChatThread(w, r, &data) {
 		return
 	}
@@ -280,7 +307,12 @@ func (a *App) buildChatThreadData(ctx context.Context, p auth.Principal, view ch
 			if run, ok := resolve(msg.RunID); ok {
 				tm.RunStatus = run.Status
 				tm.RunError = run.Error
-				tm.Pending = run.Status == jobs.StatusQueued || run.Status == jobs.StatusRunning
+				// Per the shared non-terminal table — an unknown run is
+				// terminal: it renders the outcome line and polling stops.
+				tm.Pending = dashboardNonTerminal(run.Status)
+				if tm.Pending {
+					t.Live = true
+				}
 				if run.Model != "" || run.EndpointID != "" {
 					headerModel, headerEndpointID = run.Model, run.EndpointID
 				}
@@ -452,22 +484,28 @@ func (a *App) evidenceDocumentLabel(ctx context.Context, tenantID string, spans 
 	return ""
 }
 
-// evidenceLocationLine renders persisted locators as "page 7 · section Intro"
-// — the D-21 citation words, never invented fields.
+// evidenceLocationLine renders persisted locators through the shared
+// citation join — document · page · section, only real parts, never
+// invented fields.
 func evidenceLocationLine(locators []source.Locator) string {
-	parts := make([]string, 0, len(locators)*2)
+	parts := make([]string, 0, len(locators))
 	for _, l := range locators {
+		page := 0
 		if l.Page != nil {
-			parts = append(parts, fmt.Sprintf("page %d", *l.Page))
+			page = *l.Page
 		}
+		var extras []string
 		if l.Section != "" {
-			parts = append(parts, "section "+l.Section)
+			extras = append(extras, "section "+l.Section)
 		}
 		if l.Clause != "" {
-			parts = append(parts, "clause "+l.Clause)
+			extras = append(extras, "clause "+l.Clause)
 		}
 		if l.Table != "" {
-			parts = append(parts, "table "+l.Table)
+			extras = append(extras, "table "+l.Table)
+		}
+		if cit := dashboardCitation("", page, strings.Join(extras, " · ")); cit != "" {
+			parts = append(parts, cit)
 		}
 	}
 	return strings.Join(parts, " · ")

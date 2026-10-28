@@ -28,7 +28,6 @@ import (
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/extract"
-	"enclava-go/internal/jobs"
 )
 
 // extractCollectionOption is one writable knowledge collection in the result
@@ -53,7 +52,7 @@ type extractView struct {
 	Templates   []extract.Template // Process picker: execution-grant intersection (D-25)
 	Jobs        []extract.JobView  // caller's own extraction jobs only
 	Total       int
-	Live        bool // any queued/running job → the fragment polls every 3s
+	Live        bool // any non-terminal job → the fragment polls every 3s
 	Manage      []extract.Template
 	Settings    extract.Settings
 	Models      []string
@@ -62,6 +61,11 @@ type extractView struct {
 	Fields      []extractFieldRow
 	Writable    []extractCollectionOption
 	MaxUploadMB int64
+	// Shared empty states (capability-gated in buildExtractView).
+	ProcessEmpty   dashboardEmpty
+	JobsEmpty      dashboardEmpty
+	TemplatesEmpty dashboardEmpty
+	FieldsEmpty    dashboardEmpty
 }
 
 func (extractView) DashboardTitle() string  { return "Extract" }
@@ -118,7 +122,9 @@ func (a *App) handleDashboardExtractResultFragment(w http.ResponseWriter, r *htt
 		return
 	}
 	p, _ := auth.PrincipalFromContext(r.Context())
+	caps, _ := capsFromContext(r.Context())
 	v := extractView{Tab: "jobs"}
+	v.fillEmptyStates(caps)
 	if a.extractSvc != nil {
 		detail, err := a.extractSvc.GetJob(r.Context(), p, jobID)
 		if err != nil {
@@ -150,6 +156,7 @@ func (a *App) handleDashboardExtractTemplatesFragment(w http.ResponseWriter, r *
 // the truthful empty states instead of fabricated rows.
 func (a *App) buildExtractView(ctx context.Context, tab string, p auth.Principal, caps dashboardCaps) extractView {
 	v := extractView{Tab: tab, Tabs: extractTabs(caps, tab), MaxUploadMB: a.maxUploadMB}
+	v.fillEmptyStates(caps)
 	if a.extractSvc == nil {
 		return v
 	}
@@ -193,13 +200,37 @@ func extractTabs(caps dashboardCaps, active string) []dashboardTab {
 	return tabs
 }
 
+// extractHasLive reports any job in a non-terminal state — unknown counts
+// terminal (a lost worker never resumes, so it must not keep polling).
 func extractHasLive(jobViews []extract.JobView) bool {
 	for _, j := range jobViews {
-		if j.Status == jobs.StatusQueued || j.Status == jobs.StatusRunning {
+		if dashboardNonTerminal(j.Status) {
 			return true
 		}
 	}
 	return false
+}
+
+// fillEmptyStates sets the shared dashboardEmpty per surface. The Process
+// picker distinguishes "no templates exist" (manager cap → create action)
+// from "none granted to you" (member → administrator-grants sentence, D-25).
+func (v *extractView) fillEmptyStates(caps dashboardCaps) {
+	v.ProcessEmpty = dashboardEmpty{Icon: "extract",
+		Text: "No extraction templates available to you — your administrator grants access."}
+	if caps.ExtractManage {
+		v.ProcessEmpty.Text = "No extraction templates yet."
+		v.ProcessEmpty.ActionLabel, v.ProcessEmpty.ActionHref = "New template", "/dashboard/extract?tab=templates"
+	}
+	v.JobsEmpty = dashboardEmpty{Icon: "extract", Text: "No jobs yet — process a document to see it here."}
+	if caps.Extract {
+		v.JobsEmpty.ActionLabel, v.JobsEmpty.ActionHref = "New extraction", "/dashboard/extract?tab=process"
+	}
+	// The templates tab is manager-only; the toolbar's New-template button
+	// persists, so the empty state stays sentence-only.
+	v.TemplatesEmpty = dashboardEmpty{Icon: "extract",
+		Text: "No extraction templates — create one or restore the defaults."}
+	v.FieldsEmpty = dashboardEmpty{Icon: "extract",
+		Text: "The stored result carries no fields."}
 }
 
 // extractModels lists the model aliases the tenant's vision-capable endpoints

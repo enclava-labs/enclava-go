@@ -178,7 +178,7 @@ func TestDashboardSourcesTableRows(t *testing.T) {
 // TestDashboardSourcesTableStateProjection pins the row projection against
 // SyncJob fixtures at the template boundary: Syncing-with-counts renders the
 // progress bar, counts-less Syncing stays indeterminate, a failed last sync
-// renders Needs attention with the real error.
+// renders Needs attention with an actionable credential error.
 func TestDashboardSourcesTableStateProjection(t *testing.T) {
 	set, err := dashboardTemplateSet("sources")
 	if err != nil {
@@ -206,14 +206,15 @@ func TestDashboardSourcesTableStateProjection(t *testing.T) {
 	}
 	rendered := out.String()
 	for _, want := range []string{
-		`aria-valuenow="42"`, // real counts → determinate progress bar
-		`style="width:42%"`,  // width matches the reported percent
-		`class="dot pulse"`,  // counts-less syncing → indeterminate pulse
-		"Needs attention",    // failed last sync label from the vocabulary
-		"credential refused", // the real error text surfaces
-		"every 3s",           // poll rides along with any syncing row
-		"User bindings",      // AccessManage gate open in this view
-		"1,284",              // items count when stats report it
+		`aria-valuenow="42"`,                // real counts → determinate progress bar
+		`style="width:42%"`,                 // width matches the reported percent
+		`class="dot pulse"`,                 // counts-less syncing → indeterminate pulse
+		"Needs attention",                   // failed last sync label from the vocabulary
+		"credentials were rejected",         // raw credential errors render through the actionable map
+		`href="/dashboard/sources?edit=s3"`, // Reconnect deep-links the failing row
+		"every 3s",                          // poll rides along with any syncing row
+		"User bindings",                     // AccessManage gate open in this view
+		"1,284",                             // items count when stats report it
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("table render missing %q in:\n%s", want, rendered)
@@ -234,8 +235,11 @@ func TestDashboardSourcesTableStateProjection(t *testing.T) {
 	if got := dashboardSourceState(connectors.Source{IsEnabled: false}, nil); got != "paused" {
 		t.Fatalf("disabled state = %q, want paused", got)
 	}
-	if ok, _ := dashboardStatPercent(&connectors.SyncJob{Stats: map[string]any{"percent": 42.0}}); !ok {
-		t.Fatal("percent stat not projected")
+	if ok, pct := dashboardStatPercent(&connectors.SyncJob{Stats: map[string]any{"processed": 42.0, "total": 100.0}}); !ok || pct != 42 {
+		t.Fatalf("count-backed progress = %d, ok=%v; want 42, true", pct, ok)
+	}
+	if ok, _ := dashboardStatPercent(&connectors.SyncJob{Stats: map[string]any{"percent": 42.0}}); ok {
+		t.Fatal("progress without counts must remain indeterminate")
 	}
 	if ok, _ := dashboardStatItems(&connectors.SyncJob{Stats: map[string]any{"policy": 1}}); ok {
 		t.Fatal("items projected although stats carry none")

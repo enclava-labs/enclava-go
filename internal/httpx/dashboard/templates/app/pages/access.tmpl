@@ -17,7 +17,7 @@
 </header>
 {{template "tabs" .Data.Tabs}}
 {{if .Data.Unconfigured}}
-<div class="empty">{{icon "info"}}<p>Identity management is not configured on this deployment.</p></div>
+<div class="empty">{{icon "info"}}<p>{{.Data.UnconfiguredEmpty.Text}}</p></div>
 {{else if eq .Data.Tab "people"}}{{template "frag-access-people" .}}
 {{else if eq .Data.Tab "roles"}}{{template "frag-access-roles" .}}
 {{else if eq .Data.Tab "service-accounts"}}{{template "frag-access-service-accounts" .}}

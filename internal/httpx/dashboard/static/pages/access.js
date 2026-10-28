@@ -46,10 +46,15 @@
     return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
   }
 
-  // report surfaces a failure the shared api() did not already toast.
+  // report routes every failure through the shared error→action map (11-03):
+  // the engine toasts the mapped sentence + fix link (or a retry affordance)
+  // and already handles 401/403; role_has_members lands here as a 409 whose
+  // API message explains members must be moved first — sentence only.
   function report(err) {
     if (err && (err.status === 403 || err.status === 401)) return;
-    Enclava.toast('error', (err && err.message) || 'That request failed');
+    Enclava.toast('error', (err && err.message) || 'That request failed', {
+      action: Enclava.errorAction(err),
+    });
   }
 
   function rerun(fn) {
@@ -329,4 +334,19 @@
     if (!section) return;
     section.querySelectorAll('[data-grant-item]').forEach((item) => { item.disabled = input.checked; });
   });
+
+  // Deep links: /dashboard/access/<tab>?new=1 opens that tab's create drawer
+  // once per load — the empty-state actions point here (managers only; the
+  // whole page sits behind access.manage).
+  (function () {
+    if (new URLSearchParams(location.search).get('new') !== '1') return;
+    var drawers = {
+      people: '/dashboard/partials/access/user-drawer',
+      roles: '/dashboard/partials/access/role-editor',
+      'api-keys': '/dashboard/partials/access/key-drawer',
+    };
+    var tab = location.pathname.split('/').pop();
+    if (tab === 'access') tab = 'people';
+    if (drawers[tab]) Enclava.openDrawer(drawers[tab]);
+  })();
 })();

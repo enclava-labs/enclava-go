@@ -37,10 +37,7 @@
       </div>
     </div>
     {{else}}
-    <div class="empty">
-      {{icon "extract"}}
-      <p>No extraction templates yet — an admin needs to grant access.</p>
-    </div>
+    {{template "empty" .Data.ProcessEmpty}}
     {{end}}
   </div>
   <div class="card">

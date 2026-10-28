@@ -44,6 +44,9 @@ type searchViewData struct {
 	RecentsKey  string
 	Results     *searchResultsData // nil while the query is empty
 	Collections []rag.Collection   // readable list for filter + empty-state cards
+	// Shared empty states (sentence-only on this surface — no create action).
+	ResultsEmpty     dashboardEmpty
+	CollectionsEmpty dashboardEmpty
 }
 
 func (d searchViewData) DashboardTitle() string  { return "Search" }
@@ -134,6 +137,10 @@ func (a *App) buildSearchView(w http.ResponseWriter, r *http.Request) (searchVie
 		Mode:       searchMode(q.Get("mode")),
 		Collection: strings.TrimSpace(q.Get("collection")),
 		RecentsKey: recentsBucket(p),
+		ResultsEmpty: dashboardEmpty{Icon: "search",
+			Text: "Nothing matched your search — try different words or a different collection."},
+		CollectionsEmpty: dashboardEmpty{Icon: "knowledge",
+			Text: "No collections you can search yet — your administrator grants access."},
 	}
 	collections, err := a.ragSvc.ListCollections(ctx, p)
 	if err != nil {
@@ -181,7 +188,7 @@ func (a *App) buildSearchView(w http.ResponseWriter, r *http.Request) (searchVie
 	for _, res := range out.Results {
 		title := strings.TrimSpace(res.FileName)
 		if title == "" {
-			title = res.DocumentID
+			title = "Untitled document" // raw ids are never primary labels (OA-34)
 		}
 		collection := res.CollectionName
 		if collection == "" {

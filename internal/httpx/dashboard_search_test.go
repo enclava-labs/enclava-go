@@ -305,7 +305,7 @@ func TestDashboardSearchFusionAndACLPrivacy(t *testing.T) {
 	// A member with no readable anything: honest empty, never leaks.
 	lonely, lonelyCSRF, _ := f.member(t, "search-lonely@example.test")
 	page := f.get(t, lonely, lonelyCSRF, "/dashboard/search")
-	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "No collections you can read yet") {
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "No collections you can search yet") {
 		t.Fatalf("grantless member empty page = %d body=%s", page.Code, page.Body.String())
 	}
 	empty := f.get(t, lonely, lonelyCSRF, "/dashboard/partials/search/results?q=corpus")
@@ -373,7 +373,7 @@ func TestDashboardSearchResultMarkup(t *testing.T) {
 	partial := f.get(t, sess, csrf, "/dashboard/partials/search/results?q=renewal&mode=lexical")
 	body := partial.Body.String()
 	for _, want := range []string{
-		`class="result"`, `result-title`, "Agreement.pdf", `result-meta`, "page 2",
+		`class="result"`, `result-title`, "Agreement.pdf", `result-meta`, "Page 2",
 		`result-snippet`, "<mark>renewal</mark>", `data-source-kind="upload"`,
 		`data-action="evidence:open"`, `data-evidence-id=`,
 		`data-action="search:ask-about"`, "/dashboard/chat?evidence=",

@@ -24,7 +24,7 @@
     </div>
     <p class="help">Sign-in providers are configuration-driven — adding or changing them is a deployment configuration change, not a dashboard action.</p>
   </div>
-{{else}}  <div class="empty">{{icon "link"}}<p>No sign-in providers configured.</p></div>
+{{else}}  {{template "empty" .Data.SignInEmpty}}
   <p class="help">Single sign-on providers come from deployment configuration; employees can also link a provider from Account after signing in.</p>
 {{end}}</div>
 {{end}}

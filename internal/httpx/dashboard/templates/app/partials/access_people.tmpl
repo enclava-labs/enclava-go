@@ -29,7 +29,7 @@
       </table>
     </div>
   </div>
-{{else}}  <div class="empty">{{icon "users"}}<p>No people yet — invite your first teammate.</p><button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/access/user-drawer">{{icon "plus"}}Invite person</button></div>
+{{else}}  {{template "empty" .Data.PeopleEmpty}}
 {{end}}</div>
 {{end}}
 

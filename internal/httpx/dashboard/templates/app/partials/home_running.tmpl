@@ -18,5 +18,23 @@
     </div>
   {{end}}
   </div>
-  {{else}}<div class="empty">{{icon "check"}}<p>Nothing is running right now.</p></div>{{end}}
+  {{else}}{{template "empty" .Data.Running.Empty}}{{end}}
 </div>{{end}}
+
+{{define "frag-attention"}}{{/* Needs-attention rows carry the shared
+     error→next-step map (Fix*); the 3s trigger lives only while a row's
+     underlying work is non-terminal (a syncing source). */}}
+<div id="homeAttentionList" hx-get="/dashboard/partials/home/attention" hx-trigger="refresh from:body{{if .Data.AttentionLive}}, every 3s{{end}}" hx-target="this" hx-swap="outerHTML">
+  {{if .Data.Attention}}
+  <div class="stack">
+  {{range .Data.Attention}}
+    <div class="attention">
+      <span class="activity-icon">{{icon "bell"}}</span>
+      <div class="activity-copy"><div>{{.Text}}</div>{{if .FixText}}<span class="subline">{{.FixText}}</span>{{end}}</div>
+      {{if .FixHref}}<a class="btn ghost" href="{{.FixHref}}">{{.FixLabel}}</a>{{else if .ActionHref}}<a class="btn ghost" href="{{.ActionHref}}">{{.ActionLabel}}</a>{{end}}
+    </div>
+  {{end}}
+  </div>
+  {{else}}{{template "empty" .Data.AttentionEmpty}}{{end}}
+</div>
+{{end}}

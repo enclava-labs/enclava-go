@@ -189,12 +189,6 @@ func (a *App) handleDashboardAssistantsPage(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	data.Tabs = assistantsTabs("assistants")
-	data.Empty = dashboardEmpty{
-		Icon:        "assistant",
-		Text:        "No assistants yet. Create one to bind a model, instructions, knowledge and tools.",
-		ActionLabel: "New assistant",
-		ActionHref:  "/dashboard/assistants?new=1",
-	}
 	a.renderDashboard(w, r, "assistants", data)
 }
 
@@ -207,12 +201,6 @@ func (a *App) handleDashboardInstructionsPage(w http.ResponseWriter, r *http.Req
 		return
 	}
 	data.Tabs = assistantsTabs("instructions")
-	data.Empty = dashboardEmpty{
-		Icon:        "file",
-		Text:        "No instruction templates yet. Instructions shape how an assistant answers.",
-		ActionLabel: "New instructions",
-		ActionHref:  "/dashboard/assistants/instructions?new=1",
-	}
 	// Sub-page of Assistants: render pages/assistants_instructions.tmpl but
 	// keep the sidebar's Assistants item active (the set/page split mirrors
 	// renderDashboard's own two arguments).
@@ -296,7 +284,11 @@ func (a *App) handleDashboardInstructionEditor(w http.ResponseWriter, r *http.Re
 // --- data assembly -----------------------------------------------------------
 
 func (a *App) assistantsTableData(ctx context.Context, p auth.Principal) (assistantsPageData, error) {
-	data := assistantsPageData{}
+	data := assistantsPageData{Empty: dashboardEmpty{Icon: "assistant", Text: "No assistants yet."}}
+	if caps, _ := capsFromContext(ctx); caps.AssistantsManage {
+		data.Empty.ActionLabel = "New assistant"
+		data.Empty.ActionHref = "/dashboard/assistants?new=1"
+	}
 	if a.chatbotSvc == nil {
 		return data, nil // no service wired: a truthful empty table, never fake rows
 	}
@@ -325,6 +317,20 @@ func (a *App) assistantsTableData(ctx context.Context, p auth.Principal) (assist
 			}
 		}
 	}
+	members := map[string]string{}
+	if a.identity != nil {
+		if users, err := a.identity.ListUsers(ctx, p.TenantID); err == nil {
+			for _, u := range users {
+				label := strings.TrimSpace(u.DisplayName)
+				if label == "" {
+					label = strings.TrimSpace(u.Email)
+				}
+				if label != "" {
+					members[u.ID] = label
+				}
+			}
+		}
+	}
 	states, endpoints := a.assistantEndpointAssurance(ctx, p)
 	data.Table.Rows = make([]assistantRow, 0, len(bots))
 	for _, b := range bots {
@@ -333,9 +339,7 @@ func (a *App) assistantsTableData(ctx context.Context, p auth.Principal) (assist
 			if name, ok := names[id]; ok {
 				knowledge = append(knowledge, name)
 			} else {
-				// Unreadable or deleted collection: the stored ID is the
-				// truth — never hide a configured binding.
-				knowledge = append(knowledge, id)
+				knowledge = append(knowledge, "Unavailable collection")
 			}
 		}
 		row := assistantRow{
@@ -345,7 +349,7 @@ func (a *App) assistantsTableData(ctx context.Context, p auth.Principal) (assist
 			Model:         b.Model,
 			Knowledge:     knowledge,
 			Tools:         assistantToolLabels(b),
-			Audience:      audienceText(b.Audience),
+			Audience:      audienceText(b.Audience, members),
 			StatusState:   "disabled",
 			Conversations: counts[b.ID],
 		}
@@ -364,7 +368,7 @@ func (a *App) assistantsTableData(ctx context.Context, p auth.Principal) (assist
 					}
 				}
 			} else {
-				row.Endpoint = b.ProviderID // endpoint row gone: the stored binding is the truth
+				row.Endpoint = "Unavailable endpoint"
 			}
 		}
 		data.Table.Rows = append(data.Table.Rows, row)
@@ -373,7 +377,11 @@ func (a *App) assistantsTableData(ctx context.Context, p auth.Principal) (assist
 }
 
 func (a *App) instructionsListData(ctx context.Context, p auth.Principal) (instructionsPageData, error) {
-	data := instructionsPageData{}
+	data := instructionsPageData{Empty: dashboardEmpty{Icon: "file", Text: "No instruction templates yet."}}
+	if caps, _ := capsFromContext(ctx); caps.AssistantsManage {
+		data.Empty.ActionLabel = "New template"
+		data.Empty.ActionHref = "/dashboard/assistants/instructions?new=1"
+	}
 	if a.promptSvc == nil {
 		return data, nil
 	}
@@ -485,10 +493,9 @@ func (a *App) assistantDrawerData(ctx context.Context, p auth.Principal, id stri
 			}
 		}
 	}
-	// Audience entries left over after the member pass are stored IDs of
-	// since-removed users — rendered as themselves, never dropped.
+	// Preserve selections for removed members without exposing their IDs as labels.
 	for entry := range memberSelected {
-		data.Members = append(data.Members, assistantMember{ID: entry, Label: entry, Selected: true})
+		data.Members = append(data.Members, assistantMember{ID: entry, Label: "Unavailable member", Selected: true})
 	}
 	sort.Slice(data.Members, func(i, j int) bool { return data.Members[i].Label < data.Members[j].Label })
 	// Non-tool settings ride hidden preserving inputs: the checklist owns
@@ -663,13 +670,22 @@ func assistantToolLabels(b chatbot.Instance) []string {
 	return labels
 }
 
-// audienceText renders the stored audience verbatim: actor IDs or "*" —
-// never a paraphrased or hardcoded value.
-func audienceText(entries []string) string {
+// audienceText resolves stored audience IDs to member names when available.
+func audienceText(entries []string, members map[string]string) string {
 	if len(entries) == 0 {
-		return "—"
+		return "No members"
 	}
-	return strings.Join(entries, ", ")
+	labels := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry == "*" {
+			labels = append(labels, "Everyone")
+		} else if name := members[entry]; name != "" {
+			labels = append(labels, name)
+		} else {
+			labels = append(labels, "Unavailable member")
+		}
+	}
+	return strings.Join(labels, ", ")
 }
 
 // assistantAvatar derives the colored-initials avatar: stable hue from the

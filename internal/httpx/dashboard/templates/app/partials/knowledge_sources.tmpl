@@ -24,12 +24,9 @@
 {{end}}      </tbody>
     </table>
   </div>
-{{else}}  <div class="empty">
-    {{icon "sources"}}
-    <p>No sources sync into this collection yet.</p>
-  </div>
-{{end}}  <div class="row" style="margin-top:12px">
+{{else}}{{template "empty" .Data.SourcesEmpty}}
+{{end}}{{if and .Data.Sources .Can.SourcesManage}}  <div class="row" style="margin-top:12px">
     <a class="btn primary" href="/dashboard/sources?new=1&collection={{urlquery .Data.Collection.ID}}">{{icon "plus"}}Add source</a>
-  </div>
+  </div>{{end}}
 </div>
 {{end}}

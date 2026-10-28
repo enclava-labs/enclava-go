@@ -14,7 +14,7 @@
       hx-get="/dashboard/partials/chat/history?cursor={{urlquery .Data.History.NextCursor}}{{if $conv}}&c={{$conv}}{{end}}"
       hx-target="#chatHistory" hx-swap="outerHTML">Show earlier</button>{{end}}
   {{else}}
-    <p class="muted">No conversations yet — start one with New chat.</p>
+    {{template "empty" .Data.HistoryEmpty}}
   {{end}}
 </div>
 {{end}}

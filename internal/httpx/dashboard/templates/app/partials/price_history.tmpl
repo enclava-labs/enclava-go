@@ -29,10 +29,6 @@
     </tbody>
   </table>
 </div>
-{{else}}
-<div class="empty">
-  {{icon "billing"}}
-  <p>No price rows recorded for this pair yet.</p>
-</div>
+{{else}}{{template "empty" .Data.Empty}}
 {{end}}
 {{end}}

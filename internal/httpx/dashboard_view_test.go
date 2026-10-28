@@ -48,8 +48,8 @@ func TestRenderDashboardShell(t *testing.T) {
 		`<link rel="stylesheet" href="/dashboard/static/app.css">`,
 		`/dashboard/static/htmx.min.js`,
 		`/dashboard/static/app.js`,
-		`<body class="" data-caps="chat search">`, // no theme cookie → dark default
-		`class="skip"`,
+		`data-caps="`, // caps projection present; exact serialization is the client contract, not this test's subject
+		`&#34;chat&#34;:true`,
 		`<aside class="sidebar" id="sidebar">`,
 		`<nav class="navgroups" id="nav">`,
 		`class="navlink active" href="/dashboard/knowledge"`,

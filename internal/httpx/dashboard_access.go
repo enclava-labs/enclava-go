@@ -76,6 +76,7 @@ type accessGrantSection struct {
 	All         bool
 	CallerAll   bool
 	Items       []accessGrantItem
+	Empty       dashboardEmpty // rendered when Items is nil (D-25 deny-all wording)
 }
 
 type accessPerson struct {
@@ -150,19 +151,25 @@ type accessProviderRow struct{ Name, Issuer string }
 
 // accessView is the Access page model; exactly one tab section is populated.
 type accessView struct {
-	Tab          string
-	Tabs         []dashboardTab
-	Unconfigured bool
+	Tab               string
+	Tabs              []dashboardTab
+	Unconfigured      bool
+	UnconfiguredEmpty dashboardEmpty
 
-	People      []accessPerson
-	UserDrawer  *accessUserDrawer
-	Roles       []accessRoleRow
-	RoleEditor  *accessRoleEditor
-	Accounts    []accessAccountRow
-	AccountForm []accessScopeOption
-	Keys        []accessKeyRow
-	KeyDrawer   *accessKeyDrawer
-	Providers   []accessProviderRow
+	People        []accessPerson
+	PeopleEmpty   dashboardEmpty
+	UserDrawer    *accessUserDrawer
+	Roles         []accessRoleRow
+	RolesEmpty    dashboardEmpty
+	RoleEditor    *accessRoleEditor
+	Accounts      []accessAccountRow
+	AccountsEmpty dashboardEmpty
+	AccountForm   []accessScopeOption
+	Keys          []accessKeyRow
+	KeysEmpty     dashboardEmpty
+	KeyDrawer     *accessKeyDrawer
+	Providers     []accessProviderRow
+	SignInEmpty   dashboardEmpty
 }
 
 func (v *accessView) DashboardTitle() string  { return "Access" }
@@ -341,11 +348,22 @@ func (a *App) accessGrantSections(ctx context.Context, p auth.Principal, grants 
 	sortGrantItems(endpoints)
 	sortGrantItems(assistants)
 	sortGrantItems(templates)
+	empty := func(label string, callerAll bool) dashboardEmpty {
+		text := "No " + label + " you can grant"
+		if !callerAll {
+			text += " — you hold no all-access grant for them"
+		}
+		return dashboardEmpty{Icon: "shield", Text: text + "."}
+	}
 	return []accessGrantSection{
-		{Kind: "models", Label: "Models", All: grants.Models.All, CallerAll: p.AllowedModelsAll, Items: models},
-		{Kind: "endpoints", Label: "Endpoints", All: grants.Endpoints.All, CallerAll: p.AllowedEndpointsAll, Items: endpoints},
-		{Kind: "assistants", Label: "Assistants", All: grants.Assistants.All, CallerAll: p.AllowedChatbotsAll && p.AllowedAgentsAll, Items: assistants},
-		{Kind: "extract_templates", Label: "Extraction templates", All: grants.ExtractTemplates.All, CallerAll: p.AllowedExtractTemplatesAll, Items: templates},
+		{Kind: "models", Label: "Models", All: grants.Models.All, CallerAll: p.AllowedModelsAll, Items: models,
+			Empty: empty("models", p.AllowedModelsAll)},
+		{Kind: "endpoints", Label: "Endpoints", All: grants.Endpoints.All, CallerAll: p.AllowedEndpointsAll, Items: endpoints,
+			Empty: empty("endpoints", p.AllowedEndpointsAll)},
+		{Kind: "assistants", Label: "Assistants", All: grants.Assistants.All, CallerAll: p.AllowedChatbotsAll && p.AllowedAgentsAll, Items: assistants,
+			Empty: empty("assistants", p.AllowedChatbotsAll && p.AllowedAgentsAll)},
+		{Kind: "extract_templates", Label: "Extraction templates", All: grants.ExtractTemplates.All, CallerAll: p.AllowedExtractTemplatesAll, Items: templates,
+			Empty: empty("extraction templates", p.AllowedExtractTemplatesAll)},
 	}
 }
 
@@ -454,6 +472,7 @@ func (a *App) accessProviders(ctx context.Context, tenantID string) []accessProv
 
 func (a *App) accessViewModel(r *http.Request, tab string) *accessView {
 	v := &accessView{Tab: tab, Tabs: dashboardAccessTabs(tab)}
+	v.UnconfiguredEmpty = dashboardEmpty{Icon: "info", Text: "Identity management is not configured on this deployment."}
 	p, _ := auth.PrincipalFromContext(r.Context())
 	if a.identity == nil {
 		v.Unconfigured = true
@@ -464,17 +483,24 @@ func (a *App) accessViewModel(r *http.Request, tab string) *accessView {
 	switch tab {
 	case "people":
 		v.People, err = a.accessPeople(ctx, p.TenantID)
+		// ?new=1 deep links open the matching drawer in pages/access.js.
+		v.PeopleEmpty = dashboardEmpty{Icon: "users", Text: "No people yet.", ActionLabel: "Invite person", ActionHref: "/dashboard/access/people?new=1"}
 	case "roles":
 		v.Roles, err = a.accessRoleRows(ctx, p.TenantID)
+		v.RolesEmpty = dashboardEmpty{Icon: "shield", Text: "No roles yet — create the first role to grant access.", ActionLabel: "New role", ActionHref: "/dashboard/access/roles?new=1"}
 	case "service-accounts":
 		v.Accounts, err = a.accessAccounts(ctx, p.TenantID)
+		// No action — the create form is inline below the empty state.
+		v.AccountsEmpty = dashboardEmpty{Icon: "tools", Text: "No service accounts yet — create one below for automated callers."}
 		if err == nil {
 			v.AccountForm = accessScopeOptions(p, nil)
 		}
 	case "api-keys":
 		v.Keys, err = a.accessKeys(ctx, p.TenantID)
+		v.KeysEmpty = dashboardEmpty{Icon: "key", Text: "No API keys yet.", ActionLabel: "New key", ActionHref: "/dashboard/access/api-keys?new=1"}
 	case "sign-in":
 		v.Providers = a.accessProviders(ctx, p.TenantID)
+		v.SignInEmpty = dashboardEmpty{Icon: "link", Text: "No sign-in providers configured."}
 	}
 	if err != nil {
 		log.Printf("access tab %s: %v", tab, err)

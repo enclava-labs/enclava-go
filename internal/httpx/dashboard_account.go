@@ -52,14 +52,16 @@ type accountIdentityRow struct {
 // accountData is the page model; the sessions fragment reuses the same struct
 // so the htmx refresh and the first paint render identically.
 type accountData struct {
-	Profile       accountProfile
-	Sessions      []accountSessionRow
-	SessionsErr   bool
-	Identities    []accountIdentityRow
-	IdentitiesErr bool // read failures render truthful failure text
-	Providers     []auth.OIDCProvider
-	LinkToken     string // ?link_token= → the link confirm form renders
-	OIDCReady     bool   // OIDC configured; gates the link-start actions
+	Profile         accountProfile
+	Sessions        []accountSessionRow
+	SessionsErr     bool
+	SessionsEmpty   dashboardEmpty
+	Identities      []accountIdentityRow
+	IdentitiesErr   bool // read failures render truthful failure text
+	IdentitiesEmpty dashboardEmpty
+	Providers       []auth.OIDCProvider
+	LinkToken       string // ?link_token= → the link confirm form renders
+	OIDCReady       bool   // OIDC configured; gates the link-start actions
 }
 
 func (d accountData) DashboardTitle() string  { return "Account" }
@@ -107,7 +109,7 @@ func (a *App) handleDashboardAccountSessions(w http.ResponseWriter, r *http.Requ
 		a.writeAccountUserError(w, r, err)
 		return
 	}
-	data := accountData{}
+	data := accountData{SessionsEmpty: dashboardEmpty{Icon: "clock", Text: "No sessions."}}
 	if sessions, err := a.identity.ListSessionsForUser(r.Context(), p.TenantID, user.ID); err != nil {
 		log.Printf("account sessions for %s: %v", user.ID, err)
 		data.SessionsErr = true
@@ -123,8 +125,10 @@ func (a *App) handleDashboardAccountSessions(w http.ResponseWriter, r *http.Requ
 // blanks the whole self-service page.
 func (a *App) accountDataFor(r *http.Request, p auth.Principal, user auth.User) accountData {
 	data := accountData{
-		Profile:   accountProfile{Name: user.DisplayName, Email: user.Email},
-		OIDCReady: a.sessionAuth != nil && a.sessionAuth.oidc != nil,
+		Profile:         accountProfile{Name: user.DisplayName, Email: user.Email},
+		OIDCReady:       a.sessionAuth != nil && a.sessionAuth.oidc != nil,
+		SessionsEmpty:   dashboardEmpty{Icon: "clock", Text: "No sessions."},
+		IdentitiesEmpty: dashboardEmpty{Icon: "link", Text: "No external sign-ins are linked to this account."},
 	}
 	if data.Profile.Name == "" {
 		data.Profile.Name = user.Email

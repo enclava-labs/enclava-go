@@ -24,12 +24,12 @@
           <td data-label="Knowledge">{{if .Knowledge}}{{range $i, $k := .Knowledge}}{{if $i}}, {{end}}{{$k}}{{end}}{{else}}<span class="muted">No knowledge attached</span>{{end}}</td>
           <td data-label="Tools">{{if .Tools}}{{range $i, $t := .Tools}}{{if $i}}, {{end}}{{$t}}{{end}}{{else}}<span class="muted">No tools</span>{{end}}</td>
           <td data-label="Audience">{{.Audience}}</td>
-          <td data-label="Status">{{statusPill "assistant" .StatusState}} <button type="button" class="btn" data-action="open-drawer" data-drawer-url="/dashboard/partials/assistants/drawer?id={{.ID}}">Edit</button></td>
+          <td data-label="Status">{{statusPill "assistant" .StatusState}}{{if $.Can.AssistantsManage}} <button type="button" class="btn" data-action="open-drawer" data-drawer-url="/dashboard/partials/assistants/drawer?id={{.ID}}">Edit</button>{{end}}</td>
           <td data-label="Conversations">{{count .Conversations}}</td>
         </tr>
 {{end}}      </tbody>
     </table>
   </div>
-{{else}}  {{template "empty" .Empty}}
+{{else}}  {{template "empty" .Data.Empty}}
 {{end}}</div>
 {{end}}

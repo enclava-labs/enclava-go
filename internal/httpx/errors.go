@@ -1,6 +1,9 @@
 package httpx
 
-import "net/http"
+import (
+	"net/http"
+	"strings"
+)
 
 type OpenAIErrorEnvelope struct {
 	Error OpenAIError `json:"error"`
@@ -23,6 +26,17 @@ func WriteOpenAIError(w http.ResponseWriter, status int, message, errType, code 
 			Code:    code,
 		},
 	})
+}
+
+// WritePriceMissing emits the 422 the missing-price sentinel maps to: the
+// unit token stays in the message so the server and client error→action maps
+// key on it; the internal "billing:" prefix never reaches the client.
+func WritePriceMissing(w http.ResponseWriter, message string) {
+	msg := strings.TrimSpace(strings.TrimPrefix(message, "billing: "))
+	if msg == "" {
+		msg = "required price missing"
+	}
+	WriteOpenAIError(w, http.StatusUnprocessableEntity, msg, "invalid_request_error", "price_missing")
 }
 
 func WriteMethodNotAllowed(w http.ResponseWriter) {

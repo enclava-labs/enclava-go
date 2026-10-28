@@ -9,7 +9,7 @@
 <script src="/dashboard/static/app.js" defer></script>
 {{if .Module}}<script src="/dashboard/static/pages/{{.Module}}.js" defer></script>{{end}}
 </head>
-<body class="{{.Theme}}" data-caps="{{.CapsAttr}}">
+<body class="{{.Theme}}" data-caps="{{dashboardCapsJSON .Can}}">
 <div class="app" id="app">
   <a class="skip" href="#content">Skip to content</a>
   <div class="mobilebar">

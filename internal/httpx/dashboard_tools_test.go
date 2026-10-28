@@ -160,7 +160,7 @@ func TestDashboardToolsQueueDiff(t *testing.T) {
 		t.Fatalf("reject submit_form status = %v", *code)
 	}
 	rec = sessionForm(t, f.app, http.MethodGet, "/dashboard/tools", nil, sess, nil)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Nothing needs approval.") {
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "No tools pending approval.") {
 		t.Fatalf("queue must render the designed empty state after reviews, status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }

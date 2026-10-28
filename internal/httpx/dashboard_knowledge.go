@@ -14,6 +14,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,6 +37,7 @@ type knowledgeListData struct {
 	Header          dashboardHeader
 	Rows            []knowledgeCollectionRow
 	EmbeddingModels []string
+	Empty           dashboardEmpty
 }
 
 func (d knowledgeListData) DashboardTitle() string  { return "Knowledge" }
@@ -64,6 +66,8 @@ type knowledgeCollectionData struct {
 	Docs            []rag.Document
 	DocMore         bool
 	AnyProcessing   bool
+	Empty           dashboardEmpty
+	SourcesEmpty    dashboardEmpty
 	Sources         []connectors.Source
 	EmbeddingModels []string
 	Everyone        bool // audience contains "*" — the settings access select
@@ -75,6 +79,7 @@ func (d knowledgeCollectionData) DashboardModule() string { return "knowledge" }
 // knowledgeProfilesData is the read-only profiles + preview-tool page.
 type knowledgeProfilesData struct {
 	Header dashboardHeader
+	Empty  dashboardEmpty
 }
 
 func (d knowledgeProfilesData) DashboardTitle() string  { return "Processing profiles" }
@@ -135,8 +140,10 @@ func (a *App) knowledgeListView(w http.ResponseWriter, r *http.Request, p auth.P
 			Title: "Knowledge",
 			Desc:  "Collections of documents your assistants can search and cite.",
 		},
+		Empty: dashboardEmpty{Icon: "knowledge", Text: "No collections you can read yet."},
 	}
 	if caps.KnowledgeManage {
+		data.Empty = dashboardEmpty{Icon: "knowledge", Text: "No collections yet.", ActionLabel: "New collection", ActionHref: "/dashboard/knowledge?new=1"}
 		data.Header.Actions = template.HTML(`<button type="button" class="btn primary" data-action="knowledge:new">` +
 			string(dashboardIconPlus()) + `New collection</button>`)
 		data.EmbeddingModels = a.knowledgeEmbeddingModels(ctx, p.TenantID)
@@ -233,6 +240,8 @@ func (a *App) handleDashboardKnowledgeCollection(w http.ResponseWriter, r *http.
 		Tabs:       knowledgeTabs(c.ID, tab, caps),
 		Everyone:   knowledgeAccessLabel(c) == "Everyone",
 	}
+	data.Empty = knowledgeDocumentsEmpty(knowledgeDocumentStatus(r.URL.Query().Get("status")), caps)
+	data.SourcesEmpty = knowledgeSourcesEmpty(c.ID, caps)
 	ctx := r.Context()
 	switch tab {
 	case "documents":
@@ -340,11 +349,29 @@ func (a *App) knowledgeCollectionSources(ctx context.Context, p auth.Principal, 
 // condition under which the fragment carries the 3s poll trigger.
 func knowledgeAnyProcessing(docs []rag.Document) bool {
 	for _, d := range docs {
-		if d.Status == rag.DocumentStatusProcessing {
+		if dashboardNonTerminal(d.Status) {
 			return true
 		}
 	}
 	return false
+}
+
+func knowledgeDocumentsEmpty(status string, caps dashboardCaps) dashboardEmpty {
+	empty := dashboardEmpty{Icon: "knowledge", Text: "No documents match this filter."}
+	if status == rag.DocumentStatusAll && caps.KnowledgeManage {
+		empty.Text = "No documents yet."
+		empty.ActionLabel, empty.ActionHref = "Upload document", "#knowledge-upload-file"
+	}
+	return empty
+}
+
+func knowledgeSourcesEmpty(collectionID string, caps dashboardCaps) dashboardEmpty {
+	empty := dashboardEmpty{Icon: "sources", Text: "No sources feeding this collection."}
+	if caps.SourcesManage {
+		empty.ActionLabel = "Add source"
+		empty.ActionHref = "/dashboard/sources?new=1&collection=" + url.QueryEscape(collectionID)
+	}
+	return empty
 }
 
 // knowledgeAccessLabel summarizes the collection's read audience in plain
@@ -399,6 +426,7 @@ func (a *App) knowledgeEmbeddingModels(ctx context.Context, tenantID string) []s
 
 func (a *App) handleDashboardKnowledgeDocuments(w http.ResponseWriter, r *http.Request) {
 	p, _ := auth.PrincipalFromContext(r.Context())
+	caps, _ := capsFromContext(r.Context())
 	collectionID := strings.TrimSpace(r.URL.Query().Get("collection"))
 	status := knowledgeDocumentStatus(r.URL.Query().Get("status"))
 	docs, more, ok := a.knowledgeDocuments(w, r.Context(), p, collectionID, status)
@@ -411,16 +439,19 @@ func (a *App) handleDashboardKnowledgeDocuments(w http.ResponseWriter, r *http.R
 		Docs:          docs,
 		DocMore:       more,
 		AnyProcessing: knowledgeAnyProcessing(docs),
+		Empty:         knowledgeDocumentsEmpty(status, caps),
 	}
 	a.renderDashboardFragment(w, r, "knowledge_collection", "knowledge-documents", data)
 }
 
 func (a *App) handleDashboardKnowledgeSources(w http.ResponseWriter, r *http.Request) {
 	p, _ := auth.PrincipalFromContext(r.Context())
+	caps, _ := capsFromContext(r.Context())
 	collectionID := strings.TrimSpace(r.URL.Query().Get("collection"))
 	data := knowledgeCollectionData{
-		Collection: rag.Collection{ID: collectionID},
-		Sources:    a.knowledgeCollectionSources(r.Context(), p, collectionID),
+		Collection:   rag.Collection{ID: collectionID},
+		Sources:      a.knowledgeCollectionSources(r.Context(), p, collectionID),
+		SourcesEmpty: knowledgeSourcesEmpty(collectionID, caps),
 	}
 	a.renderDashboardFragment(w, r, "knowledge_collection", "knowledge-sources", data)
 }
@@ -434,10 +465,11 @@ func (a *App) handleDashboardKnowledgeProfiles(w http.ResponseWriter, r *http.Re
 			Title: "Processing profiles",
 			Desc:  "Immutable chunking profiles collections process documents with — read-only here; the preview tool below shows exactly what a profile does to a document.",
 		},
+		Empty: dashboardEmpty{Icon: "knowledge", Text: "No processing profiles."},
 	}
 	a.renderDashboard(w, r, "knowledge_profiles", data)
 }
 
 func (a *App) handleDashboardKnowledgeProfilesPartial(w http.ResponseWriter, r *http.Request) {
-	a.renderDashboardFragment(w, r, "knowledge_profiles", "knowledge-profiles", knowledgeProfilesData{})
+	a.renderDashboardFragment(w, r, "knowledge_profiles", "knowledge-profiles", knowledgeProfilesData{Empty: dashboardEmpty{Icon: "knowledge", Text: "No processing profiles."}})
 }

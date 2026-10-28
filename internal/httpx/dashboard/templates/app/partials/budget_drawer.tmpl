@@ -13,6 +13,7 @@
 <form data-usage-form data-budget-id="{{.Data.Drawer.BudgetID}}">
   <label class="label" for="budget-limit">Limit{{if eq .Data.Drawer.Kind "tokens"}} (tokens){{end}}</label>
   <input class="field" id="budget-limit" name="limit_value" type="number" min="1" step="1" value="{{.Data.Drawer.LimitValue}}" required>
+{{if eq .Data.Drawer.Kind "amount"}}  <span class="help">Enter the amount in millionths of the currency unit.</span>{{end}}
   <span class="field-error" hidden></span>
   <div class="drawer-actions">
     <button type="button" class="btn ghost" data-action="close-drawer">Cancel</button>
@@ -31,22 +32,31 @@
     <option value="service_account">Service account</option>
   </select>
   <div data-subject-for="api_key" hidden>
+{{if .Data.Drawer.Keys}}
     <label class="label" for="budget-subject-key">API key</label>
     <select class="field" id="budget-subject-key" name="subject_id_api_key">
 {{range .Data.Drawer.Keys}}      <option value="{{.ID}}">{{.Label}}</option>
 {{end}}    </select>
+{{else}}    {{template "empty" .Data.Drawer.KeysEmpty}}
+{{end}}
   </div>
   <div data-subject-for="user" hidden>
+{{if .Data.Drawer.Users}}
     <label class="label" for="budget-subject-user">User</label>
     <select class="field" id="budget-subject-user" name="subject_id_user">
 {{range .Data.Drawer.Users}}      <option value="{{.ID}}">{{.Label}}</option>
 {{end}}    </select>
+{{else}}    {{template "empty" .Data.Drawer.UsersEmpty}}
+{{end}}
   </div>
   <div data-subject-for="service_account" hidden>
+{{if .Data.Drawer.Services}}
     <label class="label" for="budget-subject-service">Service account</label>
     <select class="field" id="budget-subject-service" name="subject_id_service_account">
 {{range .Data.Drawer.Services}}      <option value="{{.ID}}">{{.Label}}</option>
 {{end}}    </select>
+{{else}}    {{template "empty" .Data.Drawer.ServicesEmpty}}
+{{end}}
   </div>
   <label class="label" for="budget-kind">Kind</label>
   <select class="field" id="budget-kind" name="kind">
@@ -55,6 +65,7 @@
   </select>
   <label class="label" for="budget-limit-value">Limit value</label>
   <input class="field" id="budget-limit-value" name="limit_value" type="number" min="1" step="1" required>
+  <span class="help">For amount budgets, enter millionths of the currency unit.</span>
   <label class="label" for="budget-currency">Currency</label>
   <input class="field" id="budget-currency" name="currency" type="text" maxlength="3" placeholder="USD">
   <span class="help">Amount budgets only — leave empty for token budgets.</span>

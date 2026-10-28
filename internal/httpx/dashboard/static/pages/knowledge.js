@@ -14,6 +14,11 @@
 
   if (window.Enclava === undefined) return;
 
+  function writeError(error, fallback) {
+    var action = Enclava.errorAction(error);
+    Enclava.toast('error', action.text || (error && error.message) || fallback, { action: action });
+  }
+
   // ── Processing-profile selects (drawer + settings): hydrated from the ──
   // ── read-only profiles API; empty on failure, never a fabricated option ──
 
@@ -28,7 +33,7 @@
           if (!p || !p.id) return;
           var opt = document.createElement('option');
           opt.value = p.id;
-          opt.textContent = (p.profile_id || 'Profile') + ' · v' + p.version + ' · ' + p.id;
+          opt.textContent = (p.profile_id || 'Profile') + ' · v' + p.version;
           if (p.id === current) opt.selected = true;
           select.appendChild(opt);
         });
@@ -69,14 +74,17 @@
     var profile = form.elements.chunk_profile_version_id.value;
     if (profile) payload.chunk_profile_version_id = profile;
     payload.acl = form.elements.access.value === 'org' ? { audience: ['*'] } : {};
-    Enclava.api('POST', '/api/v1/rag/collections', payload).then(function (c) {
+    function created(c) {
       Enclava.closeDrawer();
       Enclava.toast('success', 'Collection created');
       if (c && c.id) location.assign('/dashboard/knowledge/' + encodeURIComponent(c.id));
       else Enclava.refresh();
-    }).catch(function (e) {
+    }
+    Enclava.api('POST', '/api/v1/rag/collections', payload, {onRetry: function () {
+      return Enclava.api('POST', '/api/v1/rag/collections', payload).then(created);
+    }}).then(created).catch(function (e) {
       if (err) { err.textContent = (e && e.message) || 'Create failed'; err.hidden = false; }
-      else Enclava.toast('error', (e && e.message) || 'Create failed');
+      writeError(e, 'Create failed');
     });
   }
 
@@ -100,7 +108,7 @@
         Enclava.toast('success', 'Document uploaded — processing started');
         Enclava.refresh();
       })
-      .catch(function (e) { Enclava.toast('error', (e && e.message) || 'Upload failed'); });
+      .catch(function (e) { writeError(e, 'Upload failed'); });
   }
 
   function retryDocument(documentID) {
@@ -109,7 +117,7 @@
         Enclava.toast('success', 'Reprocess queued');
         Enclava.refresh();
       })
-      .catch(function (e) { Enclava.toast('error', (e && e.message) || 'Reprocess failed'); });
+      .catch(function (e) { writeError(e, 'Reprocess failed'); });
   }
 
   function deleteDocument(documentID) {
@@ -118,7 +126,7 @@
         Enclava.toast('success', 'Document deleted');
         Enclava.refresh();
       })
-      .catch(function (e) { Enclava.toast('error', (e && e.message) || 'Delete failed'); });
+      .catch(function (e) { writeError(e, 'Delete failed'); });
   }
 
   // ── Settings tab: save (PUT) / delete collection ────────────────────────
@@ -141,23 +149,32 @@
       })
       .catch(function (e) {
         if (err) { err.textContent = (e && e.message) || 'Save failed'; err.hidden = false; }
-        else Enclava.toast('error', (e && e.message) || 'Save failed');
+        writeError(e, 'Save failed');
       });
   }
 
   function deleteCollection(id) {
-    Enclava.api('DELETE', '/api/v1/rag/collections/' + encodeURIComponent(id))
-      .then(function () {
-        Enclava.toast('success', 'Collection deleted');
-        location.assign('/dashboard/knowledge');
-      })
-      .catch(function (e) { Enclava.toast('error', (e && e.message) || 'Delete failed'); });
+    function deleted() {
+      Enclava.toast('success', 'Collection deleted');
+      location.assign('/dashboard/knowledge');
+    }
+    Enclava.api('DELETE', '/api/v1/rag/collections/' + encodeURIComponent(id), null, {onRetry: function () {
+      return Enclava.api('DELETE', '/api/v1/rag/collections/' + encodeURIComponent(id)).then(deleted);
+    }})
+      .then(deleted)
+      .catch(function (e) { writeError(e, 'Delete failed'); });
   }
 
   // ── Events ──────────────────────────────────────────────────────────────
 
   document.addEventListener('click', function (e) {
     if (!(e.target instanceof Element)) return;
+    var upload = e.target.closest('a[href="#knowledge-upload-file"]');
+    if (upload) {
+      var input = document.getElementById('knowledge-upload-file');
+      if (input) { e.preventDefault(); input.click(); }
+      return;
+    }
     var trigger = e.target.closest('[data-action]');
     if (!trigger) return;
     switch (trigger.dataset.action) {
@@ -240,8 +257,10 @@
   var warningsNode = document.getElementById('document-preview-warnings');
   var chunksNode = document.getElementById('document-preview-chunks');
   var profilesBody = document.getElementById('knowledge-profiles-body');
+  var profilesEmpty = document.getElementById('knowledge-profiles-empty');
+  var profilesTable = document.getElementById('knowledge-profiles-table');
   var pollAttempts = 0;
-  var maxPollAttempts = 300;
+  var maxPollAttempts = 100;
   var profileRequest = 0;
   var timer = null;
   var currentJob = '';
@@ -273,7 +292,7 @@
     }
     var list = document.createElement('dl');
     var rows = [
-      ['Version ID', profile.id], ['Profile family', profile.profile_id], ['Version', profile.version],
+      ['Profile family', profile.profile_id], ['Version', profile.version],
       ['Boundary strategy', profile.boundary_strategy], ['Size (Unicode code points)', profile.size_codepoints],
       ['Overlap (Unicode code points)', profile.overlap_codepoints], ['Parent context', profile.include_parents ? 'Included' : 'Not included'],
       ['Table handling', profile.table_handling], ['Preserve clauses', profile.preserve_clauses ? 'Yes' : 'No'],
@@ -292,20 +311,14 @@
   function renderProfilesTable(profiles) {
     if (!profilesBody) return;
     profilesBody.replaceChildren();
-    if (!profiles.length) {
-      var row = element('tr');
-      var cell = element('td', 'muted', 'No processing profiles exist yet.');
-      cell.setAttribute('colspan', '3');
-      row.appendChild(cell);
-      profilesBody.appendChild(row);
-      return;
-    }
+    if (profilesEmpty) profilesEmpty.hidden = profiles.length > 0;
+    if (profilesTable) profilesTable.hidden = profiles.length === 0;
+    if (!profiles.length) return;
     profiles.forEach(function (p) {
       if (!p || !p.id) return;
       var row = element('tr');
       var name = element('td', '', p.profile_id || 'Profile');
       name.setAttribute('data-label', 'Profile');
-      name.appendChild(element('span', 'subline', p.id));
       var version = element('td', '', 'v' + p.version);
       version.setAttribute('data-label', 'Version');
       var settings = element('td', '', [
@@ -349,7 +362,7 @@
       }
       profiles.forEach(function (profile) {
         if (!profile || !profile.id) return;
-        var option = element('option', '', (profile.profile_id || 'Profile') + ' · v' + profile.version + ' · ' + profile.id);
+        var option = element('option', '', (profile.profile_id || 'Profile') + ' · v' + profile.version);
         option.value = profile.id;
         profileSelect.appendChild(option);
       });
@@ -362,7 +375,14 @@
         });
       }
     }).catch(function (error) {
-      renderProfilesTable([]);
+      if (profilesEmpty) profilesEmpty.hidden = true;
+      if (profilesTable) profilesTable.hidden = false;
+      profilesBody.replaceChildren();
+      var row = element('tr');
+      var cell = element('td', 'muted', 'Profiles unavailable.');
+      cell.setAttribute('colspan', '3');
+      row.appendChild(cell);
+      profilesBody.appendChild(row);
       profileSelect.replaceChildren(element('option', '', 'Profiles unavailable'));
       profileDetails.textContent = 'Could not load existing profiles: ' + error.message;
       statusNode.textContent = 'Preview is unavailable until a profile can be loaded.';
@@ -404,10 +424,7 @@
     chunksNode.replaceChildren();
     var ref = value(documentData, ['ref', 'Ref']);
     if (ref) {
-      chunksNode.appendChild(element('p', 'muted', 'Source version · ' + value(ref, ['object_id', 'ObjectID']) + ' · revision ' + value(ref, ['observed_seq', 'ObservedSeq'])));
-    }
-    if (body.chunk_profile_version_id) {
-      chunksNode.appendChild(element('p', 'muted', 'Preview profile version · ' + body.chunk_profile_version_id));
+      chunksNode.appendChild(element('p', 'muted', 'Source revision ' + value(ref, ['observed_seq', 'ObservedSeq'])));
     }
     var originalURL = body.original_url || documentData.original_url;
     if (originalURL) {
@@ -425,9 +442,7 @@
     chunks.forEach(function (chunk, index) {
       var card = element('article', 'card');
       var ordinal = value(chunk, ['ordinal', 'Ordinal']);
-      var id = value(chunk, ['id', 'ID']);
       var heading = 'Chunk ' + (ordinal === undefined ? index + 1 : ordinal + 1);
-      if (id) heading += ' · ' + id;
       card.appendChild(element('h3', '', heading));
       var chunkText = element('pre', '', value(chunk, ['text', 'Text']) || '');
       chunkText.style.whiteSpace = 'pre-wrap';
@@ -445,7 +460,12 @@
         if (start !== undefined && end !== undefined) provenance += ' · UTF-8 bytes ' + start + '–' + end;
         if (sourceBlock) {
           provenance += ' · block ' + value(sourceBlock, ['ordinal', 'Ordinal']) + ' (' + (value(sourceBlock, ['kind', 'Kind']) || 'source') + ')';
-          if (sourceLocation) provenance += ' · ' + JSON.stringify(sourceLocation);
+          if (sourceLocation) {
+            var page = value(sourceLocation, ['page', 'Page']);
+            var section = value(sourceLocation, ['section', 'Section']) || value(sourceLocation, ['clause', 'Clause']);
+            if (page != null) provenance += ' · Page ' + page;
+            if (section) provenance += ' · ' + section;
+          }
           var sourceText = value(sourceBlock, ['text', 'Text']);
           if (sourceText && !displayedBlocks[blockID]) {
             displayedBlocks[blockID] = true;
@@ -462,7 +482,7 @@
       var parentID = value(chunk, ['parent_chunk_id', 'ParentChunkID']);
       if (parentID) {
         var parent = chunkByID[parentID];
-        card.appendChild(element('p', 'muted', 'Parent context' + (parent && value(parent, ['text', 'Text']) ? ': ' + value(parent, ['text', 'Text']) : ' · ' + parentID)));
+        card.appendChild(element('p', 'muted', 'Parent context' + (parent && value(parent, ['text', 'Text']) ? ': ' + value(parent, ['text', 'Text']) : ' unavailable')));
       }
       var chunkWarnings = value(chunk, ['warnings', 'Warnings']);
       (Array.isArray(chunkWarnings) ? chunkWarnings : []).forEach(function (warning) { card.appendChild(element('p', 'field-error', typeof warning === 'string' ? warning : JSON.stringify(warning))); });
@@ -486,9 +506,10 @@
     pollAttempts++;
     request('/api/v1/document-previews/' + encodeURIComponent(currentJob)).then(function (job) {
       var state = job.status || 'unknown';
-      showStatus('Preview ' + state + (job.error_message ? ': ' + job.error_message : '.'));
+      showStatus('Preview ' + state + (job.error_message ? ': ' + Enclava.errorAction({message: job.error_message, status: state}).text : '.'));
+      if ((state === 'failed' || state === 'unknown') && job.error_message) writeError({message: job.error_message, status: state}, 'Preview failed');
       if (state === 'queued' || state === 'running') {
-        timer = window.setTimeout(poll, 1000);
+        timer = window.setTimeout(poll, Enclava.POLL_MS);
         return;
       }
       stopPolling();
@@ -534,15 +555,20 @@
     var data = new FormData();
     data.append('chunk_profile_version_id', profileSelect.value);
     data.append('file', form.elements.file.files[0]);
-    Enclava.api('POST', '/api/v1/document-previews', data).then(function (job) {
+    function started(job) {
       if (!job.job_id) throw new Error('The preview service did not return a job ID.');
       currentJob = job.job_id;
       showStatus('Preview ' + (job.status || 'queued') + '.');
       pollAttempts = 0;
       cancelButton.hidden = false;
+      submitButton.disabled = true;
       poll();
-    }).catch(function (error) {
+    }
+    Enclava.api('POST', '/api/v1/document-previews', data, {onRetry: function () {
+      return Enclava.api('POST', '/api/v1/document-previews', data).then(started);
+    }}).then(started).catch(function (error) {
       showStatus('Preview could not be started: ' + error.message);
+      writeError(error, 'Preview could not be started');
       submitButton.disabled = false;
     });
   });
@@ -551,12 +577,17 @@
     if (!currentJob) return;
     cancelButton.disabled = true;
     showStatus('Cancelling preview…');
-    Enclava.api('POST', '/api/v1/document-previews/' + encodeURIComponent(currentJob) + '/cancel').then(function () {
+    function cancelled() {
       showStatus('Cancellation requested; waiting for the terminal job state…');
       pollAttempts = 0;
       poll();
-    }).catch(function (error) {
+    }
+    var cancelURL = '/api/v1/document-previews/' + encodeURIComponent(currentJob) + '/cancel';
+    Enclava.api('POST', cancelURL, null, {onRetry: function () {
+      return Enclava.api('POST', cancelURL).then(cancelled);
+    }}).then(cancelled).catch(function (error) {
       showStatus('Preview could not be cancelled: ' + error.message);
+      writeError(error, 'Preview could not be cancelled');
     }).then(function () { cancelButton.disabled = false; });
   });
 

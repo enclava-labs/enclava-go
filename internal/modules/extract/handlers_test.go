@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -35,6 +36,35 @@ func TestExtractTemplateIDFromRequestAcceptsLegacyAliases(t *testing.T) {
 		if got := extractTemplateIDFromRequest(r); got != "tpl_1" {
 			t.Fatalf("key %s: got %q", key, got)
 		}
+	}
+}
+
+// TestWriteJobErrorPriceMissing pins the 11-01 envelope contract: the
+// persisted-admission sentinel billing.ErrPriceMissing surfaces as 422 +
+// code price_missing with the unit token intact — never a generic 500.
+func TestWriteJobErrorPriceMissing(t *testing.T) {
+	rec := httptest.NewRecorder()
+	(&Handlers{}).writeJobError(rec, fmt.Errorf("%w: %s", billing.ErrPriceMissing, "cached_input"), "job_fetch_failed")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", rec.Code)
+	}
+	var env struct {
+		Error struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Error.Code != "price_missing" || !strings.Contains(env.Error.Message, "cached_input") {
+		t.Fatalf("envelope = %+v, want code price_missing with the unit retained", env.Error)
+	}
+
+	rec = httptest.NewRecorder()
+	(&Handlers{}).writeJobError(rec, extractsvc.ErrNotFound, "job_fetch_failed")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("not-found mapping regressed: %d", rec.Code)
 	}
 }
 

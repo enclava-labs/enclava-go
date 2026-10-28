@@ -62,7 +62,10 @@
       window.Enclava.toast('success', budgetId ? 'Budget limit updated' : 'Budget created');
       window.Enclava.refresh();
     }).catch((err) => {
-      showFormError(form, (err && err.message) || 'Request failed');
+      const action = window.Enclava.errorAction(err);
+      showFormError(form, action.text || (err && err.message) || 'Request failed');
+      window.Enclava.toast('error', action.text || (err && err.message) || 'Request failed',
+        { action: action });
     });
   });
 

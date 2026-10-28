@@ -44,7 +44,7 @@
           </tr>
 {{end}}        </tbody>
       </table></div>
-      {{else}}<p class="muted">No priced usage in this range.</p>{{end}}
+      {{else}}{{template "empty" .Data.Overview.Empty}}{{end}}
     </div>
     <div class="card">
       <div class="section-head"><h2>Spend by team</h2></div>
@@ -60,7 +60,7 @@
           </tr>
 {{end}}        </tbody>
       </table></div>
-      {{else}}<p class="muted">No priced usage in this range.</p>{{end}}
+      {{else}}{{template "empty" .Data.Overview.Empty}}{{end}}
     </div>
     <div class="card">
       <div class="section-head"><h2>Spend by key</h2></div>
@@ -76,7 +76,7 @@
           </tr>
 {{end}}        </tbody>
       </table></div>
-      {{else}}<p class="muted">No keyed usage in this range.</p>{{end}}
+      {{else}}{{template "empty" .Data.Overview.Empty}}{{end}}
     </div>
   </div>
 </div>

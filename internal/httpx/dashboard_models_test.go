@@ -118,8 +118,8 @@ func TestDashboardModelsMemberDenied(t *testing.T) {
 }
 
 // TestDashboardModelsEndpointsRuntime: health/assurance cells render only
-// observed state — a never-dispatched endpoint shows the unknown pill (never
-// Ready), a configured-but-unverified assurance reads Unverified, no
+// observed state — a never-dispatched endpoint shows the unobserved pill
+// (never Ready), a configured-but-unverified assurance reads Unverified, no
 // assurance mode reads Not confidential, and the verified cell (hand-built
 // row through the real fragment set) shows Verified · TEE · checked time.
 func TestDashboardModelsEndpointsRuntime(t *testing.T) {
@@ -151,7 +151,10 @@ func TestDashboardModelsEndpointsRuntime(t *testing.T) {
 	if strings.Contains(body, ">Ready<") {
 		t.Fatalf("no endpoint was ever dispatched — Ready must not render without an observation:\n%s", body)
 	}
-	for _, want := range []string{"Unknown", "Unverified", "Not confidential", "Disabled", "ep-unknown", "ep-unverified"} {
+	if !strings.Contains(body, `<td data-label="Health"><span class="pill neutral"><i class="dot"></i>Unobserved</span>`) {
+		t.Fatalf("never-dispatched endpoint must show unobserved health:\n%s", body)
+	}
+	for _, want := range []string{"Unobserved", "Unverified", "Not confidential", "Disabled", "ep-unknown", "ep-unverified"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("endpoints table missing %q\n%s", want, body)
 		}
@@ -237,7 +240,8 @@ func TestDashboardModelsPricingMatrix(t *testing.T) {
 // TestDashboardModelsDrawer: the drawer form carries only endpointRequest
 // fields — no assurance_verified control exists anywhere in the markup —
 // renders the read-only assurance status line and the private-authorization
-// help, and unknown ids 404.
+// help; an unknown id gets the drawer's sentence-only empty state (200),
+// never a bare 404.
 func TestDashboardModelsDrawer(t *testing.T) {
 	f := newModelsFixture(t)
 	session, csrf := modelsLogin(t, f, "admin@models.test", "pricing.manage")
@@ -281,8 +285,8 @@ func TestDashboardModelsDrawer(t *testing.T) {
 	}
 
 	rec = modelsGet(t, f, "/dashboard/partials/models/endpoint-drawer?id=ep-nope", session, csrf)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("unknown drawer id: expected 404, got %d", rec.Code)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "That endpoint is no longer available.") {
+		t.Fatalf("unknown drawer id: expected 200 with the drawer empty state, got %d body=%s", rec.Code, rec.Body.String())
 	}
 
 	// The page module must actually be served — the old pricing bug class.

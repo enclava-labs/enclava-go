@@ -19,18 +19,9 @@
 
 <section class="section" id="homeAttention">
   <div class="section-head"><h2>Needs attention</h2></div>
-  {{if .Data.Attention}}
-  <div class="stack">
-  {{range .Data.Attention}}
-    <div class="attention">
-      <span class="activity-icon">{{icon "bell"}}</span>
-      <div class="activity-copy"><div>{{.Text}}</div></div>
-      {{if .ActionHref}}<a class="btn ghost" href="{{.ActionHref}}">{{.ActionLabel}}</a>{{end}}
-    </div>
-  {{end}}
-  </div>
-  {{else}}<div class="empty">{{icon "check"}}<p>Nothing needs attention.</p></div>{{end}}
+  {{template "frag-attention" .}}
 </section>
+
 
 {{if .Can.BillingView}}
 <section class="section" id="homeKPIs">
@@ -99,7 +90,7 @@
     </a>
   {{end}}
   </div>
-  {{else}}<div class="empty">{{icon "chat"}}<p>No conversations yet.</p></div>{{end}}
+  {{else}}{{template "empty" .Data.ConversationsEmpty}}{{end}}
 </section>
 
 <section class="section" id="homeStartChat">
@@ -113,7 +104,7 @@
     </a>
   {{end}}
   </div>
-  {{else}}<div class="empty">{{icon "assistant"}}<p>No assistants you can use yet — ask an admin to grant access.</p></div>{{end}}
+  {{else}}{{template "empty" .Data.AssistantsEmpty}}{{end}}
 </section>
 {{end}}
 
@@ -126,14 +117,14 @@
     <div class="activity-row">
       <span class="activity-icon">{{icon "extract"}}</span>
       <div class="activity-copy">
-        <div>{{if .FileName}}{{.FileName}}{{else}}{{.ID}}{{end}}</div>
+        <div>{{if .FileName}}{{.FileName}}{{else}}Extraction{{end}}</div>
         <span class="muted">{{relTime .CreatedAt}}</span>
       </div>
       {{statusPill "job" .Status}}
     </div>
   {{end}}
   </div>
-  {{else}}<div class="empty">{{icon "extract"}}<p>No extractions yet.</p></div>{{end}}
+  {{else}}{{template "empty" .Data.ExtractionsEmpty}}{{end}}
 </section>
 {{end}}
 
@@ -152,7 +143,7 @@
     </a>
   {{end}}
   </div>
-  {{else}}<div class="empty">{{icon "knowledge"}}<p>No collections you can read yet.</p></div>{{end}}
+  {{else}}{{template "empty" .Data.CollectionsEmpty}}{{end}}
 </section>
 {{end}}
 {{end}}

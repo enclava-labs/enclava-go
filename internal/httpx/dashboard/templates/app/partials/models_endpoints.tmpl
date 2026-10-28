@@ -29,7 +29,7 @@
               {{else if eq .AssuranceState "none"}}{{statusPill "assurance" "none"}}
               {{else}}{{statusPill "assurance" "unverified"}}{{if .AssuranceNote}}<span class="subline">{{.AssuranceNote}}</span>{{end}}{{end}}
             </td>
-            <td data-label="Health">{{statusPill "model" .Runtime}}{{if .Latency}}<span class="subline">{{.Latency}} p50</span>{{end}}{{if .RuntimeNote}}<span class="subline">{{.RuntimeNote}}</span>{{end}}</td>
+            <td data-label="Health">{{statusPill "model" .Runtime}}{{if .Latency}}<span class="subline">{{.Latency}} p50</span>{{end}}{{if .RuntimeNote}}{{$fix := dashboardErrorAction .RuntimeNote $.Can}}<span class="subline">{{if $fix.Href}}<a href="{{$fix.Href}}">{{$fix.Text}}</a>{{else}}{{$fix.Text}}{{end}}</span>{{end}}</td>
             <td data-label="Models">{{range $i, $m := .Models}}{{if $i}}, {{end}}{{$m}}{{else}}<span class="muted">—</span>{{end}}</td>
             <td data-label="Capabilities">{{range .Caps}}<span class="chip">{{.}}</span> {{else}}<span class="muted">—</span>{{end}}</td>
             <td data-label="Traffic">{{if .Share}}{{.Share}}{{else}}<span class="muted">—</span>{{end}}</td>
@@ -39,13 +39,7 @@
         </tbody>
       </table>
     </div>
-    {{else if not .Data.Error}}
-    <div class="empty">
-      {{icon "models"}}
-      <p>No inference endpoints yet — add one to route models.</p>
-      <button type="button" class="btn primary" data-action="models:endpoint" data-endpoint-id="">Add endpoint</button>
-    </div>
-    {{end}}
+    {{else if not .Data.Error}}{{template "empty" .Data.Empty}}{{end}}
   </div>
 </section>
 {{end}}

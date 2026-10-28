@@ -59,6 +59,7 @@ type dashboardSourcesData struct {
 	Rows       []dashboardSourceRow
 	Status     string // active filter bucket: ""|syncing|healthy|attention|paused
 	AnySyncing bool
+	Empty      dashboardEmpty
 }
 
 func (d dashboardSourcesData) DashboardTitle() string  { return "Sources" }
@@ -108,6 +109,7 @@ func (a *App) handleDashboardPageSources(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	p, _ := auth.PrincipalFromContext(r.Context())
+	caps, _ := capsFromContext(r.Context())
 	rows, anySyncing := a.dashboardSourceRows(r.Context(), p)
 	status := r.URL.Query().Get("status")
 	rows = filterSourceRows(rows, status)
@@ -123,6 +125,7 @@ func (a *App) handleDashboardPageSources(w http.ResponseWriter, r *http.Request)
 		Rows:       rows,
 		Status:     status,
 		AnySyncing: anySyncing,
+		Empty:      sourcesEmpty(status, caps.SourcesManage),
 	}
 	a.renderDashboard(w, r, "sources", data)
 }
@@ -133,6 +136,7 @@ func (a *App) handleDashboardSourcesTable(w http.ResponseWriter, r *http.Request
 		return
 	}
 	p, _ := auth.PrincipalFromContext(r.Context())
+	caps, _ := capsFromContext(r.Context())
 	rows, anySyncing := a.dashboardSourceRows(r.Context(), p)
 	status := r.URL.Query().Get("status")
 	if _, ok := sourceStatusFilter[status]; !ok && status != "" {
@@ -140,7 +144,17 @@ func (a *App) handleDashboardSourcesTable(w http.ResponseWriter, r *http.Request
 	}
 	rows = filterSourceRows(rows, status)
 	anySyncing = anyRowSyncing(rows)
-	a.renderDashboardFragment(w, r, "sources", "sources-table", dashboardSourcesData{Rows: rows, Status: status, AnySyncing: anySyncing})
+	a.renderDashboardFragment(w, r, "sources", "sources-table", dashboardSourcesData{Rows: rows, Status: status, AnySyncing: anySyncing, Empty: sourcesEmpty(status, caps.SourcesManage)})
+}
+
+func sourcesEmpty(status string, canManage bool) dashboardEmpty {
+	empty := dashboardEmpty{Icon: "sources", Text: "No sources connected."}
+	if status != "" {
+		empty.Text = "No sources match this filter."
+	} else if canManage {
+		empty.ActionLabel, empty.ActionHref = "Add source", "/dashboard/sources?new=1"
+	}
+	return empty
 }
 
 // filterSourceRows narrows to the chip's status bucket server-side; unknown
@@ -174,6 +188,7 @@ type dashboardSourcesDrawerData struct {
 	CredentialRefs   map[string][]auth.SecretRefMeta
 	Collections      []rag.Collection
 	PresetCollection string
+	EditSource       *connectors.Source
 }
 
 func (a *App) handleDashboardSourcesDrawer(w http.ResponseWriter, r *http.Request) {
@@ -183,6 +198,18 @@ func (a *App) handleDashboardSourcesDrawer(w http.ResponseWriter, r *http.Reques
 	}
 	p, _ := auth.PrincipalFromContext(r.Context())
 	data := dashboardSourcesDrawerData{CredentialRefs: map[string][]auth.SecretRefMeta{}}
+	if id := strings.TrimSpace(r.URL.Query().Get("source")); id != "" {
+		if a.connectorSvc == nil {
+			WriteOpenAIError(w, http.StatusNotImplemented, "connectors are not configured", "server_error", "not_configured")
+			return
+		}
+		src, err := a.connectorSvc.GetSource(r.Context(), p, id)
+		if err != nil {
+			writeConnectorNotFoundOrError(w, err, "connector_source_fetch_failed")
+			return
+		}
+		data.EditSource = &src
+	}
 	if a.connectorSvc != nil {
 		for _, provider := range dashboardSourceProviders {
 			data.CredentialRefs[provider.ID] = a.connectorSvc.CredentialRefs(p, provider.ID)
@@ -279,6 +306,17 @@ func (a *App) dashboardSourceRows(ctx context.Context, p auth.Principal) ([]dash
 			State:       dashboardSourceState(src, latest),
 			LastError:   dashboardSourceError(latest),
 		}
+		if row.LastError == "" && row.State != "syncing" {
+			for _, stream := range []connectors.StreamKind{connectors.StreamContent, connectors.StreamAccess, connectors.StreamMembership} {
+				if state, err := a.connectorSvc.GetStreamState(ctx, p, src.ID, string(stream)); err == nil && state.LastError != "" {
+					row.LastError = state.LastError
+					if src.IsEnabled {
+						row.State = "warning"
+					}
+					break
+				}
+			}
+		}
 		row.NextEnabled, row.NextAt = dashboardNextSync(src.Config, src.LastSyncAt, src.CreatedAt, src.IsEnabled)
 		row.HasProgress, row.ProgressPct = dashboardStatPercent(latest)
 		row.HasItems, row.Items = dashboardStatItems(latest)
@@ -345,8 +383,7 @@ func dashboardSourceMonogram(name, kind string) string {
 	return "S"
 }
 
-// dashboardSourceCollection resolves the target collection to its readable
-// name; an unresolvable id renders verbatim (truthful), empty renders "—".
+// dashboardSourceCollection resolves a target to its readable name.
 func dashboardSourceCollection(id string, names map[string]string) string {
 	if id == "" {
 		return "—"
@@ -354,7 +391,7 @@ func dashboardSourceCollection(id string, names map[string]string) string {
 	if name := names[id]; name != "" {
 		return name
 	}
-	return id
+	return "Collection unavailable"
 }
 
 // dashboardNextSync mirrors the scheduler's syncDue contract (the connectors
@@ -419,16 +456,15 @@ func dashboardNextSync(config map[string]any, last *time.Time, created time.Time
 	return true, base.Add(interval)
 }
 
-// dashboardStatPercent reads the durable job progress document's "percent"
-// field out of SyncJob.Stats — the only count-shaped key the UI recognises.
-// Jobs report no counts today (stats carry the policy only), so this renders
-// the indeterminate pulse until a real producer exists.
+// dashboardStatPercent derives progress only from reported counts.
 func dashboardStatPercent(latest *connectors.SyncJob) (bool, int) {
 	if latest == nil {
 		return false, 0
 	}
-	if v, ok := latest.Stats["percent"].(float64); ok && v >= 0 && v <= 100 {
-		return true, int(v)
+	processed, okProcessed := latest.Stats["processed"].(float64)
+	total, okTotal := latest.Stats["total"].(float64)
+	if okProcessed && okTotal && total > 0 && processed >= 0 && processed <= total {
+		return true, int(processed * 100 / total)
 	}
 	return false, 0
 }

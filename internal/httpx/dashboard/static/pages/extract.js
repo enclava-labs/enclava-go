@@ -20,6 +20,21 @@
   const E = () => window.Enclava;
   const q = (sel, root) => (root || document).querySelector(sel);
 
+  // Shared error→action plumbing (OA-35): every api failure renders the
+  // capability-filtered next step; a retry:true outcome replays the failed
+  // call via the toast's built-in Try-again (retryFn rides onRetry).
+  function failAction(err, retryFn) {
+    const Enclava = E();
+    const act = Enclava && Enclava.errorAction ? Enclava.errorAction(err) : null;
+    const msg = (act && act.text) || (err && err.message) || 'Something went wrong';
+    const opts = {};
+    if (act && (act.href || act.retry)) {
+      if (act.retry && typeof retryFn === 'function') act.onRetry = retryFn;
+      opts.action = act;
+    }
+    Enclava.toast('error', msg, opts);
+  }
+
   // ── Process tab: real file input + drop zone + submit ──────────────────
 
   function showFileName(file) {
@@ -68,7 +83,7 @@
       showFileName(null);
       Enclava.refresh();
     } catch (err) {
-      if (!err || err.status !== 403) Enclava.toast('error', (err && err.message) || 'Extraction failed');
+      failAction(err, submitJob); // price/file-size/template-denied → mapped next step
     }
   }
 
@@ -79,7 +94,7 @@
       Enclava.toast('info', 'Cancellation requested');
       Enclava.refresh();
     } catch (err) {
-      if (!err || err.status !== 403) Enclava.toast('error', (err && err.message) || 'Cancel failed');
+      failAction(err, () => cancelJob(btn));
     }
   }
 
@@ -106,7 +121,7 @@
       const result = await fetchResult(btn.dataset.jobId);
       await Enclava.copy(JSON.stringify(result, null, 2));
     } catch (err) {
-      Enclava.toast('error', (err && err.message) || 'Could not load the result');
+      failAction(err);
     }
   }
 
@@ -127,7 +142,7 @@
       setTimeout(() => URL.revokeObjectURL(a.href), 1000);
       Enclava.toast('success', 'CSV downloaded');
     } catch (err) {
-      Enclava.toast('error', (err && err.message) || 'Could not build the CSV');
+      failAction(err);
     }
   }
 
@@ -146,7 +161,7 @@
       Enclava.toast('success', 'Added to knowledge');
       Enclava.closeDrawer();
     } catch (err) {
-      Enclava.toast('error', (err && err.message) || 'Import failed');
+      failAction(err); // forbidden/not-found → explanatory next step
     }
   }
 
@@ -163,7 +178,7 @@
       Enclava.toast('success', 'Default model saved');
       Enclava.refresh();
     } catch (err) {
-      Enclava.toast('error', (err && err.message) || 'Save failed');
+      failAction(err, () => saveSettings(btn));
     }
   }
 
@@ -348,7 +363,7 @@
       try {
         t = await Enclava.api('GET', '/api/v1/extract/templates/' + encodeURIComponent(templateId));
       } catch (err) {
-        Enclava.toast('error', (err && err.message) || 'Could not load the template');
+        failAction(err);
         return;
       }
     }
@@ -425,7 +440,7 @@
       Enclava.closeDrawer();
       Enclava.refresh();
     } catch (err) {
-      Enclava.toast('error', (err && err.message) || 'Save failed');
+      failAction(err, saveTemplate);
     }
   }
 
@@ -504,7 +519,7 @@
       }
       Enclava.refresh();
     } catch (err) {
-      if (!err || err.status !== 403) Enclava.toast('error', (err && err.message) || 'That action failed');
+      failAction(err);
     }
   });
 })();

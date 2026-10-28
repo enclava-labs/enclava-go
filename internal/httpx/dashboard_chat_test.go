@@ -472,7 +472,7 @@ func TestDashboardChatEvidencePartial(t *testing.T) {
 	body := rec.Body.String()
 	for _, want := range []string{
 		"the retained passage text", "Current", "chat-docs", objectID + ".txt",
-		"Open in source", "View retained copy", "page 7",
+		"Open in source", "View retained copy", "Page 7",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("evidence card missing %q: %s", want, body)

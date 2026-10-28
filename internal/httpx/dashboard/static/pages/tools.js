@@ -8,6 +8,10 @@
 (function () {
   if (!window.Enclava) return;
 
+  if (new URLSearchParams(location.search).has('new') && Enclava.caps.ToolsManage) {
+    Enclava.openDrawer('/dashboard/partials/tools/register');
+  }
+
   function serverPath(id) {
     return '/api/v1/mcp/servers/' + encodeURIComponent(id);
   }
@@ -22,8 +26,10 @@
       .map(function (c) { return c.value; });
   }
 
-  function fail(err, fallback) {
-    if (!err || err.status !== 403) Enclava.toast('error', (err && err.message) || fallback);
+  function fail(err) {
+    if (err && err.status === 401) return;
+    var action = Enclava.errorAction(err);
+    Enclava.toast('error', action.text, { action: action });
   }
 
   async function approve(trigger) {
@@ -42,11 +48,12 @@
       Enclava.toast('success', 'Tool approved');
       Enclava.refresh();
     } catch (err) {
-      if (err && err.status === 409) {
-        Enclava.toast('error', 'Schema changed since your review — re-review');
+      if (err && err.code === 'schema_changed') {
+        var action = Enclava.errorAction(err);
+        Enclava.toast('error', action.text, { action: { text: 'Refresh', href: location.pathname + location.search } });
         Enclava.refresh();
       } else {
-        fail(err, 'Approval failed');
+        fail(err);
       }
     }
   }
@@ -57,19 +64,20 @@
       Enclava.toast('success', 'Tool rejected');
       Enclava.refresh();
     } catch (err) {
-      fail(err, 'Rejection failed');
+      fail(err);
     }
   }
 
   async function discover(trigger) {
     trigger.disabled = true;
+    // Discovery is synchronous; the completed response makes queue polling unnecessary.
     try {
       var out = await Enclava.api('POST', serverPath(trigger.dataset.server) + '/discovery');
       var n = out && out.tools ? out.tools.length : 0;
       Enclava.toast('success', 'Discovery finished — ' + n + (n === 1 ? ' tool' : ' tools') + ' found');
       Enclava.refresh();
     } catch (err) {
-      fail(err, 'Discovery failed');
+      fail(err);
     } finally {
       trigger.disabled = false;
     }
@@ -110,7 +118,7 @@
       Enclava.toast('success', edit ? 'Server updated' : 'Server registered');
       Enclava.refresh();
     } catch (err) {
-      fail(err, 'Could not save the server');
+      fail(err);
     }
   }
 
@@ -120,7 +128,7 @@
       Enclava.toast('success', 'Server deleted');
       Enclava.refresh();
     } catch (err) {
-      fail(err, 'Delete failed');
+      fail(err);
     }
   }
 

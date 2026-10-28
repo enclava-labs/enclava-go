@@ -13,7 +13,7 @@
   </label>
   <label class="label" for="instruction-system">System prompt
     <textarea class="field" id="instruction-system" name="system_prompt" rows="5">{{if .Data.Template}}{{.Data.Template.SystemPrompt}}{{end}}</textarea>
-    <span class="help">Variables render as {{`{{.name}}`}}; {{`{{.rag_context}}`}} and {{`{{.user_input}}`}} are always available.</span>
+    <span class="help">Variables render as {{`{{.name}}`}}; knowledge context and user input are always available as {{`{{.rag_context}}`}} and {{`{{.user_input}}`}}.</span>
   </label>
   <label class="label" for="instruction-user">User prompt
     <textarea class="field" id="instruction-user" name="user_prompt" rows="3">{{if .Data.Template}}{{.Data.Template.UserPrompt}}{{else}}{{`{{.user_input}}`}}{{end}}</textarea>

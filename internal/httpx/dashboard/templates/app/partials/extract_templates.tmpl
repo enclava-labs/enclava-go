@@ -40,10 +40,7 @@
         </table>
       </div>
       {{else}}
-      <div class="empty" style="margin-top:10px">
-        {{icon "extract"}}
-        <p>No extraction templates — create one or restore the defaults.</p>
-      </div>
+      {{template "empty" .Data.TemplatesEmpty}}
       {{end}}
     </div>
 

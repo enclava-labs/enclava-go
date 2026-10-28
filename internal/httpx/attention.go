@@ -30,6 +30,16 @@ type AttentionItem struct {
 	Text        string `json:"text"`
 	ActionLabel string `json:"action_label"`
 	ActionHref  string `json:"action_href"`
+	// Cause is the raw failure text the shared error→next-step map reads —
+	// never rendered verbatim (member-visible output stays mapped).
+	Cause string `json:"-"`
+	// Fix* carry a capability-appropriate next step when the producer has
+	// one; the template renders FixText as the subline and FixHref/FixLabel
+	// as the fix link (empty Href → text only, the administrator fallback).
+	FixText, FixLabel, FixHref string `json:"-"`
+	// Live marks a row whose underlying work is still non-terminal (a
+	// syncing source); the attention fragment polls while any hold.
+	Live bool `json:"-"`
 }
 
 const (
@@ -116,12 +126,24 @@ func syncAttention(src connectors.Source, syncs []connectors.SyncJob) (Attention
 			if j.ErrorMessage != "" {
 				text += ": " + truncateAttention(j.ErrorMessage, 120)
 			}
-			return AttentionItem{Kind: "sync_failed", Severity: "bad", Text: text,
-				ActionLabel: "Open source", ActionHref: href}, true
-		case j.Status == jobs.StatusRunning && time.Since(j.CreatedAt) > syncStalledAfter:
-			return AttentionItem{Kind: "sync_stalled", Severity: "warn",
-				Text:        fmt.Sprintf("Source %q has been syncing for over a day", src.Name),
-				ActionLabel: "Open source", ActionHref: href}, true
+			item := AttentionItem{Kind: "sync_failed", Severity: "bad", Text: text,
+				ActionLabel: "Open source", ActionHref: href, Cause: j.ErrorMessage}
+			if syncAuthFailure(j.ErrorMessage) {
+				// The fix-link row deep-links the edit drawer's credential
+				// step; ActionHref keeps the existing open-source target.
+				item.FixText, item.FixLabel, item.FixHref =
+					"Authentication failed — reconnect the source's credentials.",
+					"Reconnect", "/dashboard/sources?edit="+src.ID
+			}
+			return item, true
+		case j.Status == jobs.StatusRunning:
+			kind, label := "sync_running", "is syncing"
+			if time.Since(j.CreatedAt) > syncStalledAfter {
+				kind, label = "sync_stalled", "has been syncing for over a day"
+			}
+			return AttentionItem{Kind: kind, Severity: "warn",
+				Text:        fmt.Sprintf("Source %q %s", src.Name, label),
+				ActionLabel: "Open source", ActionHref: href, Live: true}, true
 		}
 	}
 	return AttentionItem{}, false
@@ -228,6 +250,7 @@ func (a *App) attentionUnpricedUnits(ctx context.Context, p auth.Principal, caps
 				for _, k := range missing {
 					kinds = append(kinds, string(k))
 				}
+				fix := dashboardErrorAction("required price missing: "+strings.Join(kinds, ", "), caps)
 				*items = append(*items, AttentionItem{
 					Kind:     "unpriced_units",
 					Severity: "warn",
@@ -235,6 +258,7 @@ func (a *App) attentionUnpricedUnits(ctx context.Context, p auth.Principal, caps
 						endpointCardLabel(e), capability, alias, strings.Join(kinds, ", ")),
 					ActionLabel: "Set prices",
 					ActionHref:  "/dashboard/models/pricing",
+					FixText:     fix.Text, FixLabel: fix.Label, FixHref: fix.Href,
 				})
 				break // one item per endpoint+capability
 			}
@@ -388,12 +412,15 @@ func (a *App) attentionOwnFailedExtractions(ctx context.Context, p auth.Principa
 		if job.Error != "" {
 			text += ": " + truncateAttention(job.Error, 120)
 		}
+		fix := dashboardErrorAction(job.Error, caps)
 		*items = append(*items, AttentionItem{
 			Kind:        "failed_extraction",
 			Severity:    "bad",
 			Text:        text,
 			ActionLabel: "Open Extract",
 			ActionHref:  "/dashboard/extract",
+			Cause:       job.Error,
+			FixText:     fix.Text, FixLabel: fix.Label, FixHref: fix.Href,
 		})
 	}
 }
@@ -418,12 +445,15 @@ func (a *App) attentionOwnFailedRuns(ctx context.Context, p auth.Principal, caps
 		if cause != "" {
 			text += ": " + truncateAttention(cause, 120)
 		}
+		fix := dashboardErrorAction(run.Error, caps)
 		*items = append(*items, AttentionItem{
 			Kind:        "failed_run",
 			Severity:    "bad",
 			Text:        text,
 			ActionLabel: "Open chat",
 			ActionHref:  "/dashboard/chat/" + run.ConversationID,
+			Cause:       run.Error,
+			FixText:     fix.Text, FixLabel: fix.Label, FixHref: fix.Href,
 		})
 	}
 }

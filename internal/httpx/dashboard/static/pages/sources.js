@@ -53,6 +53,11 @@
     slot.hidden = !msg;
   }
 
+  function reportError(err, id) {
+    var action = Enclava.errorAction(err, id);
+    Enclava.toast('error', action.text || (err && err.message) || 'That request failed', { action: action });
+  }
+
   function setProvider(id) {
     qa('[data-provider-fields]').forEach(function (n) { n.hidden = n.dataset.providerFields !== id; });
     qa('[data-provider-access]').forEach(function (n) { n.hidden = n.dataset.providerAccess !== id; });
@@ -275,7 +280,7 @@
     var payload = collectPayload(provider, step);
     var submit = q('[data-action="sources:submit"]');
     if (submit) submit.disabled = true;
-    Enclava.api('POST', '/api/v1/connectors/sources', payload)
+    Enclava.api('POST', '/api/v1/connectors/sources', payload, { onRetry: submitWizard })
       .then(function (created) {
         // The SAME success path starts the real first sync — create alone
         // never schedules one. Toast + close + refresh happen only after the
@@ -286,7 +291,7 @@
           .then(function () {
             Enclava.toast('success', 'Source created — first sync started');
           }, function (err) {
-            Enclava.toast('error', (err && err.message) || 'Source created, but the first sync failed');
+            reportError(err, created.id);
           });
       })
       .then(function () {
@@ -296,6 +301,7 @@
       .catch(function (err) {
         if (submit) submit.disabled = false;
         showError((err && err.message) || 'Creating the source failed.');
+        reportError(err);
       });
   }
 
@@ -304,7 +310,7 @@
   function syncNow(id) {
     Enclava.api('POST', '/api/v1/connectors/sources/' + encodeURIComponent(id) + '/sync')
       .then(function () { Enclava.toast('success', 'Sync started'); Enclava.refresh(); })
-      .catch(function (err) { Enclava.toast('error', (err && err.message) || 'Sync failed to start'); });
+      .catch(function (err) { reportError(err, id); });
   }
 
   function toggleEnabled(button) {
@@ -320,13 +326,13 @@
         Enclava.toast('success', source.is_enabled ? 'Source resumed' : 'Source paused');
         Enclava.refresh();
       })
-      .catch(function (err) { Enclava.toast('error', (err && err.message) || 'That request failed'); });
+      .catch(function (err) { reportError(err, id); });
   }
 
   function deleteSource(id) {
     Enclava.api('DELETE', '/api/v1/connectors/sources/' + encodeURIComponent(id))
       .then(function () { Enclava.toast('success', 'Source deleted'); Enclava.refresh(); })
-      .catch(function (err) { Enclava.toast('error', (err && err.message) || 'Delete failed'); });
+      .catch(function (err) { reportError(err, id); });
   }
 
   function bindingsURL(id) {
@@ -350,7 +356,7 @@
         Enclava.toast('success', 'User bound');
         return Enclava.openDrawer(bindingsURL(button.dataset.sourceId));
       })
-      .catch(function (err) { Enclava.toast('error', (err && err.message) || 'Binding failed'); });
+      .catch(function (err) { reportError(err, button.dataset.sourceId); });
   }
 
   function unbindUser(button) {
@@ -360,9 +366,19 @@
         Enclava.toast('success', 'Binding revoked');
         return Enclava.openDrawer(bindingsURL(button.dataset.sourceId));
       })
-      .catch(function (err) { Enclava.toast('error', (err && err.message) || 'Revoke failed'); });
+      .catch(function (err) { reportError(err, button.dataset.sourceId); });
   }
 
+
+  function saveCredential() {
+    var section = q('[data-source-edit]');
+    var input = q('[data-edit-credential]');
+    if (!section || !input) return;
+    var id = section.dataset.sourceEdit;
+    Enclava.api('PUT', '/api/v1/connectors/sources/' + encodeURIComponent(id), { credential_ref: input.value.trim() })
+      .then(function () { Enclava.closeDrawer(); Enclava.toast('success', 'Connection saved'); Enclava.refresh(); })
+      .catch(function (err) { reportError(err, id); });
+  }
   // ── Events ───────────────────────────────────────────────────────────────
 
   function addAudienceRow() {
@@ -395,6 +411,9 @@
       }
       case 'sources:submit':
         submitWizard();
+        break;
+      case 'sources:save-credential':
+        saveCredential();
         break;
       case 'sources:sync':
         syncNow(trigger.dataset.sourceId);
@@ -444,6 +463,14 @@
   // same URL the Add source empty-state action carries.
   function openFromDeepLink() {
     var params = new URLSearchParams(location.search);
+    var edit = params.get('edit');
+    if (edit) {
+      Enclava.openDrawer('/dashboard/partials/sources/drawer?source=' + encodeURIComponent(edit)).then(function () {
+        var input = q('[data-edit-credential]');
+        if (input) input.focus();
+      });
+      return;
+    }
     if (params.get('new') !== '1') return;
     var collection = params.get('collection') || '';
     Enclava.openDrawer('/dashboard/partials/sources/drawer' +

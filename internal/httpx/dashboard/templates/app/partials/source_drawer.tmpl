@@ -3,6 +3,20 @@
      server-side per provider, Notion published-audiences editor. Markup only
      (D-20) — static/pages/sources.js drives every interaction via
      data-action delegation and writes through Enclava.api (D-17). */}}
+{{if .Data.EditSource}}
+<div class="drawer-head">
+  <h2>Reconnect {{.Data.EditSource.Name}}</h2>
+  <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}</button>
+</div>
+<div class="section" data-source-edit="{{.Data.EditSource.ID}}">
+  <h3>Connect</h3>
+  <label class="label" for="source-edit-credential">Credential reference</label>
+  <input class="field" id="source-edit-credential" data-edit-credential list="source-edit-credentials" value="{{.Data.EditSource.CredentialRef}}" autocomplete="off">
+  <datalist id="source-edit-credentials">{{range index .Data.CredentialRefs .Data.EditSource.Type}}<option value="{{.RefID}}"></option>{{end}}</datalist>
+  <p class="help">Choose the credential used to connect this source.</p>
+  <button type="button" class="btn primary" data-action="sources:save-credential">Save connection</button>
+</div>
+{{else}}
 <div class="drawer-head">
   <h2>Add source</h2>
   <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button>
@@ -178,6 +192,7 @@
   <button type="button" class="btn primary" data-action="sources:next" disabled>Continue</button>
   <button type="button" class="btn primary" data-action="sources:submit" hidden>Create source and sync</button>
 </div>
+{{end}}
 {{end}}
 
 {{define "frag-sources-bindings"}}{{/* Verified source-user bindings drawer —

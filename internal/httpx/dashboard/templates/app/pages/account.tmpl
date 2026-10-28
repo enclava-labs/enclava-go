@@ -68,7 +68,7 @@
         <span class="muted">Linked {{relTime .LinkedAt}}</span>
       </div>
 {{end}}    </div>
-{{else}}    <div class="empty">{{icon "link"}}<p>No external sign-ins are linked to this account.</p></div>
+{{else}}    {{template "empty" .Data.IdentitiesEmpty}}
 {{end}}
 {{if .Data.OIDCReady}}
 {{if .Data.Providers}}    <div class="row">

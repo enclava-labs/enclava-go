@@ -26,11 +26,11 @@
             <td data-label="Status">{{if .Enabled}}{{statusPill "server" "connected"}}{{else}}{{statusPill "server" "disabled"}}{{end}}{{if .DiscoveredAt}}<span class="subline">Discovered {{relTime .DiscoveredAt}}</span>{{end}}</td>
             <td data-label="Approved tools">{{if .Total}}{{count .Approved}} of {{count .Total}}{{else}}—{{end}}</td>
             <td data-label="Actions">
-              <div class="row">
+{{if $.Can.ToolsManage}}              <div class="row">
                 <button type="button" class="btn" data-action="tools:discover" data-server="{{.ID}}">Discover</button>
                 <button type="button" class="btn ghost" data-action="open-drawer" data-drawer-url="/dashboard/partials/tools/register?server={{.ID}}">Edit</button>
                 <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete server {{.ID}}?" data-server="{{.ID}}">Delete</button>
-              </div>
+              </div>{{end}}
             </td>
           </tr>
           {{end}}
@@ -39,7 +39,7 @@
     </div>
   </div>
   {{else}}
-  <div class="card"><div class="empty">{{icon "tools"}}<p>No servers registered yet — connect one to discover its tools.</p></div></div>
+  <div class="card">{{template "empty" .Data.ServersEmpty}}</div>
   {{end}}
 </section>
 {{end}}

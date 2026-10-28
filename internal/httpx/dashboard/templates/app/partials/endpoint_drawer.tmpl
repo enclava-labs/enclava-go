@@ -4,6 +4,7 @@
      observed at dispatch (T-09-06-03 keeps authorized_private server
      enforced; this drawer only exposes the field). The page module submits
      POST/PUT /api/v1/providers and the confirm action DELETEs. */}}
+{{if .Data.Missing}}<div class="drawer-head"><h2>Endpoint</h2><button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button></div>{{template "empty" .Data.Empty}}{{else}}
 <div class="drawer-head">
   <h2>{{if .Data.Editing}}Edit endpoint{{else}}Add endpoint{{end}}</h2>
   <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button>
@@ -45,7 +46,7 @@
       <span class="help">Bare https origin.</span>
     </div>
     <div>
-      <label class="label" for="mep-credential">Credential ref</label>
+      <label class="label" for="mep-credential">Credential reference</label>
       <input class="field" id="mep-credential" name="credential_ref" value="{{.Data.Endpoint.CredentialRef}}">
       <span class="help">Server-approved secret reference — never a raw key.</span>
     </div>
@@ -84,4 +85,5 @@
     <button type="submit" class="btn primary">{{if .Data.Editing}}Save changes{{else}}Add endpoint{{end}}</button>
   </div>
 </form>
+{{end}}
 {{end}}

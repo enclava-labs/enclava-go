@@ -27,9 +27,9 @@
       <span class="help">The stored credential's name — never a secret value.</span>
     </div>
     <div>
-      <span class="label">Audience scopes</span>
-      {{range .Data.Scopes}}<label class="row"><input type="checkbox" name="audience_scope" value="{{.Name}}"{{if .Checked}} checked{{end}}> {{.Name}}</label>{{end}}
-      <span class="help">Callers must hold every checked scope to call this server's tools.</span>
+      <span class="label">Who can use this server</span>
+      {{if .Data.Scopes}}{{range .Data.Scopes}}<label class="row"><input type="checkbox" name="audience_scope" value="{{.Name}}"{{if .Checked}} checked{{end}}> {{term .Name}}</label>{{end}}{{else}}{{template "empty" .Data.Empty}}{{end}}
+      <span class="help">Callers need every selected permission to use this server's tools.</span>
     </div>
     <label class="row"><input type="checkbox" name="authorized_private"{{if .Data.Server}}{{if .Data.Server.AuthorizedPrivate}} checked{{end}}{{end}}> Allow private destination addresses</label>
     <label class="row"><input type="checkbox" name="enabled"{{if .Data.Server}}{{if .Data.Server.Enabled}} checked{{end}}{{else}} checked{{end}}> Enabled</label>

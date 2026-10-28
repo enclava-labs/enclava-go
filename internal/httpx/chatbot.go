@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
 	"enclava-go/internal/chatbot"
 	"enclava-go/internal/inference"
 	"enclava-go/internal/llm"
@@ -343,10 +344,18 @@ func (a *App) writeChatbotCompletionError(w http.ResponseWriter, ctx context.Con
 	}
 	status, message, code := classifyChatbotCompletionError(ctx, err)
 	log.Printf("chatbot completion failed: %v", err)
-	WriteOpenAIError(w, status, message, "server_error", code)
+	errType := "server_error"
+	if status < 500 {
+		errType = "invalid_request_error"
+	}
+	WriteOpenAIError(w, status, message, errType, code)
 }
 
 func classifyChatbotCompletionError(ctx context.Context, err error) (int, string, string) {
+	if errors.Is(err, billing.ErrPriceMissing) {
+		return http.StatusUnprocessableEntity,
+			strings.TrimSpace(strings.TrimPrefix(err.Error(), "billing: ")), "price_missing"
+	}
 	if isChatbotDeadline(ctx, err) {
 		return http.StatusGatewayTimeout, "upstream request timed out", "gateway_timeout"
 	}

@@ -9,6 +9,7 @@
 {{if .Data.Job}}
 <p class="muted">{{.Data.Job.FileName}}{{if .Data.Job.TemplateID}} · {{.Data.Job.TemplateID}}{{end}}</p>
 <p>{{statusPill "job" .Data.Job.Status}}</p>
+{{if eq .Data.Job.Status "failed"}}{{with dashboardErrorAction .Data.Job.ErrorMessage $.Can}}<p class="subline bad">{{.Text}}{{if .Href}} <a href="{{.Href}}">{{.Label}}</a>{{end}}</p>{{end}}{{end}}
 {{if .Data.Result}}
   {{if or .Data.Result.ValidationErrors .Data.Result.ValidationWarnings}}
   <div class="stack">
@@ -38,7 +39,7 @@
     </table>
   </div>
   {{else}}
-  <p class="muted">The stored result carries no fields.</p>
+  {{template "empty" .Data.FieldsEmpty}}
   {{end}}
   <div class="row" style="margin-top:14px">
     <button type="button" class="btn" data-action="extract:copy" data-job-id="{{.Data.Job.ID}}">{{icon "copy"}}Copy JSON</button>

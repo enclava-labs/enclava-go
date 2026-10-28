@@ -2,6 +2,7 @@ package extractmodule
 
 import (
 	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
 	"enclava-go/internal/extract"
 	"enclava-go/internal/httpx"
 	"enclava-go/internal/inference"
@@ -113,6 +114,10 @@ func (h *Handlers) HandleProcess(w http.ResponseWriter, r *http.Request, princip
 		lowerErr := strings.ToLower(err.Error())
 		if strings.Contains(lowerErr, "unsupported") || strings.Contains(lowerErr, "template") {
 			httpx.WriteOpenAIError(w, http.StatusUnprocessableEntity, err.Error(), "invalid_request_error", "extract_failed")
+			return
+		}
+		if errors.Is(err, billing.ErrPriceMissing) {
+			httpx.WritePriceMissing(w, err.Error())
 			return
 		}
 		httpx.WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "extract_failed")
@@ -246,6 +251,10 @@ func (h *Handlers) HandleJobDetail(w http.ResponseWriter, r *http.Request, princ
 func (h *Handlers) writeJobError(w http.ResponseWriter, err error, code string) {
 	if errors.Is(err, extract.ErrNotFound) {
 		httpx.WriteOpenAIError(w, http.StatusNotFound, "job not found", "invalid_request_error", "not_found")
+		return
+	}
+	if errors.Is(err, billing.ErrPriceMissing) {
+		httpx.WritePriceMissing(w, err.Error())
 		return
 	}
 	httpx.WriteOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error", code)

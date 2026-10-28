@@ -16,6 +16,12 @@
       el.textContent = '';
     });
   }
+  function showRequestError(err) {
+    const action = Enclava.errorAction(err);
+    Enclava.toast('error', action.text || (err && err.message) || 'Request failed',
+      { action: action });
+  }
+
 
   const passwordForm = document.getElementById('account-password-form');
   if (passwordForm) passwordForm.addEventListener('submit', function (e) {
@@ -33,6 +39,7 @@
       Enclava.toast('success', 'Password updated.');
       passwordForm.reset();
     }).catch(function (err) {
+      showRequestError(err);
       if (err && err.status === 403) {
         setError('account-current-password-error', 'Current password is incorrect.');
         return;
@@ -59,7 +66,7 @@
         Enclava.toast('success', 'Session revoked.');
         Enclava.refresh();
       })
-      .catch(function () {}); // Enclava.api already reports the failure
+      .catch(showRequestError);
   });
 
   // Link challenge confirm: POST /api/v1/identities/link binds the verified
@@ -77,6 +84,7 @@
     }).then(function () {
       location.assign('/dashboard/account');
     }).catch(function (err) {
+      showRequestError(err);
       setError('account-link-error',
         err && err.status === 403
           ? 'Account linking failed — the challenge or credentials are invalid.'

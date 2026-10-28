@@ -11,6 +11,12 @@
 
   const E = window.Enclava;
 
+  function fail(err) {
+    if (err && err.status === 401) return;
+    const action = E.errorAction(err);
+    E.toast('error', action.text, { action: action });
+  }
+
   function page() {
     const el = document.querySelector('[data-assistants-page]');
     return el ? el.dataset.assistantsPage : '';
@@ -159,8 +165,8 @@
       E.toast('success', id ? 'Assistant saved' : 'Assistant created');
       E.closeDrawer();
       E.refresh();
-    } catch (_) {
-      // Enclava.api already toasted the failure.
+    } catch (err) {
+      fail(err);
     }
   }
 
@@ -187,8 +193,8 @@
       E.toast('success', id ? 'Instructions saved' : 'Instructions created');
       E.closeDrawer();
       E.refresh();
-    } catch (_) {
-      // Enclava.api already toasted the failure.
+    } catch (err) {
+      fail(err);
     }
   }
 
@@ -203,14 +209,14 @@
         E.toast('success', 'Assistant deleted');
         E.closeDrawer();
         E.refresh();
-      } catch (_) {}
+      } catch (err) { fail(err); }
     } else if (trigger.dataset.templateDelete) {
       try {
         await E.api('DELETE', '/api/v1/prompt-templates/' + encodeURIComponent(trigger.dataset.templateDelete));
         E.toast('success', 'Instructions deleted');
         E.closeDrawer();
         E.refresh();
-      } catch (_) {}
+      } catch (err) { fail(err); }
     }
   });
 })();

@@ -9,11 +9,11 @@
       <thead><tr><th scope="col">Budget</th><th scope="col">Limit</th><th scope="col">Usage</th><th scope="col">Progress</th><th scope="col">Actions</th></tr></thead>
       <tbody>
 {{range .Data.Budgets}}        <tr>
-          <td data-label="Budget"><b>{{.Name}}</b><span class="subline">{{.SubjectType}} · {{.SubjectLabel}}</span><span class="subline">{{.Kind}} · {{.Period}} · since {{absTime .StartsAt}}</span></td>
+          <td data-label="Budget"><b>{{.Name}}</b><span class="subline">{{term .SubjectType}} · {{.SubjectLabel}}</span><span class="subline">{{term .Kind}} · {{term .Period}} · since {{absTime .StartsAt}}</span></td>
           <td data-label="Limit">{{if .Unlimited}}No limit{{else}}{{.LimitDisplay}}{{end}}</td>
           <td data-label="Usage">{{if .Unlimited}}<span class="muted">—</span>{{else}}{{.CountedDisplay}}{{end}}{{if .LiabilitySummary}}<span class="subline">{{.LiabilitySummary}}</span>{{end}}</td>
           <td data-label="Progress">{{if .Unlimited}}<span class="muted">No limit</span>{{else}}<div class="progress {{.Tone}}" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{.Pct}}" title="{{.CountedDisplay}} of {{.LimitDisplay}}"><i style="width:{{.Pct}}%"></i></div><span class="pill {{.Tone}}"><i class="dot"></i>{{.Pct}}%</span>{{end}}</td>
-          <td data-label="Actions"><button type="button" class="btn" data-action="open-drawer" data-drawer-url="/dashboard/partials/usage/budget-drawer?budget={{.ID}}">{{icon "settings"}}Edit limit</button></td>
+          <td data-label="Actions">{{if $.Can.BillingView}}<button type="button" class="btn" data-action="open-drawer" data-drawer-url="/dashboard/partials/usage/budget-drawer?budget={{.ID}}">{{icon "settings"}}Edit limit</button>{{end}}</td>
         </tr>
 {{end}}      </tbody>
     </table></div>

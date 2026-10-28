@@ -29,6 +29,6 @@
       </table>
     </div>
   </div>
-{{else}}  <div class="empty">{{icon "shield"}}<p>No roles yet — create the first role to grant capabilities.</p><button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/access/role-editor">{{icon "plus"}}New role</button></div>
+{{else}}  {{template "empty" .Data.RolesEmpty}}
 {{end}}</div>
 {{end}}

@@ -273,9 +273,10 @@ func TestDashboardAssistantsTableColumns(t *testing.T) {
 	if !strings.Contains(body, "Knowledge search") || !strings.Contains(body, "web_lookup") {
 		t.Fatalf("expected the stored tools rendered, got %s", body)
 	}
-	// Audience rendered verbatim and the status pill from the stored flag.
-	if !strings.Contains(body, `<td data-label="Audience">*</td>`) {
-		t.Fatalf("expected the stored wildcard audience verbatim, got %s", body)
+	// Audience rendered in plain words (glossary): the wildcard audience is
+	// "Everyone", never the raw scope sentinel.
+	if !strings.Contains(body, `<td data-label="Audience">Everyone</td>`) {
+		t.Fatalf("expected the wildcard audience in plain words, got %s", body)
 	}
 	if !strings.Contains(body, "Ready") || !strings.Contains(body, "Disabled") {
 		t.Fatalf("expected status pills for enabled and disabled assistants, got %s", body)

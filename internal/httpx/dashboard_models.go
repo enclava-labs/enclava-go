@@ -44,6 +44,7 @@ type modelsData struct {
 	Tab       string // "endpoints" | "pricing"
 	Endpoints []modelsEndpointRow
 	Rows      []modelsPriceRow
+	Empty     dashboardEmpty // zero-row state for the active tab (OA-37)
 	Error     string
 }
 
@@ -62,7 +63,7 @@ type modelsEndpointRow struct {
 	AssuranceState   string   // verified | none | unverified
 	AssuranceChecked *time.Time
 	AssuranceNote    string
-	Runtime          string // ready | degraded | unreachable | unknown | disabled
+	Runtime          string // ready | degraded | unreachable | unobserved | disabled
 	Latency          string // "42 ms" only when observed
 	RuntimeNote      string // observed LastError, never a guess
 	Share            string // "34%" only when endpoint usage data exists
@@ -91,9 +92,6 @@ type modelsPriceCell struct {
 	Basis        string // endpoint | model — which price set supplied the rate
 }
 
-// modelsDrawerData backs the add/edit endpoint drawer. Assurance renders as
-// a read-only status line: assurance_verified is observed verification state
-// and is NEVER a form field (the API rejects payloads setting it).
 type modelsDrawerData struct {
 	Editing          bool
 	Endpoint         inference.Endpoint
@@ -102,6 +100,8 @@ type modelsDrawerData struct {
 	AssuranceState   string
 	AssuranceChecked *time.Time
 	AssuranceNote    string
+	Missing          bool // lookup failed — the drawer renders its empty state, not a bare 404
+	Empty            dashboardEmpty
 }
 
 type modelsCapabilityCheck struct {
@@ -122,12 +122,12 @@ var modelsCapabilityChoices = []struct{ Value, Label string }{
 	{inference.CapabilityMCP, "MCP tools"},
 }
 
-// modelsHistoryData backs the price-history drawer.
 type modelsHistoryData struct {
 	EndpointID string
 	Model      string
 	Capability string
 	Rows       []modelsHistoryRow
+	Empty      dashboardEmpty
 }
 
 type modelsHistoryRow struct {
@@ -182,8 +182,12 @@ func (a *App) handleDashboardModelsPricingPartial(w http.ResponseWriter, r *http
 func (a *App) handleDashboardModelsEndpointDrawer(w http.ResponseWriter, r *http.Request) {
 	data, ok := a.modelsDrawerData(r)
 	if !ok {
-		WriteOpenAIError(w, http.StatusNotFound, "provider not found", "invalid_request_error", "not_found")
-		return
+		// A stale ?id= link gets the drawer's own empty state — the same
+		// sentence-only pattern a deleted row renders, never a bare 404.
+		data = modelsDrawerData{
+			Missing: true,
+			Empty:   dashboardEmpty{Icon: "models", Text: "That endpoint is no longer available."},
+		}
 	}
 	a.renderDashboardFragment(w, r, "models", "models-endpoint-drawer", data)
 }
@@ -225,12 +229,14 @@ func modelsAssurance(e inference.Endpoint, o inference.AttestationObservation) (
 	return "unverified", nil, o.LastError
 }
 
-// modelsEndpointRuntime joins the observed dispatch state to one row; an
-// absent projection reports unknown — never healthy.
+// modelsEndpointRuntime joins the observed dispatch state to one row. An
+// absent projection (or the runtime's no-observation unknown) reports
+// "unobserved" — never healthy, and never the lost-contact label, which
+// belongs to observed work whose worker disappeared.
 func modelsEndpointRuntime(rt inference.EndpointRuntime, row *modelsEndpointRow) {
 	row.Runtime = rt.State
-	if rt.State == "" {
-		row.Runtime = inference.RuntimeStateUnknown
+	if rt.State == "" || rt.State == inference.RuntimeStateUnknown {
+		row.Runtime = "unobserved"
 	}
 	if rt.LatencyP50Millis != nil {
 		row.Latency = fmt.Sprintf("%d ms", *rt.LatencyP50Millis)
@@ -241,6 +247,8 @@ func modelsEndpointRuntime(rt inference.EndpointRuntime, row *modelsEndpointRow)
 func (a *App) modelsEndpointsData(r *http.Request) modelsData {
 	data := modelsData{Tab: "endpoints"}
 	p, _ := auth.PrincipalFromContext(r.Context())
+	caps, _ := capsFromContext(r.Context())
+	data.Empty = modelsEndpointsEmpty(caps.ModelsManage)
 	if a.endpoints == nil {
 		data.Error = "Endpoints are not configured on this deployment"
 		return data
@@ -276,7 +284,7 @@ func (a *App) modelsEndpointsData(r *http.Request) modelsData {
 				row.Models = append(row.Models, modelsModelDisplay(alias, upstream))
 				continue
 			}
-			row.Caps = append(row.Caps, c)
+			row.Caps = append(row.Caps, modelsCapabilityLabel(c))
 		}
 		row.AssuranceState, row.AssuranceChecked, row.AssuranceNote = modelsAssurance(e, att[e.ID])
 		modelsEndpointRuntime(runs[e.ID], &row)
@@ -342,6 +350,44 @@ func modelsModelDisplay(alias, upstream string) string {
 	return alias + " → " + upstream
 }
 
+// modelsEndpointsEmpty / modelsPricingEmpty name each tab's zero-row state.
+// The action is filled only when the caller can manage models — the
+// label/url pair always travels with the capability check (T-11-03-03).
+func modelsEndpointsEmpty(canManage bool) dashboardEmpty {
+	e := dashboardEmpty{
+		Icon: "models",
+		Text: "No endpoints yet — add one to route models.",
+	}
+	if canManage {
+		e.ActionDrawerLabel = "Add endpoint"
+		e.ActionDrawerURL = "/dashboard/partials/models/endpoint-drawer"
+	}
+	return e
+}
+
+func modelsPricingEmpty(canManage bool) dashboardEmpty {
+	e := dashboardEmpty{
+		Icon: "billing",
+		Text: "No model routes to price — bind a model alias on an endpoint first.",
+	}
+	if canManage {
+		e.ActionDrawerLabel = "Add endpoint"
+		e.ActionDrawerURL = "/dashboard/partials/models/endpoint-drawer"
+	}
+	return e
+}
+
+// modelsCapabilityLabel renders capability wire values in the drawer's own
+// plain words; unknown entries humanize instead of leaking raw strings.
+func modelsCapabilityLabel(value string) string {
+	for _, c := range modelsCapabilityChoices {
+		if c.Value == value {
+			return c.Label
+		}
+	}
+	return dashboardHumanize(value)
+}
+
 // unitLabel renders unit kinds in plain words; the shared vocabulary has no
 // unit rows, so the matrix labels are fixed here once.
 func unitLabel(k billing.UnitKind) string {
@@ -353,13 +399,15 @@ func unitLabel(k billing.UnitKind) string {
 	case billing.UnitOutput:
 		return "Output"
 	default:
-		return string(k)
+		return dashboardHumanize(string(k))
 	}
 }
 
 func (a *App) modelsPricingData(r *http.Request) modelsData {
 	data := modelsData{Tab: "pricing"}
 	p, _ := auth.PrincipalFromContext(r.Context())
+	caps, _ := capsFromContext(r.Context())
+	data.Empty = modelsPricingEmpty(caps.ModelsManage)
 	switch {
 	case a.endpoints == nil:
 		data.Error = "Endpoints are not configured on this deployment"
@@ -526,6 +574,7 @@ func (a *App) modelsPriceHistoryData(r *http.Request) (modelsHistoryData, bool) 
 		EndpointID: strings.TrimSpace(r.URL.Query().Get("endpoint")),
 		Model:      strings.TrimSpace(r.URL.Query().Get("model")),
 		Capability: strings.TrimSpace(r.URL.Query().Get("capability")),
+		Empty:      dashboardEmpty{Icon: "billing", Text: "No price history for this model yet."},
 	}
 	if data.Capability == "" {
 		data.Capability = inference.CapabilityChat

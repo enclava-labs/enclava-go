@@ -40,7 +40,7 @@
 {{if .Data.Knowledge}}  <div class="stack">
 {{range .Data.Knowledge}}    <label><input type="checkbox" name="knowledge" value="{{.ID}}"{{if .Selected}} checked{{end}}> {{.Name}}</label>
 {{end}}  </div>
-{{else}}  <p class="muted">No readable collections. The assistant answers without retrieval.</p>
+{{else}}  <p class="muted">No readable collections. The assistant answers without knowledge from collections.</p>
 {{end}}  <h3>Tools</h3>
   <div class="stack">
 {{range .Data.Tools}}    <label><input type="checkbox" name="tools" value="{{.ID}}"{{if .Selected}} checked{{end}}{{if not .Approved}} disabled{{end}}> {{.Label}}{{if not .Approved}}<span class="subline">{{statusLabel "tool" "pending"}}</span>{{end}}</label>
@@ -50,7 +50,7 @@
     <label><input type="radio" name="audience-mode" value="all"{{if .Data.AudienceAll}} checked{{end}}> Everyone in {{.Org}}</label>
     <label><input type="radio" name="audience-mode" value="members"{{if not .Data.AudienceAll}} checked{{end}}> Specific members</label>
     <div class="stack">
-{{range .Data.Members}}      <label><input type="checkbox" name="audience-member" value="{{.ID}}"{{if .Selected}} checked{{end}}> {{.Label}}<span class="subline">{{.ID}}</span></label>
+{{range .Data.Members}}      <label><input type="checkbox" name="audience-member" value="{{.ID}}"{{if .Selected}} checked{{end}}> {{.Label}}</label>
 {{else}}      <p class="muted">No members found.</p>
 {{end}}    </div>
     <span class="help">Audience members can run this assistant; role grants still apply.</span>

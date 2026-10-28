@@ -9,7 +9,7 @@
     <p class="desc">Requests, tokens and spend across {{.Org}}, with budgets and the combined billing and pricing audit trail.</p>
   </div>
   <div class="right-mobile">
-{{if eq .Data.ActiveTab "budgets"}}    <button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/usage/budget-drawer">{{icon "plus"}}New budget</button>
+{{if and (eq .Data.ActiveTab "budgets") .Can.BillingView}}    <button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/usage/budget-drawer">{{icon "plus"}}New budget</button>
 {{end}}  </div>
 </header>
 {{template "tabs" .Data.Tabs}}

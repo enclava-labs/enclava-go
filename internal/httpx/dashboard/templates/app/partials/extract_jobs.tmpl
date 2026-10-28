@@ -22,7 +22,7 @@
           <tr>
             <td data-label="File"><b>{{.FileName}}</b><span class="subline">{{.FileMimeType}}</span></td>
             <td data-label="Template">{{.TemplateID}}</td>
-            <td data-label="Status">{{statusPill "job" .Status}}{{if .ErrorMessage}}<span class="subline bad">{{.ErrorMessage}}</span>{{end}}</td>
+            <td data-label="Status">{{if or (eq .Status "queued") (eq .Status "running")}}<span class="pulse" aria-hidden="true"></span>{{end}}{{statusPill "job" .Status}}{{if eq .Status "failed"}}{{$fix := dashboardErrorAction .ErrorMessage $.Can}}<span class="subline bad">{{$fix.Text}}{{if $fix.Href}} <a href="{{$fix.Href}}">{{$fix.Label}}</a>{{end}}</span>{{else if .ErrorMessage}}<span class="subline bad">{{.ErrorMessage}}</span>{{end}}</td>
             <td data-label="Created">{{relTime .CreatedAt}}</td>
             <td data-label="Actions">
               <div class="row">
@@ -38,11 +38,7 @@
     </div>
   </div>
   {{else}}
-  <div class="empty">
-    {{icon "extract"}}
-    <p>No extraction jobs yet — process a document to see it here.</p>
-    <a class="btn primary" href="/dashboard/extract?tab=process">Process a document</a>
-  </div>
+  {{template "empty" .Data.JobsEmpty}}
   {{end}}
 </div>
 {{end}}

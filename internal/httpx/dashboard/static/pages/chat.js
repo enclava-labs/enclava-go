@@ -5,8 +5,9 @@
  *   chat:send   POST /api/v1/agent-runs — a 202's conversation_id is
  *               adopted into state + URL (history.replaceState) so later
  *               turns, reloads and deep links address the same conversation
- *   polling     GET /api/v1/agent-runs/{id} every 2s while queued|running —
- *               NO time cutoff; terminal → re-render + history refresh
+ *   polling     GET /api/v1/agent-runs/{id} every Enclava.POLL_MS while
+ *               queued|running — NO time cutoff; a 200 payload carrying
+ *               status failed feeds run.error through Enclava.errorAction
  *   chat:stop   the trigger's shared data-confirm arms; chat.js consumes the
  *               enclava:confirm event and DELETEs the run
  *   citations   .bubble [n] text nodes become .citation buttons carrying
@@ -65,9 +66,32 @@
     state.run = null;
   }
 
-  // Poll every 2s until terminal — no time-based cutoff: queued+running can
-  // legitimately outlive the old ~2 min worker bound. A poll-level failure
-  // never leaves a frozen runline: sticky toast + composer restored.
+  const pollMs = () => (window.Enclava && window.Enclava.POLL_MS) || 3000;
+
+  // failAction renders an API failure through the shared error→action map:
+  // sticky error toast carrying the capability-filtered fix link (Set
+  // price / administrator fallback) or the built-in Try-again. retryFn
+  // becomes the map's onRetry continuation (resumes our own success path);
+  // without it the button replays the rejected request verbatim.
+  function failAction(err, retryFn) {
+    const act = window.Enclava.errorAction
+      ? window.Enclava.errorAction(err)
+      : null;
+    const msg = (act && act.text) || (err && err.message) || 'Something went wrong';
+    const opts = {};
+    if (act && (act.href || act.retry)) {
+      if (act.retry && typeof retryFn === 'function') act.onRetry = retryFn;
+      opts.action = act;
+    }
+    window.Enclava.toast('error', msg, opts);
+  }
+  // Poll every Enclava.POLL_MS until terminal — no time-based cutoff:
+  // queued+running can legitimately outlive the old ~2 min worker bound. A
+  // poll-level failure never leaves a frozen runline: sticky toast +
+  // composer restored. A 200 payload with status failed feeds the persisted
+  // run.error through the shared error→action map; unknown renders the
+  // unknown-outcome line via the re-render and stops polling like every
+  // other terminal state.
   function startPolling(runID) {
     stopPolling();
     if (!runID) return;
@@ -81,7 +105,14 @@
         state.run = null;
         setBusy(false);
         if (err && err.status === 401) return; // api() already redirected to login
-        window.Enclava.toast('error', (err && err.message) || 'We lost track of this run — reopen the conversation.');
+        failAction(err);
+        return;
+      }
+      if (run && run.status === 'failed') {
+        stopPolling();
+        setBusy(false);
+        failAction({ message: run.error, status: 'failed' });
+        window.Enclava.refresh(); // thread re-render carries the runline
         return;
       }
       if (run && TERMINAL.has(run.status)) {
@@ -90,9 +121,9 @@
         window.Enclava.refresh();
         return;
       }
-      state.timer = setTimeout(tick, 2000);
+      state.timer = setTimeout(tick, pollMs());
     };
-    state.timer = setTimeout(tick, 2000);
+    state.timer = setTimeout(tick, pollMs());
   }
 
   async function send() {
@@ -123,7 +154,8 @@
       if (run && run.id) startPolling(run.id);
       window.Enclava.refresh(); // history gains the conversation
     } catch (err) {
-      setBusy(false); // api() toasted the server message (D-17)
+      setBusy(false);
+      failAction(err, send); // shared map: Set price / budgets / Try again
     } finally {
       state.sending = false;
     }
@@ -197,7 +229,7 @@
       window.Enclava.refresh();
     } catch (err) {
       if (err && err.status === 401) return;
-      window.Enclava.toast('error', (err && err.message) || 'The run could not be stopped — try again.');
+      failAction(err); // not_found → explanatory only (shared map)
     }
   });
 

@@ -24,7 +24,7 @@
       <tbody>
 {{range .Data.Docs}}        <tr>
           <td data-label="Document"><b>{{.FileName}}</b>{{if .SourceURI}}<span class="subline">{{.SourceURI}}</span>{{end}}</td>
-          <td data-label="Status">{{statusPill "document" .Status}}{{if .ErrorMessage}}<span class="subline">{{.ErrorMessage}}</span>{{end}}</td>
+          <td data-label="Status">{{if dashboardNonTerminal .Status}}<span class="pulse" aria-hidden="true">●</span>{{end}}{{statusPill "document" .Status}}{{if .ErrorMessage}}{{$action := dashboardErrorAction .ErrorMessage $.Can}}<span class="subline">{{$action.Text}}{{if $action.Href}} <a href="{{$action.Href}}">{{if eq $action.Href "/dashboard/models/pricing"}}Set price{{else}}View details{{end}}</a>{{end}}</span>{{end}}</td>
           <td data-label="Updated">{{relTime .UpdatedAt}}</td>
 {{if $.Can.KnowledgeManage}}          <td data-label="Actions">
             <span class="row">
@@ -36,13 +36,10 @@
 {{end}}      </tbody>
     </table>
   </div>
-{{else}}  <div class="empty">
-    {{icon "knowledge"}}
-    <p>No documents{{if ne .Data.Status "all"}} with this status{{end}} — upload one to get started.</p>
-  </div>
+{{else}}{{template "empty" .Data.Empty}}
 {{end}}{{if $.Can.KnowledgeManage}}  <div class="row" style="margin-top:12px">
     <input type="file" id="knowledge-upload-file" class="visually-hidden" data-knowledge-upload-input aria-label="Choose a document to upload">
-    <label class="btn primary" for="knowledge-upload-file">{{icon "upload"}}Upload document</label>
+{{if .Data.Docs}}    <label class="btn primary" for="knowledge-upload-file">{{icon "upload"}}Upload document</label>{{end}}
   </div>
 {{end}}</div>
 {{end}}

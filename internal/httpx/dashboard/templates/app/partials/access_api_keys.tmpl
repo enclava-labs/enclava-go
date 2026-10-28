@@ -34,7 +34,7 @@
       </table>
     </div>
   </div>
-{{else}}  <div class="empty">{{icon "key"}}<p>No API keys yet.</p><button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/access/key-drawer">{{icon "plus"}}New key</button></div>
+{{else}}  {{template "empty" .Data.KeysEmpty}}
 {{end}}</div>
 {{end}}
 

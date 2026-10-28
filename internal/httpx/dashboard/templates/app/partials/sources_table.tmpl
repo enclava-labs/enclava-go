@@ -35,7 +35,7 @@
             <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{.ProgressPct}}" title="{{.ProgressPct}}% reported by the running sync"><i style="width:{{.ProgressPct}}%"></i></div>
 {{else if eq .State "syncing"}}            <span class="pill {{statusTone "syncing"}}"><i class="dot pulse"></i>{{statusLabel "source" "syncing"}}</span>
 {{else}}            {{statusPill "source" .State}}
-{{end}}{{if .LastError}}            <span class="subline">{{.LastError}}</span>
+{{end}}{{if .LastError}}            {{$fix := dashboardErrorAction .LastError $.Can}}<span class="subline">{{$fix.Text}}{{if $fix.Href}} {{if eq $fix.Href "/dashboard/sources"}}<a href="/dashboard/sources?edit={{.Source.ID}}">{{$fix.Label}}</a>{{else}}<a href="{{$fix.Href}}">{{$fix.Label}}</a>{{end}}{{end}}</span>
 {{end}}          </td>
           <td data-label="Last sync">{{relTime .Source.LastSyncAt}}</td>
           <td data-label="Next sync">{{if .NextEnabled}}{{relTime .NextAt}}{{else}}—{{end}}</td>
@@ -43,9 +43,9 @@
           <td data-label="Permissions">{{.Permissions}}</td>
           <td data-label="Actions">
             <span class="row">
-              <button type="button" class="btn" data-action="sources:sync" data-source-id="{{.Source.ID}}">{{icon "refresh"}}Sync now</button>
+{{if $.Can.SourcesManage}}              <button type="button" class="btn" data-action="sources:sync" data-source-id="{{.Source.ID}}">{{icon "refresh"}}Sync now</button>
               <button type="button" class="btn" data-action="sources:toggle" data-source-id="{{.Source.ID}}" data-enabled="{{.Source.IsEnabled}}">{{if .Source.IsEnabled}}Pause{{else}}Resume{{end}}</button>
-              <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete source {{.Source.Name}}?" data-source-id="{{.Source.ID}}" data-source-del="1">Delete</button>
+              <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete source {{.Source.Name}}?" data-source-id="{{.Source.ID}}" data-source-del="1">Delete</button>{{end}}
 {{if $.Can.AccessManage}}              <button type="button" class="btn" data-action="sources:bindings" data-source-id="{{.Source.ID}}">{{icon "users"}}User bindings</button>
 {{end}}            </span>
           </td>
@@ -53,10 +53,6 @@
 {{end}}      </tbody>
     </table>
   </div>
-{{else}}  <div class="empty">
-    {{icon "sources"}}
-    <p>No sources yet — connect Slack, Teams, GitHub, Notion or Google Drive to start syncing knowledge.</p>
-    <a class="btn primary" href="/dashboard/sources?new=1">Add source</a>
-  </div>
+{{else}}  {{template "empty" .Data.Empty}}
 {{end}}</div>
 {{end}}

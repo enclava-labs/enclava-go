@@ -39,12 +39,7 @@
         </tbody>
       </table>
     </div>
-    {{else if not .Data.Error}}
-    <div class="empty">
-      {{icon "billing"}}
-      <p>No model routes to price — bind a model alias on an endpoint first.</p>
-    </div>
-    {{end}}
+    {{else if not .Data.Error}}{{template "empty" .Data.Empty}}{{end}}
   </div>
 </section>
 {{end}}

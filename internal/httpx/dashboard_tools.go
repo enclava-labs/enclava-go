@@ -98,10 +98,11 @@ type toolsData struct {
 	Head struct {
 		Org string
 	}
-	Queue   []toolsQueueRow
-	Servers []toolsServerRow
-	Tools   []toolsToolRow
-	Scopes  []toolsScopeChoice
+	Queue                                []toolsQueueRow
+	Servers                              []toolsServerRow
+	Tools                                []toolsToolRow
+	Scopes                               []toolsScopeChoice
+	QueueEmpty, ServersEmpty, ToolsEmpty dashboardEmpty
 }
 
 func (toolsData) DashboardTitle() string  { return "Tools" }
@@ -205,6 +206,13 @@ func toolsDiffRows(prior, current, diffFields json.RawMessage) []toolsDiffRow {
 // never disagree with the persisted store.
 func (a *App) dashboardToolsData(ctx context.Context, p auth.Principal) (toolsData, error) {
 	data := toolsData{Scopes: toolsScopeChoices(nil)}
+	data.QueueEmpty = dashboardEmpty{Icon: "check", Text: "No tools pending approval."}
+	data.ServersEmpty = dashboardEmpty{Icon: "tools", Text: "No servers registered yet."}
+	data.ToolsEmpty = dashboardEmpty{Icon: "tools", Text: "No approved tools yet."}
+	if caps, _ := capsFromContext(ctx); caps.ToolsManage {
+		data.ServersEmpty.ActionLabel = "Add server"
+		data.ServersEmpty.ActionHref = "/dashboard/tools?new=1"
+	}
 	data.Head.Org = a.dashboardOrgName(ctx, p.TenantID)
 	if a.mcpRepo == nil {
 		return data, nil
@@ -354,7 +362,9 @@ func (a *App) handleDashboardToolsRegister(w http.ResponseWriter, r *http.Reques
 	var data struct {
 		Server *mcpServerResponse
 		Scopes []toolsScopeChoice
+		Empty  dashboardEmpty
 	}
+	data.Empty = dashboardEmpty{Icon: "tools", Text: "No permissions available."}
 	if id := strings.TrimSpace(r.URL.Query().Get("server")); id != "" && a.mcpRepo != nil {
 		p, _ := auth.PrincipalFromContext(r.Context())
 		server, err := a.mcpRepo.GetServer(r.Context(), p.TenantID, id)

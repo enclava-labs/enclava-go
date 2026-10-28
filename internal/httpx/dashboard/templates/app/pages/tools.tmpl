@@ -7,9 +7,9 @@
     <h1>Tools</h1>
     <p class="desc">Approve outbound {{term "mcp"}} tools, connect servers, and see which assistants use each tool.</p>
   </div>
-  <div class="right-mobile">
+{{if .Can.ToolsManage}}  <div class="right-mobile">
     <button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/tools/register">{{icon "plus"}}Add server</button>
-  </div>
+  </div>{{end}}
 </header>
 {{template "frag-tools-queue" .}}
 {{template "frag-tools-servers" .}}
@@ -47,7 +47,7 @@
     </div>
   </div>
   {{else}}
-  <div class="card"><div class="empty">{{icon "tools"}}<p>No approved tools yet — approve one from the queue above.</p></div></div>
+  <div class="card">{{template "empty" .Data.ToolsEmpty}}</div>
   {{end}}
 </section>
 {{end}}

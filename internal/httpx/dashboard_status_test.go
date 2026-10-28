@@ -39,6 +39,8 @@ func TestStatusVocabulary(t *testing.T) {
 		"not-approved": {"Not approved", "bad"},
 		"unreachable":  {"Unreachable", "bad"},
 		"revoked":      {"Removed from search", "bad"},
+		"deleted":      {"Removed", "bad"},
+		"unknown":      {"Lost contact", "bad"},
 	}
 	if len(dashboardStatusLabels) != len(rows) {
 		t.Fatalf("vocabulary has %d rows, UI-SPEC table has %d", len(dashboardStatusLabels), len(rows))
@@ -85,12 +87,15 @@ func TestStatusPillShape(t *testing.T) {
 func TestTerm(t *testing.T) {
 	cases := map[string]string{
 		"rag":         "knowledge",
-		"qdrant":      "index",
+		"qdrant":      "search index",
 		"mcp":         "tool",
 		"tinfoil":     "confidential endpoint",
 		"api":         "service",
 		"readonly":    "Read-only",
 		"writes-data": "Writes data",
+		"micros":      "per-million-token price",
+		"json":        "data",
+		"uuid":        "identifier",
 		"RAG":         "knowledge", // lookup is case-insensitive
 	}
 	for key, want := range cases {
@@ -104,13 +109,12 @@ func TestTerm(t *testing.T) {
 }
 
 func TestGlossary(t *testing.T) {
-	// The banned-jargon keys from the plan must all be covered by the table.
-	for _, key := range []string{"rag", "qdrant", "mcp", "tinfoil", "api", "readonly", "writes-data"} {
+	// The banned-jargon keys from the plan must all be covered by the table;
+	// the shared engine (11-01) extended it with the additional plain-word
+	// rows the copy passes rely on.
+	for _, key := range []string{"rag", "qdrant", "mcp", "tinfoil", "api", "readonly", "writes-data", "micros", "json", "uuid", "assistant.use", "mcp.use"} {
 		if _, ok := dashboardGlossary[key]; !ok {
 			t.Errorf("glossary must cover banned jargon key %q", key)
 		}
-	}
-	if _, ok := dashboardGlossary["micros"]; ok {
-		t.Error("micros is internal-only — never user-facing, must not be a term")
 	}
 }

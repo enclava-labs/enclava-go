@@ -7,9 +7,9 @@
     <h1>Instructions</h1>
     <p class="desc">Prompt templates that shape how assistants answer.</p>
   </div>
-  <div class="right-mobile">
+{{if .Can.AssistantsManage}}  <div class="right-mobile">
     <button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/assistants/instructions/editor?new=1">{{icon "plus"}}New instructions</button>
-  </div>
+  </div>{{end}}
 </header>
 {{template "tabs" .Data.Tabs}}
 <section data-assistants-page="instructions">

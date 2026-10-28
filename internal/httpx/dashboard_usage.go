@@ -90,6 +90,7 @@ type usageOverviewData struct {
 	ByModel   []usageGroupRow
 	ByTeam    []usageGroupRow
 	ByKey     []usageGroupRow
+	Empty     dashboardEmpty
 }
 
 // usageRangeDays accepts exactly 7/30/90; anything else is the 30 default.
@@ -151,7 +152,7 @@ func (a *App) handleDashboardUsageOverviewFragment(w http.ResponseWriter, r *htt
 // usageOverview reads every named billing projection for the window
 // server-side; nothing on the page is invented.
 func (a *App) usageOverview(ctx context.Context, tenantID string, days int) (usageOverviewData, error) {
-	out := usageOverviewData{Days: days}
+	out := usageOverviewData{Days: days, Empty: dashboardEmpty{Icon: "usage", Text: "No usage in this range."}}
 	since := time.Now().UTC().AddDate(0, 0, -days)
 
 	totals, err := a.billingRepo.UsageTotals(ctx, tenantID, since)
@@ -368,7 +369,8 @@ func (a *App) handleDashboardUsageBudgetsPage(w http.ResponseWriter, r *http.Req
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "usage_budgets_failed")
 		return
 	}
-	a.renderDashboard(w, r, "usage", usageBudgetsView(tenantID, rows))
+	caps, _ := capsFromContext(r.Context())
+	a.renderDashboard(w, r, "usage", usageBudgetsView(tenantID, rows, caps))
 }
 
 func (a *App) handleDashboardUsageBudgetsFragment(w http.ResponseWriter, r *http.Request) {
@@ -387,16 +389,16 @@ func (a *App) handleDashboardUsageBudgetsFragment(w http.ResponseWriter, r *http
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "usage_budgets_failed")
 		return
 	}
-	a.renderDashboardFragment(w, r, "usage", "usage-budgets", usageBudgetsView(tenantID, rows))
+	caps, _ := capsFromContext(r.Context())
+	a.renderDashboardFragment(w, r, "usage", "usage-budgets", usageBudgetsView(tenantID, rows, caps))
 }
 
-func usageBudgetsView(tenantID string, rows []usageBudgetRow) usageView {
+func usageBudgetsView(tenantID string, rows []usageBudgetRow, caps dashboardCaps) usageView {
 	view := usageView{ActiveTab: "budgets", Tabs: usageTabs("budgets"), Budgets: rows}
-	if len(rows) == 0 {
-		view.BudgetsEmpty = dashboardEmpty{
-			Icon: "billing",
-			Text: "No budgets yet — create one to cap spending or tokens for the workspace, a key, a user or a service account.",
-		}
+	view.BudgetsEmpty = dashboardEmpty{Icon: "billing", Text: "No budgets yet."}
+	if caps.BillingView {
+		view.BudgetsEmpty.ActionDrawerLabel = "New budget"
+		view.BudgetsEmpty.ActionDrawerURL = "/dashboard/partials/usage/budget-drawer"
 	}
 	return view
 }
@@ -485,18 +487,19 @@ type usageSubjectOption struct {
 }
 
 type usageBudgetDrawer struct {
-	Edit        bool
-	BudgetID    string
-	Name        string
-	Kind        string
-	KindLabel   string
-	PeriodLabel string
-	LimitValue  string
-	Keys        []usageSubjectOption
-	Users       []usageSubjectOption
-	Services    []usageSubjectOption
-	OrgName     string
-	Today       string
+	Edit                                 bool
+	BudgetID                             string
+	Name                                 string
+	Kind                                 string
+	KindLabel                            string
+	PeriodLabel                          string
+	LimitValue                           string
+	Keys                                 []usageSubjectOption
+	Users                                []usageSubjectOption
+	Services                             []usageSubjectOption
+	KeysEmpty, UsersEmpty, ServicesEmpty dashboardEmpty
+	OrgName                              string
+	Today                                string
 }
 
 func (a *App) handleDashboardUsageBudgetDrawer(w http.ResponseWriter, r *http.Request) {
@@ -530,8 +533,11 @@ func (a *App) handleDashboardUsageBudgetDrawer(w http.ResponseWriter, r *http.Re
 // set, the limit-only edit form for that budget.
 func (a *App) usageBudgetDrawerData(ctx context.Context, tenantID, budgetID string) (usageBudgetDrawer, error) {
 	drawer := usageBudgetDrawer{
-		OrgName: a.dashboardOrgName(ctx, tenantID),
-		Today:   time.Now().UTC().Format("2006-01-02"),
+		OrgName:       a.dashboardOrgName(ctx, tenantID),
+		Today:         time.Now().UTC().Format("2006-01-02"),
+		KeysEmpty:     dashboardEmpty{Icon: "key", Text: "No API keys available."},
+		UsersEmpty:    dashboardEmpty{Icon: "users", Text: "No people available."},
+		ServicesEmpty: dashboardEmpty{Icon: "users", Text: "No service accounts available."},
 	}
 	if keys, err := a.identity.ListAPIKeys(ctx, tenantID); err == nil {
 		for _, k := range keys {
@@ -540,7 +546,7 @@ func (a *App) usageBudgetDrawerData(ctx context.Context, tenantID, budgetID stri
 			}
 			name := strings.TrimSpace(k.Name)
 			if name == "" {
-				name = "API key " + k.ID
+				name = "Unnamed API key"
 			}
 			drawer.Keys = append(drawer.Keys, usageSubjectOption{ID: k.ID, Label: name})
 		}
@@ -830,9 +836,7 @@ func (a *App) usageAuditData(ctx context.Context, tenantID string, f usageAuditF
 		out.NextOffset = offset + limit
 		out.NextHref = usageAuditHref(f, limit, out.NextOffset)
 	}
-	if out.Total == 0 {
-		out.Empty = dashboardEmpty{Icon: "audit", Text: "No billing or pricing events match these filters."}
-	}
+	out.Empty = dashboardEmpty{Icon: "audit", Text: "No events in this range."}
 	return out, nil
 }
 

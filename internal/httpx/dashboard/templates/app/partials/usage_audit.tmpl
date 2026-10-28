@@ -22,9 +22,9 @@
       <tbody>
 {{range .Data.Audit.Rows}}        <tr>
           <td data-label="When">{{relTime .Time}}</td>
-          <td data-label="Event"><b>{{.Kind}}</b></td>
-          <td data-label="Actor">{{.Actor}}{{if .ActorType}}<span class="subline">{{.ActorType}}</span>{{end}}</td>
-          <td data-label="Subject">{{.SubjectLabel}}<span class="subline">{{.SubjectType}} · {{.SubjectID}}</span></td>
+          <td data-label="Event"><b>{{term .Kind}}</b></td>
+          <td data-label="Actor">{{.Actor}}{{if .ActorType}}<span class="subline">{{term .ActorType}}</span>{{end}}</td>
+          <td data-label="Subject">{{.SubjectLabel}}<span class="subline">{{term .SubjectType}} · {{.SubjectID}}</span></td>
           <td data-label="Amount">{{if .Amount}}{{.Amount}}{{else}}<span class="muted">—</span>{{end}}</td>
         </tr>
 {{end}}      </tbody>

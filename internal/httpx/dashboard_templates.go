@@ -28,6 +28,10 @@ type dashboardTab struct {
 
 type dashboardEmpty struct {
 	Icon, Text, ActionLabel, ActionHref string
+	// ActionDrawer* render a drawer-opening button instead of the link when
+	// set (e.g. "New budget" → the budget drawer); callers gate either action
+	// on the matching .Can.* — empty fields mean sentence-only.
+	ActionDrawerLabel, ActionDrawerURL string
 }
 
 type dashboardHeader struct {

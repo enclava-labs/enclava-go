@@ -25,7 +25,7 @@
       <legend class="label">{{.Label}}</legend>
 {{if .CallerAll}}      <label class="row"><input type="checkbox" data-grant-all{{if .All}} checked{{end}}> All {{.Label}}</label>
 {{end}}{{range .Items}}      <label class="row"><input type="checkbox" data-grant-item value="{{.ID}}"{{if .Checked}} checked{{end}}> {{.Label}}</label>
-{{end}}{{if not .Items}}      <p class="help">No {{.Label}} you can grant{{if not .CallerAll}} — you hold no all-access grant for them{{end}}.</p>
+{{end}}{{if not .Items}}      {{template "empty" .Empty}}
 {{end}}    </fieldset>
 {{end}}  </div>
   <div class="drawer-actions">

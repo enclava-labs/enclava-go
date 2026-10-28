@@ -34,6 +34,25 @@
     document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
   }
 
+  // API failures keep their inline slot AND surface the shared
+  // error→action toast (OA-35): a fix link (or Try again) when the central
+  // map has one, nothing extra when the failure is already explained.
+  function errorToast(err) {
+    if (typeof Enclava.errorAction !== 'function') return false;
+    const a = Enclava.errorAction(err);
+    if (!a || !(a.href || a.retry)) return false;
+    Enclava.toast('error', a.text || (err && err.message), { action: a });
+    return true;
+  }
+
+  // Non-form writes have no inline slot: the toast carries the map's
+  // sentence (member-safe when capability-filtered) plus any fix action.
+  function errorToastOr(err, fallback) {
+    if (errorToast(err)) return;
+    const a = typeof Enclava.errorAction === 'function' && Enclava.errorAction(err);
+    Enclava.toast('error', (a && a.text) || (err && err.message) || fallback);
+  }
+
   function showFormError(form, message) {
     const slot = form.querySelector('[data-models-form-error]');
     if (slot) {
@@ -100,6 +119,7 @@
       Enclava.refresh();
     } catch (err) {
       showFormError(form, err.message || 'Saving the endpoint failed');
+      errorToast(err);
     }
   }
 
@@ -112,7 +132,7 @@
       Enclava.closeDrawer();
       Enclava.refresh();
     } catch (err) {
-      Enclava.toast('error', err.message || 'Disabling the endpoint failed');
+      errorToastOr(err, 'Disabling the endpoint failed');
     }
   }
 
@@ -127,7 +147,7 @@
     form.innerHTML =
       '<b>Set ' + d.unitLabel + ' price</b>' +
       '<p class="help">' + d.model + ' @ ' + d.endpoint + ' · ' + d.capability + '</p>' +
-      '<label class="label" for="models-price-rate">Rate — integer micros per 1M tokens</label>' +
+      '<label class="label" for="models-price-rate">Rate — millionths of the currency unit, per 1M tokens</label>' +
       '<input class="field" id="models-price-rate" name="rate_micros" type="number" min="0" step="1" required>' +
       '<span class="help" data-models-price-preview>Enter a rate to preview it.</span>' +
       '<label class="label" for="models-price-currency">Currency</label>' +
@@ -146,7 +166,7 @@
     errorSlot.hidden = true;
     const rate = Math.trunc(Number(rateInput.value));
     if (!rateInput.value.trim() || Number.isNaN(rate) || rate < 0) {
-      errorSlot.textContent = 'Rate must be a whole number of micros, zero or greater.';
+      errorSlot.textContent = 'Rate must be a whole number of millionths, zero or greater.';
       errorSlot.hidden = false;
       return;
     }
@@ -166,6 +186,7 @@
     } catch (err) {
       errorSlot.textContent = err.message || 'Saving the price failed';
       errorSlot.hidden = false;
+      errorToast(err);
     }
   }
 

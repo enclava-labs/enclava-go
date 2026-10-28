@@ -28,10 +28,6 @@
 {{end}}      </tbody>
     </table>
   </div>
-{{else}}  <div class="empty">
-    {{icon "knowledge"}}
-    <p>No collections you can read yet.</p>
-{{if $.Can.KnowledgeManage}}    <button type="button" class="btn primary" data-action="knowledge:new">{{icon "plus"}}New collection</button>
-{{end}}  </div>
+{{else}}{{template "empty" .Data.Empty}}
 {{end}}</div>
 {{end}}

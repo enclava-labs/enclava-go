@@ -17,7 +17,7 @@
       </thead>
       <tbody>
 {{range .Data.Sessions}}        <tr>
-          <td data-label="Session">{{.ShortID}}{{if .Current}} {{statusPill "session" "current"}}{{end}}</td>
+          <td data-label="Session">{{if .Current}}This session {{statusPill "session" "current"}}{{else}}Other session{{end}}</td>
           <td data-label="Signed in">{{relTime .CreatedAt}}</td>
           <td data-label="Idle expiry">{{relTime .IdleExpiresAt}}</td>
           <td data-label="Status">{{if .Revoked}}{{statusPill "session" "stopped"}}{{if .Reason}}<span class="subline">{{.Reason}}</span>{{end}}{{else}}—{{end}}</td>
@@ -26,6 +26,6 @@
 {{end}}      </tbody>
     </table>
   </div>
-{{else}}  <div class="empty">{{icon "clock"}}<p>No sessions.</p></div>
+{{else}}  {{template "empty" .Data.SessionsEmpty}}
 {{end}}</div>
 {{end}}

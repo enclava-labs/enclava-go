@@ -43,10 +43,16 @@
       status: status,
     };
   }
-
-  // api(method, path, body) → Promise<parsed body>. FormData is sent raw (the
-  // browser sets its multipart boundary); anything else goes out as JSON.
-  async function api(method, path, body) {
+  // api(method, path, body, opts?) → Promise<parsed body>. FormData is sent
+  // raw (the browser sets its multipart boundary); anything else goes out as
+  // JSON. Every rejection carries err.request={method,path,body} so the error
+  // map can offer an in-place replay; opts.onRetry (async () => void) rides
+  // along and, when present, REPLACES the blind replay — the caller resumes
+  // its own success continuation (create→sync, preview→poll, create→nav).
+  async function api(method, path, body, opts) {
+    const request = { method: method, path: path, body: body };
+    const onRetry = opts && typeof opts.onRetry === 'function' ? opts.onRetry : null;
+    const reject = (err) => { err.request = request; err.onRetry = onRetry; return err; };
     const options = {
       method: method,
       credentials: 'same-origin',
@@ -63,21 +69,113 @@
       res = await fetch(path, options);
     } catch (err) {
       toast('error', 'Network error — try again');
-      throw err;
+      throw reject(Object.assign(err instanceof Error ? err : new Error('network'), { message: 'Network error — try again', code: 'network_error' }));
     }
     if (res.status === 401) {
       loginRedirect();
-      throw { message: 'Sign in required', code: 'unauthorized', status: 401 };
+      throw reject({ message: 'Sign in required', code: 'unauthorized', status: 401 });
     }
     let data = null;
     if (res.status !== 204) data = await res.json().catch(() => null);
     if (!res.ok) {
       const err = errorShape(data, res.status);
       if (res.status === 403) toast('error', err.message);
-      throw err;
+      throw reject(err);
     }
     return data;
   }
+
+  // ── Capability projection + error→next-step map (OA-35, CONTEXT 9/10) ──
+
+  // Enclava.caps is the server-emitted capability projection, parsed once.
+  // Both serializations are accepted (JSON booleans from dashboardCapsJSON,
+  // or the space-separated name list) — absent/unparseable fails closed so a
+  // member never gets a link that lands on a 403.
+  const caps = (function () {
+    const raw = document.body ? document.body.dataset.caps : '';
+    if (!raw) return {};
+    if (raw.charAt(0) === '{') {
+      try { return JSON.parse(raw) || {}; } catch (_) { return {}; }
+    }
+    const out = {};
+    raw.split(/\s+/).forEach((name) => { if (name) out[name] = true; });
+    return out;
+  })();
+
+  // errorAction(errOrPayload, sourceID?) → {text, label?, href?} |
+  // {text, label, retry, request?, onRetry?} | {text}. It accepts the
+  // {message, code} envelope api() rejects with AND persisted failure
+  // payloads from a 200 GET (run.error / job.error_message — callers pass
+  // {message: run.error} or {message: job.error_message, status}). Gated
+  // links require the matching capability; without it the row degrades to
+  // the sentence plus the administrator fallback — never a 403-bound href.
+  function errorAction(err, sourceID) {
+    const e = err || {};
+    let message = (typeof e.message === 'string' && e.message) ||
+      (typeof e.error === 'string' && e.error) ||
+      (typeof e.error_message === 'string' && e.error_message) || '';
+    let code = typeof e.code === 'string' ? e.code : '';
+    const lower = message.toLowerCase();
+    if (!code) {
+      if (lower.indexOf('required price missing') !== -1) code = 'price_missing';
+      else if (lower.indexOf('budget exceeded') !== -1) code = 'budget_exceeded';
+      else if (lower.indexOf('credential') !== -1 || lower.indexOf('authorization') !== -1 ||
+               lower.indexOf('auth failed') !== -1) code = 'source_auth_failed';
+    }
+    const adminFallback = ' — your administrator can fix this.';
+    switch (code) {
+      case 'price_missing': {
+        const text = "The model isn't priced for every unit this request bills";
+        if (caps['models.manage']) {
+          return { text: text + '.', label: 'Set price', href: '/dashboard/models/pricing' };
+        }
+        return { text: text + adminFallback };
+      }
+      case 'source_auth_failed': {
+        const text = "The source's credentials were rejected — reconnect it to resume syncing";
+        if (caps['sources.manage']) {
+          const href = sourceID
+            ? '/dashboard/sources?edit=' + encodeURIComponent(sourceID)
+            : '/dashboard/sources';
+          return { text: text + '.', label: 'Reconnect', href: href };
+        }
+        return { text: text + adminFallback };
+      }
+      case 'budget_exceeded': {
+        const text = 'This request exceeds the configured budget';
+        if (caps['billing.view']) {
+          return { text: text + '.', label: 'View budgets', href: '/dashboard/usage/budgets' };
+        }
+        return { text: text + adminFallback };
+      }
+      case 'rate_limited':
+      case 'overloaded':
+      case 'gateway_timeout':
+      case 'upstream_unavailable':
+      case 'network_error': {
+        const action = { text: "That request couldn't complete — try again.", label: 'Try again', retry: true };
+        if (e.request) action.request = e.request;
+        if (e.onRetry) action.onRetry = e.onRetry;
+        return action;
+      }
+      case 'schema_changed':
+      case 'conflict':
+        return { text: "The tool's schema changed — refresh to see the latest before approving." };
+      case 'forbidden':
+      case 'agent_run_denied':
+      case 'invalid_api_key':
+      case 'unauthorized':
+        return { text: message || "You don't have access to do that — check with your administrator if you should." };
+      case 'not_found':
+        return { text: message || 'That item is no longer available.' };
+    }
+    if (lower.indexOf('schema') !== -1) {
+      return { text: "The tool's schema changed — refresh to see the latest before approving." };
+    }
+    return { text: message || 'That request failed' };
+  }
+
+  const POLL_MS = 3000; // the one client poll interval (htmx uses every 3s)
 
   // Shared gate for every HTML fragment load (drawer/modal/evidence): status is
   // resolved BEFORE anything is injected — an expired session never swaps the
@@ -125,11 +223,32 @@
     t.appendChild(span);
     if (kind === 'error') {
       const o = opts || {};
-      if (o.action && o.action.label && o.action.href) {
+      // opts.action accepts the legacy {label, href} link AND an
+      // Enclava.errorAction result {label, href} | {label, retry, request?,
+      // onRetry?} — retry renders a button that replays the captured request
+      // (or runs the caller's onRetry continuation) then refreshes.
+      const action = o.action || null;
+      if (action && action.href && (action.label || action.text)) {
         const a = document.createElement('a');
-        a.href = o.action.href;
-        a.textContent = o.action.label;
+        a.href = action.href;
+        a.textContent = action.label || action.text;
         t.appendChild(a);
+      } else if (action && action.retry) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'btn';
+        b.textContent = action.label || 'Try again';
+        b.addEventListener('click', async () => {
+          b.disabled = true;
+          try {
+            if (typeof action.onRetry === 'function') await action.onRetry();
+            else if (action.request) await api(action.request.method, action.request.path, action.request.body);
+            t.classList.remove('show');
+            t.textContent = '';
+            refresh();
+          } catch (_) { b.disabled = false; }
+        });
+        t.appendChild(b);
       }
       const close = document.createElement('button');
       close.type = 'button';
@@ -462,6 +581,9 @@
     refresh: refresh,
     copy: copy,
     evidence: { open: openEvidence, close: closeEvidence },
+    caps: caps,
+    errorAction: errorAction,
+    POLL_MS: POLL_MS,
   };
   window.Enclava.version = 'oa';
 })();

@@ -289,17 +289,17 @@ func TestDashboardUsageAuditFilters(t *testing.T) {
 	kindOnly := renderAudit("?kind=price.create")
 	// The chip rail lists every kind; the filtered table must hold only the
 	// pricing event.
-	if !strings.Contains(kindOnly, "<b>price.create</b>") || strings.Contains(kindOnly, "<b>api_key.created</b>") {
+	if !strings.Contains(kindOnly, "Price create") || strings.Contains(kindOnly, "Api key created") {
 		t.Fatalf("kind filter must narrow table rows to pricing events: %s", kindOnly)
 	}
 
 	subjectOnly := renderAudit("?subject_id=key-1")
-	if !strings.Contains(subjectOnly, "<b>api_key.created</b>") || strings.Contains(subjectOnly, "<b>budget.created</b>") {
+	if !strings.Contains(subjectOnly, "Api key created") || strings.Contains(subjectOnly, "Budget created") {
 		t.Fatalf("subject filter must narrow rows: %s", subjectOnly)
 	}
 
 	actorOnly := renderAudit("?actor=admin-2")
-	if !strings.Contains(actorOnly, "<b>budget.created</b>") || strings.Contains(actorOnly, "<b>api_key.created</b>") {
+	if !strings.Contains(actorOnly, "Budget created") || strings.Contains(actorOnly, "Api key created") {
 		t.Fatalf("actor filter must narrow rows: %s", actorOnly)
 	}
 

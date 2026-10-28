@@ -19,7 +19,6 @@ import (
 	"enclava-go/internal/auth"
 	"enclava-go/internal/chatbot"
 	"enclava-go/internal/extract"
-	"enclava-go/internal/jobs"
 	"enclava-go/internal/rag"
 	"enclava-go/internal/store/postgres"
 )
@@ -38,6 +37,7 @@ type homeData struct {
 	Greeting        string
 	APIBase         string
 	Attention       []AttentionItem
+	AttentionLive   bool // any non-terminal attention row → the fragment polls
 	KPIs            homeKPIs
 	Running         homeRunningData
 	Conversations   []chatbot.ConversationSummary
@@ -45,6 +45,13 @@ type homeData struct {
 	Extractions     []extract.JobView
 	ExtractionTotal int
 	Collections     []rag.Collection
+	// Shared empty states (typed dashboardEmpty — actions only where the
+	// caller's caps grant them; grantless members get sentence-only).
+	AttentionEmpty     dashboardEmpty
+	ConversationsEmpty dashboardEmpty
+	AssistantsEmpty    dashboardEmpty
+	ExtractionsEmpty   dashboardEmpty
+	CollectionsEmpty   dashboardEmpty
 }
 
 func (d homeData) DashboardTitle() string  { return "Home" }
@@ -73,9 +80,14 @@ type homeBudget struct {
 // GET /dashboard/partials/home/running). Live reports non-terminal work —
 // the fragment emits the 3s trigger only while it holds.
 type homeRunningData struct {
-	Rows []homeRunningRow
-	Live bool
+	Rows  []homeRunningRow
+	Live  bool
+	Empty dashboardEmpty
 }
+
+// homeRunningEmpty is the fixed empty state for the running fragment — it
+// has no action (running work is not a creatable surface).
+var homeRunningEmpty = dashboardEmpty{Icon: "check", Text: "Nothing is running right now."}
 
 // homeRunningRow is one activity row plus its render projections: Percent is
 // set only when the stored worker progress carries a real number.
@@ -94,6 +106,7 @@ func (a *App) registerDashboardHomeRoutes() {
 	a.mux.HandleFunc("/dashboard", a.sessionAuth.capSession(a.handleDashboardHomePage))
 	a.mux.HandleFunc("/dashboard/", a.sessionAuth.capSession(a.handleDashboardHomeSubtree))
 	a.mux.HandleFunc("/dashboard/partials/home/running", a.sessionAuth.capSession(a.handleDashboardHomeRunning))
+	a.mux.HandleFunc("/dashboard/partials/home/attention", a.sessionAuth.capSession(a.handleDashboardHomeAttention))
 }
 
 // handleDashboardHomeSubtree preserves the phase-6 catch-all contract: the
@@ -130,6 +143,31 @@ func (a *App) handleDashboardHomeRunning(w http.ResponseWriter, r *http.Request)
 	a.renderDashboardFragment(w, r, "home", "running", d)
 }
 
+// handleDashboardHomeAttention serves the self-replacing needs-attention
+// fragment; it polls only while a row's underlying work is non-terminal.
+func (a *App) handleDashboardHomeAttention(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	caps, _ := capsFromContext(r.Context())
+	p, _ := auth.PrincipalFromContext(r.Context())
+	d := homeData{APIBase: "/v1", Attention: []AttentionItem{}}
+	d.fillEmptyStates(caps)
+	if items, err := a.dashboardAttention(r.Context(), p, caps); err != nil {
+		log.Printf("dashboard home: attention: %v", err)
+	} else {
+		d.Attention = items
+	}
+	for _, it := range d.Attention {
+		if it.Live {
+			d.AttentionLive = true
+			break
+		}
+	}
+	a.renderDashboardFragment(w, r, "home", "attention", d)
+}
+
 // dashboardHomeData composes every section from real producer reads. A
 // failing producer logs and degrades its own section — one broken read never
 // blanks the page.
@@ -140,10 +178,17 @@ func (a *App) dashboardHomeData(ctx context.Context, caps dashboardCaps) homeDat
 		APIBase:   "/v1", // OpenAI-compatible routes live under /v1, never /api/v1
 		Attention: []AttentionItem{},
 	}
+	d.fillEmptyStates(caps)
 	if items, err := a.dashboardAttention(ctx, p, caps); err != nil {
 		log.Printf("dashboard home: attention: %v", err)
 	} else {
 		d.Attention = items
+	}
+	for _, it := range d.Attention {
+		if it.Live {
+			d.AttentionLive = true
+			break
+		}
 	}
 	if caps.BillingView {
 		if m, err := a.dashboardHomeMetrics(ctx, p, caps); err != nil {
@@ -205,14 +250,15 @@ func (a *App) dashboardHomeRunning(ctx context.Context, caps dashboardCaps) home
 	items, err := a.dashboardActivity(ctx, p, caps)
 	if err != nil {
 		log.Printf("dashboard home: activity: %v", err)
-		return homeRunningData{Rows: []homeRunningRow{}}
+		return homeRunningData{Rows: []homeRunningRow{}, Empty: homeRunningEmpty}
 	}
 	rows := make([]homeRunningRow, 0, len(items))
 	live := false
 	for _, it := range items {
+		// Non-terminal per the shared status table — unknown counts terminal.
 		row := homeRunningRow{
 			ActivityItem: it,
-			Live:         it.Status == jobs.StatusQueued || it.Status == jobs.StatusRunning,
+			Live:         dashboardNonTerminal(it.Status),
 		}
 		if row.Live {
 			live = true
@@ -230,7 +276,31 @@ func (a *App) dashboardHomeRunning(ctx context.Context, caps dashboardCaps) home
 		}
 		rows = append(rows, row)
 	}
-	return homeRunningData{Rows: rows, Live: live}
+	return homeRunningData{Rows: rows, Live: live, Empty: homeRunningEmpty}
+}
+
+// fillEmptyStates sets the shared dashboardEmpty per section; actions are
+// capability-gated here (callers never branch in the template).
+func (d *homeData) fillEmptyStates(caps dashboardCaps) {
+	d.AttentionEmpty = dashboardEmpty{Icon: "check", Text: "Nothing needs attention."}
+	d.Running.Empty = dashboardEmpty{Icon: "check", Text: "Nothing is running right now."}
+	d.ConversationsEmpty = dashboardEmpty{Icon: "chat", Text: "No conversations yet."}
+	if caps.Chat {
+		d.ConversationsEmpty.ActionLabel, d.ConversationsEmpty.ActionHref = "New chat", "/dashboard/chat"
+	}
+	// D-25 grant-empty: managers see "no assistants exist — create one";
+	// members get the administrator-grants truth, never an implied grant.
+	d.AssistantsEmpty = dashboardEmpty{Icon: "assistant",
+		Text: "No assistants you can use yet — ask an admin to grant access."}
+	if caps.AssistantsManage {
+		d.AssistantsEmpty.Text = "No assistants yet."
+		d.AssistantsEmpty.ActionLabel, d.AssistantsEmpty.ActionHref = "New assistant", "/dashboard/assistants?new=1"
+	}
+	d.ExtractionsEmpty = dashboardEmpty{Icon: "extract", Text: "No extractions yet."}
+	if caps.Extract {
+		d.ExtractionsEmpty.ActionLabel, d.ExtractionsEmpty.ActionHref = "New extraction", "/dashboard/extract"
+	}
+	d.CollectionsEmpty = dashboardEmpty{Icon: "knowledge", Text: "No collections you can search yet."}
 }
 
 // homeGreeting picks the daypart word for the greeting card.
