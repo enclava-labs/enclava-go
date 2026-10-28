@@ -129,9 +129,13 @@ type Reservation struct {
 	EndpointID        string
 	JobID             string
 	AttemptID         string
-	DispatchedAt      *time.Time
-	CreatedAt         time.Time
-	SettledAt         *time.Time
+	// CredentialID is the api-key credential the attempt was admitted for
+	// ('' for session and other credential kinds) — the verified per-key
+	// attribution column behind key-scoped budgets and spend reads.
+	CredentialID string
+	DispatchedAt *time.Time
+	CreatedAt    time.Time
+	SettledAt    *time.Time
 }
 
 // UsageRecord is the immutable settlement evidence for a settled reservation
@@ -150,7 +154,9 @@ type UsageRecord struct {
 	Currency      string
 	Price         PriceSnapshot
 	Outcome       string // completed|unknown|not_dispatched
-	CreatedAt     time.Time
+	// CredentialID mirrors the reservation's admitted api-key credential.
+	CredentialID string
+	CreatedAt    time.Time
 }
 
 // Usage is raw reported per-kind usage — never clipped. CachedInputUnits is a

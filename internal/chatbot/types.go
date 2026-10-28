@@ -56,7 +56,9 @@ type Conversation struct {
 }
 
 // Message is a tenant-scoped messages row. Token accounting lives on the
-// usage record, not the message row.
+// usage record, not the message row. RunID links a turn to its durable
+// agent run (OA-14); Steps is the ordered tool-step projection, populated
+// only on assistant turns at read time — never persisted.
 type Message struct {
 	TenantID       string             `json:"-"`
 	ID             string             `json:"id"`
@@ -64,6 +66,8 @@ type Message struct {
 	Role           string             `json:"role"`
 	Content        string             `json:"content"`
 	OwnerActorID   string             `json:"-"`
+	RunID          string             `json:"run_id,omitempty"`
+	Steps          []AssistantRunStep `json:"steps,omitempty"`
 	EvidenceIDs    []string           `json:"evidence_ids,omitempty"`
 	InputRefs      []source.ObjectRef `json:"-"`
 	CreatedAt      time.Time          `json:"created_at"`
@@ -97,19 +101,28 @@ type ConversationSummary struct {
 type AssistantRunInput struct {
 	ConversationID string `json:"conversation_id,omitempty"`
 	Input          string `json:"input"`
+	// EvidenceIDs hand off server-issued evidence IDs ("ask about this"):
+	// resolved and authorized server-side before the run starts — client
+	// passage text or source refs are never accepted.
+	EvidenceIDs []string `json:"evidence_ids,omitempty"`
 }
 
 type AssistantRun struct {
-	ID                    string                     `json:"id"`
-	TenantID              string                     `json:"-"`
-	JobID                 string                     `json:"job_id,omitempty"`
-	OwnerActorID          string                     `json:"-"`
-	ChatbotID             string                     `json:"chatbot_id"`
-	ConversationID        string                     `json:"conversation_id"`
-	Status                string                     `json:"status"`
-	Input                 string                     `json:"input"`
-	Output                string                     `json:"output,omitempty"`
-	Error                 string                     `json:"error,omitempty"`
+	ID             string `json:"id"`
+	TenantID       string `json:"-"`
+	JobID          string `json:"job_id,omitempty"`
+	OwnerActorID   string `json:"-"`
+	ChatbotID      string `json:"chatbot_id"`
+	ConversationID string `json:"conversation_id"`
+	Status         string `json:"status"`
+	Input          string `json:"input"`
+	Output         string `json:"output,omitempty"`
+	Error          string `json:"error,omitempty"`
+	// EndpointID/Model are the route actually dispatched, persisted from
+	// inference.Result — never the configured provider label.
+	EndpointID            string                     `json:"endpoint_id,omitempty"`
+	Model                 string                     `json:"model,omitempty"`
+	Steps                 []AssistantRunStep         `json:"steps,omitempty"`
 	ConfigSnapshot        json.RawMessage            `json:"-"`
 	PromptTemplateID      string                     `json:"prompt_template_id,omitempty"`
 	PromptTemplateVersion int                        `json:"prompt_template_version,omitempty"`
@@ -133,6 +146,23 @@ type AssistantRunAttempt struct {
 	Error     string    `json:"error,omitempty"`
 	StartedAt time.Time `json:"started_at"`
 	EndedAt   time.Time `json:"ended_at,omitempty"`
+}
+
+// AssistantRunStep is one ordered tool-step projection on a run and on the
+// assistant turn it belongs to (OA-14). Input/Output carry bounded
+// tool-level payloads only — model request bodies and system prompts never
+// reach a step row; when the run's evidence is no longer readable the
+// source-bearing fields are cleared and metadata alone survives.
+type AssistantRunStep struct {
+	Number    int        `json:"number"`
+	Kind      string     `json:"kind"`
+	Name      string     `json:"name"`
+	Status    string     `json:"status"`
+	Input     string     `json:"input,omitempty"`
+	Output    string     `json:"output,omitempty"`
+	Error     string     `json:"error,omitempty"`
+	StartedAt time.Time  `json:"started_at"`
+	EndedAt   *time.Time `json:"ended_at,omitempty"`
 }
 
 type CreateChatbotInput struct {

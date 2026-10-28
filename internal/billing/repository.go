@@ -75,6 +75,11 @@ type BillingRepository interface {
 	// CreateBudget inserts an enforceable limit row.
 	CreateBudget(ctx context.Context, tenantID, id string, b Budget) error
 
+	// LatestPrices returns the latest price row effective at now per unit
+	// kind for one price key, outside any transaction — the read path for
+	// display/routing price-coverage checks (never a substitute for Reserve).
+	LatestPrices(ctx context.Context, tenantID, subjectType, subjectID, capability string, now time.Time) ([]Price, error)
+
 	// GetReservation returns the canonical reservation row.
 	GetReservation(ctx context.Context, tenantID, id string) (Reservation, error)
 

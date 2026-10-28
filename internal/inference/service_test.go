@@ -107,6 +107,9 @@ type fx struct {
 	principal     auth.Principal
 	factoryErr    error
 	conversations inference.ConversationStore
+	// billingOverride swaps the executor's billing seam (tests exercising
+	// accounting failure); nil uses f.billing.
+	billingOverride inference.Billing
 }
 
 func newFx(t *testing.T) *fx {
@@ -142,11 +145,15 @@ func newFx(t *testing.T) *fx {
 // construction.
 func (f *fx) build(t *testing.T) {
 	t.Helper()
+	billingSeam := inference.Billing(f.billing)
+	if f.billingOverride != nil {
+		billingSeam = f.billingOverride
+	}
 	svc, err := inference.NewService(inference.Deps{
 		Endpoints:     f.endpoint,
 		Sources:       f.sources,
 		Authorizer:    source.NewAuthorizer(f.sources, time.Hour),
-		Billing:       f.billing,
+		Billing:       billingSeam,
 		Artifacts:     f.artifact,
 		Conversations: f.conversations,
 	}, inference.WithTransportFactory(
@@ -979,5 +986,442 @@ func TestExecuteConfidentialSDKOfflineDemoResponsesLifecycle(t *testing.T) {
 	}
 	if err == nil || !strings.Contains(err.Error(), "provider_response_manage_failed") {
 		t.Fatalf("demo Responses follow-up must fail closed, got %v", err)
+	}
+}
+
+// --- endpoint runtime observations (plan 08-07 task 3) -----------------------
+
+// runtimeFor returns the runtime row for one endpoint id.
+func runtimeFor(t *testing.T, f *fx, endpointID string) inference.EndpointRuntime {
+	t.Helper()
+	rows, err := f.svc.EndpointRuntime(f.ctx, f.tenant)
+	if err != nil {
+		t.Fatalf("endpoint runtime: %v", err)
+	}
+	for _, rt := range rows {
+		if rt.EndpointID == endpointID {
+			return rt
+		}
+	}
+	t.Fatalf("endpoint %s missing from runtime rows", endpointID)
+	return inference.EndpointRuntime{}
+}
+
+func TestEndpointRuntimeUnknownUntilDispatched(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+
+	rt := runtimeFor(t, f, "ep-1")
+	if rt.State != inference.RuntimeStateUnknown {
+		t.Fatalf("never-dispatched endpoint state = %q, want unknown", rt.State)
+	}
+	if rt.LatencyP50Millis != nil || rt.LastSuccessAt != nil || rt.LastError != "" {
+		t.Fatalf("unknown endpoint must carry no fabricated evidence: %+v", rt)
+	}
+}
+
+func TestEndpointRuntimeSuccessReadyWithLatency(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+	if _, err := f.svc.Execute(f.ctx, f.principal, f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`)); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	rt := runtimeFor(t, f, "ep-1")
+	if rt.State != inference.RuntimeStateReady {
+		t.Fatalf("state = %q, want ready", rt.State)
+	}
+	if rt.Observations != 1 || rt.LastSuccessAt == nil {
+		t.Fatalf("observation missing: %+v", rt)
+	}
+	// A real (non-zero) measured latency sample backs the P50.
+	if rt.LatencyP50Millis == nil || *rt.LatencyP50Millis < 0 {
+		t.Fatalf("latency p50 missing: %+v", rt)
+	}
+}
+
+func TestEndpointRuntimeUpstreamErrorDegraded(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+	f.upstream.err = &llm.UpstreamError{StatusCode: 503, Message: "upstream overloaded"}
+
+	_, err := f.svc.Execute(f.ctx, f.principal, f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err == nil {
+		t.Fatal("expected upstream error")
+	}
+	rt := runtimeFor(t, f, "ep-1")
+	if rt.State != inference.RuntimeStateDegraded {
+		t.Fatalf("answered upstream error state = %q, want degraded", rt.State)
+	}
+	if rt.LastError == "" {
+		t.Fatal("degraded endpoint must carry the real error")
+	}
+}
+
+func TestEndpointRuntimeTransportFailureUnreachable(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+	f.upstream.err = errors.New("dial tcp 10.0.0.1:443: connection refused")
+
+	_, err := f.svc.Execute(f.ctx, f.principal, f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err == nil {
+		t.Fatal("expected transport failure")
+	}
+	rt := runtimeFor(t, f, "ep-1")
+	if rt.State != inference.RuntimeStateUnreachable {
+		t.Fatalf("transport failure state = %q, want unreachable", rt.State)
+	}
+	if rt.LastError == "" {
+		t.Fatal("unreachable endpoint must carry the real error")
+	}
+}
+
+func TestEndpointRuntimeStreamFailureClasses(t *testing.T) {
+	t.Run("mid-stream read failure is unreachable", func(t *testing.T) {
+		f := newFx(t)
+		f.mkEndpoint(t)
+		f.flatPrices(t)
+		f.upstream.stream = readErrCloser{err: errors.New("unexpected EOF")}
+		req := f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`)
+		req.Stream = true
+		res, err := f.svc.Execute(f.ctx, f.principal, req)
+		if err != nil {
+			t.Fatalf("stream open: %v", err)
+		}
+		_, _ = io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		rt := runtimeFor(t, f, "ep-1")
+		if rt.State != inference.RuntimeStateUnreachable {
+			t.Fatalf("mid-stream read failure state = %q, want unreachable", rt.State)
+		}
+	})
+	t.Run("terminal failure event is degraded", func(t *testing.T) {
+		f := newFx(t)
+		f.mkEndpoint(t)
+		f.flatPrices(t)
+		f.upstream.stream = io.NopCloser(strings.NewReader(
+			"data: {\"type\":\"response.failed\"}\n\n"))
+		req := f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`)
+		req.Stream = true
+		res, err := f.svc.Execute(f.ctx, f.principal, req)
+		if err != nil {
+			t.Fatalf("stream open: %v", err)
+		}
+		_, _ = io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		rt := runtimeFor(t, f, "ep-1")
+		if rt.State != inference.RuntimeStateDegraded {
+			t.Fatalf("failed terminal event state = %q, want degraded", rt.State)
+		}
+	})
+	t.Run("client-cancelled stream records nothing", func(t *testing.T) {
+		f := newFx(t)
+		f.mkEndpoint(t)
+		f.flatPrices(t)
+		// A stream that would keep producing; the caller abandons it.
+		f.upstream.stream = io.NopCloser(strings.NewReader(
+			"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+		req := f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`)
+		req.Stream = true
+		res, err := f.svc.Execute(f.ctx, f.principal, req)
+		if err != nil {
+			t.Fatalf("stream open: %v", err)
+		}
+		if err := res.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
+		rt := runtimeFor(t, f, "ep-1")
+		if rt.State != inference.RuntimeStateUnknown || rt.Observations != 0 {
+			t.Fatalf("client-cancelled stream must record no observation: %+v", rt)
+		}
+	})
+}
+
+// readErrCloser is a stream body whose reads fail after headers returned.
+type readErrCloser struct{ err error }
+
+func (r readErrCloser) Read([]byte) (int, error) { return 0, r.err }
+func (r readErrCloser) Close() error             { return nil }
+
+func TestEndpointRuntimeManageObservations(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	manageReq := inference.ManageRequest{
+		EndpointID: "ep-1", Method: http.MethodGet, Path: "/responses/resp_1",
+	}
+	f.upstream.resp = []byte(`{"id":"resp_1"}`)
+	if _, err := f.svc.Manage(f.ctx, f.principal, manageReq); err != nil {
+		t.Fatalf("manage: %v", err)
+	}
+	if rt := runtimeFor(t, f, "ep-1"); rt.State != inference.RuntimeStateReady {
+		t.Fatalf("manage success state = %q, want ready", rt.State)
+	}
+	f.upstream.err = errors.New("dial tcp: i/o timeout")
+	if _, err := f.svc.Manage(f.ctx, f.principal, manageReq); err == nil {
+		t.Fatal("expected manage failure")
+	}
+	rt := runtimeFor(t, f, "ep-1")
+	if rt.State != inference.RuntimeStateUnreachable {
+		t.Fatalf("manage transport failure state = %q, want unreachable", rt.State)
+	}
+	if rt.Observations != 2 {
+		t.Fatalf("observations = %d, want 2", rt.Observations)
+	}
+}
+
+// Accounting failures never fabricate endpoint state: the transport outcome
+// already recorded the truth, so a settlement error leaves the endpoint ready.
+func TestEndpointRuntimeAccountingFailureKeepsReady(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+	// Wrap the billing seam so settlement of the successful attempt fails.
+	f.billingOverride = &failingSettleBilling{Billing: f.billing}
+	f.build(t)
+
+	res, err := f.svc.Execute(f.ctx, f.principal, f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if res.SettlementError == nil {
+		t.Fatal("expected settlement failure evidence")
+	}
+	rt := runtimeFor(t, f, "ep-1")
+	if rt.State != inference.RuntimeStateReady {
+		t.Fatalf("accounting failure must not fabricate endpoint state, got %q", rt.State)
+	}
+}
+
+// failingSettleBilling fails only the settle leg — the observation must not
+// depend on accounting success.
+type failingSettleBilling struct{ inference.Billing }
+
+func (b *failingSettleBilling) Settle(ctx context.Context, p auth.Principal, reservationID string, actual billing.Usage) (billing.UsageRecord, error) {
+	return billing.UsageRecord{}, errors.New("settlement store unavailable")
+}
+
+// Two tenants' identically named endpoints never share observations: a
+// success for tenant A's ep-1 must leave tenant B's ep-1 unknown.
+func TestEndpointRuntimeTwoTenantsIsolated(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+	if _, err := f.svc.Execute(f.ctx, f.principal, f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`)); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	// Tenant B gets its own endpoint with the SAME id "ep-1".
+	tenantB := testdb.SeedTenant(t, f.db, fmt.Sprintf("inf-b-%d", fixtureSeq.Add(1)))
+	if err := f.endpoint.Create(f.ctx, inference.Endpoint{
+		ID: "ep-1", TenantID: tenantB, Protocol: "openai_compatible",
+		BaseOrigin:   "https://api.upstream.example",
+		Capabilities: []string{inference.CapabilityChat, "model:gpt-fast=gpt-4o-mini"},
+		Enabled:      true,
+	}); err != nil {
+		t.Fatalf("create tenant B endpoint: %v", err)
+	}
+	rows, err := f.svc.EndpointRuntime(f.ctx, tenantB)
+	if err != nil {
+		t.Fatalf("tenant B runtime: %v", err)
+	}
+	if len(rows) != 1 || rows[0].EndpointID != "ep-1" {
+		t.Fatalf("tenant B rows = %+v", rows)
+	}
+	if rows[0].State != inference.RuntimeStateUnknown || rows[0].Observations != 0 {
+		t.Fatalf("tenant B endpoint borrowed tenant A state: %+v", rows[0])
+	}
+	if rows[0].LastSuccessAt != nil || rows[0].LatencyP50Millis != nil || rows[0].LastError != "" {
+		t.Fatalf("tenant B endpoint leaked A's evidence: %+v", rows[0])
+	}
+}
+
+// --- priced/routable selector (plan 08-07 task 3) ----------------------------
+
+func TestPricedModelSelectorCoverage(t *testing.T) {
+	f := newFx(t)
+	// Two endpoints: ep-1 sorts first and carries NO prices; ep-2 prices the
+	// alias completely. Both bind the alias and advertise chat.
+	f.mkEndpoint(t)
+	if err := f.endpoint.Create(f.ctx, inference.Endpoint{
+		ID: "ep-2", TenantID: f.tenant, Protocol: "openai_compatible",
+		BaseOrigin:   "https://api.upstream.example",
+		Capabilities: []string{inference.CapabilityChat, "model:gpt-fast=gpt-4o-mini"},
+		Enabled:      true,
+	}); err != nil {
+		t.Fatalf("create ep-2: %v", err)
+	}
+	f.priceFor(t, "ep-2", inference.CapabilityChat, billing.UnitInput, 1, 1)
+	f.priceFor(t, "ep-2", inference.CapabilityChat, billing.UnitOutput, 2, 1)
+
+	models, err := f.svc.PricedModelSelector(f.ctx, f.principal, "")
+	if err != nil {
+		t.Fatalf("priced model selector: %v", err)
+	}
+	if len(models) != 0 {
+		t.Fatalf("unpriced first-eligible route must exclude the alias, got %+v", models)
+	}
+
+	pinned, err := f.svc.PricedModelSelector(f.ctx, f.principal, "ep-2")
+	if err != nil {
+		t.Fatalf("pinned selector: %v", err)
+	}
+	if len(pinned) != 1 || pinned[0].ID != "gpt-fast" {
+		t.Fatalf("pinned priced route must include the alias, got %+v", pinned)
+	}
+}
+
+func TestPricedModelSelectorModelFallbackAndCapabilityScope(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t, inference.CapabilityVision)
+	// No endpoint prices at all; the model price set is complete for chat.
+	modelPrice := func(unit billing.UnitKind, micros int64) {
+		t.Helper()
+		if err := f.brepo.PutPrice(f.ctx, f.tenant,
+			fmt.Sprintf("m-%s-%s-%d", unit, "chat", fixtureSeq.Add(1)), billing.Price{
+				SubjectType: billing.PriceSubjectModel, SubjectID: "gpt-4o-mini",
+				Capability: inference.CapabilityChat, Unit: unit,
+				RateMicros: micros, UnitQuantity: 1, Currency: "USD",
+			}, "tester", time.Now().UTC().Add(-time.Minute)); err != nil {
+			t.Fatalf("put model price: %v", err)
+		}
+	}
+	modelPrice(billing.UnitInput, 1)
+	modelPrice(billing.UnitOutput, 2)
+	modelPrice(billing.UnitCachedInput, 1)
+
+	models, err := f.svc.PricedModelSelector(f.ctx, f.principal, "")
+	if err != nil {
+		t.Fatalf("selector: %v", err)
+	}
+	if len(models) != 1 || models[0].ID != "gpt-fast" {
+		t.Fatalf("complete model price set must make the route selectable, got %+v", models)
+	}
+
+	// Capability scoping: the same endpoint+alias is chat-priced but has no
+	// vision price set — vision coverage must report missing units.
+	missing, err := f.svc.PriceCoverage(f.ctx, f.tenant, "ep-1", "gpt-fast", inference.CapabilityVision, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("vision coverage: %v", err)
+	}
+	if len(missing) == 0 {
+		t.Fatal("chat prices must not cover the vision capability")
+	}
+	covered, err := f.svc.PriceCoverage(f.ctx, f.tenant, "ep-1", "gpt-fast", inference.CapabilityChat, time.Now().UTC())
+	if err != nil || len(covered) != 0 {
+		t.Fatalf("chat coverage = (%v, %v), want (nil, empty)", covered, err)
+	}
+}
+
+func TestPricedModelSelectorDeniesUngrantedPrincipal(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+	// A principal whose grants deny the endpoint/model sees nothing.
+	denied := f.principal
+	denied.AllowedModelsAll = false
+	denied.AllowedEndpointsAll = false
+	models, err := f.svc.PricedModelSelector(f.ctx, denied, "")
+	if err != nil {
+		t.Fatalf("selector: %v", err)
+	}
+	if len(models) != 0 {
+		t.Fatalf("denied principal must see no routable models, got %+v", models)
+	}
+}
+
+// --- key-attributed budgets (plan 08-07 task 3, DB-backed) --------------------
+
+// keyPrincipal is a real api-key-authenticated principal: credential kind and
+// id set, billing subject the owning user.
+func keyPrincipal(tenant, keyID, ownerUserID string) auth.Principal {
+	return auth.Principal{
+		TenantID: tenant, ActorID: ownerUserID, ActorKind: auth.ActorKindUser,
+		UserID:              ownerUserID,
+		CredentialKind:      auth.CredentialKindAPIKey,
+		CredentialID:        keyID,
+		BillingSubjectKind:  auth.BillingSubjectUser,
+		BillingSubjectID:    ownerUserID,
+		AllowedModelsAll:    true,
+		AllowedEndpointsAll: true,
+	}
+}
+
+func TestTwoKeysOneOwnerBillIndependently(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+
+	owner := testdb.SeedUser(t, f.db, f.tenant, "owner@example.com", nil)
+	_, k1 := testdb.SeedAPIKey(t, f.db, f.tenant, testdb.SeedKeySpec{Name: "k1", OwnerUserID: owner.ID})
+	_, k2 := testdb.SeedAPIKey(t, f.db, f.tenant, testdb.SeedKeySpec{Name: "k2", OwnerUserID: owner.ID})
+	p1, p2 := keyPrincipal(f.tenant, k1.ID, owner.ID), keyPrincipal(f.tenant, k2.ID, owner.ID)
+	payload := `{"messages":[{"role":"user","content":"hi"}]}`
+
+	// key1 runs and settles 18µ (12×1 + 3×2).
+	res1, err := f.svc.Execute(f.ctx, p1, f.chatRequest(payload))
+	if err != nil {
+		t.Fatalf("key1 execute: %v", err)
+	}
+	if _, err := f.billing.Settle(f.ctx, p1, res1.ReservationID, billing.Usage{InputUnits: 12, OutputUnits: 3}); err != nil {
+		t.Fatalf("key1 settle: %v", err)
+	}
+	// Credential attribution persisted on the canonical rows.
+	var cred string
+	if err := f.db.SQL.QueryRowContext(f.ctx,
+		`SELECT credential_id FROM usage_records WHERE tenant_id = $1 AND reservation_id = $2`,
+		f.tenant, res1.ReservationID).Scan(&cred); err != nil || cred != k1.ID {
+		t.Fatalf("usage credential_id = %q (%v), want %q", cred, err, k1.ID)
+	}
+
+	// A budget bound to key1 only, under its settled spend: key1's next
+	// request exceeds; key2's identical request sails through.
+	if err := f.brepo.CreateBudget(f.ctx, f.tenant, "budget-k1", billing.Budget{
+		Name: "key1-only", Subject: billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: k1.ID},
+		Kind: billing.BudgetKindAmount, Period: billing.PeriodMonthly,
+		LimitAmountMicros: 10, Currency: "USD", StartsAt: time.Now().UTC().Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("create budget: %v", err)
+	}
+	if _, err := f.svc.Execute(f.ctx, p1, f.chatRequest(payload)); !errors.Is(err, billing.ErrBudgetExceeded) {
+		t.Fatalf("key1 execute = %v, want ErrBudgetExceeded", err)
+	}
+	res2, err := f.svc.Execute(f.ctx, p2, f.chatRequest(payload))
+	if err != nil {
+		t.Fatalf("key2 execute must not touch key1's budget: %v", err)
+	}
+	if _, err := f.billing.Settle(f.ctx, p2, res2.ReservationID, billing.Usage{InputUnits: 12, OutputUnits: 3}); err != nil {
+		t.Fatalf("key2 settle: %v", err)
+	}
+
+	// Settled spend is recoverable per key and per owner, never doubled.
+	sums, err := f.brepo.UsageBySubject(f.ctx, f.tenant, time.Now().UTC().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("usage by subject: %v", err)
+	}
+	byKey := map[string]int64{} // "type:id" → request count
+	for _, s := range sums {
+		byKey[s.SubjectType+":"+s.SubjectID] += s.RequestCount
+	}
+	if byKey["user:"+owner.ID] != 2 {
+		t.Fatalf("owner canonical rows = %d requests, want 2 (never double-counted)", byKey["user:"+owner.ID])
+	}
+	if byKey["api_key:"+k1.ID] != 1 || byKey["api_key:"+k2.ID] != 1 {
+		t.Fatalf("key attribution rows wrong: %+v", byKey)
+	}
+	// Key-scoped settled liability resolves through the credential column.
+	rows, err := f.brepo.Liabilities(f.ctx, f.tenant,
+		billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: k1.ID},
+		time.Now().UTC().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("key liabilities: %v", err)
+	}
+	var k1Settled int64
+	for _, row := range rows {
+		k1Settled += row.AmountMicros
+	}
+	if k1Settled != 18 {
+		t.Fatalf("key1 settled liability = %d, want 18", k1Settled)
 	}
 }

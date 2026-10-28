@@ -38,6 +38,9 @@ type Repository interface {
 	// ListConversations returns the owner's newest-first conversation
 	// summaries under the opaque keyset cursor (own-only, admins included).
 	ListConversations(ctx context.Context, tenantID, ownerActorID string, limit int, cursor string) ([]ConversationSummary, string, error)
+	// CountConversations counts one owner's conversations; the owner binds
+	// to the caller at the service boundary — never a request parameter.
+	CountConversations(ctx context.Context, tenantID, ownerActorID string) (int64, error)
 }
 
 type RunRepository interface {
@@ -49,6 +52,9 @@ type RunRepository interface {
 	UpdateRunAttempt(ctx context.Context, attempt AssistantRunAttempt, owner string, fence int64) error
 	ListRunAttempts(ctx context.Context, tenantID, runID string) ([]AssistantRunAttempt, error)
 	AddRunMessage(ctx context.Context, message Message, jobID, owner string, fence int64) error
+	// ListFailedRuns derives terminal status from the BOUND JOB so
+	// pre-dispatch failures and queued cancels surface without a worker.
+	ListFailedRuns(ctx context.Context, tenantID, ownerActorID string, limit int) ([]AssistantRun, error)
 }
 
 type MCPInputAuthorizer interface {
@@ -452,12 +458,13 @@ func (s *Service) PrepareChatCompletion(ctx context.Context, p auth.Principal, c
 	if err != nil {
 		return PreparedCompletion{}, err
 	}
+	// Redacted turns (revoked evidence) contribute no text to inference.
 	history := make([]map[string]any, 0, len(historyMessages))
 	for _, message := range historyMessages {
+		if strings.TrimSpace(message.Content) == "" {
+			continue
+		}
 		history = append(history, map[string]any{"role": message.Role, "content": message.Content})
-	}
-	if err != nil {
-		return PreparedCompletion{}, err
 	}
 	messages := append(history, userMessage)
 	userIndex = len(messages) - 1
@@ -555,7 +562,102 @@ func (s *Service) ListConversation(ctx context.Context, p auth.Principal, conver
 	if err != nil {
 		return ConversationView{}, err
 	}
+	messages, err = s.attachRunTurns(ctx, p, conversation, messages)
+	if err != nil {
+		return ConversationView{}, err
+	}
 	return ConversationView{Conversation: conversation, Messages: messages}, nil
+}
+
+// attachRunTurns binds turns to their durable runs (OA-14): assistant
+// messages gain the ordered steps of the run named by run_id — through the
+// ONE shared authorizedSteps loader, never a raw attempt fetch — and runs
+// that ended without a persisted assistant reply project a DISPLAY-ONLY
+// terminal turn at their own user message's position. Projection runs at
+// READ time from durable run/job state because a run cancelled while queued
+// or failed before the worker's fail closure never held a lease that
+// AddRunMessage's fencing would accept; the projected turn is never
+// persisted, so it structurally cannot enter inference history.
+func (s *Service) attachRunTurns(ctx context.Context, p auth.Principal, conversation Conversation, messages []Message) ([]Message, error) {
+	if s.runRepo == nil || len(messages) == 0 {
+		return messages, nil
+	}
+	runs := map[string]AssistantRun{}
+	answered := map[string]bool{}
+	for _, msg := range messages {
+		if msg.RunID == "" {
+			continue
+		}
+		if _, seen := runs[msg.RunID]; !seen {
+			run, err := s.runRepo.GetRun(ctx, p.TenantID, msg.RunID)
+			if err != nil {
+				continue // the run row is gone — the turn keeps its plain text
+			}
+			// Same live-status overlay as GetRun: a run row still reading
+			// queued takes the bound job's terminal status.
+			if s.jobSvc != nil && run.JobID != "" {
+				if job, jobErr := s.jobSvc.Get(ctx, p, run.JobID); jobErr == nil {
+					run.Status = job.Status
+					if job.Status == jobs.StatusUnknown {
+						run.Error = "worker outcome unknown; the attempt will not be repeated"
+					}
+				}
+			}
+			runs[msg.RunID] = run
+		}
+		if msg.Role == "assistant" {
+			answered[msg.RunID] = true
+		}
+	}
+	if len(runs) == 0 {
+		return messages, nil
+	}
+	out := make([]Message, 0, len(messages)+len(runs))
+	for _, msg := range messages {
+		if msg.RunID != "" {
+			if run, ok := runs[msg.RunID]; ok {
+				if msg.Role == "assistant" {
+					steps, _, err := s.authorizedSteps(ctx, p, run)
+					if err != nil {
+						return nil, err
+					}
+					msg.Steps = steps
+				}
+				out = append(out, msg)
+				// The terminal projection slots in where the assistant turn
+				// would have been: directly after the run's own user turn.
+				if msg.Role != "assistant" {
+					if turn, ok := s.terminalProjection(ctx, p, conversation, run, answered[msg.RunID]); ok {
+						out = append(out, turn)
+					}
+				}
+				continue
+			}
+		}
+		out = append(out, msg)
+	}
+	return out, nil
+}
+
+// terminalProjection renders the display-only assistant turn for a run that
+// ended without a persisted reply; successful (or still in-flight) runs are
+// skipped — an unanswered successful run keeps today's empty-content shape.
+func (s *Service) terminalProjection(ctx context.Context, p auth.Principal, conversation Conversation, run AssistantRun, answered bool) (Message, bool) {
+	if answered {
+		return Message{}, false
+	}
+	if run.Status != jobs.StatusFailed && run.Status != jobs.StatusCancelled && run.Status != jobs.StatusUnknown {
+		return Message{}, false
+	}
+	steps, _, err := s.authorizedSteps(ctx, p, run)
+	if err != nil {
+		return Message{}, false
+	}
+	return Message{
+		TenantID: p.TenantID, ConversationID: conversation.ID, Role: "assistant",
+		Content: "", OwnerActorID: conversation.OwnerActorID,
+		RunID: run.ID, Steps: steps, CreatedAt: run.CreatedAt,
+	}, true
 }
 
 // ListAssistantToolBindings answers "which assistants use this tool"
@@ -648,6 +750,32 @@ func (s *Service) ListConversations(ctx context.Context, p auth.Principal, limit
 	return out, next, nil
 }
 
+// ListFailedRuns is the own-scope failed-run read for the member attention
+// feed (OA-19): the owner binds to the caller unconditionally — admins
+// included, no owner parameter, no tenant-wide variant. The repo query
+// derives terminal status from the bound job so pre-dispatch failures and
+// queued cancels surface without a worker.
+func (s *Service) ListFailedRuns(ctx context.Context, p auth.Principal, limit int) ([]AssistantRun, error) {
+	if err := requireTenant(p); err != nil {
+		return nil, err
+	}
+	if s.runRepo == nil {
+		return nil, errors.New("chatbot: durable runs are not configured")
+	}
+	return s.runRepo.ListFailedRuns(ctx, p.TenantID, actorKey(p), limit)
+}
+
+// CountConversations counts the caller's OWN conversations for the Home
+// KPI: the owner binds to actorKey(p) unconditionally — a caller-supplied
+// owner cannot widen the count; a tenant-wide variant would be a separate,
+// explicitly gated read.
+func (s *Service) CountConversations(ctx context.Context, p auth.Principal) (int64, error) {
+	if err := requireTenant(p); err != nil {
+		return 0, err
+	}
+	return s.repo.CountConversations(ctx, p.TenantID, actorKey(p))
+}
+
 // conversationTitle derives the preview from the first VISIBLE user message
 // under the authorizedHistory suppression rule: messages carrying input
 // refs but no evidence IDs, and messages whose evidence is revoked, never
@@ -662,6 +790,10 @@ func (s *Service) conversationTitle(ctx context.Context, p auth.Principal, conve
 			continue
 		}
 		content := strings.TrimSpace(message.Content)
+		// Redacted turns (revoked evidence) never contribute preview text.
+		if content == "" {
+			continue
+		}
 		if runes := []rune(content); len(runes) > maxTitleRunes {
 			return string(runes[:maxTitleRunes])
 		}
@@ -675,7 +807,7 @@ func (s *Service) authorizedHistory(ctx context.Context, p auth.Principal, conve
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	var visible []Message
+	var history []Message
 	var refs []source.ObjectRef
 	var evidenceIDs []string
 	for _, msg := range stored {
@@ -686,22 +818,44 @@ func (s *Service) authorizedHistory(ctx context.Context, p auth.Principal, conve
 			continue
 		}
 		if len(msg.EvidenceIDs) > 0 {
-			resolver, ok := s.rag.(EvidenceResolver)
-			if !ok {
-				continue
-			}
-			if _, err := resolver.ResolveEvidence(ctx, p, msg.EvidenceIDs); err != nil {
-				if errors.Is(err, source.ErrDenied) {
-					continue
-				}
+			denied, err := s.evidenceDenied(ctx, p, msg.EvidenceIDs)
+			if err != nil {
 				return nil, nil, nil, err
 			}
+			if denied {
+				// Revoked evidence: the published turn survives replay as a
+				// redacted skeleton (steps still attach via run_id) but its
+				// text and refs never feed future inference.
+				msg.Content = ""
+				history = append(history, msg)
+				continue
+			}
 		}
-		visible = append(visible, msg)
+		history = append(history, msg)
 		refs = mergeObjectRefs(refs, msg.InputRefs)
 		evidenceIDs = mergeStrings(evidenceIDs, msg.EvidenceIDs)
 	}
-	return visible, refs, evidenceIDs, nil
+	return history, refs, evidenceIDs, nil
+}
+
+// evidenceDenied replays evidence IDs under CURRENT access: denied,
+// revoked or unverifiable bindings (no resolver configured) are denied;
+// infrastructure failures propagate.
+func (s *Service) evidenceDenied(ctx context.Context, p auth.Principal, ids []string) (bool, error) {
+	if len(ids) == 0 {
+		return false, nil
+	}
+	resolver, ok := s.rag.(EvidenceResolver)
+	if !ok {
+		return true, nil
+	}
+	if _, err := resolver.ResolveEvidence(ctx, p, ids); err != nil {
+		if errors.Is(err, source.ErrDenied) {
+			return true, nil
+		}
+		return false, err
+	}
+	return false, nil
 }
 
 func evidenceIDsForResults(results []rag.SearchResult) []string {

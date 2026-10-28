@@ -225,10 +225,10 @@ func (r *ChatbotRepo) AddMessage(ctx context.Context, m chatbot.Message) error {
 		return fmt.Errorf("marshal message input refs: %w", err)
 	}
 	_, err = r.db.SQL.ExecContext(ctx, `
-		INSERT INTO messages (tenant_id, id, conversation_id, role, content, owner_actor_id, evidence_ids, input_refs)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		INSERT INTO messages (tenant_id, id, conversation_id, role, content, owner_actor_id, evidence_ids, input_refs, run_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		m.TenantID, m.ID, m.ConversationID, m.Role, m.Content,
-		nullableText(m.OwnerActorID), evidenceIDs, inputRefs)
+		nullableText(m.OwnerActorID), evidenceIDs, inputRefs, nullableText(m.RunID))
 	if err != nil {
 		return fmt.Errorf("add message: %w", err)
 	}
@@ -240,7 +240,7 @@ func (r *ChatbotRepo) AddMessage(ctx context.Context, m chatbot.Message) error {
 func (r *ChatbotRepo) ListMessages(ctx context.Context, tenantID, conversationID string) ([]chatbot.Message, error) {
 	rows, err := r.db.SQL.QueryContext(ctx, `
 		SELECT tenant_id::text, id, conversation_id, role, content,
-		       COALESCE(owner_actor_id, ''), evidence_ids, input_refs, created_at
+		       COALESCE(owner_actor_id, ''), COALESCE(run_id, ''), evidence_ids, input_refs, created_at
 		FROM messages
 		WHERE tenant_id = $1 AND conversation_id = $2
 		ORDER BY created_at ASC, id ASC`, tenantID, conversationID)
@@ -254,7 +254,7 @@ func (r *ChatbotRepo) ListMessages(ctx context.Context, tenantID, conversationID
 		var m chatbot.Message
 		var evidenceIDs, inputRefs []byte
 		if err := rows.Scan(&m.TenantID, &m.ID, &m.ConversationID, &m.Role, &m.Content,
-			&m.OwnerActorID, &evidenceIDs, &inputRefs, &m.CreatedAt); err != nil {
+			&m.OwnerActorID, &m.RunID, &evidenceIDs, &inputRefs, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal(evidenceIDs, &m.EvidenceIDs)
@@ -265,6 +265,20 @@ func (r *ChatbotRepo) ListMessages(ctx context.Context, tenantID, conversationID
 		return nil, fmt.Errorf("iterate messages: %w", err)
 	}
 	return out, nil
+}
+
+// CountConversations counts one owner's conversations. The owner predicate
+// is unconditional at this boundary; the service binds the owner to the
+// caller so no read can widen the count past the principal's own rows.
+func (r *ChatbotRepo) CountConversations(ctx context.Context, tenantID, ownerActorID string) (int64, error) {
+	var count int64
+	err := r.db.SQL.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM conversations WHERE tenant_id = $1 AND owner_actor_id = $2`,
+		tenantID, ownerActorID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count conversations: %w", err)
+	}
+	return count, nil
 }
 
 // encodeConversationCursor makes the opaque keyset cursor: the exact

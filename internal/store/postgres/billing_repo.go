@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -21,6 +22,10 @@ import (
 type BillingRepo struct {
 	db *sql.DB
 }
+
+// ErrBudgetNotFound is returned for unknown or cross-tenant budget ids —
+// handlers surface both as one indistinguishable not-found.
+var ErrBudgetNotFound = errors.New("postgres: budget not found")
 
 // NewBillingRepo wraps the shared pool.
 func NewBillingRepo(db *DB) *BillingRepo {
@@ -144,9 +149,14 @@ func (t billingTx) LockActiveBudgets(ctx context.Context, tenantID string, subje
 	return scanBudgets(rows)
 }
 
+// budgetCols is the shared budget projection; budgetSelectSQL adds the
+// active-window predicates on top of it.
+const budgetCols = `
+	id, name, subject_type, subject_id, kind, period, limit_value,
+	COALESCE(currency, ''), starts_at, ends_at`
+
 const budgetSelectSQL = `
-	SELECT id, name, subject_type, subject_id, kind, period, limit_value,
-	       COALESCE(currency, ''), starts_at, ends_at
+	SELECT ` + budgetCols + `
 	FROM budgets
 	WHERE tenant_id = $1::uuid
 	  AND active
@@ -240,6 +250,18 @@ func queryLiabilities(ctx context.Context, q billingQuerier, tenantID string, sc
 			FROM usage_records
 			WHERE tenant_id = $1::uuid AND created_at >= $2`,
 			tenantID, from)
+	} else if scope.Type == billing.BudgetSubjectAPIKey {
+		// Key-scoped settled usage matches the verified credential
+		// attribution column (canonical subject stays the owner) plus rows
+		// whose canonical subject is itself the key — a row is returned
+		// once either way, so nothing double-counts.
+		urows, err = q.QueryContext(ctx, `
+			SELECT 'settled', amount_micros, currency::text, units::text
+			FROM usage_records
+			WHERE tenant_id = $1::uuid AND created_at >= $2
+			  AND (credential_id = $3
+			       OR (subject_type = 'api_key' AND subject_id = $3))`,
+			tenantID, from, scope.ID)
 	} else {
 		urows, err = q.QueryContext(ctx, `
 			SELECT 'settled', amount_micros, currency::text, units::text
@@ -293,12 +315,12 @@ func (t billingTx) InsertReservations(ctx context.Context, rows []billing.Reserv
 			INSERT INTO reservations
 				(tenant_id, id, job_id, attempt_id, subject_type, subject_id,
 				 price_id, price_snapshot, reserved_units, limit_amount_micros,
-				 currency, state, capability, model, endpoint_id)
-			VALUES ($1::uuid, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, 'held', $11, $12, $13)`,
+				 currency, state, capability, model, endpoint_id, credential_id)
+			VALUES ($1::uuid, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, 'held', $11, $12, $13, $14)`,
 			res.TenantID, res.ID, nullStr(res.JobID), nullStr(res.AttemptID),
 			res.Subject.Type, res.Subject.ID, string(snap), string(units),
 			res.LimitAmountMicros, res.Currency, res.Capability, res.Model,
-			nullStr(res.EndpointID))
+			nullStr(res.EndpointID), res.CredentialID)
 		if err != nil {
 			return fmt.Errorf("insert reservation: %w", err)
 		}
@@ -361,11 +383,11 @@ func (t billingTx) InsertUsageRecord(ctx context.Context, rec billing.UsageRecor
 		INSERT INTO usage_records
 			(tenant_id, id, reservation_id, subject_type, subject_id,
 			 capability, model, endpoint_id, units, amount_micros, currency,
-			 price_snapshot, outcome)
-		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+			 price_snapshot, outcome, credential_id)
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
 		rec.TenantID, rec.ID, rec.ReservationID, rec.Subject.Type, rec.Subject.ID,
 		rec.Capability, rec.Model, nullStr(rec.EndpointID), string(units),
-		rec.AmountMicros, rec.Currency, string(snap), rec.Outcome)
+		rec.AmountMicros, rec.Currency, string(snap), rec.Outcome, rec.CredentialID)
 	if err != nil {
 		return fmt.Errorf("insert usage record: %w", err)
 	}
@@ -385,7 +407,7 @@ func (t billingTx) GetUsageRecord(ctx context.Context, tenantID, reservationID s
 const reservationCols = `tenant_id::text, id, subject_type, subject_id,
 	price_snapshot::text, reserved_units::text, limit_amount_micros,
 	currency::text, state, dispatched_at, settled_at, created_at,
-	capability, model, endpoint_id, job_id, attempt_id`
+	capability, model, endpoint_id, job_id, attempt_id, credential_id`
 
 func scanReservation(row rowScanner) (billing.Reservation, error) {
 	var r billing.Reservation
@@ -395,7 +417,7 @@ func scanReservation(row rowScanner) (billing.Reservation, error) {
 	err := row.Scan(&r.TenantID, &r.ID, &r.Subject.Type, &r.Subject.ID,
 		&snap, &units, &r.LimitAmountMicros, &r.Currency, &r.State,
 		&dispatched, &settled, &created, &capability, &model, &endpointID,
-		&jobID, &attemptID)
+		&jobID, &attemptID, &r.CredentialID)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return billing.Reservation{}, billing.ErrReservationNotFound
@@ -429,7 +451,7 @@ func scanReservation(row rowScanner) (billing.Reservation, error) {
 
 const usageCols = `tenant_id::text, id, reservation_id, subject_type,
 	subject_id, capability, model, endpoint_id, units::text, amount_micros,
-	currency::text, price_snapshot::text, outcome, created_at`
+	currency::text, price_snapshot::text, outcome, created_at, credential_id`
 
 func scanUsageRecord(row rowScanner) (billing.UsageRecord, error) {
 	var r billing.UsageRecord
@@ -437,7 +459,8 @@ func scanUsageRecord(row rowScanner) (billing.UsageRecord, error) {
 	var endpointID sql.NullString
 	err := row.Scan(&r.TenantID, &r.ID, &r.ReservationID, &r.Subject.Type,
 		&r.Subject.ID, &r.Capability, &r.Model, &endpointID, &units,
-		&r.AmountMicros, &r.Currency, &snap, &r.Outcome, &r.CreatedAt)
+		&r.AmountMicros, &r.Currency, &snap, &r.Outcome, &r.CreatedAt,
+		&r.CredentialID)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return billing.UsageRecord{}, billing.ErrReservationNotFound
@@ -683,6 +706,81 @@ func (r *BillingRepo) ListBillingAudit(ctx context.Context, tenantID, subjectTyp
 	return out, rows.Err()
 }
 
+// GetBudget returns one tenant budget row regardless of its active window —
+// a budget whose starts_at lies in the future must stay editable.
+func (r *BillingRepo) GetBudget(ctx context.Context, tenantID, id string) (billing.Budget, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT `+budgetCols+`
+		FROM budgets WHERE tenant_id = $1::uuid AND id = $2`, tenantID, id)
+	if err != nil {
+		return billing.Budget{}, fmt.Errorf("get budget: %w", err)
+	}
+	budgets, err := scanBudgets(rows)
+	if err != nil {
+		return billing.Budget{}, err
+	}
+	if len(budgets) == 0 {
+		return billing.Budget{}, ErrBudgetNotFound
+	}
+	return budgets[0], nil
+}
+
+// UpdateBudgetLimit narrows one budget's limit_value — the liability window,
+// period, subject and currency columns are never touched.
+func (r *BillingRepo) UpdateBudgetLimit(ctx context.Context, tenantID, id string, limitValue int64) error {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE budgets SET limit_value = $3
+		WHERE tenant_id = $1::uuid AND id = $2`, tenantID, id, limitValue)
+	if err != nil {
+		return fmt.Errorf("update budget limit: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrBudgetNotFound
+	}
+	return nil
+}
+
+// ListAllActiveBudgets returns every active tenant budget at now — the
+// all-subject administrative read behind the budgets screen (platform.admin
+// only; member budget reads keep using the subject-filtered list).
+func (r *BillingRepo) ListAllActiveBudgets(ctx context.Context, tenantID string, now time.Time) ([]billing.Budget, error) {
+	rows, err := r.db.QueryContext(ctx, budgetSelectSQL+`
+		ORDER BY subject_type, subject_id, id`, tenantID, now)
+	if err != nil {
+		return nil, fmt.Errorf("list all budgets: %w", err)
+	}
+	return scanBudgets(rows)
+}
+
+// LatestPrices is the non-transactional SelectPrices twin used by display and
+// routing price-coverage checks.
+func (r *BillingRepo) LatestPrices(ctx context.Context, tenantID, subjectType, subjectID, capability string, now time.Time) ([]billing.Price, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT DISTINCT ON (unit_kind)
+		       subject_type, subject_id, capability, unit_kind,
+		       rate_micros, unit_quantity, currency, effective_from
+		FROM billing_prices
+		WHERE tenant_id = $1::uuid AND subject_type = $2 AND subject_id = $3
+		  AND capability = $4 AND effective_from <= $5
+		ORDER BY unit_kind, effective_from DESC`, tenantID, subjectType, subjectID, capability, now)
+	if err != nil {
+		return nil, fmt.Errorf("latest prices: %w", err)
+	}
+	defer rows.Close()
+	var out []billing.Price
+	for rows.Next() {
+		var p billing.Price
+		var unit string
+		if err := rows.Scan(&p.SubjectType, &p.SubjectID, &p.Capability, &unit,
+			&p.RateMicros, &p.UnitQuantity, &p.Currency, &p.EffectiveFrom); err != nil {
+			return nil, fmt.Errorf("scan price: %w", err)
+		}
+		p.Unit = billing.UnitKind(unit)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // ListActiveBudgets returns active budgets applicable to any of subjects at
 // now — the non-transactional twin of LockActiveBudgets for reads.
 func (r *BillingRepo) ListActiveBudgets(ctx context.Context, tenantID string, subjects []billing.Subject, now time.Time) ([]billing.Budget, error) {
@@ -748,7 +846,10 @@ func (r *BillingRepo) UsageTotals(ctx context.Context, tenantID string, since ti
 	return out, rows.Err()
 }
 
-// UsageBySubject aggregates settled usage per billing subject.
+// UsageBySubject aggregates settled usage per billing subject, plus per-key
+// attribution rows: settled usage carrying a credential_id also emits a
+// subject_type='api_key' row keyed by that credential. Canonical subject
+// rows stay untouched, so per-owner totals never double-count.
 func (r *BillingRepo) UsageBySubject(ctx context.Context, tenantID string, since time.Time) ([]UsageGroupSum, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT subject_type, subject_id, COUNT(*), `+usageUnitsTotalSQL+`,
@@ -756,6 +857,12 @@ func (r *BillingRepo) UsageBySubject(ctx context.Context, tenantID string, since
 		FROM usage_records
 		WHERE tenant_id = $1::uuid AND created_at >= $2
 		GROUP BY subject_type, subject_id, currency
+		UNION ALL
+		SELECT 'api_key', credential_id, COUNT(*), `+usageUnitsTotalSQL+`,
+		       COALESCE(SUM(amount_micros), 0), currency::text
+		FROM usage_records
+		WHERE tenant_id = $1::uuid AND created_at >= $2 AND credential_id <> ''
+		GROUP BY credential_id, currency
 		ORDER BY subject_type, subject_id`, tenantID, since)
 	if err != nil {
 		return nil, fmt.Errorf("usage by subject: %w", err)
@@ -818,18 +925,87 @@ func scanGroupSums(rows *sql.Rows) ([]UsageGroupSum, error) {
 }
 
 // SubjectUsageSince aggregates settled usage for one subject since `since`
-// — the usage-display half of the retained budget guard.
+// — the usage-display half of the retained budget guard. An api_key subject
+// resolves through the credential attribution column.
 func (r *BillingRepo) SubjectUsageSince(ctx context.Context, tenantID string, subject billing.Subject, since time.Time) (totalUnits, amountMicros int64, err error) {
 	var units sql.NullInt64
 	var micros sql.NullInt64
-	err = r.db.QueryRowContext(ctx, `
-		SELECT `+usageUnitsTotalSQL+`, COALESCE(SUM(amount_micros), 0)
+	q := `
+		SELECT ` + usageUnitsTotalSQL + `, COALESCE(SUM(amount_micros), 0)
 		FROM usage_records
-		WHERE tenant_id = $1::uuid AND created_at >= $2
-		  AND subject_type = $3 AND subject_id = $4`,
-		tenantID, since, subject.Type, subject.ID).Scan(&units, &micros)
+		WHERE tenant_id = $1::uuid AND created_at >= $2`
+	args := []any{tenantID, since}
+	if subject.Type == billing.BudgetSubjectAPIKey {
+		q += ` AND (credential_id = $3 OR (subject_type = 'api_key' AND subject_id = $3))`
+		args = append(args, subject.ID)
+	} else {
+		q += ` AND subject_type = $3 AND subject_id = $4`
+		args = append(args, subject.Type, subject.ID)
+	}
+	err = r.db.QueryRowContext(ctx, q, args...).Scan(&units, &micros)
 	if err != nil {
 		return 0, 0, fmt.Errorf("subject usage since: %w", err)
 	}
 	return units.Int64, micros.Int64, nil
+}
+
+// DailyUsageRow is one UTC day bucket of settled usage for one currency.
+type DailyUsageRow struct {
+	Day          time.Time
+	RequestCount int64
+	TotalUnits   int64
+	AmountMicros int64
+	Currency     string
+}
+
+// ListDailyUsage groups settled usage records into explicit UTC day bins
+// (date_trunc over created_at AT TIME ZONE 'UTC') per currency, so a non-UTC
+// session TimeZone can never shift a record across the day boundary.
+func (r *BillingRepo) ListDailyUsage(ctx context.Context, tenantID string, since time.Time) ([]DailyUsageRow, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT date_trunc('day', created_at AT TIME ZONE 'UTC'),
+		       COUNT(*), `+usageUnitsTotalSQL+`,
+		       COALESCE(SUM(amount_micros), 0), currency::text
+		FROM usage_records
+		WHERE tenant_id = $1::uuid AND created_at >= $2
+		GROUP BY 1, currency
+		ORDER BY 1 ASC, currency ASC`, tenantID, since)
+	if err != nil {
+		return nil, fmt.Errorf("daily usage: %w", err)
+	}
+	defer rows.Close()
+	var out []DailyUsageRow
+	for rows.Next() {
+		var row DailyUsageRow
+		if err := rows.Scan(&row.Day, &row.RequestCount, &row.TotalUnits,
+			&row.AmountMicros, &row.Currency); err != nil {
+			return nil, fmt.Errorf("scan daily usage: %w", err)
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// ListUsageByTeam groups settled usage by the billing subject's team label.
+// user subjects join to users.team (empty team = the literal "No team"
+// bucket); service accounts and keys group under their own subject-derived
+// label — no team is fabricated for them. One row per bucket per currency.
+func (r *BillingRepo) ListUsageByTeam(ctx context.Context, tenantID string, since time.Time) ([]UsageGroupSum, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT CASE ur.subject_type
+		       WHEN 'user' THEN COALESCE(NULLIF(u.team, ''), 'No team')
+		       ELSE ur.subject_type || ':' || ur.subject_id
+		       END AS bucket,
+		       COUNT(*), `+usageUnitsTotalSQL+`,
+		       COALESCE(SUM(ur.amount_micros), 0), ur.currency::text
+		FROM usage_records ur
+		LEFT JOIN users u
+		  ON ur.subject_type = 'user' AND u.tenant_id = ur.tenant_id AND u.id = ur.subject_id
+		WHERE ur.tenant_id = $1::uuid AND ur.created_at >= $2
+		GROUP BY bucket, ur.currency
+		ORDER BY bucket, ur.currency`, tenantID, since)
+	if err != nil {
+		return nil, fmt.Errorf("usage by team: %w", err)
+	}
+	return scanGroupSums(rows)
 }

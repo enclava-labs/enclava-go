@@ -14,9 +14,11 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"time"
 
 	"enclava-go/internal/artifacts"
 	"enclava-go/internal/auth"
+	"enclava-go/internal/billing"
 	"enclava-go/internal/source"
 )
 
@@ -604,4 +606,118 @@ func (s *Service) route(ctx context.Context, p auth.Principal, req Request, capa
 		return e, nil
 	}
 	return Endpoint{}, fmt.Errorf("%w", ErrNoRoute)
+}
+
+// modelAliasOf extracts the public alias half of a "model:<alias>[=<upstream>]"
+// capability binding — the selector-facing twin of upstreamModelFor.
+func modelAliasOf(capability string) (string, bool) {
+	binding, ok := strings.CutPrefix(capability, ModelCapabilityPrefix)
+	if !ok {
+		return "", false
+	}
+	alias, _, _ := strings.Cut(binding, "=")
+	alias = strings.TrimSpace(alias)
+	return alias, alias != ""
+}
+
+// requiredUnits is the priced unit set a capability's dispatch may demand —
+// the exact bound set checkEstimate validates caller estimates against.
+// cached_input is always included where the bound carries it: Execute raises
+// every estimate's cached-input bound to input, so an endpoint that cannot
+// price cached input is not routable for the operation.
+func requiredUnits(capability string) []billing.UnitKind {
+	bound, ok := boundFor(capability)
+	if !ok {
+		return nil
+	}
+	var kinds []billing.UnitKind
+	if bound.InputUnits > 0 {
+		kinds = append(kinds, billing.UnitInput)
+	}
+	if bound.OutputUnits > 0 {
+		kinds = append(kinds, billing.UnitOutput)
+	}
+	if bound.CachedInputUnits > 0 {
+		kinds = append(kinds, billing.UnitCachedInput)
+	}
+	return kinds
+}
+
+// missingPriceUnits reports which required kinds have no rate row in the
+// price set (SelectPrices/LatestPrices return the latest row per unit kind).
+func missingPriceUnits(prices []billing.Price, kinds []billing.UnitKind) []billing.UnitKind {
+	var missing []billing.UnitKind
+	for _, k := range kinds {
+		found := false
+		for _, p := range prices {
+			if p.Unit == k {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, k)
+		}
+	}
+	return missing
+}
+
+// priceCurrencyMismatch re-checks the selected rates' currency coherence —
+// a set that would refuse at snapshot time is not coverage.
+func priceCurrencyMismatch(prices []billing.Price, kinds []billing.UnitKind) error {
+	currency := ""
+	for _, k := range kinds {
+		for _, p := range prices {
+			if p.Unit != k {
+				continue
+			}
+			if currency == "" {
+				currency = p.Currency
+			} else if currency != p.Currency {
+				return fmt.Errorf("%w: %s vs %s", billing.ErrCurrencyMismatch, currency, p.Currency)
+			}
+			break
+		}
+	}
+	return nil
+}
+
+// PriceCoverage evaluates the effective-price coverage the exact reserve
+// path would apply: the alias resolved to the endpoint's execution upstream
+// model first, latest effective rates excluding future prices, endpoint
+// price set first with a full model-set fallback on ErrPriceMissing — the
+// two sets are never merged. The required unit set is the capability's
+// bound set: chat and vision are distinct capabilities even when their unit
+// kinds coincide, and an endpoint priced for one is not thereby priced for
+// the other. Callers must never invoke Reserve to test display availability.
+// Returns the missing units of the last evaluated (model) set — empty means
+// completely priced.
+func (s *Service) PriceCoverage(ctx context.Context, tenantID, endpointID, modelAlias, capability string, now time.Time) ([]billing.UnitKind, error) {
+	kinds := requiredUnits(capability)
+	if len(kinds) == 0 {
+		return nil, ErrUnsupportedCapability
+	}
+	e, err := s.endpoints.Get(ctx, tenantID, endpointID)
+	if err != nil || e.TenantID != tenantID {
+		return nil, fmt.Errorf("%w", ErrNoRoute)
+	}
+	upstream, bound := upstreamModelFor(e, modelAlias)
+	if !bound {
+		return nil, fmt.Errorf("%w: model %q is not bound on endpoint %q", ErrNoRoute, modelAlias, endpointID)
+	}
+	var missing []billing.UnitKind
+	for _, key := range [2]billing.PriceKey{
+		{SubjectType: billing.PriceSubjectEndpoint, SubjectID: endpointID},
+		{SubjectType: billing.PriceSubjectModel, SubjectID: upstream},
+	} {
+		prices, err := s.billing.LatestPrices(ctx, tenantID, key.SubjectType, key.SubjectID, capability, now)
+		if err != nil {
+			return nil, err
+		}
+		missing = missingPriceUnits(prices, kinds)
+		if len(missing) == 0 {
+			return nil, priceCurrencyMismatch(prices, kinds)
+		}
+	}
+	return missing, nil
 }

@@ -141,6 +141,23 @@ var terminalStreamTypes = map[string]bool{
 	"response.cancelled":  true,
 }
 
+// streamResult classifies how a streamed body ended — the endpoint-health
+// evidence the runtime observation ring consumes. Client cancellation is
+// never endpoint health; a terminal error event is an answered upstream.
+type streamResult struct {
+	// ClientCanceled is set when the caller closed the body before the
+	// upstream ended it — no endpoint observation may be derived.
+	ClientCanceled bool
+	// Terminal is set when a terminal event/[DONE] ended the stream.
+	Terminal bool
+	// UpstreamFailed is set when a terminal event reported failure
+	// ("error"/"response.failed"): the endpoint answered, so the outcome is
+	// degraded rather than unreachable.
+	UpstreamFailed bool
+	// Err is the upstream read error when the body failed mid-stream.
+	Err error
+}
+
 // accountingStream wraps one dispatched streaming body: it observes SSE
 // events for the terminal usage record and settles or retains the attempt's
 // liability exactly once — on clean termination, early caller Close or EOF
@@ -151,15 +168,27 @@ type accountingStream struct {
 	body   io.ReadCloser
 	finish func(usage []byte, terminal bool)
 
-	pending  []byte
-	usageRaw []byte
-	terminal bool
-	eof      bool
-	once     sync.Once
+	// outcomeFn is the optional endpoint-health observer; it runs once with
+	// the terminal classification, alongside finish.
+	outcomeFn func(streamResult)
+
+	pending        []byte
+	usageRaw       []byte
+	terminal       bool
+	upstreamFailed bool
+	eof            bool
+	readErr        error
+	once           sync.Once
 }
 
 func newAccountingStream(body io.ReadCloser, finish func(usage []byte, terminal bool)) *accountingStream {
 	return &accountingStream{body: body, finish: finish}
+}
+
+// onOutcome registers the endpoint-health observer for this stream. At most
+// one observer; invoked exactly once, in the same once-block as finish.
+func (s *accountingStream) onOutcome(fn func(streamResult)) {
+	s.outcomeFn = fn
 }
 
 func (s *accountingStream) Read(p []byte) (int, error) {
@@ -167,8 +196,14 @@ func (s *accountingStream) Read(p []byte) (int, error) {
 	if n > 0 {
 		s.scan(p[:n])
 	}
-	if errors.Is(err, io.EOF) {
+	switch {
+	case errors.Is(err, io.EOF):
 		s.eof = true
+		s.finalize()
+	case err != nil:
+		// The upstream body broke mid-stream — the read error is the
+		// endpoint-failure evidence; accounting still decides below.
+		s.readErr = err
 		s.finalize()
 	}
 	return n, err
@@ -209,6 +244,11 @@ func (s *accountingStream) observeLine(line []byte) {
 	}
 	if t, _ := env["type"].(string); terminalStreamTypes[t] || t == "error" {
 		s.terminal = true
+		if t == "error" || t == "response.failed" {
+			// The endpoint answered with a reported failure — degraded
+			// evidence, not a connectivity failure.
+			s.upstreamFailed = true
+		}
 	}
 	if usageObject(env) != nil {
 		s.usageRaw = append([]byte(nil), data...)
@@ -220,8 +260,19 @@ func (s *accountingStream) observeLine(line []byte) {
 // finalize runs the once-only accounting decision. A terminal event with
 // parseable usage settles under the immutable snapshot; anything else —
 // truncated stream, missing usage, early Close — retains unknown liability.
+// The same once-block derives the endpoint-health classification: caller
+// Close before any upstream end is client cancellation (no observation),
+// a read error carries its error, EOF without a terminal event is a
+// transport-class premature end.
 func (s *accountingStream) finalize() {
 	s.once.Do(func() {
+		if s.outcomeFn != nil {
+			res := streamResult{Terminal: s.terminal, UpstreamFailed: s.upstreamFailed, Err: s.readErr}
+			if s.readErr == nil && !s.eof && !s.terminal {
+				res.ClientCanceled = true
+			}
+			s.outcomeFn(res)
+		}
 		s.finish(s.usageRaw, s.terminal)
 	})
 }

@@ -128,6 +128,7 @@ func (s *Service) Reserve(ctx context.Context, p auth.Principal, req ReserveRequ
 			EndpointID:        req.EndpointID,
 			JobID:             req.JobID,
 			AttemptID:         req.AttemptID,
+			CredentialID:      credentialIDFor(p),
 			CreatedAt:         now,
 		}
 		rows := make([]Reservation, 0, len(subjects))
@@ -197,6 +198,7 @@ func (s *Service) Settle(ctx context.Context, p auth.Principal, reservationID st
 			Currency:      res.Currency,
 			Price:         res.Price,
 			Outcome:       "completed",
+			CredentialID:  res.CredentialID,
 			CreatedAt:     s.now(),
 		}
 		if err := tx.InsertUsageRecord(ctx, rec); err != nil {
@@ -276,6 +278,21 @@ func billingSubjectFor(p auth.Principal) Subject {
 		return Subject{Type: p.BillingSubjectKind, ID: p.BillingSubjectID}
 	}
 	return Subject{Type: BudgetSubjectTenant, ID: p.TenantID}
+}
+
+// credentialIDFor is the verified api-key credential attribution: only an
+// api-key credential carries its id; sessions and other kinds write ”.
+func credentialIDFor(p auth.Principal) string {
+	if p.CredentialKind == auth.CredentialKindAPIKey {
+		return p.CredentialID
+	}
+	return ""
+}
+
+// LatestPrices exposes the read-side effective-rate query so display and
+// routing checks can evaluate price coverage without reserving.
+func (s *Service) LatestPrices(ctx context.Context, tenantID, subjectType, subjectID, capability string, now time.Time) ([]Price, error) {
+	return s.repo.LatestPrices(ctx, tenantID, subjectType, subjectID, capability, now)
 }
 
 // subjectsFor returns the deduplicated, deterministically ordered subject set:

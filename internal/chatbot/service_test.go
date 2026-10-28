@@ -76,6 +76,12 @@ type fakeRAGSearcher struct {
 	revoked             bool
 	emptyDoc            bool
 	deniedCollectionFor map[string]bool
+	// evidenceContent is the passage ReadEvidence returns for the attached
+	// evidence; evidenceReadDenied drops the passage at execution time
+	// (revocation between enqueue and worker read).
+	evidenceContent    string
+	evidenceReadDenied bool
+	reads              []string
 }
 
 func (f *fakeRAGSearcher) Search(ctx context.Context, p auth.Principal, input rag.SearchInput) ([]rag.SearchResult, error) {
@@ -114,10 +120,36 @@ func (f *fakeRAGSearcher) BuildContext(_ context.Context, _ auth.Principal, cand
 }
 
 func (f *fakeRAGSearcher) ResolveEvidence(_ context.Context, _ auth.Principal, ids []string) ([]rag.EvidenceResolution, error) {
-	if f.revoked || len(ids) == 0 || f.evidenceID == "" || ids[0] != f.evidenceID {
+	if f.revoked || len(ids) == 0 || f.evidenceID == "" {
 		return nil, source.ErrDenied
 	}
-	return []rag.EvidenceResolution{{ID: f.evidenceID, Status: "current"}}, nil
+	for _, id := range ids {
+		if id != f.evidenceID {
+			return nil, source.ErrDenied
+		}
+	}
+	return []rag.EvidenceResolution{{
+		ID: f.evidenceID, Status: "current",
+		Spans: []source.Span{{Ref: source.ObjectRef{ObjectID: "doc_attached", ObservedSeq: 7}, BlockID: "blk_1"}},
+	}}, nil
+}
+
+// ReadEvidence is the CURRENT-passage reader the worker uses for
+// evidence-attached runs; the fake tracks the executing principal.
+func (f *fakeRAGSearcher) ReadEvidence(_ context.Context, p auth.Principal, evidenceID string) (rag.EvidenceText, error) {
+	if f.evidenceReadDenied || f.revoked || f.evidenceID == "" || evidenceID != f.evidenceID {
+		return rag.EvidenceText{}, source.ErrDenied
+	}
+	f.reads = append(f.reads, p.ActorID)
+	content := f.evidenceContent
+	if content == "" {
+		content = "attached-passage-bytes"
+	}
+	return rag.EvidenceText{
+		EvidenceID: evidenceID, DocumentID: "doc_attached", CollectionID: "ragcol_test",
+		Content: content,
+		Spans:   []source.Span{{Ref: source.ObjectRef{ObjectID: "doc_attached", ObservedSeq: 9}, BlockID: "blk_1"}},
+	}, nil
 }
 
 type allowContext struct{}
@@ -637,9 +669,19 @@ func TestConversationReplayWithholdsRevokedEvidenceAndIgnoresClientHistory(t *te
 		t.Fatalf("conversation before revocation: %#v err=%v", before, err)
 	}
 	searcher.revoked = true
+	// The revoked turn survives replay as a redacted skeleton — the row
+	// stays, its content is cleared, and no source-derived text surfaces.
 	after, err := f.svc.ListConversation(ctx, p, first.Conversation.ID)
-	if err != nil || len(after.Messages) != 1 || strings.Contains(fmt.Sprint(after.Messages), "revoked-secret") {
-		t.Fatalf("revoked assistant content was not withheld: %#v err=%v", after, err)
+	if err != nil || len(after.Messages) != 2 {
+		t.Fatalf("conversation after revocation: %#v err=%v", after, err)
+	}
+	for _, msg := range after.Messages {
+		if msg.Role == "assistant" && strings.TrimSpace(msg.Content) != "" {
+			t.Fatalf("revoked assistant content was not withheld: %#v", msg)
+		}
+	}
+	if strings.Contains(fmt.Sprint(after.Messages), "revoked-secret") {
+		t.Fatalf("revoked assistant content leaked: %#v", after.Messages)
 	}
 	forged, _ := json.Marshal(map[string]any{
 		"conversation_id": first.Conversation.ID,
@@ -905,23 +947,34 @@ type runWorkerFixture struct {
 
 func newRunWorkerFixture(t *testing.T, responses []string, onDispatch func(n int)) *runWorkerFixture {
 	t.Helper()
+	return newRunWorkerFixtureWithRAG(t, nil, responses, onDispatch)
+}
+
+// newRunWorkerFixtureWithRAG wires the run worker with a fake RAG searcher
+// so evidence-attached runs exercise ResolveEvidence + ReadEvidence paths.
+func newRunWorkerFixtureWithRAG(t *testing.T, searcher *fakeRAGSearcher, responses []string, onDispatch func(n int)) *runWorkerFixture {
+	t.Helper()
 	db := testdb.New(t)
 	tenant := testdb.SeedTenant(t, db, "run-aud")
 	chatRepo := postgres.NewChatbotRepo(db)
 	runsRepo := postgres.NewChatbotRunsRepo(db)
 	jobSvc := jobs.NewService(postgres.NewJobsRepo(db), 0)
 	executor := &scriptExecutor{responses: responses, onDispatch: onDispatch}
-	svc := chatbot.NewService(chatRepo, postgres.NewPromptsRepo(db), nil, executor)
+	svc := chatbot.NewService(chatRepo, postgres.NewPromptsRepo(db), searcher, executor)
 	svc.ConfigureRuns(runsRepo, jobSvc, nil, runPrincipalResolver{})
 	return &runWorkerFixture{svc: svc, chatRepo: chatRepo, runsRepo: runsRepo, jobSvc: jobSvc, executor: executor, tenant: tenant}
 }
 
 // scriptExecutor is the model-dispatch seam: scripted response bodies plus a
-// hook that runs at dispatch time (e.g. a concurrent audience edit).
+// hook that runs at dispatch time (e.g. a concurrent audience edit). The
+// observed route fields mirror what inference.Result reports in production.
 type scriptExecutor struct {
-	responses  []string
-	onDispatch func(n int)
-	dispatches int32
+	responses        []string
+	onDispatch       func(n int)
+	dispatches       int32
+	observedEndpoint string
+	observedModel    string
+	requests         []inference.Request
 }
 
 func (e *scriptExecutor) Execute(ctx context.Context, p auth.Principal, req inference.Request) (*inference.Result, error) {
@@ -929,12 +982,13 @@ func (e *scriptExecutor) Execute(ctx context.Context, p auth.Principal, req infe
 	if e.onDispatch != nil {
 		e.onDispatch(int(n))
 	}
+	e.requests = append(e.requests, req)
 	if len(e.responses) == 0 {
 		return nil, errors.New("no scripted model response left")
 	}
 	body := e.responses[0]
 	e.responses = e.responses[1:]
-	return &inference.Result{Body: io.NopCloser(strings.NewReader(body))}, nil
+	return &inference.Result{Body: io.NopCloser(strings.NewReader(body)), EndpointID: e.observedEndpoint, Model: e.observedModel}, nil
 }
 
 // runPrincipalResolver plays the current-authority seam: CurrentPrincipal
@@ -1074,9 +1128,11 @@ func TestRunWorkerAdmissionRejectsAudienceRemoval(t *testing.T) {
 	if attempts, err := f.runsRepo.ListRunAttempts(ctx, f.tenant, run.ID); err != nil || len(attempts) != 0 {
 		t.Fatalf("denied run recorded attempts: %#v err=%v", attempts, err)
 	}
+	// The terminal-exit wrap marks the run failed under the same fencing
+	// rules — the persisted status stays truthful for retained reads.
 	stored, err := f.runsRepo.GetRun(ctx, f.tenant, run.ID)
-	if err != nil || stored.Status != jobs.StatusQueued {
-		t.Fatalf("queued run row = %#v err=%v, want still queued (never executed)", stored, err)
+	if err != nil || stored.Status != jobs.StatusFailed || !strings.Contains(stored.Error, "not allowed") {
+		t.Fatalf("pre-dispatch failed run row = %#v err=%v, want failed with denial error", stored, err)
 	}
 }
 
@@ -1563,5 +1619,425 @@ func TestListAssistantToolBindingsVisibility(t *testing.T) {
 	ownerBindings, err := f.svc.ListAssistantToolBindings(ctx, creator, []string{"mcp_search"})
 	if err != nil || len(ownerBindings["mcp_search"]) != 2 {
 		t.Fatalf("owner bindings = %#v err=%v, want both bots", ownerBindings, err)
+	}
+}
+
+// ---------------------------------------------------------------------
+// OA-14: ordered run steps, evidence-attached runs, truthful route.
+
+// startAndRun enqueues a run and executes it through the REAL worker
+// handler on a leased claim, returning the run and the handler error.
+func startAndRun(t *testing.T, f *runWorkerFixture, p auth.Principal, botID string, input chatbot.AssistantRunInput) (chatbot.AssistantRun, error) {
+	t.Helper()
+	run, err := f.svc.StartRun(context.Background(), p, botID, input)
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	_, handlerErr := f.svc.JobHandler()(context.Background(), leaseRunJob(t, f.jobSvc), nil)
+	return run, handlerErr
+}
+
+// TestRunEvidenceHandoffFlowsToExecutorAndReplays: an authorized
+// evidence_id is resolved server-side at start, persisted on run and user
+// message, re-read at worker time through the CURRENT-passage reader, and
+// its canonical object ref reaches the executor. The run reports the route
+// actually dispatched and replays ordered steps.
+func TestRunEvidenceHandoffFlowsToExecutorAndReplays(t *testing.T) {
+	ctx := context.Background()
+	searcher := &fakeRAGSearcher{evidenceID: "ev_attached", evidenceContent: "attached-passage-bytes"}
+	f := newRunWorkerFixtureWithRAG(t, searcher, []string{runWorkerDone}, nil)
+	f.executor.observedEndpoint, f.executor.observedModel = "ep-observed", "upstream-model-x"
+	member, _, _ := runWorkerPrincipals(f.tenant)
+	bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+
+	run, handlerErr := startAndRun(t, f, member, bot.ID, chatbot.AssistantRunInput{
+		Input: "ask about the clause", EvidenceIDs: []string{"ev_attached"},
+	})
+	if handlerErr != nil {
+		t.Fatalf("worker error: %v", handlerErr)
+	}
+	if len(f.executor.requests) != 1 {
+		t.Fatalf("dispatches = %d", len(f.executor.requests))
+	}
+	req := f.executor.requests[0]
+	if !strings.Contains(string(req.Payload), "attached-passage-bytes") {
+		t.Fatalf("attached passage never reached the executor payload: %s", req.Payload)
+	}
+	canonical := false
+	for _, ref := range req.Inputs {
+		if ref.ObjectID == "doc_attached" && ref.ObservedSeq == 9 {
+			canonical = true
+		}
+	}
+	if !canonical {
+		t.Fatalf("canonical read ref (doc_attached@9) missing from executor inputs: %#v", req.Inputs)
+	}
+
+	got, err := f.svc.GetRun(ctx, member, run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if got.EndpointID != "ep-observed" || got.Model != "upstream-model-x" {
+		t.Fatalf("observed route = %q/%q, want the dispatched endpoint/model", got.EndpointID, got.Model)
+	}
+	if len(got.Steps) != 1 || got.Steps[0].Number != 1 || got.Steps[0].Kind != "model" || got.Steps[0].Status != "succeeded" {
+		t.Fatalf("steps = %#v, want one succeeded ordered model step", got.Steps)
+	}
+	if strings.Contains(got.Steps[0].Input, "attached-passage-bytes") || strings.Contains(got.Steps[0].Input, "system") {
+		t.Fatalf("model step input carries prompt payload: %q", got.Steps[0].Input)
+	}
+	if got.Steps[0].Output != runWorkerDone {
+		t.Fatalf("step output = %q", got.Steps[0].Output)
+	}
+	if got.Steps[0].EndedAt == nil {
+		t.Fatal("ended step has no ended_at")
+	}
+
+	// Both turns link to the run via durable run_id — round-tripped through
+	// the repo, never in-memory.
+	messages, err := f.chatRepo.ListMessages(ctx, f.tenant, run.ConversationID)
+	if err != nil || len(messages) != 2 {
+		t.Fatalf("messages = %#v err=%v", messages, err)
+	}
+	for _, msg := range messages {
+		if msg.RunID != run.ID {
+			t.Fatalf("%s turn run_id = %q, want the durable linkage", msg.Role, msg.RunID)
+		}
+	}
+	if fmt.Sprint(messages[0].EvidenceIDs) != fmt.Sprint([]string{"ev_attached"}) {
+		t.Fatalf("user message evidence = %#v", messages[0].EvidenceIDs)
+	}
+
+	// Conversation replay attaches the same steps to the assistant turn.
+	view, err := f.svc.ListConversation(ctx, member, run.ConversationID)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	var assistant *chatbot.Message
+	for i := range view.Messages {
+		if view.Messages[i].Role == "assistant" {
+			assistant = &view.Messages[i]
+		}
+	}
+	if assistant == nil || assistant.RunID != run.ID || len(assistant.Steps) != 1 || assistant.Steps[0].Number != 1 {
+		t.Fatalf("assistant turn steps = %#v", assistant)
+	}
+	// Attempts and steps stay one projection: RunAttempts delegates to it.
+	attempts, err := f.svc.RunAttempts(ctx, member, run.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].Number != 1 || attempts[0].Kind != "model" {
+		t.Fatalf("attempts = %#v err=%v", attempts, err)
+	}
+}
+
+// TestRunMultiAttemptStepsStayOrdered: a tool-calling run persists one model
+// step then one tool step; steps replay ordered by number with tool-level
+// input only.
+func TestRunMultiAttemptStepsStayOrdered(t *testing.T) {
+	ctx := context.Background()
+	f := newRunWorkerFixture(t, []string{runWorkerTool, runWorkerDone}, nil)
+	member, _, _ := runWorkerPrincipals(f.tenant)
+	bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+
+	run, handlerErr := startAndRun(t, f, member, bot.ID, chatbot.AssistantRunInput{Input: "use the tool"})
+	if handlerErr == nil {
+		t.Fatal("unapproved tool arguments must fail the run after the tool attempt")
+	}
+	got, err := f.svc.GetRun(ctx, member, run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if len(got.Steps) != 2 || got.Steps[0].Number != 1 || got.Steps[0].Kind != "model" || got.Steps[0].Status != "succeeded" {
+		t.Fatalf("steps = %#v, want model step first", got.Steps)
+	}
+	tool := got.Steps[1]
+	if tool.Number != 2 || tool.Kind != "tool" || tool.Name != "knowledge.search" || tool.Status != "failed" || tool.Error == "" {
+		t.Fatalf("tool step = %#v, want ordered failed tool step with error", tool)
+	}
+	if !strings.Contains(tool.Input, "knowledge.search") && !strings.Contains(tool.Input, `"query"`) {
+		t.Fatalf("tool step input = %q, want the tool arguments", tool.Input)
+	}
+	if strings.Contains(tool.Input, "system") {
+		t.Fatalf("tool step input carries prompt payload: %q", tool.Input)
+	}
+	if tool.EndedAt == nil {
+		t.Fatal("finished tool step has no ended_at")
+	}
+}
+
+// TestStartRunRejectsDeniedEvidence: unknown or denied evidence IDs fail the
+// run start under the existing not-found/denied mapping — never stripped.
+func TestStartRunRejectsDeniedEvidence(t *testing.T) {
+	ctx := context.Background()
+	searcher := &fakeRAGSearcher{evidenceID: "ev_attached"}
+	f := newRunWorkerFixtureWithRAG(t, searcher, []string{runWorkerDone}, nil)
+	member, _, _ := runWorkerPrincipals(f.tenant)
+	bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+
+	if _, err := f.svc.StartRun(ctx, member, bot.ID, chatbot.AssistantRunInput{Input: "hi", EvidenceIDs: []string{"ev_attached", "ev_other"}}); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("denied evidence start = %v, want source.ErrDenied", err)
+	}
+	if got, _ := f.chatRepo.CountConversations(ctx, f.tenant, runWorkerMember); got != 0 {
+		t.Fatalf("rejected run persisted %d conversations", got)
+	}
+}
+
+// TestRunEvidenceRevokedBetweenEnqueueAndExecutionDropsPassage: revoking the
+// attached evidence after StartRun drops the passage at worker read time —
+// the executor payload proves the revoked text never entered context while
+// the run still executes.
+func TestRunEvidenceRevokedBetweenEnqueueAndExecutionDropsPassage(t *testing.T) {
+	ctx := context.Background()
+	searcher := &fakeRAGSearcher{evidenceID: "ev_attached", evidenceContent: "revoked-passage-secret"}
+	f := newRunWorkerFixtureWithRAG(t, searcher, []string{runWorkerDone}, nil)
+	member, _, _ := runWorkerPrincipals(f.tenant)
+	bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+
+	run, err := f.svc.StartRun(ctx, member, bot.ID, chatbot.AssistantRunInput{
+		Input: "summarize", EvidenceIDs: []string{"ev_attached"},
+	})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	searcher.evidenceReadDenied = true
+
+	if _, handlerErr := f.svc.JobHandler()(ctx, leaseRunJob(t, f.jobSvc), nil); handlerErr != nil {
+		t.Fatalf("worker error: %v", handlerErr)
+	}
+	if len(f.executor.requests) != 1 {
+		t.Fatalf("dispatches = %d", len(f.executor.requests))
+	}
+	if strings.Contains(string(f.executor.requests[0].Payload), "revoked-passage-secret") {
+		t.Fatalf("revoked passage reached inference context: %s", f.executor.requests[0].Payload)
+	}
+	for _, ref := range f.executor.requests[0].Inputs {
+		if ref.ObjectID == "doc_attached" && ref.ObservedSeq == 9 {
+			t.Fatalf("revoked read ref reached executor inputs: %#v", f.executor.requests[0].Inputs)
+		}
+	}
+	got, err := f.svc.GetRun(ctx, member, run.ID)
+	if err != nil || got.Output != "all done" || got.Status == jobs.StatusFailed {
+		t.Fatalf("run = %#v err=%v, want a completed run without the passage", got, err)
+	}
+}
+
+// TestTerminalRunTurnsProjectAfterReload: a REAL failing run (executor error
+// through the worker), a run cancelled WHILE QUEUED, and a PRE-DISPATCH
+// admission failure each render a durable display-only assistant turn after
+// conversation reload — with no persisted assistant message row, no
+// fabricated reply, and no entry into future inference history.
+func TestTerminalRunTurnsProjectAfterReload(t *testing.T) {
+	ctx := context.Background()
+	f := newRunWorkerFixture(t, nil, nil) // no scripted responses: the model dispatch itself fails
+	member, _, admin := runWorkerPrincipals(f.tenant)
+	bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+
+	// 1. Real failing run: the executor errors through the worker.
+	failed, handlerErr := startAndRun(t, f, member, bot.ID, chatbot.AssistantRunInput{Input: "will fail at dispatch"})
+	if handlerErr == nil {
+		t.Fatal("executor failure must fail the run")
+	}
+	stored, err := f.runsRepo.GetRun(ctx, f.tenant, failed.ID)
+	if err != nil || stored.Status != jobs.StatusFailed {
+		t.Fatalf("failed run row = %#v err=%v", stored, err)
+	}
+
+	// 2. Cancelled while queued: never claimed by any worker.
+	cancelled, err := f.svc.StartRun(ctx, member, bot.ID, chatbot.AssistantRunInput{
+		Input: "cancelled while queued", ConversationID: failed.ConversationID,
+	})
+	if err != nil {
+		t.Fatalf("start cancelled run: %v", err)
+	}
+	if err := f.svc.CancelRun(ctx, member, cancelled.ID); err != nil {
+		t.Fatalf("cancel queued run: %v", err)
+	}
+
+	// 3. Pre-dispatch failure: audience narrowed between enqueue and claim.
+	preDispatch, err := f.svc.StartRun(ctx, member, bot.ID, chatbot.AssistantRunInput{
+		Input: "denied at admission", ConversationID: failed.ConversationID,
+	})
+	if err != nil {
+		t.Fatalf("start pre-dispatch run: %v", err)
+	}
+	narrowAudience(t, f.chatRepo, f.tenant, bot.ID)
+	if _, handlerErr := f.svc.JobHandler()(ctx, leaseRunJob(t, f.jobSvc), nil); !errors.Is(handlerErr, chatbot.ErrChatbotNotAllowed) {
+		t.Fatalf("pre-dispatch admission error = %v", handlerErr)
+	}
+
+	// The member lost audience access with the narrowing — the admin gate
+	// (platform.admin bypasses the audience term) proves the durable read.
+	view, err := f.svc.ListConversation(ctx, admin, failed.ConversationID)
+	if err != nil {
+		t.Fatalf("admin replay: %v", err)
+	}
+	wantRoles := []string{"user", "assistant", "user", "assistant", "user", "assistant"}
+	if len(view.Messages) != len(wantRoles) {
+		t.Fatalf("replayed messages = %d (%#v), want the %d-turn shape", len(view.Messages), view.Messages, len(wantRoles))
+	}
+	runIDs := map[string]string{failed.ID: "will fail at dispatch", cancelled.ID: "cancelled while queued", preDispatch.ID: "denied at admission"}
+	for i, msg := range view.Messages {
+		if msg.Role != wantRoles[i] {
+			t.Fatalf("message[%d] role = %q, want %q", i, msg.Role, wantRoles[i])
+		}
+		if msg.Role != "assistant" {
+			continue
+		}
+		if strings.TrimSpace(msg.Content) != "" {
+			t.Fatalf("projected turn fabricated content: %q", msg.Content)
+		}
+		run, ok := runIDs[msg.RunID]
+		if !ok {
+			t.Fatalf("projected turn run_id %q is not one of the terminal runs", msg.RunID)
+		}
+		delete(runIDs, msg.RunID)
+		_ = run
+	}
+	if len(runIDs) != 0 {
+		t.Fatalf("terminal runs without a projected turn: %v", runIDs)
+	}
+
+	// No assistant message row exists for any terminal run — the turn is the
+	// read-time projection only.
+	persisted, err := f.chatRepo.ListMessages(ctx, f.tenant, failed.ConversationID)
+	if err != nil {
+		t.Fatalf("list persisted messages: %v", err)
+	}
+	for _, msg := range persisted {
+		if msg.Role == "assistant" {
+			t.Fatalf("terminal run persisted a fake assistant row: %#v", msg)
+		}
+	}
+
+	// Steps replay via the shared loader: the failing run keeps its failed
+	// model attempt; the never-claimed runs have none.
+	turns := 0
+	for _, msg := range view.Messages {
+		if msg.Role != "assistant" {
+			continue
+		}
+		turns++
+		if msg.RunID == failed.ID {
+			if len(msg.Steps) != 1 || msg.Steps[0].Status != "failed" || msg.Steps[0].Kind != "model" {
+				t.Fatalf("failing run turn steps = %#v, want the failed model attempt", msg.Steps)
+			}
+		} else if len(msg.Steps) != 0 {
+			t.Fatalf("unclaimed run projected steps: %#v", msg.Steps)
+		}
+	}
+	if turns != 3 {
+		t.Fatalf("projected turns = %d", turns)
+	}
+
+	// The projection never enters inference history: the next run's payload
+	// carries only the persisted user turns.
+	f.executor.responses = []string{runWorkerDone}
+	if _, handlerErr := startAndRun(t, f, admin, bot.ID, chatbot.AssistantRunInput{
+		Input: "follow-up question", ConversationID: failed.ConversationID,
+	}); handlerErr != nil {
+		t.Fatalf("follow-up run: %v", handlerErr)
+	}
+	payload := string(f.executor.requests[len(f.executor.requests)-1].Payload)
+	for _, needle := range []string{"will fail at dispatch", "cancelled while queued", "denied at admission", "follow-up question"} {
+		if !strings.Contains(payload, needle) {
+			t.Fatalf("payload lost user input %q: %s", needle, payload)
+		}
+	}
+	if strings.Contains(payload, `"role":"assistant"`) {
+		t.Fatalf("projected turns entered inference history: %s", payload)
+	}
+
+	// All three runs appear in the own-scope failed-run read (the member's
+	// own rows, derived from run row and bound job alike).
+	failedRuns, err := f.svc.ListFailedRuns(ctx, member, 10)
+	if err != nil {
+		t.Fatalf("list failed runs: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, run := range failedRuns {
+		seen[run.ID] = true
+	}
+	if !seen[failed.ID] || !seen[cancelled.ID] || !seen[preDispatch.ID] {
+		t.Fatalf("failed-run feed = %#v, want all three terminal runs", failedRuns)
+	}
+	if count, err := f.svc.CountConversations(ctx, member); err != nil || count != 1 {
+		t.Fatalf("member conversation count = %d err=%v, want the single own conversation", count, err)
+	}
+	if count, err := f.svc.CountConversations(ctx, admin); err != nil || count != 0 {
+		t.Fatalf("admin conversation count = %d err=%v, want own rows only (zero)", count, err)
+	}
+}
+
+// TestRevokedEvidenceTurnKeepsMetadataOnlySteps: a completed run whose
+// evidence is later revoked keeps its turn at replay with the content
+// cleared, the steps reduced to metadata (number/kind/name/status kept,
+// input/output/error cleared), and neither text nor refs feeding the next
+// run's inference context.
+func TestRevokedEvidenceTurnKeepsMetadataOnlySteps(t *testing.T) {
+	ctx := context.Background()
+	searcher := &fakeRAGSearcher{evidenceID: "ev_attached", evidenceContent: "maple-vector-citadel-secret"}
+	f := newRunWorkerFixtureWithRAG(t, searcher, []string{runWorkerDone, runWorkerDone}, nil)
+	member, _, _ := runWorkerPrincipals(f.tenant)
+	bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+
+	first, handlerErr := startAndRun(t, f, member, bot.ID, chatbot.AssistantRunInput{
+		Input: "first question", EvidenceIDs: []string{"ev_attached"},
+	})
+	if handlerErr != nil {
+		t.Fatalf("first run worker error: %v", handlerErr)
+	}
+
+	// Two-turn replay on the SAME conversation after revocation.
+	searcher.revoked = true
+	second, handlerErr := startAndRun(t, f, member, bot.ID, chatbot.AssistantRunInput{
+		Input: "second question", ConversationID: first.ConversationID,
+	})
+	if handlerErr != nil {
+		t.Fatalf("second run worker error: %v", handlerErr)
+	}
+	if second.ConversationID != first.ConversationID || len(f.executor.requests) != 2 {
+		t.Fatalf("second run = %#v dispatches=%d", second, len(f.executor.requests))
+	}
+	if strings.Contains(string(f.executor.requests[1].Payload), "maple-vector-citadel-secret") || strings.Contains(string(f.executor.requests[1].Payload), "all done") {
+		t.Fatalf("revoked text or redacted reply reached the next run: %s", f.executor.requests[1].Payload)
+	}
+	if !strings.Contains(string(f.executor.requests[1].Payload), "second question") {
+		t.Fatalf("next run lost its own input: %s", f.executor.requests[1].Payload)
+	}
+
+	view, err := f.svc.ListConversation(ctx, member, first.ConversationID)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	redacted := 0
+	for _, msg := range view.Messages {
+		if msg.Role != "assistant" || msg.RunID != first.ID {
+			continue
+		}
+		redacted++
+		if strings.TrimSpace(msg.Content) != "" {
+			t.Fatalf("revoked turn kept content: %q", msg.Content)
+		}
+		if len(msg.Steps) == 0 {
+			t.Fatal("redacted turn lost its steps entirely — metadata must survive")
+		}
+		step := msg.Steps[0]
+		if step.Number != 1 || step.Kind != "model" || step.Name == "" || step.Status != "succeeded" || step.StartedAt.IsZero() {
+			t.Fatalf("step metadata = %#v, want number/kind/name/status/timestamps kept", step)
+		}
+		if step.Input != "" || step.Output != "" || step.Error != "" {
+			t.Fatalf("denied step kept source-bearing fields: %#v", step)
+		}
+	}
+	if redacted != 1 {
+		t.Fatalf("redacted assistant turns = %d, want exactly the revoked one", redacted)
+	}
+
+	// Run reads project the identical metadata-only steps.
+	got, err := f.svc.GetRun(ctx, member, first.ID)
+	if err != nil || len(got.Steps) != 1 || got.Steps[0].Output != "" || got.Steps[0].Number != 1 {
+		t.Fatalf("denied run read = %#v err=%v", got, err)
+	}
+	if got.Output != "" {
+		t.Fatalf("denied run kept retained output: %q", got.Output)
 	}
 }

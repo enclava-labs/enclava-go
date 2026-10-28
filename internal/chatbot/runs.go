@@ -15,6 +15,7 @@ import (
 	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
 	"enclava-go/internal/prompts"
+	"enclava-go/internal/rag"
 	"enclava-go/internal/source"
 )
 
@@ -35,6 +36,61 @@ type runConfigSnapshot struct {
 	Prompt    prompts.Template `json:"prompt"`
 }
 
+// maxRunEvidenceIDs bounds the client-supplied evidence handoff.
+const maxRunEvidenceIDs = 8
+
+// normalizeRunEvidenceIDs trims, validates and dedupes the bounded
+// evidence_ids handoff; empty entries or an oversize list are 400-class.
+func normalizeRunEvidenceIDs(raw []string) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	if len(raw) > maxRunEvidenceIDs {
+		return nil, invalidInput(fmt.Errorf("evidence_ids accepts at most %d entries", maxRunEvidenceIDs))
+	}
+	seen := make(map[string]struct{}, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, id := range raw {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return nil, invalidInput(errors.New("evidence_ids entries must be non-empty evidence IDs"))
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out, nil
+}
+
+// resolveRunEvidence authorizes the client-supplied IDs server-side before
+// anything persists: denied/forbidden/unknown IDs fail the run start under
+// the existing not-found/denied mapping — never silently stripped. The
+// resolutions' span refs become the run's canonical persisted input refs.
+func (s *Service) resolveRunEvidence(ctx context.Context, p auth.Principal, ids []string) ([]source.ObjectRef, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	resolver, ok := s.rag.(EvidenceResolver)
+	if !ok {
+		return nil, source.ErrDenied
+	}
+	resolutions, err := resolver.ResolveEvidence(ctx, p, ids)
+	if err != nil {
+		return nil, err
+	}
+	var refs []source.ObjectRef
+	for _, resolution := range resolutions {
+		for _, span := range resolution.Spans {
+			if span.Ref.ObjectID != "" {
+				refs = append(refs, span.Ref)
+			}
+		}
+	}
+	return refs, nil
+}
+
 func (s *Service) StartRun(ctx context.Context, p auth.Principal, chatbotRef string, input AssistantRunInput) (AssistantRun, error) {
 	if err := requireTenant(p); err != nil {
 		return AssistantRun{}, err
@@ -45,6 +101,14 @@ func (s *Service) StartRun(ctx context.Context, p auth.Principal, chatbotRef str
 	input.Input = strings.TrimSpace(input.Input)
 	if input.Input == "" || len(input.Input) > maxRunInputBytes {
 		return AssistantRun{}, invalidInput(errors.New("run input is empty or exceeds the byte limit"))
+	}
+	evidenceIDs, err := normalizeRunEvidenceIDs(input.EvidenceIDs)
+	if err != nil {
+		return AssistantRun{}, err
+	}
+	evidenceRefs, err := s.resolveRunEvidence(ctx, p, evidenceIDs)
+	if err != nil {
+		return AssistantRun{}, err
 	}
 	bot, err := s.getByRef(ctx, p, chatbotRef)
 	if err != nil {
@@ -75,6 +139,7 @@ func (s *Service) StartRun(ctx context.Context, p auth.Principal, chatbotRef str
 		ID: newID("chatrun"), TenantID: p.TenantID, OwnerActorID: actorKey(p), ChatbotID: bot.ID,
 		ConversationID: conversation.ID, Status: jobs.StatusQueued, Input: input.Input,
 		ConfigSnapshot: snapshot, PromptTemplateID: template.ID,
+		EvidenceIDs: evidenceIDs, InputRefs: evidenceRefs,
 	}
 	if err := s.runRepo.CreateRun(ctx, run); err != nil {
 		return AssistantRun{}, err
@@ -82,6 +147,7 @@ func (s *Service) StartRun(ctx context.Context, p auth.Principal, chatbotRef str
 	if err := s.repo.AddMessage(ctx, Message{
 		TenantID: p.TenantID, ID: newID("chatmsg"), ConversationID: conversation.ID,
 		Role: "user", Content: input.Input, OwnerActorID: p.ActorID,
+		RunID: run.ID, EvidenceIDs: evidenceIDs, InputRefs: evidenceRefs,
 	}); err != nil {
 		run.Status, run.Error = jobs.StatusFailed, err.Error()
 		_ = s.runRepo.UpdateRun(ctx, run)
@@ -128,41 +194,35 @@ func (s *Service) GetRun(ctx context.Context, p auth.Principal, id string) (Assi
 			}
 		}
 	}
-	if len(run.EvidenceIDs) > 0 {
-		resolver, ok := s.rag.(EvidenceResolver)
-		if !ok {
-			run.Output = ""
-		} else if _, err := resolver.ResolveEvidence(ctx, p, run.EvidenceIDs); err != nil {
-			if errors.Is(err, source.ErrDenied) {
-				run.Output = ""
-			} else {
-				return AssistantRun{}, err
-			}
-		}
+	// One shared authorized projection: the current-evidence gate both
+	// suppresses the retained output and reduces the steps to metadata —
+	// the exact projection conversation replay attaches to the turn.
+	steps, evidenceDenied, err := s.authorizedSteps(ctx, p, run)
+	if err != nil {
+		return AssistantRun{}, err
 	}
+	if evidenceDenied {
+		run.Output = ""
+	}
+	run.Steps = steps
 	return run, nil
 }
 
-func (s *Service) RunAttempts(ctx context.Context, p auth.Principal, runID string) ([]AssistantRunAttempt, error) {
-	run, err := s.GetRun(ctx, p, runID)
+// authorizedSteps projects a run's persisted attempts into ordered steps
+// under the CURRENT evidence gate. It is the single attempt read path:
+// GetRun and conversation assembly both consume this projection, so replay
+// never fetches raw attempts through a second, unauthorized route. When the
+// run's evidence is denied the projection keeps step METADATA ONLY —
+// Number/Kind/Name/Status/timestamps survive, the source-bearing
+// Input/Output/Error are cleared (tool errors can quote source content).
+func (s *Service) authorizedSteps(ctx context.Context, p auth.Principal, run AssistantRun) ([]AssistantRunStep, bool, error) {
+	denied, err := s.evidenceDenied(ctx, p, run.EvidenceIDs)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	if len(run.EvidenceIDs) > 0 {
-		resolver, ok := s.rag.(EvidenceResolver)
-		if !ok {
-			return nil, nil
-		}
-		if _, err := resolver.ResolveEvidence(ctx, p, run.EvidenceIDs); err != nil {
-			if errors.Is(err, source.ErrDenied) {
-				return nil, nil
-			}
-			return nil, err
-		}
-	}
-	attempts, err := s.runRepo.ListRunAttempts(ctx, p.TenantID, run.ID)
+	attempts, err := s.runRepo.ListRunAttempts(ctx, run.TenantID, run.ID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if run.Status == jobs.StatusUnknown {
 		for i := range attempts {
@@ -170,6 +230,43 @@ func (s *Service) RunAttempts(ctx context.Context, p auth.Principal, runID strin
 				attempts[i].Status = jobs.StatusUnknown
 			}
 		}
+	}
+	steps := make([]AssistantRunStep, 0, len(attempts))
+	for _, attempt := range attempts {
+		step := AssistantRunStep{
+			Number: attempt.Number, Kind: attempt.Kind, Name: attempt.Name, Status: attempt.Status,
+			Input: attempt.Input, Output: attempt.Output, Error: attempt.Error,
+			StartedAt: attempt.StartedAt,
+		}
+		if !attempt.EndedAt.IsZero() {
+			ended := attempt.EndedAt
+			step.EndedAt = &ended
+		}
+		if denied {
+			step.Input, step.Output, step.Error = "", "", ""
+		}
+		steps = append(steps, step)
+	}
+	return steps, denied, nil
+}
+
+func (s *Service) RunAttempts(ctx context.Context, p auth.Principal, runID string) ([]AssistantRunAttempt, error) {
+	run, err := s.GetRun(ctx, p, runID)
+	if err != nil {
+		return nil, err
+	}
+	attempts := make([]AssistantRunAttempt, 0, len(run.Steps))
+	for _, step := range run.Steps {
+		attempt := AssistantRunAttempt{
+			TenantID: run.TenantID, RunID: run.ID,
+			Number: step.Number, Kind: step.Kind, Name: step.Name, Status: step.Status,
+			Input: step.Input, Output: step.Output, Error: step.Error,
+			StartedAt: step.StartedAt,
+		}
+		if step.EndedAt != nil {
+			attempt.EndedAt = *step.EndedAt
+		}
+		attempts = append(attempts, attempt)
 	}
 	return attempts, nil
 }
@@ -207,21 +304,39 @@ func (s *Service) JobHandler() jobs.HandlerFunc {
 		if err != nil {
 			return "", err
 		}
+		// Terminal-exit synchronization: every exit after the run row loads
+		// marks the run under the same fencing rules executeRun's fail
+		// closure uses — exits before that closure (admission denial,
+		// decode errors) would otherwise leave the run row queued while the
+		// durable job fails. A stale lease no-ops the fenced write.
+		failRun := func(cause error) (string, error) {
+			status := jobs.StatusFailed
+			if errors.Is(cause, context.Canceled) {
+				status = jobs.StatusCancelled
+			}
+			run.Status, run.Error = status, cause.Error()
+			_ = s.runRepo.UpdateRunFenced(context.Background(), run, claim.Owner, claim.FenceToken)
+			return "", cause
+		}
 		var frozen auth.Principal
 		if err := json.Unmarshal(job.PrincipalSnapshot, &frozen); err != nil {
-			return "", fmt.Errorf("decode run principal: %w", err)
+			return failRun(fmt.Errorf("decode run principal: %w", err))
 		}
 		if frozen.TenantID != job.TenantID || actorKey(frozen) != run.OwnerActorID || s.principalResolver == nil {
-			return "", source.ErrDenied
+			return failRun(source.ErrDenied)
 		}
 		principal, err := s.principalResolver.CurrentPrincipal(ctx, frozen)
 		if err != nil {
-			return "", err
+			return failRun(err)
 		}
 		if principal.TenantID != job.TenantID || actorKey(principal) != run.OwnerActorID {
-			return "", source.ErrDenied
+			return failRun(source.ErrDenied)
 		}
-		return s.executeRun(ctx, principal, claim, run)
+		runID, err := s.executeRun(ctx, principal, claim, run)
+		if err != nil {
+			return failRun(err)
+		}
+		return runID, nil
 	}
 }
 
@@ -294,6 +409,13 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 	}
 	messages := make([]map[string]any, 0, len(storedHistory)+1)
 	for _, message := range storedHistory {
+		// Redacted assistant turns (revoked evidence) contribute no text to
+		// inference. Redacted USER turns stay: their content is replaced by
+		// the rendered prompt below, and the run's own turn must remain the
+		// last user message even when its attached evidence was revoked.
+		if message.Role != "user" && strings.TrimSpace(message.Content) == "" {
+			continue
+		}
 		messages = append(messages, map[string]any{"role": message.Role, "content": message.Content})
 	}
 	userIndex := -1
@@ -313,6 +435,18 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 	ragResults, ragContext, err := s.retrieveRAG(ctx, p, owner, bot, run.Input)
 	if err != nil {
 		return "", err
+	}
+	// Evidence-attached runs: re-read every persisted binding through the
+	// CURRENT-passage reader under the CURRENT principal. Denied, revoked or
+	// superseded IDs at execution time contribute NO passage and NO refs —
+	// revoked source text is never reintroduced into inference context.
+	attachedResults, attachedContext, err := s.attachedEvidence(ctx, p, run.EvidenceIDs, bot)
+	if err != nil {
+		return "", err
+	}
+	if len(attachedResults) > 0 {
+		ragResults = append(ragResults, attachedResults...)
+		ragContext = strings.TrimSpace(strings.Join(nonEmptyLines(ragContext, attachedContext), "\n\n"))
 	}
 	vars := mapFromAny(bot.Settings["variables"])
 	rendered, err := prompts.Render(frozen.Prompt, prompts.RenderInput{UserInput: run.Input, RAGContext: ragContext, Variables: vars})
@@ -407,7 +541,11 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 		if err := refreshPrincipal(); err != nil {
 			return fail(err)
 		}
-		attempt := AssistantRunAttempt{TenantID: p.TenantID, RunID: run.ID, Number: attemptNumber, Kind: "model", Name: bot.Model, Status: "running", Input: string(body), StartedAt: time.Now().UTC()}
+		// Attempt-write hygiene: model attempts persist a bounded route
+		// summary only — the assembled request body (system prompt, history,
+		// attached passages) never reaches a step row. Tool attempts keep
+		// their tool-level arguments.
+		attempt := AssistantRunAttempt{TenantID: p.TenantID, RunID: run.ID, Number: attemptNumber, Kind: "model", Name: bot.Model, Status: "running", Input: modelAttemptSummary(bot.Model, len(messages), len(definitions)), StartedAt: time.Now().UTC()}
 		if err := s.runRepo.AddRunAttempt(ctx, attempt, claim.Owner, claim.FenceToken); err != nil {
 			return fail(err)
 		}
@@ -427,6 +565,14 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 			attempt.EndedAt = time.Now().UTC()
 			_ = s.runRepo.UpdateRunAttempt(ctx, attempt, claim.Owner, claim.FenceToken)
 			return fail(err)
+		}
+		// Observed route: persist the endpoint/model actually dispatched —
+		// never the configured provider label.
+		if result.EndpointID != "" {
+			run.EndpointID = result.EndpointID
+		}
+		if result.Model != "" {
+			run.Model = result.Model
 		}
 		response, readErr := io.ReadAll(io.LimitReader(result.Body, maxRunOutputBytes+1))
 		closeErr := result.Body.Close()
@@ -462,7 +608,7 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 			}
 			run.Output, run.Status, run.EvidenceIDs, run.InputRefs = turnResult.Content, jobs.StatusSucceeded, evidenceIDs, inputRefs
 			if strings.TrimSpace(turnResult.Content) != "" {
-				if err := s.runRepo.AddRunMessage(ctx, Message{TenantID: p.TenantID, ID: newID("chatmsg"), ConversationID: run.ConversationID, Role: "assistant", Content: turnResult.Content, OwnerActorID: p.ActorID, EvidenceIDs: evidenceIDs, InputRefs: inputRefs}, run.JobID, claim.Owner, claim.FenceToken); err != nil {
+				if err := s.runRepo.AddRunMessage(ctx, Message{TenantID: p.TenantID, ID: newID("chatmsg"), ConversationID: run.ConversationID, Role: "assistant", Content: turnResult.Content, OwnerActorID: p.ActorID, RunID: run.ID, EvidenceIDs: evidenceIDs, InputRefs: inputRefs}, run.JobID, claim.Owner, claim.FenceToken); err != nil {
 					return fail(err)
 				}
 			}
@@ -557,6 +703,53 @@ func countRunAttempts(ctx context.Context, repo RunRepository, tenantID, runID s
 		return 0, err
 	}
 	return len(attempts), nil
+}
+
+// modelAttemptSummary is the tool-safe model-attempt input summary persisted
+// on step rows: route shape only, never the assembled request body.
+func modelAttemptSummary(model string, messages, tools int) string {
+	return fmt.Sprintf(`{"model":%q,"messages":%d,"tools":%d}`, model, messages, tools)
+}
+
+// attachedEvidence re-reads every attached evidence ID through the narrow
+// CURRENT-passage reader (ReadEvidence authorizes the exact published
+// version; ResolveEvidence is metadata-only and would happily return
+// superseded records). Still-authorized passages become search-result-shaped
+// inputs feeding the same context/ref plumbing as search-derived evidence.
+func (s *Service) attachedEvidence(ctx context.Context, p auth.Principal, ids []string, bot Instance) ([]rag.SearchResult, string, error) {
+	reader, ok := s.rag.(EvidenceReader)
+	if !ok || len(ids) == 0 {
+		return nil, "", nil
+	}
+	results := make([]rag.SearchResult, 0, len(ids))
+	for _, id := range ids {
+		text, err := reader.ReadEvidence(ctx, p, id)
+		if err != nil {
+			continue // denied/revoked/superseded: no passage, no refs
+		}
+		results = append(results, rag.SearchResult{
+			DocumentID: text.DocumentID, CollectionID: text.CollectionID,
+			Spans: text.Spans, EvidenceID: text.EvidenceID, Content: text.Content,
+		})
+	}
+	if len(results) == 0 {
+		return nil, "", nil
+	}
+	context, err := s.rag.BuildContext(ctx, p, results, settingInt(bot.Settings, "rag_context_max_chars", 6000, 500, 50000))
+	if err != nil {
+		return nil, "", err
+	}
+	return results, context.Text, nil
+}
+
+func nonEmptyLines(parts ...string) []string {
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if strings.TrimSpace(part) != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 type runToolCall struct {

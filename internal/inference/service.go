@@ -24,13 +24,15 @@ import (
 )
 
 // Billing is the reservation/settlement seam consumed by the executor;
-// *billing.Service satisfies it.
+// *billing.Service satisfies it. LatestPrices backs the read-only
+// price-coverage checks — never a substitute for Reserve.
 type Billing interface {
 	Reserve(ctx context.Context, p auth.Principal, req billing.ReserveRequest) (billing.Reservation, error)
 	Settle(ctx context.Context, p auth.Principal, reservationID string, actual billing.Usage) (billing.UsageRecord, error)
 	MarkUnknown(ctx context.Context, p auth.Principal, reservationID string) error
 	MarkDispatched(ctx context.Context, p auth.Principal, reservationID string) error
 	ReleaseUndispatched(ctx context.Context, p auth.Principal, reservationID string) error
+	LatestPrices(ctx context.Context, tenantID, subjectType, subjectID, capability string, now time.Time) ([]billing.Price, error)
 }
 
 // Upstream is the transport surface the executor dispatches on — the union
@@ -73,6 +75,48 @@ type Service struct {
 
 	mu         sync.Mutex
 	transports map[string]transportEntry
+	// runtime is the per-(tenant,endpoint) dispatch observation ring —
+	// in-memory, process-local observed truth; nothing here is persisted or
+	// probed. Keyed exactly like transports so two tenants' identically
+	// named endpoints never share observations.
+	runtime map[string][]dispatchSample
+}
+
+// runtimeObservationLimit bounds the per-endpoint ring.
+const runtimeObservationLimit = 100
+
+// Runtime observation states. unknown ≠ healthy: an endpoint never
+// dispatched reports unknown, never ready.
+const (
+	RuntimeStateUnknown     = "unknown"
+	RuntimeStateReady       = "ready"
+	RuntimeStateDegraded    = "degraded"
+	RuntimeStateUnreachable = "unreachable"
+	RuntimeStateDisabled    = "disabled"
+)
+
+// dispatchSample is one terminal dispatch outcome. latency is recorded only
+// for non-stream successes — a stream's wall time measures the client's read
+// pace, not the endpoint.
+type dispatchSample struct {
+	at         time.Time
+	ok         bool
+	errClass   string // "" on success; RuntimeStateDegraded|Unreachable
+	errMsg     string
+	latency    time.Duration
+	hasLatency bool
+}
+
+// EndpointRuntime is one endpoint's observed dispatch health — the only
+// health/latency truth the screens may render. Attestation/confidential
+// semantics belong to phase-7's projection and are never derived here.
+type EndpointRuntime struct {
+	EndpointID       string     `json:"endpoint_id"`
+	State            string     `json:"state"`
+	LastSuccessAt    *time.Time `json:"last_success_at,omitempty"`
+	LastError        string     `json:"last_error,omitempty"`
+	LatencyP50Millis *int64     `json:"latency_p50_millis,omitempty"`
+	Observations     int        `json:"observations"`
 }
 
 type transportEntry struct {
@@ -127,6 +171,7 @@ func NewService(deps Deps, opts ...Option) (*Service, error) {
 		attemptTimeout: defaultAttemptTimeout,
 		admission:      NewAdmission(AdmissionConfig{}),
 		transports:     map[string]transportEntry{},
+		runtime:        map[string][]dispatchSample{},
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -247,6 +292,7 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 		raw, err := s.dispatchStream(ctx, up, capability, req, body)
 		if err != nil {
 			permit.Release()
+			s.observeDispatchFailure(endpoint, err)
 			s.failAttempt(ctx, p, res, err)
 			return nil, err
 		}
@@ -263,6 +309,11 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 				_ = err
 			}
 		})
+		// Endpoint-health observations ride the stream's terminal
+		// classification: a client-cancelled body records nothing.
+		stream.onOutcome(func(res streamResult) {
+			s.observeStreamOutcome(endpoint, res)
+		})
 		return &Result{
 			AttemptID:     req.AttemptID,
 			ReservationID: res.ID,
@@ -273,9 +324,11 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 		}, nil
 	}
 
+	dstart := time.Now()
 	raw, err := s.dispatch(dctx, up, capability, req, body)
 	if err != nil {
 		permit.Release()
+		s.observeDispatchFailure(endpoint, err)
 		if isUpstreamError(err) {
 			// A definitive upstream error response settles its (possibly
 			// zero) reported usage honestly.
@@ -300,6 +353,7 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 	if endpoint.Protocol == "confidential_sdk" {
 		s.stampVerification(ctx, endpoint)
 	}
+	s.observeDispatchSuccess(endpoint, time.Since(dstart))
 	usage, known := usageFromJSON(raw)
 	rec, serr := s.settleReservation(ctx, p, res, usage, known)
 	result := &Result{
@@ -355,16 +409,24 @@ func (s *Service) Manage(ctx context.Context, p auth.Principal, req ManageReques
 		if err != nil {
 			cancel()
 			permit.Release()
+			// An open failure is real reachability evidence.
+			s.observeDispatchFailure(e, err)
 			return nil, err
 		}
+		// An opened Manage stream's body is consumed elsewhere; only its
+		// open outcome is observed here — client cancellation is never
+		// inferred from a body we do not read.
 		return &ManageResult{EndpointID: e.ID, Body: &cancelOnClose{ReadCloser: raw, done: func() { cancel(); permit.Release() }}}, nil
 	}
 	defer cancel()
 	defer permit.Release()
+	mstart := time.Now()
 	raw, err := up.DoResponsesRequest(mctx, req.Method, path, req.Body)
 	if err != nil {
+		s.observeDispatchFailure(e, err)
 		return nil, err
 	}
+	s.observeDispatchSuccess(e, time.Since(mstart))
 	return &ManageResult{EndpointID: e.ID, Body: io.NopCloser(bytes.NewReader(raw))}, nil
 }
 
@@ -448,6 +510,13 @@ func (s *Service) reserve(ctx context.Context, p auth.Principal, req Request, en
 			SubjectType: billing.PriceSubjectEndpoint,
 			SubjectID:   endpoint.ID,
 		},
+	}
+	// Verified credential attribution: an api-key credential is an
+	// additional budget subject evaluated at admission, while BillingSubject
+	// stays the owner — canonical per-owner usage never double-counts.
+	if p.CredentialKind == auth.CredentialKindAPIKey && p.CredentialID != "" {
+		base.SubjectKeys = append(base.SubjectKeys,
+			billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: p.CredentialID})
 	}
 	res, err := s.billing.Reserve(ctx, p, base)
 	if err == nil {
@@ -648,4 +717,211 @@ func (s *Service) defaultTransport(ctx context.Context, e Endpoint, credential s
 	default:
 		return nil, fmt.Errorf("%w: protocol %q", ErrUnsupportedCapability, e.Protocol)
 	}
+}
+
+// --- endpoint runtime observations -------------------------------------------
+
+// recordObservation appends one terminal dispatch outcome to the endpoint's
+// bounded ring. Failure messages are truncated to a display-safe length.
+func (s *Service) recordObservation(e Endpoint, sample dispatchSample) {
+	if len(sample.errMsg) > 200 {
+		sample.errMsg = sample.errMsg[:200]
+	}
+	key := e.TenantID + "\x00" + e.ID
+	s.mu.Lock()
+	ring := append(s.runtime[key], sample)
+	if len(ring) > runtimeObservationLimit {
+		ring = ring[len(ring)-runtimeObservationLimit:]
+	}
+	s.runtime[key] = ring
+	s.mu.Unlock()
+}
+
+// observeDispatchSuccess records a completed dispatch. A zero duration
+// (stream finalizations) contributes state but no latency sample.
+func (s *Service) observeDispatchSuccess(e Endpoint, latency time.Duration) {
+	sample := dispatchSample{at: time.Now().UTC(), ok: true}
+	if latency > 0 {
+		sample.latency = latency
+		sample.hasLatency = true
+	}
+	s.recordObservation(e, sample)
+}
+
+// observeDispatchFailure records a failed dispatch. A caller-cancelled
+// context is client cancellation, not endpoint health, and records nothing;
+// an answered upstream error degrades, everything else is transport class.
+func (s *Service) observeDispatchFailure(e Endpoint, err error) {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return
+	}
+	class := RuntimeStateUnreachable
+	if isUpstreamError(err) {
+		class = RuntimeStateDegraded
+	}
+	s.recordObservation(e, dispatchSample{
+		at: time.Now().UTC(), ok: false, errClass: class, errMsg: err.Error(),
+	})
+}
+
+// observeStreamOutcome maps a streamed body's terminal classification into
+// the ring: client cancellation records nothing, a terminal error event
+// degrades, a mid-stream read error classifies by kind, a premature EOF is
+// transport class, and a clean terminal event is a success (no latency
+// sample — the wall time measures the client's read pace).
+func (s *Service) observeStreamOutcome(e Endpoint, res streamResult) {
+	switch {
+	case res.ClientCanceled:
+		return
+	case res.Err != nil:
+		s.observeDispatchFailure(e, res.Err)
+	case res.UpstreamFailed:
+		s.recordObservation(e, dispatchSample{
+			at: time.Now().UTC(), ok: false,
+			errClass: RuntimeStateDegraded,
+			errMsg:   "stream ended with an upstream failure event",
+		})
+	case !res.Terminal:
+		// EOF without a terminal event — the upstream connection ended
+		// prematurely: transport-class failure.
+		s.recordObservation(e, dispatchSample{
+			at: time.Now().UTC(), ok: false,
+			errClass: RuntimeStateUnreachable,
+			errMsg:   "stream ended before a terminal event",
+		})
+	default:
+		s.observeDispatchSuccess(e, 0)
+	}
+}
+
+// EndpointRuntime joins the tenant's real endpoint rows to their dispatch
+// observations. Disabled endpoints report disabled; never-dispatched
+// endpoints report unknown. Latency is the P50 of recorded non-stream
+// success samples — absent samples leave it nil, never zero.
+func (s *Service) EndpointRuntime(ctx context.Context, tenantID string) ([]EndpointRuntime, error) {
+	endpoints, err := s.endpoints.List(ctx, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list endpoints: %w", err)
+	}
+	s.mu.Lock()
+	rings := make(map[string][]dispatchSample, len(endpoints))
+	for _, e := range endpoints {
+		key := tenantID + "\x00" + e.ID
+		if ring := s.runtime[key]; len(ring) > 0 {
+			rings[key] = append([]dispatchSample(nil), ring...)
+		}
+	}
+	s.mu.Unlock()
+
+	out := make([]EndpointRuntime, 0, len(endpoints))
+	for _, e := range endpoints {
+		rt := EndpointRuntime{EndpointID: e.ID, State: RuntimeStateUnknown}
+		if !e.Enabled {
+			rt.State = RuntimeStateDisabled
+			out = append(out, rt)
+			continue
+		}
+		ring := rings[tenantID+"\x00"+e.ID]
+		rt.Observations = len(ring)
+		if len(ring) == 0 {
+			out = append(out, rt)
+			continue
+		}
+		var latencies []time.Duration
+		for i := range ring {
+			sample := ring[i]
+			if !sample.ok {
+				continue
+			}
+			if rt.LastSuccessAt == nil || sample.at.After(*rt.LastSuccessAt) {
+				at := sample.at
+				rt.LastSuccessAt = &at
+			}
+			if sample.hasLatency {
+				latencies = append(latencies, sample.latency)
+			}
+		}
+		// The most recent outcome is the state: ready only when the last
+		// dispatch succeeded; otherwise the recorded error class speaks.
+		last := ring[len(ring)-1]
+		if last.ok {
+			rt.State = RuntimeStateReady
+		} else {
+			rt.State = last.errClass
+			rt.LastError = last.errMsg
+		}
+		if len(latencies) > 0 {
+			sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+			// The observed P50 in whole milliseconds; a sub-millisecond
+			// dispatch truthfully reports 0.
+			p50 := latencies[len(latencies)/2].Milliseconds()
+			rt.LatencyP50Millis = &p50
+		}
+		out = append(out, rt)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].EndpointID < out[j].EndpointID })
+	return out, nil
+}
+
+// --- priced/routable model selector -------------------------------------------
+
+// PricedModelSelector returns the permitted model aliases whose execution
+// route — the pinned endpoint, or the first eligible endpoint in route order
+// (the exact route loop: enabled, actor endpoint- and model-allowlisted,
+// capability-advertising, alias-bound) — has complete capability-scoped
+// price coverage. An alias whose selected route cannot price every required
+// unit is absent: execution has no failover, so the selector promises none.
+// The Assistants model select consumes this with the chat capability.
+func (s *Service) PricedModelSelector(ctx context.Context, p auth.Principal, pinnedEndpointID string) ([]llm.Model, error) {
+	capability := CapabilityChat
+	var candidates []Endpoint
+	if pinnedEndpointID != "" {
+		e, err := s.endpoints.Get(ctx, p.TenantID, pinnedEndpointID)
+		if err != nil || e.TenantID != p.TenantID {
+			return nil, fmt.Errorf("%w", ErrNoRoute)
+		}
+		candidates = []Endpoint{e}
+	} else {
+		list, err := s.endpoints.ListCapabilities(ctx, p.TenantID, capability)
+		if err != nil {
+			return nil, fmt.Errorf("list endpoints: %w", err)
+		}
+		candidates = list // repo already returns id-ordered, enabled rows
+	}
+
+	aliases := map[string]bool{}
+	for _, e := range candidates {
+		if !e.Enabled || !capabilityAdvertised(e, capability) || !auth.EndpointAllowed(p, e.ID) {
+			continue
+		}
+		for _, cap := range e.Capabilities {
+			alias, ok := modelAliasOf(cap)
+			if !ok || !auth.ModelAllowed(p, alias) {
+				continue
+			}
+			aliases[alias] = true
+		}
+	}
+	now := time.Now().UTC()
+	models := make([]llm.Model, 0, len(aliases))
+	for alias := range aliases {
+		// The route execution will take: first candidate passing every
+		// eligibility check for this alias. No candidate passes — the alias
+		// has no route and is never listed.
+		for _, e := range candidates {
+			if !e.Enabled || !capabilityAdvertised(e, capability) || !auth.EndpointAllowed(p, e.ID) {
+				continue
+			}
+			if _, bound := upstreamModelFor(e, alias); !bound {
+				continue
+			}
+			missing, err := s.PriceCoverage(ctx, p.TenantID, e.ID, alias, capability, now)
+			if err == nil && len(missing) == 0 {
+				models = append(models, llm.Model{ID: alias, Object: "model", OwnedBy: "enclava"})
+			}
+			break
+		}
+	}
+	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
+	return models, nil
 }

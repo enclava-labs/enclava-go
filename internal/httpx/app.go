@@ -203,6 +203,11 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/api/v1/admin/usage/summary", a.authenticated("platform.admin", a.handleAdminUsageSummary))
 	a.mux.HandleFunc("/api/v1/admin/pricing", a.authenticated("pricing.manage", a.handleAdminPricing))
 	a.mux.HandleFunc("/api/v1/admin/billing-audit", a.authenticated("platform.admin", a.handleAdminBillingAudit))
+	// 08-07: the narrow budget write API — create, all-subject list and
+	// limit-only PATCH. The legacy is_unlimited/budget_* fields on the
+	// api-key route stay no-ops; these routes are the real budget surface.
+	a.mux.HandleFunc("/api/v1/admin/budgets", a.authenticated("platform.admin", a.handleAdminBudgets))
+	a.mux.HandleFunc("/api/v1/admin/budgets/", a.authenticated("platform.admin", a.handleAdminBudgetByID))
 
 	// 01-24 identity administration: tenant-scoped user/role/service-account
 	// and session/link management over the shared auth services. Mutations on
