@@ -1,0 +1,15 @@
+{{/* Shared component defines (07-02; contracts frozen in 07-CONTEXT).
+     Pages and layout consume these via {{template "name" .Arg}} and must NOT
+     redefine shared names. Args are the typed structs from
+     dashboard_templates.go: dashboardEmpty → "empty", dashboardHeader →
+     "page-head", []dashboardTab → "tabs", dashboardConfirm → "confirm-btn";
+     "drawer-shell" takes nil and is invoked exactly once by layout.tmpl —
+     app.js owns everything injected into #drawer/#pop/#toast. */}}
+{{define "empty"}}<div class="empty">{{icon .Icon}}<p>{{.Text}}</p>{{if .ActionLabel}}<a class="btn primary" href="{{.ActionHref}}">{{.ActionLabel}}</a>{{end}}</div>{{end}}
+{{define "page-head"}}<header class="head"><div class="headcopy">{{if .Crumb}}<div class="crumb">{{.Crumb}}</div>{{end}}<h1>{{.Title}}</h1>{{if .Desc}}<p class="desc">{{.Desc}}</p>{{end}}</div>{{.Actions}}</header>{{end}}
+{{define "tabs"}}<nav class="tabs">{{range .}}<a class="tab{{if .Active}} active{{end}}" href="{{.Href}}"{{if .Active}} aria-current="page"{{end}}>{{.Label}}</a>{{end}}</nav>{{end}}
+{{define "confirm-btn"}}<button class="btn danger" type="button" data-action="confirm" data-confirm="{{.Confirm}}">{{.Label}}</button>{{end}}
+{{define "drawer-shell"}}<div class="drawer-backdrop" id="backdrop" data-action="close-drawer"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true"></aside>
+<div id="pop"></div>
+<div class="toast" id="toast" aria-live="polite"></div>{{end}}

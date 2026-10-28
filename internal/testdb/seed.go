@@ -25,8 +25,17 @@ func SeedTenant(t *testing.T, db *postgres.DB, slug string) string {
 }
 
 // SeedUser inserts an active user with a bcrypt password and returns it.
-// scopes are granted via a dedicated seeded role assigned to the user.
+// scopes are granted via a dedicated seeded role assigned to the user; the
+// role carries no resource grants (explicit deny).
 func SeedUser(t *testing.T, db *postgres.DB, tenantID, email string, scopes []string) auth.User {
+	t.Helper()
+	return SeedUserWithGrants(t, db, tenantID, email, scopes, auth.ResourceGrants{})
+}
+
+// SeedUserWithGrants inserts an active user whose dedicated seeded role
+// carries exactly the supplied resource grants plus scopes — the helper
+// downstream member/manager session tests use for real list-grant authority.
+func SeedUserWithGrants(t *testing.T, db *postgres.DB, tenantID, email string, scopes []string, grants auth.ResourceGrants) auth.User {
 	t.Helper()
 	ctx := context.Background()
 	repo := postgres.NewIdentityRepo(db)
@@ -47,8 +56,8 @@ func SeedUser(t *testing.T, db *postgres.DB, tenantID, email string, scopes []st
 	if err := repo.CreateUser(ctx, tenantID, user); err != nil {
 		t.Fatalf("seed user %q: %v", email, err)
 	}
-	if len(scopes) > 0 {
-		role := auth.Role{ID: "role_" + randSuffix(), Name: "seeded-" + user.ID, Scopes: scopes}
+	if len(scopes) > 0 || grantsSpecified(grants) {
+		role := auth.Role{ID: "role_" + randSuffix(), Name: "seeded-" + user.ID, Scopes: scopes, Grants: grants}
 		if err := repo.CreateRole(ctx, tenantID, role); err != nil {
 			t.Fatalf("seed role: %v", err)
 		}
@@ -75,12 +84,18 @@ func SeedServiceAccount(t *testing.T, db *postgres.DB, tenantID, name string, sc
 	return sa
 }
 
-// SeedKeySpec describes the key row SeedAPIKey writes.
+// SeedKeySpec describes the key row SeedAPIKey writes. The optional grant
+// slices seed restricted list grants; nil keeps today's mode:all seed.
 type SeedKeySpec struct {
 	Name             string
 	OwnerUserID      string // exactly one of OwnerUserID / ServiceAccountID
 	ServiceAccountID string
 	Scopes           []string
+	AllowedModels    *[]string
+	AllowedTemplates *[]string
+	AllowedChatbots  *[]string
+	AllowedAgents    *[]string
+	AllowedEndpoints *[]string
 	ExpiresAt        *time.Time
 }
 
@@ -104,11 +119,11 @@ func SeedAPIKey(t *testing.T, db *postgres.DB, tenantID string, spec SeedKeySpec
 		KeyHash:          hash,
 		KeyHashAlgo:      algo,
 		Scopes:           listGrant(spec.Scopes),
-		AllowedModels:    allGrant(),
-		AllowedTemplates: allGrant(),
-		AllowedChatbots:  allGrant(),
-		AllowedAgents:    allGrant(),
-		AllowedEndpoints: allGrant(),
+		AllowedModels:    keyGrant(spec.AllowedModels),
+		AllowedTemplates: keyGrant(spec.AllowedTemplates),
+		AllowedChatbots:  keyGrant(spec.AllowedChatbots),
+		AllowedAgents:    keyGrant(spec.AllowedAgents),
+		AllowedEndpoints: keyGrant(spec.AllowedEndpoints),
 		AllowedIPs:       allGrant(),
 		IsActive:         true,
 		ExpiresAt:        spec.ExpiresAt,
@@ -117,6 +132,15 @@ func SeedAPIKey(t *testing.T, db *postgres.DB, tenantID string, spec SeedKeySpec
 		t.Fatalf("seed api key: %v", err)
 	}
 	return plaintext, record
+}
+
+// grantsSpecified reports whether any grant document carries authority —
+// ResourceGrants holds slices, so it is not comparable to the zero value.
+func grantsSpecified(g auth.ResourceGrants) bool {
+	return g.Models.All || len(g.Models.Items) > 0 ||
+		g.Endpoints.All || len(g.Endpoints.Items) > 0 ||
+		g.Assistants.All || len(g.Assistants.Items) > 0 ||
+		g.ExtractTemplates.All || len(g.ExtractTemplates.Items) > 0
 }
 
 func listGrant(items []string) json.RawMessage {
@@ -128,6 +152,15 @@ func listGrant(items []string) json.RawMessage {
 		panic(fmt.Sprintf("marshal list grant: %v", err))
 	}
 	return raw
+}
+
+// keyGrant maps an optional restricted list to its stored document; nil
+// keeps the unrestricted mode:all seed.
+func keyGrant(items *[]string) json.RawMessage {
+	if items == nil {
+		return allGrant()
+	}
+	return listGrant(*items)
 }
 
 func allGrant() json.RawMessage {

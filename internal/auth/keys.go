@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -49,6 +50,22 @@ func (a Allowlist) marshal() json.RawMessage {
 
 func scopeList(scopes []string) json.RawMessage {
 	return Allowlist{Items: scopes}.marshal()
+}
+
+// EncodeAllowlist writes the canonical stored grant document: all →
+// {"mode":"all"}; otherwise {"mode":"list","items":[...]} with items sorted
+// for deterministic storage. It is the write-side counterpart of
+// DecodeAllowlist.
+func EncodeAllowlist(items map[string]struct{}, all bool) json.RawMessage {
+	if all {
+		return json.RawMessage(`{"mode":"all"}`)
+	}
+	keys := make([]string, 0, len(items))
+	for id := range items {
+		keys = append(keys, id)
+	}
+	sort.Strings(keys)
+	return Allowlist{Items: keys}.marshal()
 }
 
 // IssueAPIKey creates a stored tenant-scoped key for an administrator actor

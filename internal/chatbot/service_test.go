@@ -16,6 +16,7 @@ import (
 	"enclava-go/internal/billing"
 	"enclava-go/internal/chatbot"
 	"enclava-go/internal/inference"
+	"enclava-go/internal/jobs"
 	"enclava-go/internal/llm"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
@@ -744,4 +745,134 @@ func resumeBody(t *testing.T, conversationID, content string) []byte {
 		t.Fatalf("marshal resume body: %v", err)
 	}
 	return body
+}
+
+// TestChatbotAccessBoundByStoredGrants drives the real configured chatbot
+// service over stored role grants: the assistants grant is the ONLY access
+// bound for sessions AND keys — at List/Get/run and at the Update/Delete
+// mutations, where ownership AND the grant must both pass (D-25).
+func TestChatbotAccessBoundByStoredGrants(t *testing.T) {
+	ctx := context.Background()
+	db := testdb.New(t)
+	repo := postgres.NewIdentityRepo(db)
+	tenant := testdb.SeedTenant(t, db, "grants-chat")
+	authSvc := auth.NewService(repo, "")
+	svc := chatbot.NewService(postgres.NewChatbotRepo(db), postgres.NewPromptsRepo(db), nil, nil)
+	svc.ConfigureRuns(postgres.NewChatbotRunsRepo(db), jobs.NewService(postgres.NewJobsRepo(db), 0), nil, authSvc)
+
+	creator := testdb.SeedUserWithGrants(t, db, tenant, "creator@example.com",
+		[]string{auth.ScopePlatformAdmin},
+		auth.ResourceGrants{
+			Models:     auth.Allowlist{All: true},
+			Assistants: auth.Allowlist{All: true},
+		})
+	creatorP, err := authSvc.PrincipalForActor(ctx, tenant, creator.ID)
+	if err != nil {
+		t.Fatalf("creator principal: %v", err)
+	}
+	bot, err := svc.Create(ctx, creatorP, chatbot.CreateChatbotInput{
+		Name: "Granted Bot", Model: "chat-test-model", ExternalID: "granted_bot",
+	})
+	if err != nil {
+		t.Fatalf("create bot: %v", err)
+	}
+	bot2, err := svc.Create(ctx, creatorP, chatbot.CreateChatbotInput{
+		Name: "Unlisted Bot", Model: "chat-test-model",
+	})
+	if err != nil {
+		t.Fatalf("create second bot: %v", err)
+	}
+
+	// (a) A member whose role lists the bot sees exactly that bot; the
+	// unlisted second bot is not-found.
+	member := testdb.SeedUserWithGrants(t, db, tenant, "member@example.com", []string{"chatbot"},
+		auth.ResourceGrants{Assistants: auth.Allowlist{Items: []string{bot.ID}}})
+	memberP, err := authSvc.PrincipalForActor(ctx, tenant, member.ID)
+	if err != nil {
+		t.Fatalf("member principal: %v", err)
+	}
+	list, err := svc.List(ctx, memberP)
+	if err != nil || len(list) != 1 || list[0].ID != bot.ID {
+		t.Fatalf("granted member list = %#v err=%v, want exactly bot %s", list, err, bot.ID)
+	}
+	if _, err := svc.Get(ctx, memberP, bot2.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("unlisted bot get = %v, want ErrNoRows", err)
+	}
+
+	// (b) platform.admin scope with explicit empty deny grants NOTHING —
+	// List empty, Get not-found, run refused.
+	denyAdmin := testdb.SeedUserWithGrants(t, db, tenant, "denyadmin@example.com",
+		[]string{auth.ScopePlatformAdmin}, auth.ResourceGrants{})
+	denyAdminP, err := authSvc.PrincipalForActor(ctx, tenant, denyAdmin.ID)
+	if err != nil {
+		t.Fatalf("deny-admin principal: %v", err)
+	}
+	if list, err := svc.List(ctx, denyAdminP); err != nil || len(list) != 0 {
+		t.Fatalf("empty-grant admin list = %#v err=%v, want empty", list, err)
+	}
+	if _, err := svc.Get(ctx, denyAdminP, bot.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("empty-grant admin get = %v, want ErrNoRows", err)
+	}
+	if _, err := svc.StartRun(ctx, denyAdminP, bot.ID, chatbot.AssistantRunInput{Input: "hello"}); !errors.Is(err, chatbot.ErrChatbotNotAllowed) {
+		t.Fatalf("empty-grant admin start run = %v, want ErrChatbotNotAllowed", err)
+	}
+
+	// (d) An API-key-shaped platform.admin principal without assistant
+	// grants is denied identically — the non-session admin bypass is gone.
+	keyAdmin := auth.Principal{
+		TenantID: tenant, ActorID: "key_admin",
+		CredentialKind:   auth.CredentialKindAPIKey,
+		Scopes:           map[string]struct{}{auth.ScopePlatformAdmin: {}},
+		AllowedModelsAll: true,
+	}
+	if list, err := svc.List(ctx, keyAdmin); err != nil || len(list) != 0 {
+		t.Fatalf("restricted key admin list = %#v err=%v, want empty", list, err)
+	}
+	if _, err := svc.Get(ctx, keyAdmin, bot.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("restricted key admin get = %v, want ErrNoRows", err)
+	}
+
+	// (e) Mutations: the granted owner mutates; a granted non-owner and an
+	// empty-grant admin get not-found on both mutations.
+	renamed := "Renamed Bot"
+	if _, err := svc.Update(ctx, creatorP, bot.ID, chatbot.UpdateChatbotInput{Name: &renamed}); err != nil {
+		t.Fatalf("granted owner update: %v", err)
+	}
+	if _, err := svc.Update(ctx, memberP, bot.ID, chatbot.UpdateChatbotInput{Name: &renamed}); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("granted non-owner update = %v, want ErrNoRows", err)
+	}
+	if err := svc.Delete(ctx, memberP, bot.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("granted non-owner delete = %v, want ErrNoRows", err)
+	}
+	if _, err := svc.Update(ctx, denyAdminP, bot.ID, chatbot.UpdateChatbotInput{Name: &renamed}); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("empty-grant admin update = %v, want ErrNoRows", err)
+	}
+	if err := svc.Delete(ctx, denyAdminP, bot.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("empty-grant admin delete = %v, want ErrNoRows", err)
+	}
+
+	// (c) The bot's OWNER loses access the request after its role grant is
+	// revoked — no owner bypass, no re-login.
+	if _, err := db.SQL.ExecContext(ctx,
+		`UPDATE roles SET allowed_assistants = '{"mode":"list","items":[]}'::jsonb
+		 WHERE tenant_id = $1::uuid AND id IN (SELECT role_id FROM user_roles WHERE user_id = $2)`,
+		tenant, creator.ID); err != nil {
+		t.Fatalf("revoke owner grant: %v", err)
+	}
+	revokedOwnerP, err := authSvc.PrincipalForActor(ctx, tenant, creator.ID)
+	if err != nil {
+		t.Fatalf("revoked owner principal: %v", err)
+	}
+	if list, err := svc.List(ctx, revokedOwnerP); err != nil || len(list) != 0 {
+		t.Fatalf("revoked owner list = %#v err=%v, want empty", list, err)
+	}
+	if _, err := svc.StartRun(ctx, revokedOwnerP, bot.ID, chatbot.AssistantRunInput{Input: "hello"}); !errors.Is(err, chatbot.ErrChatbotNotAllowed) {
+		t.Fatalf("revoked owner start run = %v, want ErrChatbotNotAllowed", err)
+	}
+	if _, err := svc.Update(ctx, revokedOwnerP, bot.ID, chatbot.UpdateChatbotInput{Name: &renamed}); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("revoked owner update = %v, want ErrNoRows", err)
+	}
+	if err := svc.Delete(ctx, revokedOwnerP, bot.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("revoked owner delete = %v, want ErrNoRows", err)
+	}
 }

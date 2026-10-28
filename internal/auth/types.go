@@ -24,11 +24,23 @@ type User struct {
 	CreatedAt     time.Time
 }
 
-// Role is a named scope bundle assigned to users.
+// ResourceGrants bundles the four stored AI-resource grant documents a role
+// carries. Every field follows the Allowlist mode contract and denies by
+// default: absent/malformed/empty means no access, never unrestricted.
+type ResourceGrants struct {
+	Models           Allowlist
+	Endpoints        Allowlist
+	Assistants       Allowlist
+	ExtractTemplates Allowlist
+}
+
+// Role is a named scope bundle assigned to users. Grants holds the stored
+// resource grant documents (deny by default); scopes never imply grants.
 type Role struct {
 	ID        string
 	Name      string
 	Scopes    []string
+	Grants    ResourceGrants
 	CreatedAt time.Time
 }
 

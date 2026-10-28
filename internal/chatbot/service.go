@@ -134,19 +134,16 @@ func actorKey(p auth.Principal) string {
 	return strings.TrimSpace(p.ActorID)
 }
 
+// chatbotAllowed is the single stored-grant bound for assistant access:
+// List/Get/run AND the Update/Delete mutations require it (D-25). Neither
+// platform.admin scope nor record ownership substitutes for a grant —
+// ownership only narrows mutations (chatbotOwnerAllowed).
 func chatbotAllowed(p auth.Principal, bot Instance) bool {
 	ids := []string{bot.ID}
 	if ext := strings.TrimSpace(bot.ExternalID); ext != "" {
 		ids = append(ids, ext)
 	}
-	allowed := auth.ChatbotAllowed(p, ids...) || auth.AgentAllowed(p, ids...)
-	if allowed {
-		return true
-	}
-	if p.CredentialKind != auth.CredentialKindSession && !auth.HasScope(p, "platform.admin") {
-		return false
-	}
-	return chatbotOwnerAllowed(p, bot)
+	return auth.ChatbotAllowed(p, ids...) || auth.AgentAllowed(p, ids...)
 }
 func chatbotOwnerAllowed(p auth.Principal, bot Instance) bool {
 	return auth.HasScope(p, "platform.admin") || bot.OwnerActorID != "" && bot.OwnerActorID == actorKey(p)
@@ -267,7 +264,10 @@ func (s *Service) Update(ctx context.Context, p auth.Principal, id string, input
 	if err != nil {
 		return Instance{}, err
 	}
-	if !chatbotOwnerAllowed(p, b) {
+	// Mutation gate: record ownership AND the stored assistant grant must
+	// both pass — a granted non-owner and a revoked owner both get
+	// not-found.
+	if !chatbotOwnerAllowed(p, b) || !chatbotAllowed(p, b) {
 		return Instance{}, sql.ErrNoRows
 	}
 	if input.Name != nil {
@@ -324,7 +324,8 @@ func (s *Service) Delete(ctx context.Context, p auth.Principal, id string) error
 	if err != nil {
 		return err
 	}
-	if !chatbotOwnerAllowed(p, b) {
+	// Same dual gate as Update: ownership AND the stored assistant grant.
+	if !chatbotOwnerAllowed(p, b) || !chatbotAllowed(p, b) {
 		return sql.ErrNoRows
 	}
 	return s.repo.Delete(ctx, p.TenantID, b.ID)

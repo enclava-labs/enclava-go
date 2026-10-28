@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"enclava-go/internal/auth"
@@ -109,15 +110,67 @@ func (r *IdentityRepo) CreateTenant(ctx context.Context, slug, displayName strin
 
 // --- roles -----------------------------------------------------------------
 
+// allowlistDoc encodes a stored Allowlist as the canonical grant document;
+// the slice item form is converted to the decode-canonical set
+// EncodeAllowlist consumes, so every writer emits one document shape.
+func allowlistDoc(a auth.Allowlist) string {
+	items := make(map[string]struct{}, len(a.Items))
+	for _, id := range a.Items {
+		items[id] = struct{}{}
+	}
+	return string(auth.EncodeAllowlist(items, a.All))
+}
+
+// allowlistItems renders a decoded item set as the sorted slice the
+// Allowlist storage type carries.
+func allowlistItems(items map[string]struct{}) []string {
+	out := make([]string, 0, len(items))
+	for id := range items {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// roleGrantsDoc encodes a role's stored grant documents for the four NOT NULL
+// grant columns; zero grants encode the explicit deny document.
+func roleGrantsDoc(g auth.ResourceGrants) [4]string {
+	return [4]string{
+		allowlistDoc(g.Models),
+		allowlistDoc(g.Endpoints),
+		allowlistDoc(g.Assistants),
+		allowlistDoc(g.ExtractTemplates),
+	}
+}
+
+// scanRoleGrants decodes the four allowlist columns; malformed/absent values
+// decode deny-by-default via DecodeAllowlist.
+func scanRoleGrants(models, endpoints, assistants, templates json.RawMessage) auth.ResourceGrants {
+	var g auth.ResourceGrants
+	set, all := auth.DecodeAllowlist(scanRaw(models))
+	g.Models = auth.Allowlist{Items: allowlistItems(set), All: all}
+	set, all = auth.DecodeAllowlist(scanRaw(endpoints))
+	g.Endpoints = auth.Allowlist{Items: allowlistItems(set), All: all}
+	set, all = auth.DecodeAllowlist(scanRaw(assistants))
+	g.Assistants = auth.Allowlist{Items: allowlistItems(set), All: all}
+	set, all = auth.DecodeAllowlist(scanRaw(templates))
+	g.ExtractTemplates = auth.Allowlist{Items: allowlistItems(set), All: all}
+	return g
+}
+
+const roleGrantColumns = `allowed_models, allowed_endpoints, allowed_assistants, allowed_extract_templates`
+
 func (r *IdentityRepo) CreateRole(ctx context.Context, tenantID string, role auth.Role) error {
 	scopes, err := scopesJSON(role.Scopes)
 	if err != nil {
 		return fmt.Errorf("create role: marshal scopes: %w", err)
 	}
+	grants := roleGrantsDoc(role.Grants)
 	_, err = r.db.ExecContext(ctx,
-		`INSERT INTO roles (tenant_id, id, name, scopes)
-		 VALUES ($1::uuid, $2, $3, $4::jsonb)`,
-		tenantID, role.ID, role.Name, scopes)
+		`INSERT INTO roles (tenant_id, id, name, scopes, `+roleGrantColumns+`)
+		 VALUES ($1::uuid, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb)`,
+		tenantID, role.ID, role.Name, scopes,
+		grants[0], grants[1], grants[2], grants[3])
 	if err != nil {
 		return fmt.Errorf("create role: %w", err)
 	}
@@ -139,7 +192,7 @@ func (r *IdentityRepo) AssignRole(ctx context.Context, tenantID, userID, roleID 
 
 func (r *IdentityRepo) RolesForUser(ctx context.Context, tenantID, userID string) ([]auth.Role, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT ro.id, ro.name, ro.scopes, ro.created_at
+		`SELECT ro.id, ro.name, ro.scopes, `+roleGrantColumns+`, ro.created_at
 		 FROM roles ro
 		 JOIN user_roles ur
 		   ON ur.tenant_id = ro.tenant_id AND ur.role_id = ro.id
@@ -155,10 +208,12 @@ func (r *IdentityRepo) RolesForUser(ctx context.Context, tenantID, userID string
 	for rows.Next() {
 		var role auth.Role
 		var raw json.RawMessage
-		if err := rows.Scan(&role.ID, &role.Name, &raw, &role.CreatedAt); err != nil {
+		var models, endpoints, assistants, templates json.RawMessage
+		if err := rows.Scan(&role.ID, &role.Name, &raw, &models, &endpoints, &assistants, &templates, &role.CreatedAt); err != nil {
 			return nil, fmt.Errorf("roles for user: scan: %w", err)
 		}
 		role.Scopes = scopeSlice(raw)
+		role.Grants = scanRoleGrants(models, endpoints, assistants, templates)
 		out = append(out, role)
 	}
 	if err := rows.Err(); err != nil {
@@ -171,7 +226,7 @@ func (r *IdentityRepo) RolesForUser(ctx context.Context, tenantID, userID string
 // path (01-24); RolesForUser stays the per-user membership query.
 func (r *IdentityRepo) ListRoles(ctx context.Context, tenantID string) ([]auth.Role, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, name, scopes, created_at FROM roles
+		`SELECT id, name, scopes, `+roleGrantColumns+`, created_at FROM roles
 		 WHERE tenant_id = $1::uuid ORDER BY id`,
 		tenantID)
 	if err != nil {
@@ -182,10 +237,12 @@ func (r *IdentityRepo) ListRoles(ctx context.Context, tenantID string) ([]auth.R
 	for rows.Next() {
 		var role auth.Role
 		var raw json.RawMessage
-		if err := rows.Scan(&role.ID, &role.Name, &raw, &role.CreatedAt); err != nil {
+		var models, endpoints, assistants, templates json.RawMessage
+		if err := rows.Scan(&role.ID, &role.Name, &raw, &models, &endpoints, &assistants, &templates, &role.CreatedAt); err != nil {
 			return nil, fmt.Errorf("list roles: scan: %w", err)
 		}
 		role.Scopes = scopeSlice(raw)
+		role.Grants = scanRoleGrants(models, endpoints, assistants, templates)
 		out = append(out, role)
 	}
 	return out, rows.Err()
@@ -195,10 +252,11 @@ func (r *IdentityRepo) ListRoles(ctx context.Context, tenantID string) ([]auth.R
 func (r *IdentityRepo) GetRole(ctx context.Context, tenantID, roleID string) (auth.Role, error) {
 	var role auth.Role
 	var raw json.RawMessage
+	var models, endpoints, assistants, templates json.RawMessage
 	err := r.db.QueryRowContext(ctx,
-		`SELECT id, name, scopes, created_at FROM roles
+		`SELECT id, name, scopes, `+roleGrantColumns+`, created_at FROM roles
 		 WHERE tenant_id = $1::uuid AND id = $2`,
-		tenantID, roleID).Scan(&role.ID, &role.Name, &raw, &role.CreatedAt)
+		tenantID, roleID).Scan(&role.ID, &role.Name, &raw, &models, &endpoints, &assistants, &templates, &role.CreatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
 			return auth.Role{}, auth.ErrNotFound
@@ -206,6 +264,7 @@ func (r *IdentityRepo) GetRole(ctx context.Context, tenantID, roleID string) (au
 		return auth.Role{}, fmt.Errorf("get role: %w", err)
 	}
 	role.Scopes = scopeSlice(raw)
+	role.Grants = scanRoleGrants(models, endpoints, assistants, templates)
 	return role, nil
 }
 

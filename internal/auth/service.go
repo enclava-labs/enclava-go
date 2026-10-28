@@ -251,18 +251,53 @@ func (s *Service) AuthenticatePassword(ctx context.Context, tenantID, email, pas
 	return s.principalForUser(ctx, user)
 }
 
-// principalForUser builds a principal for a stored, active user: scopes are
-// the union of the user's assigned role scopes.
+// principalForUser builds a principal for a stored, active user: scopes and
+// AI-resource grants are each the union of the user's assigned roles'
+// stored documents (D-25). No scope — including platform.admin — implies a
+// grant; every *All flag comes from a role storing {"mode":"all"}.
 func (s *Service) principalForUser(ctx context.Context, user User) (Principal, error) {
 	roles, err := s.repo.RolesForUser(ctx, user.TenantID, user.ID)
 	if err != nil {
 		return Principal{}, fmt.Errorf("load user roles: %w", err)
 	}
 	scopes := make(map[string]struct{})
+	models := map[string]struct{}{}
+	endpoints := map[string]struct{}{}
+	assistants := map[string]struct{}{}
+	templates := map[string]struct{}{}
+	var modelsAll, endpointsAll, assistantsAll, templatesAll bool
 	for _, role := range roles {
 		for _, scope := range role.Scopes {
 			if scope != "" {
 				scopes[scope] = struct{}{}
+			}
+		}
+		if role.Grants.Models.All {
+			modelsAll = true
+		} else if !modelsAll {
+			for _, id := range role.Grants.Models.Items {
+				models[id] = struct{}{}
+			}
+		}
+		if role.Grants.Endpoints.All {
+			endpointsAll = true
+		} else if !endpointsAll {
+			for _, id := range role.Grants.Endpoints.Items {
+				endpoints[id] = struct{}{}
+			}
+		}
+		if role.Grants.Assistants.All {
+			assistantsAll = true
+		} else if !assistantsAll {
+			for _, id := range role.Grants.Assistants.Items {
+				assistants[id] = struct{}{}
+			}
+		}
+		if role.Grants.ExtractTemplates.All {
+			templatesAll = true
+		} else if !templatesAll {
+			for _, id := range role.Grants.ExtractTemplates.Items {
+				templates[id] = struct{}{}
 			}
 		}
 	}
@@ -275,17 +310,14 @@ func (s *Service) principalForUser(ctx context.Context, user User) (Principal, e
 		BillingSubjectID:   user.ID,
 		BillingSubjectKind: BillingSubjectUser,
 	}
-	// A user holding platform.admin administers every tenant resource;
-	// item-level allowlists apply to scoped keys and service accounts, not to
-	// the platform administrator's employee session.
-	if _, ok := scopes[ScopePlatformAdmin]; ok {
-		p.AllowedModelsAll = true
-		p.AllowedExtractTemplatesAll = true
-		p.AllowedChatbotsAll = true
-		p.AllowedAgentsAll = true
-		p.AllowedEndpointsAll = true
-		p.AllowedIPsAll = true
-	}
+	// Assistants grants feed BOTH chatbot and agent allowlists — chatbot
+	// access ORs the two (AllowedIPs stays credential-scoped: roles carry
+	// none).
+	p.AllowedModels, p.AllowedModelsAll = models, modelsAll
+	p.AllowedEndpoints, p.AllowedEndpointsAll = endpoints, endpointsAll
+	p.AllowedChatbots, p.AllowedChatbotsAll = assistants, assistantsAll
+	p.AllowedAgents, p.AllowedAgentsAll = assistants, assistantsAll
+	p.AllowedExtractTemplates, p.AllowedExtractTemplatesAll = templates, templatesAll
 	return p, nil
 }
 
