@@ -281,7 +281,20 @@ func (s *SessionAuth) RequireSession(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		principal, ok := s.SessionPrincipal(r)
 		if !ok {
+			// Expired/absent session on an htmx request: 401 + HX-Redirect to
+			// a FULL page (htmx follows the header; a 303 or fragment body
+			// would be swapped into the page). The return target comes from
+			// HX-Current-URL, never the fragment's own RequestURI.
+			if r.Header.Get("HX-Request") != "" {
+				w.Header().Set("HX-Redirect", "/dashboard/login?return_to="+url.QueryEscape(hxLoginReturnTo(r)))
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
 			if r.Method == http.MethodGet {
+				if target := r.URL.RequestURI(); safeLocalRedirect(target) && target != "" {
+					http.Redirect(w, r, "/dashboard/login?return_to="+url.QueryEscape(target), http.StatusSeeOther)
+					return
+				}
 				http.Redirect(w, r, "/dashboard/login", http.StatusSeeOther)
 				return
 			}
@@ -296,6 +309,29 @@ func (s *SessionAuth) RequireSession(next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 		next(w, r.WithContext(auth.WithPrincipal(r.Context(), principal)))
+	}
+}
+
+// RequireSessionScope composes RequireSession with the scope check the API
+// applies through authenticated(scope, ...): the session principal must hold
+// scope before the handler runs. Dashboard routes use it to mirror the
+// permission of the equivalent /api/v1 endpoint — a signed-in member without
+// the scope gets a truthful 403, never tenant-wide data or admin mutations.
+func (s *SessionAuth) RequireSessionScope(scope string, next http.HandlerFunc) http.HandlerFunc {
+	return s.RequireSession(requireSessionScope(scope, next))
+}
+
+// requireSessionScope denies a request whose verified principal lacks scope.
+// It runs inside RequireSession, so the principal is always present; the
+// fail-closed branch still covers a context built without one.
+func requireSessionScope(scope string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		p, ok := auth.PrincipalFromContext(r.Context())
+		if !ok || !auth.HasScope(p, scope) {
+			WriteForbidden(w, "missing required scope: "+scope)
+			return
+		}
+		next(w, r)
 	}
 }
 
@@ -368,6 +404,24 @@ func returnToParam(r *http.Request) string {
 		return target
 	}
 	return ""
+}
+
+// hxLoginReturnTo selects the FULL-page return target for an expired htmx
+// request: the same-origin page identified by HX-Current-URL (absolute URL
+// on this host, or a root-absolute path), else /dashboard. Fragment,
+// partial and login targets are rejected so login never loops and a swap
+// never renders the expired fragment's URL.
+func hxLoginReturnTo(r *http.Request) string {
+	u, err := url.Parse(strings.TrimSpace(r.Header.Get("HX-Current-URL")))
+	if err != nil || (u.Host != "" && u.Host != r.Host) {
+		return "/dashboard"
+	}
+	target := u.RequestURI()
+	if !safeLocalRedirect(target) || u.Path == "" ||
+		strings.HasPrefix(u.Path, "/dashboard/partials/") || u.Path == "/dashboard/login" {
+		return "/dashboard"
+	}
+	return target
 }
 
 // safeLocalRedirect mirrors the service's return_to allowlist: local

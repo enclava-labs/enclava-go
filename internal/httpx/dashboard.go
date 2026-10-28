@@ -43,24 +43,19 @@ var dashboardStaticFiles fs.FS = func() fs.FS {
 	return files
 }()
 
+// dashboardDefaultScopes is the hidden form field's least-privilege default:
+// use/read scopes only. platform.admin and every *.manage grant are absent —
+// the create handler still enforces "scopes ⊆ caller's scopes" on whatever
+// arrives, so a crafted form cannot mint beyond the operator's own authority.
 var dashboardDefaultScopes = []string{
-	"platform.admin",
-	"api_keys.manage",
-	"analytics.read",
-	"budgets.manage",
 	"models.list",
 	"chat.completions",
 	"embeddings.create",
 	"responses",
 	"openai.proxy",
 	"extract",
-	"extract.manage",
 	"rag",
-	"rag.manage",
 	"chatbot",
-	"chatbot.manage",
-	"connectors.manage",
-	"pricing.manage",
 }
 
 type dashboardUsageRow struct {
@@ -108,6 +103,7 @@ type dashboardStatsData struct {
 	ActiveAPIKeys     int
 	RecentExtractJobs int64
 	TotalExtractJobs  int64
+	PlatformAdmin     bool
 }
 
 type dashboardPageCommon struct {
@@ -119,6 +115,18 @@ type dashboardPageCommon struct {
 	KnowledgeReadable bool
 	ConnectorsManage  bool
 	PlatformAdmin     bool
+	scopes            map[string]struct{}
+}
+
+// HasScope mirrors auth.HasScope for templates so nav items stay in step
+// with the route gates — a link is hidden when the session principal could
+// only ever receive a 403 from the page behind it.
+func (d dashboardPageCommon) HasScope(scope string) bool {
+	if _, ok := d.scopes["*"]; ok {
+		return true
+	}
+	_, ok := d.scopes[scope]
+	return ok
 }
 
 // dashboardIdentityData feeds page_identity: the signed-in account plus the
@@ -163,40 +171,44 @@ func (a *App) registerDashboardRoutes() {
 			http.NotFound(w, r)
 		}
 	})
+	// Dashboard data endpoints carry the same scope as the equivalent
+	// /api/v1 route — session sign-in alone never widens what a member may
+	// read or change. Mutating POST branches keep an additional *.manage
+	// check inside the handlers where the API splits read and write scopes.
 	a.mux.HandleFunc("/dashboard/partials/stats", a.sessionAuth.RequireSession(a.handleDashboardStats))
-	a.mux.HandleFunc("/dashboard/partials/keys", a.sessionAuth.RequireSession(a.handleDashboardAPIKeys))
-	a.mux.HandleFunc("/dashboard/partials/usage", a.sessionAuth.RequireSession(a.handleDashboardUsage))
+	a.mux.HandleFunc("/dashboard/partials/keys", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardAPIKeys))
+	a.mux.HandleFunc("/dashboard/partials/usage", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardUsage))
 	a.mux.HandleFunc("/dashboard/partials/budgets", a.sessionAuth.RequireSession(a.handleDashboardBudgets))
-	a.mux.HandleFunc("/dashboard/partials/extract", a.sessionAuth.RequireSession(a.handleDashboardExtract))
-	a.mux.HandleFunc("/dashboard/partials/extract/templates", a.sessionAuth.RequireSession(a.handleDashboardExtractTemplates))
-	a.mux.HandleFunc("/dashboard/partials/extract/templates/", a.sessionAuth.RequireSession(a.handleDashboardExtractTemplateByID))
-	a.mux.HandleFunc("/dashboard/partials/extract/reset-defaults", a.sessionAuth.RequireSession(a.handleDashboardExtractResetDefaults))
-	a.mux.HandleFunc("/dashboard/partials/extract/settings", a.sessionAuth.RequireSession(a.handleDashboardExtractSettings))
-	a.mux.HandleFunc("/dashboard/partials/extract/jobs", a.sessionAuth.RequireSession(a.handleDashboardExtractJobs))
-	a.mux.HandleFunc("/dashboard/partials/extract/process", a.sessionAuth.RequireSession(a.handleDashboardExtractProcess))
-	a.mux.HandleFunc("/dashboard/partials/extract/models", a.sessionAuth.RequireSession(a.handleDashboardExtractModels))
-	a.mux.HandleFunc("/dashboard/partials/providers", a.sessionAuth.RequireSession(a.handleDashboardProviders))
-	a.mux.HandleFunc("/dashboard/partials/pricing", a.sessionAuth.RequireSession(a.handleDashboardPricing))
-	a.mux.HandleFunc("/dashboard/partials/billing-audit", a.sessionAuth.RequireSession(a.handleDashboardBillingAudit))
-	a.mux.HandleFunc("/dashboard/partials/rag", a.sessionAuth.RequireSession(a.handleDashboardRAG))
-	a.mux.HandleFunc("/dashboard/partials/chatbots", a.sessionAuth.RequireSession(a.handleDashboardChatbots))
-	a.mux.HandleFunc("/dashboard/partials/prompt-templates", a.sessionAuth.RequireSession(a.handleDashboardPromptTemplates))
-	a.mux.HandleFunc("/dashboard/partials/mcp", a.sessionAuth.RequireSession(a.handleDashboardMCP))
-	a.mux.HandleFunc("/dashboard/partials/connectors", a.sessionAuth.RequireSession(a.handleDashboardConnectors))
-	a.mux.HandleFunc("/dashboard/rag/documents/", a.sessionAuth.RequireSession(a.handleDashboardRAGDocumentDownload))
+	a.mux.HandleFunc("/dashboard/partials/extract", a.sessionAuth.RequireSessionScope("extract", a.handleDashboardExtract))
+	a.mux.HandleFunc("/dashboard/partials/extract/templates", a.sessionAuth.RequireSessionScope("extract", a.handleDashboardExtractTemplates))
+	a.mux.HandleFunc("/dashboard/partials/extract/templates/", a.sessionAuth.RequireSessionScope("extract.manage", a.handleDashboardExtractTemplateByID))
+	a.mux.HandleFunc("/dashboard/partials/extract/reset-defaults", a.sessionAuth.RequireSessionScope("extract.manage", a.handleDashboardExtractResetDefaults))
+	a.mux.HandleFunc("/dashboard/partials/extract/settings", a.sessionAuth.RequireSessionScope("extract", a.handleDashboardExtractSettings))
+	a.mux.HandleFunc("/dashboard/partials/extract/jobs", a.sessionAuth.RequireSessionScope("extract", a.handleDashboardExtractJobs))
+	a.mux.HandleFunc("/dashboard/partials/extract/process", a.sessionAuth.RequireSessionScope("extract", a.handleDashboardExtractProcess))
+	a.mux.HandleFunc("/dashboard/partials/extract/models", a.sessionAuth.RequireSessionScope("extract", a.handleDashboardExtractModels))
+	a.mux.HandleFunc("/dashboard/partials/providers", a.sessionAuth.RequireSessionScope("pricing.manage", a.handleDashboardProviders))
+	a.mux.HandleFunc("/dashboard/partials/pricing", a.sessionAuth.RequireSessionScope("pricing.manage", a.handleDashboardPricing))
+	a.mux.HandleFunc("/dashboard/partials/billing-audit", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardBillingAudit))
+	a.mux.HandleFunc("/dashboard/partials/rag", a.sessionAuth.RequireSessionScope("rag", a.handleDashboardRAG))
+	a.mux.HandleFunc("/dashboard/partials/chatbots", a.sessionAuth.RequireSessionScope("chatbot", a.handleDashboardChatbots))
+	a.mux.HandleFunc("/dashboard/partials/prompt-templates", a.sessionAuth.RequireSessionScope("chatbot", a.handleDashboardPromptTemplates))
+	a.mux.HandleFunc("/dashboard/partials/mcp", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardMCP))
+	a.mux.HandleFunc("/dashboard/partials/connectors", a.sessionAuth.RequireSessionScope("connectors.manage", a.handleDashboardConnectors))
+	a.mux.HandleFunc("/dashboard/rag/documents/", a.sessionAuth.RequireSessionScope("rag", a.handleDashboardRAGDocumentDownload))
 	a.mux.HandleFunc("/dashboard/documents", a.sessionAuth.RequireSession(a.handleDashboardPageDocuments))
-	a.mux.HandleFunc("/dashboard/extract", a.sessionAuth.RequireSession(a.handleDashboardPageExtract))
-	a.mux.HandleFunc("/dashboard/keys", a.sessionAuth.RequireSession(a.handleDashboardPageKeys))
+	a.mux.HandleFunc("/dashboard/extract", a.sessionAuth.RequireSessionScope("extract", a.handleDashboardPageExtract))
+	a.mux.HandleFunc("/dashboard/keys", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardPageKeys))
 	a.mux.HandleFunc("/dashboard/budgets", a.sessionAuth.RequireSession(a.handleDashboardPageBudgets))
-	a.mux.HandleFunc("/dashboard/analytics", a.sessionAuth.RequireSession(a.handleDashboardPageAnalytics))
-	a.mux.HandleFunc("/dashboard/providers", a.sessionAuth.RequireSession(a.handleDashboardPageProviders))
-	a.mux.HandleFunc("/dashboard/pricing", a.sessionAuth.RequireSession(a.handleDashboardPagePricing))
-	a.mux.HandleFunc("/dashboard/billing-audit", a.sessionAuth.RequireSession(a.handleDashboardPageBillingAudit))
-	a.mux.HandleFunc("/dashboard/rag", a.sessionAuth.RequireSession(a.handleDashboardPageRAG))
-	a.mux.HandleFunc("/dashboard/chatbots", a.sessionAuth.RequireSession(a.handleDashboardPageChatbots))
-	a.mux.HandleFunc("/dashboard/prompt-templates", a.sessionAuth.RequireSession(a.handleDashboardPagePromptTemplates))
-	a.mux.HandleFunc("/dashboard/connectors", a.sessionAuth.RequireSession(a.handleDashboardPageConnectors))
-	a.mux.HandleFunc("/dashboard/mcp", a.sessionAuth.RequireSession(a.handleDashboardPageMCP))
+	a.mux.HandleFunc("/dashboard/analytics", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardPageAnalytics))
+	a.mux.HandleFunc("/dashboard/providers", a.sessionAuth.RequireSessionScope("pricing.manage", a.handleDashboardPageProviders))
+	a.mux.HandleFunc("/dashboard/pricing", a.sessionAuth.RequireSessionScope("pricing.manage", a.handleDashboardPagePricing))
+	a.mux.HandleFunc("/dashboard/billing-audit", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardPageBillingAudit))
+	a.mux.HandleFunc("/dashboard/rag", a.sessionAuth.RequireSessionScope("rag", a.handleDashboardPageRAG))
+	a.mux.HandleFunc("/dashboard/chatbots", a.sessionAuth.RequireSessionScope("chatbot", a.handleDashboardPageChatbots))
+	a.mux.HandleFunc("/dashboard/prompt-templates", a.sessionAuth.RequireSessionScope("chatbot", a.handleDashboardPagePromptTemplates))
+	a.mux.HandleFunc("/dashboard/connectors", a.sessionAuth.RequireSessionScope("connectors.manage", a.handleDashboardPageConnectors))
+	a.mux.HandleFunc("/dashboard/mcp", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardPageMCP))
 	a.mux.HandleFunc("/dashboard/identity", a.sessionAuth.RequireSession(a.handleDashboardPageIdentity))
 	a.mux.HandleFunc("/dashboard", a.sessionAuth.RequireSession(a.handleDashboardPage))
 	a.mux.HandleFunc("/dashboard/", a.sessionAuth.RequireSession(a.handleDashboardPage))
@@ -210,7 +222,8 @@ func (a *App) dashboardPageData(r *http.Request, activePage, pageTitle string) d
 		DefaultScopes: strings.Join(dashboardDefaultScopes, ", "),
 	}
 	if principal, ok := auth.PrincipalFromContext(r.Context()); ok {
-		data.KnowledgeReadable = auth.HasScope(principal, "rag") || auth.HasScope(principal, "connectors.manage")
+		data.scopes = principal.Scopes
+		data.KnowledgeReadable = auth.HasScope(principal, "rag")
 		data.ConnectorsManage = auth.HasScope(principal, "connectors.manage")
 		data.PlatformAdmin = auth.HasScope(principal, "platform.admin")
 	}
@@ -254,6 +267,12 @@ func (a *App) handleDashboardPageIdentity(w http.ResponseWriter, r *http.Request
 func (a *App) handleDashboardPage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		WriteMethodNotAllowed(w)
+		return
+	}
+	// The /dashboard/ subtree registration funnels unknown paths here; only
+	// the exact Home paths render Home — everything else is a truthful 404.
+	if r.URL.Path != "/dashboard" && r.URL.Path != "/dashboard/" {
+		a.sessionAuth.renderDashboardNotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -339,6 +358,12 @@ func (a *App) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	p, ok := auth.PrincipalFromContext(r.Context())
+	if !ok || p.TenantID == "" {
+		WriteUnauthorized(w, "authenticated principal required")
+		return
+	}
+
 	keys, err := a.identity.ListAPIKeys(r.Context(), tenantID)
 	if err != nil {
 		log.Printf("failed to load dashboard stats keys: %v", err)
@@ -346,20 +371,22 @@ func (a *App) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Only an administrator sees the tenant-wide key count; other members get
+	// their own keys' count — the same data their own credentials could see.
+	tenantWideKeys := auth.HasScope(p, auth.ScopePlatformAdmin)
 	activeKeys := 0
 	for _, key := range keys {
-		if key.IsActive {
-			activeKeys++
+		if !key.IsActive {
+			continue
 		}
+		if !tenantWideKeys && key.OwnerUserID != p.UserID {
+			continue
+		}
+		activeKeys++
 	}
 
 	var recentExtractJobs int64
 	if a.extractSvc != nil {
-		p, ok := auth.PrincipalFromContext(r.Context())
-		if !ok || p.TenantID == "" {
-			WriteUnauthorized(w, "authenticated principal required")
-			return
-		}
 		since := time.Now().UTC().Add(-24 * time.Hour)
 		recentExtractJobs, _, err = a.extractSvc.JobStats(r.Context(), p, since)
 		if err != nil {
@@ -376,6 +403,7 @@ func (a *App) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 	if err := dashboardTemplates.ExecuteTemplate(w, "partial-stats", dashboardStatsData{
 		ActiveAPIKeys:     activeKeys,
 		RecentExtractJobs: recentExtractJobs,
+		PlatformAdmin:     tenantWideKeys,
 	}); err != nil {
 		log.Printf("failed to render dashboard stats: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_stats_render_failed")
@@ -564,6 +592,12 @@ func (a *App) createDashboardAPIKey(w http.ResponseWriter, r *http.Request, tena
 		a.renderDashboardKeys(w, r.Context(), tenantID, err.Error())
 		return
 	}
+	// Same rule as the admin API route: a key's scopes must be a subset of
+	// the operator's own — the dashboard form cannot mint beyond them.
+	if !principalCoversScopes(principal, key.Scopes) {
+		a.renderDashboardKeys(w, r.Context(), tenantID, "Key scopes must be a subset of your scopes")
+		return
+	}
 	plaintext, prefix, hash, usedAlgo, err := a.generateKey(a.apiKeyPrefix, a.apiKeyAlgo, a.apiKeyPepper)
 	if err != nil {
 		log.Printf("failed to generate dashboard API key: %v", err)
@@ -705,7 +739,12 @@ func (a *App) handleDashboardBudgets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	subject := billingSubjectOf(p)
-	subjects := []billing.Subject{subject, {Type: billing.BudgetSubjectTenant, ID: tenantID}}
+	subjects := []billing.Subject{subject}
+	// The tenant-wide budget subject is administrator data; members see only
+	// the budgets their own billing subject is bound to.
+	if auth.HasScope(p, auth.ScopePlatformAdmin) {
+		subjects = append(subjects, billing.Subject{Type: billing.BudgetSubjectTenant, ID: tenantID})
+	}
 	if p.CredentialKind == auth.CredentialKindAPIKey && p.CredentialID != "" {
 		subjects = append(subjects, billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: p.CredentialID})
 	}

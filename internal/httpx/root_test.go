@@ -91,13 +91,26 @@ func newSessionApp(t *testing.T) (*App, *postgres.IdentityRepo, string) {
 func TestDashboardSessionLoginFlow(t *testing.T) {
 	app, repo, tenant := newSessionApp(t)
 	seedLoginUser(t, repo, tenant, "login@example.com", "correct-horse")
+	// The keys partial requires platform.admin, and creation enforces
+	// scopes ⊆ caller — grant the form's default set so the CSRF-success
+	// assertion below exercises a permitted mint.
+	role := auth.Role{
+		ID: "role_login_admin", Name: "admin",
+		Scopes: append([]string{auth.ScopePlatformAdmin}, dashboardDefaultScopes...),
+	}
+	if err := repo.CreateRole(context.Background(), tenant, role); err != nil {
+		t.Fatalf("seed admin role: %v", err)
+	}
+	if err := repo.AssignRole(context.Background(), tenant, "user_login_test", role.ID); err != nil {
+		t.Fatalf("assign admin role: %v", err)
+	}
 
 	// Unauthenticated GET redirects to login.
 	req := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
 	rec := httptest.NewRecorder()
 	app.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/dashboard/login" {
-		t.Fatalf("expected 303 to /dashboard/login, got %d %q", rec.Code, rec.Header().Get("Location"))
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/dashboard/login?return_to=%2Fdashboard" {
+		t.Fatalf("expected 303 to /dashboard/login with return_to, got %d %q", rec.Code, rec.Header().Get("Location"))
 	}
 
 	// Login page renders; no OIDC providers configured → none listed.
@@ -190,7 +203,33 @@ func TestDashboardSessionLoginFlow(t *testing.T) {
 	req.AddCookie(session)
 	rec = httptest.NewRecorder()
 	app.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/dashboard/login" {
-		t.Fatalf("post-logout GET expected 303 to login, got %d %q", rec.Code, rec.Header().Get("Location"))
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/dashboard/login?return_to=%2Fdashboard" {
+		t.Fatalf("post-logout GET expected 303 to login with return_to, got %d %q", rec.Code, rec.Header().Get("Location"))
+	}
+}
+
+// TestDashboardUnknownPathReturns404 pins the catch-all: an authenticated
+// request to an unregistered /dashboard/* path renders the 404 page — it
+// used to leak Home with 200 — while the exact Home paths still render 200.
+func TestDashboardUnknownPathReturns404(t *testing.T) {
+	app, repo, tenant := newSessionApp(t)
+	seedLoginUser(t, repo, tenant, "catchall@example.com", "correct-horse")
+
+	rec, session, _ := postLogin(t, app, "catchall@example.com", "correct-horse", "")
+
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/not-a-real-page", nil)
+	req.AddCookie(session)
+	rec = httptest.NewRecorder()
+	app.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown dashboard path expected 404, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	req.AddCookie(session)
+	rec = httptest.NewRecorder()
+	app.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("exact /dashboard expected 200 Home, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
