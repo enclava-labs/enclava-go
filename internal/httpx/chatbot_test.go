@@ -326,6 +326,9 @@ func TestChatbotAndPromptReadsHonorAllowlist(t *testing.T) {
 		Model:            "chat-test-model",
 		ExternalID:       "allowed_ext",
 		PromptTemplateID: allowedTemplate.ID,
+		// This test is about grant allowlists; a tenant-wide audience keeps
+		// the audience term out of the picture.
+		Audience: []string{"*"},
 	})
 	if err != nil {
 		t.Fatalf("create allowed bot: %v", err)
@@ -335,6 +338,7 @@ func TestChatbotAndPromptReadsHonorAllowlist(t *testing.T) {
 		Model:            "chat-test-model",
 		ExternalID:       "hidden_ext",
 		PromptTemplateID: hiddenTemplate.ID,
+		Audience:         []string{"*"},
 	})
 	if err != nil {
 		t.Fatalf("create hidden bot: %v", err)
@@ -513,5 +517,207 @@ func TestAgentRunErrorsMapToClientStatuses(t *testing.T) {
 		if rec.Code != tc.code {
 			t.Errorf("%v status=%d, want %d", tc.err, rec.Code, tc.code)
 		}
+	}
+}
+
+// conversationsPayload mirrors the frozen OA-13 envelope.
+type conversationsPayload struct {
+	Conversations []chatbot.ConversationSummary `json:"conversations"`
+	NextCursor    string                        `json:"next_cursor"`
+}
+
+func getConversations(t *testing.T, app *App, principal auth.Principal, query string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/conversations"+query, nil)
+	rec := httptest.NewRecorder()
+	app.handleConversations(rec, req, principal)
+	return rec
+}
+
+// TestConversationsHandlerOwnOnlyAndPaging proves the OA-13 handler: own
+// conversations only (member AND admin), hidden assistants filtered, the
+// frozen payload shape, disjoint keyset pages and a 400 on malformed
+// cursors.
+func TestConversationsHandlerOwnOnlyAndPaging(t *testing.T) {
+	ctx := context.Background()
+	db := testdb.New(t)
+	tenantID := testdb.SeedTenant(t, db, "conversations-http")
+	chatRepo := postgres.NewChatbotRepo(db)
+	chatSvc := chatbot.NewService(chatRepo, postgres.NewPromptsRepo(db), nil, nil)
+	app := &App{chatbotSvc: chatSvc}
+
+	creator := openChatPrincipal(tenantID)
+	botVisible, err := chatSvc.Create(ctx, creator, chatbot.CreateChatbotInput{
+		Name: "Visible Bot", Model: "chat-test-model", Audience: []string{"member_actor"},
+	})
+	if err != nil {
+		t.Fatalf("create visible bot: %v", err)
+	}
+	botHidden, err := chatSvc.Create(ctx, creator, chatbot.CreateChatbotInput{
+		Name: "Hidden Bot", Model: "chat-test-model", Audience: []string{},
+	})
+	if err != nil {
+		t.Fatalf("create hidden bot: %v", err)
+	}
+	member := auth.Principal{TenantID: tenantID, ActorID: "member_actor",
+		AllowedChatbots: map[string]struct{}{botVisible.ID: {}, botHidden.ID: {}}}
+
+	seed := func(id, owner, botID, content string) {
+		t.Helper()
+		if err := chatRepo.CreateConversation(ctx, chatbot.Conversation{
+			TenantID: tenantID, ID: id, ChatbotID: botID, OwnerActorID: owner,
+		}); err != nil {
+			t.Fatalf("seed conversation %s: %v", id, err)
+		}
+		if err := chatRepo.AddMessage(ctx, chatbot.Message{
+			TenantID: tenantID, ID: id + "_msg", ConversationID: id,
+			Role: "user", Content: content, OwnerActorID: owner,
+		}); err != nil {
+			t.Fatalf("seed message %s: %v", id, err)
+		}
+	}
+	seed("conv_new", "member_actor", botVisible.ID, "newer conversation")
+	seed("conv_old", "member_actor", botVisible.ID, "older conversation")
+	seed("conv_hidden", "member_actor", botHidden.ID, "hidden history")
+	seed("conv_foreign", "someone_else", botVisible.ID, "not mine")
+	// conv_new is the newest; age conv_old so the order is deterministic.
+	if _, err := db.SQL.ExecContext(ctx,
+		`UPDATE conversations SET created_at = '2020-01-01T00:00:00Z'::timestamptz
+		 WHERE tenant_id = $1::uuid AND id = 'conv_old'`, tenantID); err != nil {
+		t.Fatalf("age conversation: %v", err)
+	}
+
+	// Member: own visible rows only, in the frozen envelope shape.
+	rec := getConversations(t, app, member, "?limit=10")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("member list status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var payload conversationsPayload
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode member list: %v", err)
+	}
+	if len(payload.Conversations) != 2 || payload.Conversations[0].ID != "conv_new" || payload.Conversations[1].ID != "conv_old" {
+		t.Fatalf("member conversations = %#v", payload.Conversations)
+	}
+	first := payload.Conversations[0]
+	if first.ChatbotID != botVisible.ID || first.AssistantName != "Visible Bot" || first.Title != "newer conversation" {
+		t.Fatalf("summary shape = %#v", first)
+	}
+	if first.CreatedAt.IsZero() || first.UpdatedAt.IsZero() {
+		t.Fatalf("summary timestamps missing: %#v", first)
+	}
+	if payload.NextCursor != "" {
+		t.Fatalf("next_cursor = %q on a complete page", payload.NextCursor)
+	}
+
+	// Cursor paging: two disjoint pages over limit=1.
+	rec = getConversations(t, app, member, "?limit=1")
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil || len(payload.Conversations) != 1 {
+		t.Fatalf("page 1 = %s err=%v", rec.Body.String(), err)
+	}
+	if payload.NextCursor == "" {
+		t.Fatal("page 1 must carry a next_cursor")
+	}
+	firstPage := payload.Conversations[0].ID
+	rec = getConversations(t, app, member, "?limit=1&cursor="+url.QueryEscape(payload.NextCursor))
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil || len(payload.Conversations) != 1 {
+		t.Fatalf("page 2 = %s err=%v", rec.Body.String(), err)
+	}
+	if payload.Conversations[0].ID == firstPage {
+		t.Fatal("page 2 repeated page 1's row")
+	}
+	if payload.NextCursor != "" {
+		t.Fatalf("page 2 must end the list, next_cursor = %q", payload.NextCursor)
+	}
+
+	// Malformed cursor is a 400, never an ignored parameter (plain chars
+	// survive query parsing but fail the cursor payload check).
+	if rec := getConversations(t, app, member, "?cursor=not-a-cursor"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("malformed cursor status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	// Admin sees only their own conversations — none seeded, none leaked.
+	admin := auth.Principal{TenantID: tenantID, ActorID: "admin_actor",
+		Scopes: map[string]struct{}{auth.ScopePlatformAdmin: {}}, AllowedChatbotsAll: true}
+	rec = getConversations(t, app, admin, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin list status = %d", rec.Code)
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil || len(payload.Conversations) != 0 {
+		t.Fatalf("admin conversations = %s err=%v, want own-only empty", rec.Body.String(), err)
+	}
+
+	// Non-GET is a 405; a nil chatbot service is a 501 not_configured.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/conversations", strings.NewReader("{}"))
+	rec = httptest.NewRecorder()
+	app.handleConversations(rec, req, member)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST status = %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	(&App{}).handleConversations(rec, httptest.NewRequest(http.MethodGet, "/api/v1/conversations", nil), member)
+	if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), "not_configured") {
+		t.Fatalf("nil service status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestConversationsRouteSessionAuth drives the registered route over the
+// real mux: unauthenticated requests are refused by session auth and a
+// granted member session gets exactly their own rows.
+func TestConversationsRouteSessionAuth(t *testing.T) {
+	f := newIdentityFixture(t)
+	ctx := context.Background()
+	chatRepo := postgres.NewChatbotRepo(f.db)
+	if err := chatRepo.Create(ctx, chatbot.Instance{
+		TenantID: f.tenant, ID: "bot_conv", ExternalID: "bot_conv_ext",
+		Name: "Conv Bot", Model: "m", IsEnabled: true,
+		OwnerActorID: "seed_owner", Audience: []string{"*"},
+	}); err != nil {
+		t.Fatalf("seed bot: %v", err)
+	}
+
+	sess, csrf := loginUserWithGrants(t, f, "conv-member@example.com", []string{"chatbot"},
+		auth.ResourceGrants{Assistants: auth.Allowlist{Items: []string{"bot_conv"}}}, "member-pass")
+	var memberID string
+	if err := f.db.SQL.QueryRowContext(ctx,
+		`SELECT id::text FROM users WHERE tenant_id = $1::uuid AND email = $2`,
+		f.tenant, "conv-member@example.com").Scan(&memberID); err != nil {
+		t.Fatalf("read member id: %v", err)
+	}
+	for _, conv := range []struct{ id, owner string }{
+		{"conv_member_1", memberID},
+		{"conv_foreign", "someone_else"},
+	} {
+		if err := chatRepo.CreateConversation(ctx, chatbot.Conversation{
+			TenantID: f.tenant, ID: conv.id, ChatbotID: "bot_conv", OwnerActorID: conv.owner,
+		}); err != nil {
+			t.Fatalf("seed conversation %s: %v", conv.id, err)
+		}
+		if err := chatRepo.AddMessage(ctx, chatbot.Message{
+			TenantID: f.tenant, ID: conv.id + "_msg", ConversationID: conv.id,
+			Role: "user", Content: "hello from " + conv.owner, OwnerActorID: conv.owner,
+		}); err != nil {
+			t.Fatalf("seed message %s: %v", conv.id, err)
+		}
+	}
+
+	// No credential at all: authentication fails before any scope check.
+	if rec := f.do(t, http.MethodGet, "/api/v1/conversations", "", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec := sessionDo(t, f.app, http.MethodGet, "/api/v1/conversations", "", sess, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("member session GET = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload conversationsPayload
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode session list: %v", err)
+	}
+	if len(payload.Conversations) != 1 || payload.Conversations[0].ID != "conv_member_1" {
+		t.Fatalf("session conversations = %#v, want only conv_member_1", payload.Conversations)
+	}
+	if payload.Conversations[0].AssistantName != "Conv Bot" || payload.Conversations[0].Title != "hello from "+memberID {
+		t.Fatalf("session summary = %#v", payload.Conversations[0])
 	}
 }

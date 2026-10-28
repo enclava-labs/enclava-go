@@ -177,7 +177,7 @@ func (t *StreamableHTTP) Call(ctx context.Context, s Server, a Approval, remote 
 		if len(outputSchema) == 0 {
 			outputSchema = json.RawMessage(`{}`)
 		}
-		if tool.Name == remote && SchemaHash(tool.InputSchema) == a.InputSchemaHash && SchemaHash(outputSchema) == a.OutputSchemaHash {
+		if tool.Name == remote && SchemaDigest(tool.InputSchema) == a.InputSchemaHash && SchemaDigest(outputSchema) == a.OutputSchemaHash {
 			found = true
 			break
 		}
@@ -226,10 +226,23 @@ func (t *StreamableHTTP) Call(ctx context.Context, s Server, a Approval, remote 
 	return payload, nil
 }
 
+// ToolAnnotations carries only the MCP spec's display hints. They are
+// untrusted UI metadata surfaced verbatim — never authorization evidence.
+type ToolAnnotations struct {
+	Title           string `json:"title,omitempty"`
+	ReadOnlyHint    *bool  `json:"readOnlyHint,omitempty"`
+	DestructiveHint *bool  `json:"destructiveHint,omitempty"`
+	IdempotentHint  *bool  `json:"idempotentHint,omitempty"`
+	OpenWorldHint   *bool  `json:"openWorldHint,omitempty"`
+}
+
 type DiscoveredTool struct {
 	Name         string          `json:"name"`
+	Title        string          `json:"title,omitempty"`
+	Description  string          `json:"description,omitempty"`
 	InputSchema  json.RawMessage `json:"inputSchema"`
 	OutputSchema json.RawMessage `json:"outputSchema"`
+	Annotations  ToolAnnotations `json:"annotations"`
 }
 
 // Discover lists a bounded snapshot without approving or enabling any tool.
@@ -337,6 +350,10 @@ func (t *StreamableHTTP) Discover(ctx context.Context, s Server) ([]DiscoveredTo
 	for i := range response.Result.Tools {
 		tool := &response.Result.Tools[i]
 		if tool.Name == "" || !json.Valid(tool.InputSchema) {
+			return nil, ErrDenied
+		}
+		// Descriptive metadata is bounded display text, not free storage.
+		if len(tool.Title) > 1024 || len(tool.Description) > 4096 || len(tool.Annotations.Title) > 1024 {
 			return nil, ErrDenied
 		}
 		if len(tool.OutputSchema) == 0 {

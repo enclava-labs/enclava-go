@@ -55,7 +55,7 @@ func TestStreamableHTTPCallChecksApprovedSchemaAndUsesSession(t *testing.T) {
 			if len(out) > 0 {
 				outputSchema = `,"outputSchema":` + string(out)
 			}
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + stringInt(req.ID) + `,"result":{"tools":[{"name":"remote","inputSchema":` + string(in) + outputSchema + `,"annotations":{"readOnlyHint":true}}]}}`))
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + stringInt(req.ID) + `,"result":{"tools":[{"name":"remote","title":"Remote Tool","description":"Finds things","inputSchema":` + string(in) + outputSchema + `,"annotations":{"readOnlyHint":true,"title":"R"}}]}}`))
 		case "tools/call":
 			if req.Params.Name != "remote" {
 				t.Errorf("called name=%q", req.Params.Name)
@@ -72,7 +72,7 @@ func TestStreamableHTTPCallChecksApprovedSchemaAndUsesSession(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	a := Approval{RemoteName: "remote", InputSchema: in, OutputSchema: out, InputSchemaHash: SchemaHash(in), OutputSchemaHash: SchemaHash(out)}
+	a := Approval{RemoteName: "remote", InputSchema: in, OutputSchema: out, InputSchemaHash: SchemaDigest(in), OutputSchemaHash: SchemaDigest(out)}
 	got, err := (&StreamableHTTP{}).Call(context.Background(), Server{TenantID: "t", Origin: srv.URL, EndpointPath: "/mcp", AuthorizedPrivate: true}, a, "remote", json.RawMessage(`{"q":"x"}`), 1024)
 	if err != nil {
 		t.Fatal(err)
@@ -88,12 +88,15 @@ func TestStreamableHTTPCallChecksApprovedSchemaAndUsesSession(t *testing.T) {
 	if err != nil || len(discovered) != 1 || discovered[0].Name != "remote" {
 		t.Fatalf("discovery=%v err=%v", discovered, err)
 	}
+	if discovered[0].Title != "Remote Tool" || discovered[0].Description != "Finds things" || discovered[0].Annotations.Title != "R" || discovered[0].Annotations.ReadOnlyHint == nil || !*discovered[0].Annotations.ReadOnlyHint {
+		t.Fatalf("safe metadata dropped: %+v", discovered[0])
+	}
 	if strings.Join(methods, ",") != "initialize,notifications/initialized,tools/list" {
 		t.Fatalf("discovery methods=%v", methods)
 	}
 	out = json.RawMessage(`{}`)
 	contentOnly = true
-	a.OutputSchema, a.OutputSchemaHash = out, SchemaHash(out)
+	a.OutputSchema, a.OutputSchemaHash = out, SchemaDigest(out)
 	got, err = (&StreamableHTTP{}).Call(context.Background(), Server{TenantID: "t", Origin: srv.URL, EndpointPath: "/mcp", AuthorizedPrivate: true}, a, "remote", json.RawMessage(`{"q":"x"}`), 1024)
 	if err != nil || !strings.HasPrefix(string(got), `[`) {
 		t.Fatalf("content-only result with omitted schema = %s err=%v", got, err)

@@ -113,6 +113,13 @@ func (s *Service) GetRun(ctx context.Context, p auth.Principal, id string) (Assi
 	if err != nil || (!auth.HasScope(p, "platform.admin") && run.OwnerActorID != actorKey(p)) {
 		return AssistantRun{}, ErrRunNotFound
 	}
+	// Current-visibility gate: even the run's owner reads retained runs only
+	// while the CURRENT assistant row still admits them (grant AND audience;
+	// owner/platform.admin bypass the audience term only). Unknown and
+	// forbidden share ErrRunNotFound.
+	if bot, botErr := s.repo.GetByID(ctx, p.TenantID, run.ChatbotID); botErr != nil || !chatbotAllowed(p, bot) {
+		return AssistantRun{}, ErrRunNotFound
+	}
 	if s.jobSvc != nil && run.JobID != "" {
 		if job, jobErr := s.jobSvc.Get(ctx, p, run.JobID); jobErr == nil {
 			run.Status = job.Status
@@ -237,7 +244,10 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 		return "", ErrChatbotNotAllowed
 	}
 	bot.TenantID, bot.OwnerActorID = p.TenantID, currentBot.OwnerActorID
-	if !bot.IsEnabled || !chatbotAllowed(p, bot) {
+	// Admission authorizes against the CURRENT bot row and the CURRENT
+	// principal — never frozen.Assistant, which supplies configuration only.
+	// A run whose audience or grants narrowed while queued fails here.
+	if !bot.IsEnabled || !chatbotAllowed(p, currentBot) {
 		return "", ErrChatbotNotAllowed
 	}
 	if !auth.ModelAllowed(p, bot.Model) {
@@ -255,7 +265,12 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 			return source.ErrDenied
 		}
 		p = current
-		if !chatbotAllowed(p, bot) {
+		// Every privileged refresh re-loads the CURRENT assistant and
+		// re-checks grants AND audience before the pending model/tool
+		// dispatch — a mid-run audience or grant removal aborts the run
+		// here, before any further dispatch executes.
+		liveBot, err := s.repo.GetByID(ctx, p.TenantID, run.ChatbotID)
+		if err != nil || !chatbotAllowed(p, liveBot) {
 			return ErrChatbotNotAllowed
 		}
 		if !auth.ModelAllowed(p, bot.Model) {

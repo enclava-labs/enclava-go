@@ -1,0 +1,294 @@
+{{define "content"}}{{/* Dev-only component gallery (07-04): every UI-SPEC
+     component in inventory order, synthetic fixtures only. Static shell
+     markup — no scripts, no inline handlers, no htmx event hooks (D-20);
+     behaviors ride app.js via data-action hooks already frozen. Deleted at
+     OA-41. */}}
+<header class="head">
+  <div class="headcopy">
+    <div class="crumb">{{.Org}} / Dev</div>
+    <h1>Component gallery</h1>
+    <p class="desc">Every shared shell component rendered with example data. Dev-only page — deleted in phase 12.</p>
+  </div>
+  <div class="right-mobile">
+    <button type="button" class="btn primary">{{icon "plus"}}Example action</button>
+    <button type="button" class="btn">{{icon "refresh"}}Refresh</button>
+    <button type="button" class="btn ghost" data-action="theme">{{icon "sun"}}Theme</button>
+    <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete example collection?">Delete</button>
+    <button type="button" class="iconbtn" aria-label="Notifications">{{icon "bell"}}<span class="visually-hidden">Notifications</span></button>
+  </div>
+</header>
+<nav class="tabs" aria-label="Example sections">
+  <a class="tab active" href="#gallery-components" aria-current="page">Components</a>
+  <a class="tab" href="#gallery-table">Table</a>
+  <a class="tab" href="#gallery-chat">Chat</a>
+</nav>
+
+<div class="section" id="gallery-components">
+  <div class="section-head"><h2>Buttons and inputs</h2></div>
+  <div class="card">
+    <div class="row">
+      <button type="button" class="btn primary">{{icon "plus"}}Primary</button>
+      <button type="button" class="btn">Default</button>
+      <button type="button" class="btn ghost">{{icon "external"}}Ghost</button>
+      <button type="button" class="btn danger">{{icon "x"}}Danger</button>
+      <button type="button" class="btn" disabled>Disabled</button>
+      <button type="button" class="iconbtn" aria-label="Copy example"><span class="visually-hidden">Copy</span>{{icon "copy"}}</button>
+      <span class="admin-tag">Example admin tag</span>
+    </div>
+    <div class="filters" role="group" aria-label="Example filters">
+      <button type="button" class="chip active" aria-pressed="true">All</button>
+      <button type="button" class="chip" aria-pressed="false">Example filter</button>
+      <button type="button" class="chip" aria-pressed="false">Another filter</button>
+      <button type="button" class="chip" data-action="theme" aria-pressed="false">Toggle theme</button>
+    </div>
+    <div class="grid two">
+      <div>
+        <label class="label" for="gallery-input">Example input</label>
+        <input class="field" id="gallery-input" type="text" placeholder="Example placeholder">
+        <span class="help">Plain helper text under the field.</span>
+      </div>
+      <div>
+        <label class="label" for="gallery-select">Example select</label>
+        <select class="field" id="gallery-select">
+          <option>Example option one</option>
+          <option>Example option two</option>
+        </select>
+      </div>
+      <div>
+        <label class="label" for="gallery-textarea">Example textarea</label>
+        <textarea class="field" id="gallery-textarea" rows="3" placeholder="Example multi-line text"></textarea>
+      </div>
+      <div>
+        <label class="label" for="gallery-required">Required field</label>
+        <input class="field" id="gallery-required" type="text" required aria-describedby="gallery-required-help">
+        <span class="help" id="gallery-required-help">Turns red once touched and left empty (user-invalid).</span>
+      </div>
+      <div>
+        <label class="label" for="gallery-invalid">Field with error</label>
+        <input class="field" id="gallery-invalid" type="text" value="example" aria-describedby="gallery-invalid-error">
+        <span class="field-error" id="gallery-invalid-error">Example error message.</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-head"><h2>Status pills and indicators</h2></div>
+  <div class="card">
+    <div class="row">
+      {{statusPill "document" "ready"}}
+      {{statusPill "document" "syncing"}}
+      {{statusPill "document" "queued"}}
+      {{statusPill "document" "failed"}}
+      {{statusPill "job" "processing"}}
+      {{statusPill "source" "connected"}}
+      {{statusPill "model" "unreachable"}}
+      <span class="pill accent"><i class="dot"></i>Example accent</span>
+      <span class="pill blue"><i class="dot"></i>{{term "writes-data"}}</span>
+      <span class="pill neutral"><i class="dot"></i>{{term "readonly"}}</span>
+      <span class="pill warn"><i class="dot pulse"></i>{{statusLabel "job" "running"}}</span>
+    </div>
+    <div class="grid two">
+      <div>
+        <b>Syncing · 42 of 100</b>
+        <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="42" title="Example checked {{absTime .Data.Now}}"><i style="width:42%"></i></div>
+      </div>
+      <div>
+        <b>Indeterminate example</b>
+        <p class="muted">A running job with no counts shows the pulse, never an invented percentage.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-head"><h2>Cards, KPIs and charts</h2></div>
+  <div class="grid four">
+    <div class="kpi">
+      <div class="kpi-label">Example requests</div>
+      <div class="kpi-value">{{count 42100}}</div>
+      <div class="kpi-foot">+{{count 310}} this week</div>
+      {{spark .Data.Spark}}
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Example spend</div>
+      <div class="kpi-value">{{money .Data.Spent "USD"}}</div>
+      <div class="kpi-foot">Example period</div>
+      {{bars .Data.Bars}}
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Example documents</div>
+      <div class="kpi-value">{{count 1284}}</div>
+      <div class="kpi-foot">{{statusPill "document" "syncing"}}</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Example members</div>
+      <div class="kpi-value">{{count 12}}</div>
+      <div class="kpi-foot">{{statusPill "member" "active"}}</div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Example card</div>
+    <div class="card-sub">A plain card with title and sub-line.</div>
+    <p class="home-greeting">Example greeting line.</p>
+    <p class="price-warning">Example pricing warning: requests without a price are refused.</p>
+  </div>
+  <div class="attention">
+    {{icon "alert"}}
+    <p><b>Example source needs attention.</b> Its last sync failed — reconnect to resume syncing.</p>
+    <a class="btn" href="#gallery-components">Review</a>
+  </div>
+  <div class="card">
+    <div class="activity-row">
+      <span class="activity-icon">{{icon "upload"}}</span>
+      <span class="activity-copy"><b>Example upload finished</b><small>{{relTime .Data.LastSync}}</small></span>
+    </div>
+    <div class="activity-row">
+      <span class="activity-icon">{{icon "refresh"}}</span>
+      <span class="activity-copy"><b>Example sync started</b><small>Syncing · 42 of 100</small></span>
+    </div>
+  </div>
+  <div class="card">
+    <div class="result">
+      <a class="result-title" href="#gallery-components">Example result title</a>
+      <div class="result-meta">Example collection · {{relTime .Data.LastSync}}</div>
+      <p class="result-snippet">…example snippet mentioning {{mark "the wind tunnel measurements" "wind"}} for relevance…</p>
+    </div>
+    <div class="result">
+      <a class="result-title" href="#gallery-components">Another example result</a>
+      <div class="result-meta">Example profile · {{statusLabel "document" "ready"}}</div>
+      <p class="result-snippet">…a second {{mark "example snippet with a marked match" "marked match"}}…</p>
+    </div>
+  </div>
+
+  <div class="section-head"><h2>Lists, empty and interactive triggers</h2></div>
+  <div class="grid two">
+    <div class="stack">
+      <a class="card" href="#gallery-components"><div class="card-title">Example link card</div><div class="card-sub">Opens an example destination</div></a>
+      <a class="card" href="#gallery-components"><div class="card-title">Another link card</div><div class="card-sub">Stacked under the first</div></a>
+    </div>
+    <div class="empty">
+      {{icon "knowledge"}}
+      <p>No example collections yet — the empty state offers the action the capability allows.</p>
+      <a class="btn primary" href="#gallery-components">Create example</a>
+    </div>
+  </div>
+  <div class="card">
+    <div class="row">
+      <button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/dev/gallery/drawer">{{icon "layers"}}Open example drawer</button>
+      <button type="button" class="conf-card" data-action="conf-pop" aria-haspopup="dialog" aria-expanded="false" aria-controls="pop">
+        <span class="conf-title">{{icon "shield"}}<strong>Confidential</strong></span>
+        <small class="conf-copy">No confidential endpoints</small>
+      </button>
+      <button type="button" class="user-menu" data-action="user-menu" aria-label="User menu" aria-haspopup="dialog" aria-expanded="false" aria-controls="pop"><span aria-hidden="true">···</span></button>
+    </div>
+    <p class="muted">The drawer, popover and toast targets (#drawer, #pop, #toast) are single shared regions in the layout — the triggers above rely on app.js. The .authwrap centered card is demonstrated on the login, 403 and 404 pages, not here.</p>
+    <div class="row">
+      <button type="button" class="mobile-chats">{{icon "chat"}}Example chats</button>
+      <div class="mobile-chats-list">
+        <a class="history-item selected" href="#gallery-chat">Example conversation</a>
+        <a class="history-item" href="#gallery-chat">Another conversation</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-head"><h2>Icon set</h2></div>
+  <div class="card">
+    <div class="grid four">
+      {{range .Data.Icons}}<div>{{icon .}} <span class="muted">{{.}}</span></div>{{end}}
+    </div>
+  </div>
+</div>
+
+<div class="section" id="gallery-table">
+  <div class="section-head"><h2>Table</h2></div>
+  <div class="card">
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Collection</th>
+            <th scope="col">Status</th>
+            <th scope="col">Documents</th>
+            <th scope="col">Last sync</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td data-label="Collection">Example collection<span class="subline">An example description line</span></td>
+            <td data-label="Status">{{statusPill "collection" "ready"}}</td>
+            <td data-label="Documents">{{count 1284}}</td>
+            <td data-label="Last sync">{{relTime .Data.LastSync}}</td>
+          </tr>
+          <tr>
+            <td data-label="Collection">Another example collection<span class="subline">Syncing with example counts</span></td>
+            <td data-label="Status">{{statusPill "collection" "syncing"}}</td>
+            <td data-label="Documents">{{count 58}}</td>
+            <td data-label="Last sync">Syncing · 42 of 100</td>
+          </tr>
+          <tr>
+            <td data-label="Collection">Failed example collection<span class="subline">Needs attention after an example error</span></td>
+            <td data-label="Status">{{statusPill "collection" "failed"}}</td>
+            <td data-label="Documents">{{count 0}}</td>
+            <td data-label="Last sync">{{relTime .Data.LastSync}}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="section" id="gallery-chat">
+  <div class="section-head"><h2>Chat surface (markup only)</h2></div>
+  <div class="thread-layout">
+    <aside class="history">
+      <h3>Example history</h3>
+      <a class="history-item selected" href="#gallery-chat">Example conversation</a>
+      <a class="history-item" href="#gallery-chat">Another conversation</a>
+      <a class="history-item" href="#gallery-chat">Third example</a>
+    </aside>
+    <div class="thread">
+      <div class="thread-head"><strong>Example assistant</strong><span class="muted">Example model</span></div>
+      <div class="thread-body">
+        <div class="message"><div class="author">Example user</div><div class="bubble">An example question about the knowledge base?</div></div>
+        <div class="toolstep"><b>{{term "tool"}}</b> Searched example collection — {{count 3}} matches</div>
+        <div class="message"><div class="author">Example assistant</div><div class="bubble">An example grounded answer <span class="citation">[1]</span> with a citation marker.</div></div>
+        <div class="runline">{{icon "sparkles"}}Example answer complete</div>
+        <div class="quote">Quoted example passage backing the answer.</div>
+        <div class="evidence-panel">
+          <div class="result">
+            <a class="result-title" href="#gallery-chat">Example evidence title</a>
+            <div class="result-meta">Example collection</div>
+            <p class="result-snippet">…{{mark "example evidence snippet" "evidence"}}…</p>
+          </div>
+        </div>
+      </div>
+      <div class="composer">
+        <textarea class="field" rows="2" placeholder="Example composer placeholder" aria-label="Example composer"></textarea>
+        <div class="compose-foot"><span class="muted">Example footnote</span><button type="button" class="btn primary">{{icon "send"}}Ask</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+{{end}}
+
+{{define "frag-drawer"}}{{/* Drawer fragment for the open-drawer trigger —
+     served by GET /dashboard/dev/gallery/drawer through renderDashboardFragment. */}}
+<div class="drawer-head">
+  <h2>Example drawer</h2>
+  <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button>
+</div>
+<div class="stepper" aria-label="Example steps">
+  <span class="step active">1</span>
+  <span class="step">2</span>
+  <span class="step">3</span>
+  <span class="step">4</span>
+  <span class="step">5</span>
+</div>
+<div class="tilegrid">
+  <button type="button" class="tile selected">{{icon "knowledge"}}Example tile</button>
+  <button type="button" class="tile">{{icon "sources"}}Another tile</button>
+  <button type="button" class="tile">{{icon "layers"}}Third tile</button>
+  <button type="button" class="tile">{{icon "upload"}}Fourth tile</button>
+</div>
+<div class="drawer-actions">
+  <button type="button" class="btn ghost" data-action="close-drawer">Cancel</button>
+  <button type="button" class="btn primary">Save example</button>
+</div>
+{{end}}

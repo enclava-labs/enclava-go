@@ -154,7 +154,13 @@ func (h *Handlers) HandleJobsList(w http.ResponseWriter, r *http.Request, princi
 			offset = n
 		}
 	}
-	jobsList, total, err := h.svc.ListJobs(r.Context(), principal, limit, offset)
+	operation := strings.TrimSpace(r.URL.Query().Get("operation"))
+	if operation != "" && operation != extract.OperationProcess && operation != extract.OperationVision {
+		httpx.WriteOpenAIError(w, http.StatusBadRequest,
+			"operation must be extract.process or extract.vision", "invalid_request_error", "invalid_operation")
+		return
+	}
+	jobsList, total, err := h.svc.ListJobs(r.Context(), principal, operation, limit, offset)
 	if err != nil {
 		httpx.WriteOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error", "jobs_list_failed")
 		return
@@ -285,7 +291,11 @@ func (h *Handlers) HandleTemplateByID(w http.ResponseWriter, r *http.Request, pr
 		httpx.WriteOpenAIError(w, http.StatusBadRequest, "template id is required", "invalid_request_error", "missing_template_id")
 		return
 	}
-	if !auth.ExtractTemplateAllowed(principal, templateID) {
+	// Authority split: extract.manage admits the template for authoring
+	// (GET + the per-method PUT/DELETE manage checks below); without it, only
+	// the stored execution grant admits the execution-context GET. Manage
+	// never implies execution and a grant never implies mutation (D-25).
+	if !auth.HasScope(principal, "extract.manage") && !auth.ExtractTemplateAllowed(principal, templateID) {
 		httpx.WriteForbidden(w, "template is not allowed for this API key")
 		return
 	}

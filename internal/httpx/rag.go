@@ -66,8 +66,9 @@ func (a *App) handleRAGCollectionByID(w http.ResponseWriter, r *http.Request, pr
 			a.handleRAGSearch(w, r, principal, collectionID)
 			return
 		}
-		// 01-22: document ingest is unmounted — the …/documents sub-route
-		// serves metadata GETs only; uploads 404 until executor-backed ingest.
+		// …/documents serves metadata GETs only; the multipart upload POST
+		// lands with 08-08's executor-backed route. The GET below is the
+		// authorized, status-filtered document list.
 		if parts[1] == "documents" && len(parts) == 2 && r.Method == http.MethodGet {
 			a.handleRAGCollectionDocuments(w, r, principal, collectionID)
 			return
@@ -119,9 +120,19 @@ func (a *App) handleRAGCollectionDocuments(w http.ResponseWriter, r *http.Reques
 	switch r.Method {
 	case http.MethodGet:
 		limit, offset := paginationFromRequest(r)
-		docs, err := a.ragSvc.ListDocuments(r.Context(), principal, collectionID, limit, offset)
+		status := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
+		switch status {
+		case "", rag.DocumentStatusAll, rag.DocumentStatusReady, rag.DocumentStatusProcessing,
+			rag.DocumentStatusFailed, rag.DocumentStatusRemoved:
+		default:
+			WriteOpenAIError(w, http.StatusBadRequest,
+				"status must be one of all, ready, processing, failed, removed",
+				"invalid_request_error", "invalid_status")
+			return
+		}
+		docs, err := a.ragSvc.ListDocuments(r.Context(), principal, collectionID, status, limit, offset)
 		if err != nil {
-			writeRAGNotFoundOrError(w, err, "rag_document_list_failed")
+			a.writeRAGNotFoundOrBadRequest(w, err, "rag_document_list_failed")
 			return
 		}
 		WriteJSON(w, http.StatusOK, map[string]any{"documents": docs, "limit": limit, "offset": offset})
@@ -289,6 +300,19 @@ func (a *App) handleRAGEvidenceByID(w http.ResponseWriter, r *http.Request, prin
 		w.Header().Set("X-Enclava-Evidence-View", "retained-copy")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(blob)
+		return
+	}
+	// Passage view: the quoted chunk content for currently-authorized
+	// evidence. Unknown, forbidden, revoked, tombstoned and superseded IDs
+	// are the same 404; infrastructure failures surface as 5xx, never a
+	// flattened 404.
+	if len(parts) == 2 && parts[1] == "passage" && r.Method == http.MethodGet {
+		text, err := a.ragSvc.ReadEvidence(r.Context(), principal, parts[0])
+		if err != nil {
+			writeRAGNotFoundOrError(w, err, "rag_evidence_not_found")
+			return
+		}
+		WriteJSON(w, http.StatusOK, text)
 		return
 	}
 	WriteMethodNotAllowed(w)

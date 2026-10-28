@@ -229,15 +229,38 @@ func (r *JobsRepo) GetOwnedJob(ctx context.Context, tenantID, id, submitterKey s
 	return row, nil
 }
 
-func (r *JobsRepo) ListOwnedJobs(ctx context.Context, tenantID, submitterKey string, limit int) ([]jobs.JobRow, error) {
+// appendJobPredicate appends an `column IN (...)` predicate with positional
+// placeholders; predicates apply before ORDER BY/LIMIT so the filtered count
+// IS the total. Empty slices append nothing.
+func appendJobPredicate(query string, args []any, column string, values []string) (string, []any) {
+	if len(values) == 0 {
+		return query, args
+	}
+	placeholders := make([]string, len(values))
+	for i, v := range values {
+		args = append(args, v)
+		placeholders[i] = "$" + strconv.Itoa(len(args))
+	}
+	return query + ` AND ` + column + ` IN (` + strings.Join(placeholders, ",") + `)`, args
+}
+
+// ListOwnedJobsFiltered lists the submitter's non-deleted rows restricted to
+// the given operations and statuses — predicates apply in SQL before LIMIT.
+// Nil slices skip the predicate.
+func (r *JobsRepo) ListOwnedJobsFiltered(ctx context.Context, tenantID, submitterKey string, ops, statuses []string, limit int) ([]jobs.JobRow, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := r.db.SQL.QueryContext(ctx, `
-		SELECT `+jobColumns+` FROM jobs
-		WHERE tenant_id = $1 AND submitter_key = $2 AND deleted_at IS NULL
+	query := `
+		SELECT ` + jobColumns + ` FROM jobs
+		WHERE tenant_id = $1 AND submitter_key = $2 AND deleted_at IS NULL`
+	args := []any{tenantID, submitterKey}
+	query, args = appendJobPredicate(query, args, "operation", ops)
+	query, args = appendJobPredicate(query, args, "status", statuses)
+	query += `
 		ORDER BY submitted_at DESC, id DESC
-		LIMIT $3`, tenantID, submitterKey, limit)
+		LIMIT ` + strconv.Itoa(limit)
+	rows, err := r.db.SQL.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list jobs: %w", err)
 	}
@@ -251,6 +274,12 @@ func (r *JobsRepo) ListOwnedJobs(ctx context.Context, tenantID, submitterKey str
 		out = append(out, row)
 	}
 	return out, rows.Err()
+}
+
+// ListOwnedJobs keeps the operation-unfiltered owner listing for callers that
+// page across every operation (jobs.Service.List, connectors).
+func (r *JobsRepo) ListOwnedJobs(ctx context.Context, tenantID, submitterKey string, limit int) ([]jobs.JobRow, error) {
+	return r.ListOwnedJobsFiltered(ctx, tenantID, submitterKey, nil, nil, limit)
 }
 
 // ListConnectionJobs lists a connection's non-deleted jobs regardless of
@@ -286,31 +315,48 @@ func (r *JobsRepo) ListConnectionJobs(ctx context.Context, tenantID, connectionI
 	return out, rows.Err()
 }
 
-// CountOwnedJobs counts the submitter's non-deleted rows — the total the
-// owner-scoped list is paged over.
-func (r *JobsRepo) CountOwnedJobs(ctx context.Context, tenantID, submitterKey string) (int, error) {
-	var total int
-	if err := r.db.SQL.QueryRowContext(ctx, `
+// CountOwnedJobsFiltered counts the submitter's non-deleted rows restricted
+// to the given operations — the total the filtered list pages over.
+func (r *JobsRepo) CountOwnedJobsFiltered(ctx context.Context, tenantID, submitterKey string, ops []string) (int, error) {
+	query := `
 		SELECT COUNT(*) FROM jobs
-		WHERE tenant_id = $1 AND submitter_key = $2 AND deleted_at IS NULL`,
-		tenantID, submitterKey).Scan(&total); err != nil {
+		WHERE tenant_id = $1 AND submitter_key = $2 AND deleted_at IS NULL`
+	args := []any{tenantID, submitterKey}
+	query, args = appendJobPredicate(query, args, "operation", ops)
+	var total int
+	if err := r.db.SQL.QueryRowContext(ctx, query, args...).Scan(&total); err != nil {
 		return 0, fmt.Errorf("count owned jobs: %w", err)
 	}
 	return total, nil
 }
 
-// CountOwnedJobsSince counts the submitter's non-deleted rows submitted at or
-// after `since` — the "recent" window stat the dashboard renders.
-func (r *JobsRepo) CountOwnedJobsSince(ctx context.Context, tenantID, submitterKey string, since time.Time) (int, error) {
-	var total int
-	if err := r.db.SQL.QueryRowContext(ctx, `
+// CountOwnedJobs counts the submitter's non-deleted rows — the total the
+// operation-unfiltered owner-scoped list is paged over.
+func (r *JobsRepo) CountOwnedJobs(ctx context.Context, tenantID, submitterKey string) (int, error) {
+	return r.CountOwnedJobsFiltered(ctx, tenantID, submitterKey, nil)
+}
+
+// CountOwnedJobsSinceFiltered counts the submitter's non-deleted rows
+// restricted to the given operations submitted at or after `since` — the
+// operation-scoped "recent" window stat.
+func (r *JobsRepo) CountOwnedJobsSinceFiltered(ctx context.Context, tenantID, submitterKey string, ops []string, since time.Time) (int, error) {
+	query := `
 		SELECT COUNT(*) FROM jobs
 		WHERE tenant_id = $1 AND submitter_key = $2 AND deleted_at IS NULL
-		  AND submitted_at >= $3`,
-		tenantID, submitterKey, since).Scan(&total); err != nil {
+		  AND submitted_at >= $3`
+	args := []any{tenantID, submitterKey, since}
+	query, args = appendJobPredicate(query, args, "operation", ops)
+	var total int
+	if err := r.db.SQL.QueryRowContext(ctx, query, args...).Scan(&total); err != nil {
 		return 0, fmt.Errorf("count owned jobs since: %w", err)
 	}
 	return total, nil
+}
+
+// CountOwnedJobsSince counts the submitter's non-deleted rows submitted at or
+// after `since` — the unfiltered "recent" window stat.
+func (r *JobsRepo) CountOwnedJobsSince(ctx context.Context, tenantID, submitterKey string, since time.Time) (int, error) {
+	return r.CountOwnedJobsSinceFiltered(ctx, tenantID, submitterKey, nil, since)
 }
 
 // CountLiveArtifactReferences protects a shared artifact from one job's
@@ -682,7 +728,6 @@ func (r *JobsRepo) CountActivePreviews(ctx context.Context, tenantID string) (in
 		  AND status IN ('queued','running')`, tenantID, extract.OperationPreview).Scan(&count)
 	return count, err
 }
-
 
 func (r *JobsRepo) CountActiveExtractions(ctx context.Context, tenantID string) (int, error) {
 	var count int

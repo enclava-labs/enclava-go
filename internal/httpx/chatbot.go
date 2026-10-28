@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -486,4 +487,44 @@ func (a *App) handleConversationByID(w http.ResponseWriter, r *http.Request, p a
 		return
 	}
 	WriteJSON(w, http.StatusOK, view)
+}
+
+// handleConversations serves GET /api/v1/conversations (OA-13): the
+// caller's own conversations, newest-first, keyset-paginated with an opaque
+// cursor. The service binds the owner to the principal unconditionally —
+// admins included — and drops rows whose assistant the caller may no longer
+// see, so the envelope can never carry another member's history.
+func (a *App) handleConversations(w http.ResponseWriter, r *http.Request, p auth.Principal) {
+	if a.chatbotSvc == nil {
+		WriteOpenAIError(w, http.StatusNotImplemented, "chatbot service is not configured", "server_error", "not_configured")
+		return
+	}
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	// Same clamp convention as paginationFromRequest: parse errors keep the
+	// default, values outside the bound are clamped.
+	limit := 20
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	summaries, next, err := a.chatbotSvc.ListConversations(r.Context(), p, limit, r.URL.Query().Get("cursor"))
+	if err != nil {
+		if errors.Is(err, chatbot.ErrInvalidInput) {
+			WriteOpenAIError(w, http.StatusBadRequest, "invalid conversation list request", "invalid_request_error", "invalid_conversation_request")
+			return
+		}
+		writeChatbotNotFoundOrError(w, err, "conversation_list_failed")
+		return
+	}
+	if summaries == nil {
+		summaries = []chatbot.ConversationSummary{}
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{"conversations": summaries, "next_cursor": next})
 }

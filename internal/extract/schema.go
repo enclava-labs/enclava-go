@@ -106,6 +106,7 @@ func (s *compiledOutputSchema) validate(value any) error {
 	if err := s.schema.Validate(value); err != nil {
 		var validation *jsonschema.ValidationError
 		if errors.As(err, &validation) {
+			validation = mostSpecificValidation(validation)
 			instanceLocation := strings.Join(validation.InstanceLocation, "/")
 			if instanceLocation != "" {
 				instanceLocation = "/" + instanceLocation
@@ -115,6 +116,16 @@ func (s *compiledOutputSchema) validate(value any) error {
 		return fmt.Errorf("validate extraction output: %w", err)
 	}
 	return nil
+}
+func mostSpecificValidation(root *jsonschema.ValidationError) *jsonschema.ValidationError {
+	best := root
+	for _, cause := range root.Causes {
+		candidate := mostSpecificValidation(cause)
+		if len(candidate.InstanceLocation) > len(best.InstanceLocation) {
+			best = candidate
+		}
+	}
+	return best
 }
 
 type rejectSchemaLoader struct{}

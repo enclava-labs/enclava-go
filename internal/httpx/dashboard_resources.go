@@ -343,12 +343,18 @@ func (a *App) handleDashboardRAG(w http.ResponseWriter, r *http.Request) {
 		WriteMethodNotAllowed(w)
 		return
 	}
-	if a.ragSvc == nil {
-		WriteOpenAIError(w, http.StatusNotImplemented, "rag is not configured", "server_error", "not_configured")
-		return
-	}
 	p, ok := a.extractPrincipal(w, r)
 	if !ok {
+		return
+	}
+	// The API requires rag.manage for collection/document mutations; the
+	// dashboard POST actions are exactly those mutations.
+	if r.Method == http.MethodPost && !auth.HasScope(p, "rag.manage") {
+		WriteForbidden(w, "missing required scope: rag.manage")
+		return
+	}
+	if a.ragSvc == nil {
+		WriteOpenAIError(w, http.StatusNotImplemented, "rag is not configured", "server_error", "not_configured")
 		return
 	}
 	successMessage := ""
@@ -364,7 +370,7 @@ func (a *App) handleDashboardRAG(w http.ResponseWriter, r *http.Request) {
 	}
 	documents := make([]rag.Document, 0)
 	for _, collection := range collections {
-		docs, err := a.ragSvc.ListDocuments(r.Context(), p, collection.ID, 100, 0)
+		docs, err := a.ragSvc.ListDocuments(r.Context(), p, collection.ID, rag.DocumentStatusAll, 100, 0)
 		if err != nil {
 			log.Printf("failed to load dashboard rag documents collection_id=%s: %v", collection.ID, err)
 			continue
@@ -413,16 +419,21 @@ func (a *App) handleDashboardChatbots(w http.ResponseWriter, r *http.Request) {
 		WriteMethodNotAllowed(w)
 		return
 	}
+	p, ok := a.extractPrincipal(w, r)
+	if !ok {
+		return
+	}
+	// Chatbot create/update/delete maps to the API's chatbot.manage scope.
+	if r.Method == http.MethodPost && !auth.HasScope(p, "chatbot.manage") {
+		WriteForbidden(w, "missing required scope: chatbot.manage")
+		return
+	}
 	if a.chatbotSvc == nil {
 		WriteOpenAIError(w, http.StatusNotImplemented, "chatbots are not configured", "server_error", "not_configured")
 		return
 	}
 	successMessage := ""
 	errorMessage := ""
-	p, ok := a.extractPrincipal(w, r)
-	if !ok {
-		return
-	}
 	if r.Method == http.MethodPost {
 		successMessage, errorMessage = a.handleDashboardChatbotAction(r, p)
 	}
@@ -450,12 +461,17 @@ func (a *App) handleDashboardPromptTemplates(w http.ResponseWriter, r *http.Requ
 		WriteMethodNotAllowed(w)
 		return
 	}
-	if a.promptSvc == nil {
-		WriteOpenAIError(w, http.StatusNotImplemented, "prompt templates are not configured", "server_error", "not_configured")
-		return
-	}
 	p, ok := a.extractPrincipal(w, r)
 	if !ok {
+		return
+	}
+	// Prompt-template writes map to the API's chatbot.manage scope.
+	if r.Method == http.MethodPost && !auth.HasScope(p, "chatbot.manage") {
+		WriteForbidden(w, "missing required scope: chatbot.manage")
+		return
+	}
+	if a.promptSvc == nil {
+		WriteOpenAIError(w, http.StatusNotImplemented, "prompt templates are not configured", "server_error", "not_configured")
 		return
 	}
 	successMessage := ""

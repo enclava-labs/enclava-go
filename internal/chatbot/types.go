@@ -16,6 +16,9 @@ var (
 	ErrChatbotNotAllowed  = errors.New("chatbot is not allowed for this API key")
 	ErrCollectionNotFound = errors.New("knowledge collection was not found")
 	ErrInvalidInput       = errors.New("invalid chatbot input")
+	// ErrInvalidCursor marks a malformed conversation-list keyset cursor; the
+	// service maps it onto the 400-class invalid-input path, never ignores it.
+	ErrInvalidCursor = errors.New("invalid conversation cursor")
 )
 
 // Instance is the tenant-scoped chatbots domain row. TenantID and
@@ -30,11 +33,15 @@ type Instance struct {
 	Model            string         `json:"model"`
 	RAGCollectionIDs []string       `json:"rag_collection_ids,omitempty"`
 	Settings         map[string]any `json:"settings,omitempty"`
-	ExternalID       string         `json:"external_id"`
-	IsEnabled        bool           `json:"is_enabled"`
-	OwnerActorID     string         `json:"-"`
-	CreatedAt        time.Time      `json:"created_at"`
-	UpdatedAt        time.Time      `json:"updated_at"`
+	// Audience is stored authorization (D-07): actor IDs or "*" tenant-wide.
+	// It intersects with resource grants in chatbotAllowed — owner and
+	// platform.admin bypass the audience term, never the grant check.
+	Audience     []string  `json:"audience,omitempty"`
+	ExternalID   string    `json:"external_id"`
+	IsEnabled    bool      `json:"is_enabled"`
+	OwnerActorID string    `json:"-"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 // Conversation is the tenant-scoped conversations row. OwnerActorID carries
@@ -72,6 +79,19 @@ type InputRef struct {
 type ConversationView struct {
 	Conversation Conversation `json:"conversation"`
 	Messages     []Message    `json:"messages"`
+}
+
+// ConversationSummary is one own-conversation list row (OA-13). Title and
+// UpdatedAt are server-derived from the first VISIBLE user message and the
+// last message timestamp — never stored on the conversation row and never
+// taken from client input.
+type ConversationSummary struct {
+	ID            string    `json:"id"`
+	ChatbotID     string    `json:"assistant_id"`
+	AssistantName string    `json:"assistant_name"`
+	Title         string    `json:"title"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 type AssistantRunInput struct {
@@ -123,8 +143,11 @@ type CreateChatbotInput struct {
 	Model            string         `json:"model"`
 	RAGCollectionIDs []string       `json:"rag_collection_ids,omitempty"`
 	Settings         map[string]any `json:"settings,omitempty"`
-	ExternalID       string         `json:"external_id,omitempty"`
-	IsEnabled        *bool          `json:"is_enabled,omitempty"`
+	// Audience: nil omits (create defaults to owner-only), explicit []
+	// locks the assistant to owner+platform.admin, "*" is tenant-wide.
+	Audience   []string `json:"audience,omitempty"`
+	ExternalID string   `json:"external_id,omitempty"`
+	IsEnabled  *bool    `json:"is_enabled,omitempty"`
 }
 
 type UpdateChatbotInput struct {
@@ -135,8 +158,11 @@ type UpdateChatbotInput struct {
 	Model            *string        `json:"model,omitempty"`
 	RAGCollectionIDs []string       `json:"rag_collection_ids,omitempty"`
 	Settings         map[string]any `json:"settings,omitempty"`
-	ExternalID       *string        `json:"external_id,omitempty"`
-	IsEnabled        *bool          `json:"is_enabled,omitempty"`
+	// Audience nil = unchanged; non-nil replaces the stored audience after
+	// trim/dedupe normalization (empty entries are rejected).
+	Audience   []string `json:"audience,omitempty"`
+	ExternalID *string  `json:"external_id,omitempty"`
+	IsEnabled  *bool    `json:"is_enabled,omitempty"`
 }
 
 type CompletionOutput struct {

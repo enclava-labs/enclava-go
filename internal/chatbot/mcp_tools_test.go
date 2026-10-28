@@ -67,7 +67,7 @@ func TestApprovedMCPToolRunsUnderConfiguredAssistantAndCurrentApproval(t *testin
 	output := json.RawMessage(`{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}`)
 	repo := &runMCPRepo{
 		server:    mcp.Server{TenantID: "tenant", ID: "server", Origin: "https://mcp.example", EndpointPath: "/mcp", Enabled: true, AudienceScopes: []string{"assistant.use"}},
-		approvals: []mcp.Approval{{TenantID: "tenant", ServerID: "server", ToolID: "remote-tool", ModelName: "approved.lookup", RemoteName: "remote-tool", InputSchema: input, OutputSchema: output, InputSchemaHash: mcp.SchemaHash(input), OutputSchemaHash: mcp.SchemaHash(output), CallerScopes: []string{"mcp.use"}, Enabled: true}},
+		approvals: []mcp.Approval{{TenantID: "tenant", ServerID: "server", ToolID: "remote-tool", ModelName: "approved.lookup", RemoteName: "remote-tool", InputSchema: input, OutputSchema: output, InputSchemaHash: mcp.SchemaDigest(input), OutputSchemaHash: mcp.SchemaDigest(output), CallerScopes: []string{"mcp.use"}, Enabled: true}},
 	}
 	transport := &runMCPTransport{}
 	dispatcher := MCPRunTools{Executor: &mcp.Executor{Repository: repo, Caller: MCPCaller{}, Transport: transport}, Authorizer: runMCPInputAuth{}}
@@ -119,7 +119,7 @@ func TestChangedMCPApprovalSchemaCannotReachTransport(t *testing.T) {
 	output := json.RawMessage(`{"type":"object"}`)
 	repo := &runMCPRepo{
 		server:    mcp.Server{TenantID: "tenant", ID: "server", Origin: "https://mcp.example", Enabled: true, AudienceScopes: []string{"assistant.use"}},
-		approvals: []mcp.Approval{{TenantID: "tenant", ServerID: "server", ToolID: "remote-tool", ModelName: "approved.lookup", RemoteName: "remote-tool", InputSchema: json.RawMessage(`{"type":"string"}`), OutputSchema: output, InputSchemaHash: mcp.SchemaHash(input), OutputSchemaHash: mcp.SchemaHash(output), CallerScopes: []string{"mcp.use"}, Enabled: true}},
+		approvals: []mcp.Approval{{TenantID: "tenant", ServerID: "server", ToolID: "remote-tool", ModelName: "approved.lookup", RemoteName: "remote-tool", InputSchema: json.RawMessage(`{"type":"string"}`), OutputSchema: output, InputSchemaHash: mcp.SchemaDigest(input), OutputSchemaHash: mcp.SchemaDigest(output), CallerScopes: []string{"mcp.use"}, Enabled: true}},
 	}
 	transport := &runMCPTransport{}
 	dispatcher := MCPRunTools{Executor: &mcp.Executor{Repository: repo, Caller: MCPCaller{}, Transport: transport}, Authorizer: runMCPInputAuth{}}

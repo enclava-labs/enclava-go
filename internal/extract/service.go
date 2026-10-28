@@ -43,9 +43,9 @@ type SettingsRepo interface {
 type JobReader interface {
 	GetOwnedJob(ctx context.Context, tenantID, id, submitterKey string) (jobs.JobRow, error)
 	GetIdempotency(ctx context.Context, tenantID, operation, key string) (jobs.JobRow, error)
-	ListOwnedJobs(ctx context.Context, tenantID, submitterKey string, limit int) ([]jobs.JobRow, error)
-	CountOwnedJobs(ctx context.Context, tenantID, submitterKey string) (int, error)
-	CountOwnedJobsSince(ctx context.Context, tenantID, submitterKey string, since time.Time) (int, error)
+	ListOwnedJobsFiltered(ctx context.Context, tenantID, submitterKey string, ops, statuses []string, limit int) ([]jobs.JobRow, error)
+	CountOwnedJobsFiltered(ctx context.Context, tenantID, submitterKey string, ops []string) (int, error)
+	CountOwnedJobsSinceFiltered(ctx context.Context, tenantID, submitterKey string, ops []string, since time.Time) (int, error)
 	CountLiveArtifactReferences(ctx context.Context, tenantID, artifactRef, excludingJobID string) (int, error)
 	ListDeletedExtractJobs(ctx context.Context) ([]jobs.JobRow, error)
 	CountActiveExtractions(ctx context.Context, tenantID string) (int, error)
@@ -541,9 +541,33 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 	return rref.ID, nil
 }
 
-// ListJobs returns the caller's newest jobs plus the total row count for
-// paging — owner-bound through the jobs submitter key.
-func (s *Service) ListJobs(ctx context.Context, p auth.Principal, limit, offset int) ([]JobView, int, error) {
+// memberJobOperations is the member-facing extraction operation set — shared
+// jobs (previews, embeds, syncs) never surface in extraction lists or stats.
+var memberJobOperations = []string{OperationProcess, OperationVision}
+
+// jobOperations resolves the ?operation= filter: empty selects the full
+// member-facing extraction set; anything else must name one of its members.
+func jobOperations(operation string) ([]string, error) {
+	operation = strings.TrimSpace(operation)
+	if operation == "" {
+		return memberJobOperations, nil
+	}
+	for _, op := range memberJobOperations {
+		if op == operation {
+			return []string{op}, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: %q", ErrInvalidOperation, operation)
+}
+
+// ListJobs returns the caller's newest extraction jobs plus the total row
+// count for paging — owner-bound through the jobs submitter key and scoped to
+// the requested extraction operation (empty = extract.process+extract.vision).
+func (s *Service) ListJobs(ctx context.Context, p auth.Principal, operation string, limit, offset int) ([]JobView, int, error) {
+	ops, err := jobOperations(operation)
+	if err != nil {
+		return nil, 0, err
+	}
 	if limit <= 0 {
 		limit = 20
 	}
@@ -554,11 +578,11 @@ func (s *Service) ListJobs(ctx context.Context, p auth.Principal, limit, offset 
 		offset = 0
 	}
 	key := jobs.SubmitterKey(p)
-	total, err := s.jobRows.CountOwnedJobs(ctx, p.TenantID, key)
+	total, err := s.jobRows.CountOwnedJobsFiltered(ctx, p.TenantID, key, ops)
 	if err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.jobRows.ListOwnedJobs(ctx, p.TenantID, key, limit+offset)
+	rows, err := s.jobRows.ListOwnedJobsFiltered(ctx, p.TenantID, key, ops, nil, limit+offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -574,14 +598,15 @@ func (s *Service) ListJobs(ctx context.Context, p auth.Principal, limit, offset 
 }
 
 // JobStats returns the caller's recent (submitted at or after `since`) and
-// total non-deleted job counts — the owner-bound pair the dashboard renders.
+// total non-deleted extraction job counts — the owner-bound pair the
+// dashboard renders. Shared operations never move these counters.
 func (s *Service) JobStats(ctx context.Context, p auth.Principal, since time.Time) (recent int64, total int64, err error) {
 	key := jobs.SubmitterKey(p)
-	t, err := s.jobRows.CountOwnedJobs(ctx, p.TenantID, key)
+	t, err := s.jobRows.CountOwnedJobsFiltered(ctx, p.TenantID, key, memberJobOperations)
 	if err != nil {
 		return 0, 0, err
 	}
-	rec, err := s.jobRows.CountOwnedJobsSince(ctx, p.TenantID, key, since)
+	rec, err := s.jobRows.CountOwnedJobsSinceFiltered(ctx, p.TenantID, key, memberJobOperations, since)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -625,8 +650,42 @@ func (s *Service) GetJob(ctx context.Context, p auth.Principal, jobID string) (J
 	return detail, nil
 }
 
+// ListTemplates is the authoring/management list: the full tenant set for
+// extract.manage callers, otherwise the caller's execution-grant
+// intersection. An empty grant set yields an empty list — never a fabricated
+// default (D-25 deny-default).
 func (s *Service) ListTemplates(ctx context.Context, p auth.Principal) ([]Template, error) {
-	return s.templatesRepo.ListTemplates(ctx, p.TenantID)
+	all, err := s.templatesRepo.ListTemplates(ctx, p.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	if auth.HasScope(p, "extract.manage") {
+		return all, nil
+	}
+	return allowedTemplates(all, p), nil
+}
+
+// ListExecutableTemplates is the Process picker read: ALWAYS the caller's
+// execution-grant intersection — extract.manage never bypasses it. Template
+// administration and execution selection are separate authorities (D-25).
+func (s *Service) ListExecutableTemplates(ctx context.Context, p auth.Principal) ([]Template, error) {
+	all, err := s.templatesRepo.ListTemplates(ctx, p.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	return allowedTemplates(all, p), nil
+}
+
+// allowedTemplates projects the tenant set onto the principal's stored
+// extract-template grants; the empty grant set stays empty.
+func allowedTemplates(all []Template, p auth.Principal) []Template {
+	out := make([]Template, 0, len(all))
+	for _, t := range all {
+		if auth.ExtractTemplateAllowed(p, t.ID) {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func (s *Service) GetTemplate(ctx context.Context, p auth.Principal, id string) (Template, error) {

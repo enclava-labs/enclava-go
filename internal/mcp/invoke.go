@@ -34,7 +34,7 @@ func (e *Executor) Invoke(ctx context.Context, p auth.Principal, serverID, toolI
 		return nil, ErrDenied
 	}
 	a, err := e.Repository.GetApproval(ctx, p.TenantID, serverID, toolID)
-	if err != nil || a.TenantID != p.TenantID || a.ServerID != serverID || a.ToolID != toolID || !a.Enabled || a.InputSchemaHash != SchemaHash(a.InputSchema) || a.OutputSchemaHash != SchemaHash(a.OutputSchema) {
+	if err != nil || a.TenantID != p.TenantID || a.ServerID != serverID || a.ToolID != toolID || !a.Enabled || a.InputSchemaHash != SchemaDigest(a.InputSchema) || a.OutputSchemaHash != SchemaDigest(a.OutputSchema) {
 		return nil, ErrDenied
 	}
 	if !hasAll(p, a.CallerScopes) {

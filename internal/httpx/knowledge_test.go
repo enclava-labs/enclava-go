@@ -124,7 +124,7 @@ func TestKnowledgeImportHTTPAuthorizationAndDuplicate(t *testing.T) {
 	if success, failure := app.handleDashboardRAGAction(uploadRequest, ownerPrincipal); success == "" || failure != "" {
 		t.Fatalf("upload action success=%q failure=%q", success, failure)
 	}
-	uploaded, err := ragSvc.ListDocuments(ctx, ownerPrincipal, collection.ID, 10, 0)
+	uploaded, err := ragSvc.ListDocuments(ctx, ownerPrincipal, collection.ID, rag.DocumentStatusAll, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

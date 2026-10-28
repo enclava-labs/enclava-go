@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"enclava-go/internal/jobs"
@@ -334,6 +335,10 @@ func (r *RAGRepo) ListCollectionItems(ctx context.Context, tenantID, collectionI
 
 // documentSelect projects the legacy-stable rag.Document JSON shape: object
 // row + latest version + latest index generation state + chunk count.
+// latest_gen is scoped per (collection, object_version) so a generation in
+// one collection cannot mask another, the chunk count spans only that latest
+// generation of the listing collection, and a durable failed embed/ingest
+// job projects its real error text.
 const documentSelect = `
 	WITH latest_version AS (
 		SELECT DISTINCT ON (object_id) id, object_id, observed_seq, artifact_ref,
@@ -343,22 +348,52 @@ const documentSelect = `
 		ORDER BY object_id, observed_seq DESC
 	),
 	latest_gen AS (
-		SELECT DISTINCT ON (object_version_id) object_version_id, state
+		SELECT DISTINCT ON (collection_id, object_version_id)
+		       collection_id, object_version_id, generation, state
 		FROM index_generations
 		WHERE tenant_id = $1
-		ORDER BY object_version_id, generation DESC
+		ORDER BY collection_id, object_version_id, generation DESC
 	)
 	SELECT o.id, ci.collection_id, o.kind, o.native_id, o.observed_seq,
 	       lv.id, lv.observed_seq, lv.artifact_ref, lv.content_sha256, lv.byte_size,
 	       lv.mime_type, lv.original_filename, lv.provenance,
-	       COALESCE(lg.state, 'staging'), COALESCE(o.deleted_at, o.tombstoned_at) IS NOT NULL,
+	       COALESCE(lg.state, 'staging'),
+	       COALESCE(ci.removed_at, o.deleted_at, o.tombstoned_at) IS NOT NULL,
 	       o.first_seen_at, o.last_seen_at,
 	       (SELECT COUNT(*) FROM chunks k
-	        WHERE k.tenant_id = $1 AND k.object_version_id = lv.id)
+	        WHERE k.tenant_id = $1 AND k.object_version_id = lv.id
+	          AND k.collection_id = ci.collection_id AND k.generation = lg.generation),
+	       j.error->>'message'
 	FROM source_objects o
 	JOIN collection_items ci ON ci.tenant_id = o.tenant_id AND ci.object_id = o.id
 	LEFT JOIN latest_version lv ON lv.object_id = o.id
-	LEFT JOIN latest_gen lg ON lg.object_version_id = lv.id`
+	LEFT JOIN latest_gen lg ON lg.object_version_id = lv.id AND lg.collection_id = ci.collection_id
+	LEFT JOIN jobs j ON j.tenant_id = $1
+	     AND j.operation IN ('` + rag.OperationEmbed + `', '` + rag.OperationIngest + `')
+	     AND j.input_ref = lg.object_version_id
+	     AND j.policy->>'generation' = lg.generation::text
+	     AND j.status = 'failed'`
+
+// documentStatusPredicate mirrors scanDocument's Go-side status derivation so
+// the repo filter and the service projection can never disagree.
+func documentStatusPredicate(status string) string {
+	const (
+		removed = `(COALESCE(ci.removed_at, o.deleted_at, o.tombstoned_at) IS NOT NULL)`
+		failed  = `(j.id IS NOT NULL OR lg.state = 'failed')`
+	)
+	switch status {
+	case rag.DocumentStatusRemoved:
+		return removed
+	case rag.DocumentStatusFailed:
+		return `NOT ` + removed + ` AND ` + failed
+	case rag.DocumentStatusReady:
+		return `NOT ` + removed + ` AND NOT ` + failed + ` AND lg.state = 'published'`
+	case rag.DocumentStatusProcessing:
+		return `NOT ` + removed + ` AND NOT ` + failed + ` AND COALESCE(lg.state, 'staging') NOT IN ('published', 'failed')`
+	default:
+		return `NOT ` + removed
+	}
+}
 
 func scanDocument(scanner interface {
 	Scan(dest ...any) error
@@ -372,10 +407,11 @@ func scanDocument(scanner interface {
 	var gone bool
 	var firstSeen, lastSeen time.Time
 	var chunkCount int64
+	var errorMessage sql.NullString
 	err := scanner.Scan(&d.ID, &d.CollectionID, &d.SourceType, &nativeID, &seq,
 		&verID, &verSeq, &artifactRef, &sha, &byteSize,
 		&mime, &filename, &provenance,
-		&state, &gone, &firstSeen, &lastSeen, &chunkCount)
+		&state, &gone, &firstSeen, &lastSeen, &chunkCount, &errorMessage)
 	if err != nil {
 		return rag.Document{}, err
 	}
@@ -390,8 +426,30 @@ func scanDocument(scanner interface {
 	d.UpdatedAt = lastSeen
 	d.QdrantPointCount = int(chunkCount)
 	if gone {
-		// Caller treats deleted objects as absent.
-		return rag.Document{}, source.ErrDenied
+		// Management-visible tombstone metadata only: never re-expose
+		// content fields for a removed document.
+		d.Status = rag.DocumentStatusRemoved
+		d.TextHash = ""
+		d.Metadata = map[string]any{}
+		d.QdrantPointCount = 0
+		return d, nil
+	}
+	if errorMessage.Valid && errorMessage.String != "" {
+		// The generation's durable embed/ingest job failed: carry the job's
+		// real error text, never an invented string.
+		d.Status = rag.DocumentStatusFailed
+		d.ErrorMessage = errorMessage.String
+	} else {
+		switch state {
+		case "failed":
+			d.Status = rag.DocumentStatusFailed
+		case "published":
+			d.Status = rag.DocumentStatusReady
+			now := d.UpdatedAt
+			d.ProcessedAt = &now
+		default:
+			d.Status = rag.DocumentStatusProcessing
+		}
 	}
 	var prov map[string]any
 	if provenance.Valid {
@@ -408,16 +466,6 @@ func scanDocument(scanner interface {
 	if d.Metadata == nil {
 		d.Metadata = map[string]any{}
 	}
-	switch state {
-	case "published":
-		d.Status = rag.DocumentStatusReady
-		now := d.UpdatedAt
-		d.ProcessedAt = &now
-	case "failed":
-		d.Status = rag.DocumentStatusFailed
-	default:
-		d.Status = rag.DocumentStatusProcessing
-	}
 	return d, nil
 }
 
@@ -430,66 +478,151 @@ func (r *RAGRepo) GetDocument(ctx context.Context, tenantID, objectID string) (r
 	if err != nil {
 		return rag.Document{}, fmt.Errorf("get document: %w", err)
 	}
+	if d.Status == rag.DocumentStatusRemoved {
+		// Single-document reads treat removed objects as absent; the
+		// management projection is list-only.
+		return rag.Document{}, source.ErrDenied
+	}
 	d.TenantID = tenantID
 	return d, nil
 }
 
-func (r *RAGRepo) ListDocuments(ctx context.Context, tenantID, collectionID string, limit, offset int) ([]rag.Document, error) {
+func (r *RAGRepo) ListDocuments(ctx context.Context, tenantID, collectionID, status string, limit, offset int) ([]rag.Document, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	rows, err := r.db.SQL.QueryContext(ctx,
-		documentSelect+` WHERE o.tenant_id = $1 AND ci.collection_id = $2
-		 ORDER BY o.first_seen_at DESC LIMIT $3 OFFSET $4`,
+		documentSelect+` WHERE o.tenant_id = $1 AND ci.collection_id = $2 AND `+documentStatusPredicate(status)+`
+		 ORDER BY o.first_seen_at DESC, o.id, ci.id LIMIT $3 OFFSET $4`,
 		tenantID, collectionID, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("list documents: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
+	return collectDocuments(rows, tenantID)
+}
+
+// ListFailedDocuments is the raw tenant-wide failed-document projection — an
+// internal building block for Service.ListFailedDocuments, which authorizes
+// per principal BEFORE its limit. Never serve these rows to a caller
+// directly: source ACLs are not applied here.
+func (r *RAGRepo) ListFailedDocuments(ctx context.Context, tenantID string, limit, offset int) ([]rag.Document, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := r.db.SQL.QueryContext(ctx,
+		documentSelect+` WHERE o.tenant_id = $1 AND j.id IS NOT NULL
+		 AND COALESCE(ci.removed_at, o.deleted_at, o.tombstoned_at) IS NULL
+		 ORDER BY o.first_seen_at DESC, o.id, ci.id LIMIT $2 OFFSET $3`,
+		tenantID, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("list failed documents: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	return collectDocuments(rows, tenantID)
+}
+
+// ListTenantDocuments is the raw tenant-wide non-removed document projection —
+// an internal building block for Service.CountDocuments, which authorizes per
+// principal. Never serve these rows to a caller directly.
+func (r *RAGRepo) ListTenantDocuments(ctx context.Context, tenantID string, limit, offset int) ([]rag.Document, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := r.db.SQL.QueryContext(ctx,
+		documentSelect+` WHERE o.tenant_id = $1
+		 AND COALESCE(ci.removed_at, o.deleted_at, o.tombstoned_at) IS NULL
+		 ORDER BY o.first_seen_at DESC, o.id, ci.id LIMIT $2 OFFSET $3`,
+		tenantID, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("list tenant documents: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	return collectDocuments(rows, tenantID)
+}
+
+// CountDocuments counts tenant documents; excludeRemoved drops the removed
+// tombstones. Raw tenant-wide building block — never served raw to a caller
+// (no management exception: knowledge.manage derives from rag.manage and
+// unlocks nothing here).
+func (r *RAGRepo) CountDocuments(ctx context.Context, tenantID string, excludeRemoved bool) (int64, error) {
+	q := `SELECT COUNT(DISTINCT o.id) FROM source_objects o
+		JOIN collection_items ci ON ci.tenant_id = o.tenant_id AND ci.object_id = o.id
+		WHERE o.tenant_id = $1`
+	if excludeRemoved {
+		q += ` AND COALESCE(ci.removed_at, o.deleted_at, o.tombstoned_at) IS NULL`
+	}
+	var n int64
+	if err := r.db.SQL.QueryRowContext(ctx, q, tenantID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count documents: %w", err)
+	}
+	return n, nil
+}
+
+// MarkCollectionItemRemoved writes the soft tombstone: the collection item
+// row stays as management metadata while every member read-path excludes it.
+func (r *RAGRepo) MarkCollectionItemRemoved(ctx context.Context, tenantID, collectionID, objectID string) error {
+	res, err := r.db.SQL.ExecContext(ctx, `
+		UPDATE collection_items SET removed_at = now()
+		WHERE tenant_id = $1 AND collection_id = $2 AND object_id = $3 AND removed_at IS NULL`,
+		tenantID, collectionID, objectID)
+	if err != nil {
+		return fmt.Errorf("mark collection item removed: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return source.ErrDenied
+	}
+	return nil
+}
+
+// ListBlockLocators returns the retained locators for parsed blocks — the
+// single resolution path for citation locations. Only persisted fields are
+// ever surfaced; missing blocks resolve to nothing.
+func (r *RAGRepo) ListBlockLocators(ctx context.Context, tenantID string, blockIDs []string) (map[string]source.Locator, error) {
+	out := make(map[string]source.Locator, len(blockIDs))
+	if len(blockIDs) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(blockIDs))
+	args := make([]any, 0, len(blockIDs)+1)
+	args = append(args, tenantID)
+	for i, id := range blockIDs {
+		placeholders[i] = fmt.Sprintf("$%d", i+2)
+		args = append(args, id)
+	}
+	rows, err := r.db.SQL.QueryContext(ctx,
+		`SELECT id, locator FROM blocks WHERE tenant_id = $1 AND id IN (`+strings.Join(placeholders, ",")+`)`,
+		args...)
+	if err != nil {
+		return nil, fmt.Errorf("list block locators: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			return nil, err
+		}
+		var locator source.Locator
+		if len(raw) > 0 {
+			_ = json.Unmarshal(raw, &locator)
+		}
+		out[id] = locator
+	}
+	return out, rows.Err()
+}
+
+func collectDocuments(rows *sql.Rows, tenantID string) ([]rag.Document, error) {
 	var out []rag.Document
 	for rows.Next() {
 		d, err := scanDocument(rows)
 		if err != nil {
-			if errors.Is(err, source.ErrDenied) {
-				continue
-			}
 			return nil, err
 		}
 		d.TenantID = tenantID
 		out = append(out, d)
 	}
 	return out, rows.Err()
-}
-
-// DeleteObjectRows removes the durable object row and its dependents —
-// items, generations, chunks and versions — after the caller already
-// tombstoned the object and dropped its index points.
-func (r *RAGRepo) DeleteObjectRows(ctx context.Context, tenantID, objectID string) error {
-	return WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
-		stmts := []struct {
-			q    string
-			args []any
-		}{
-			{`DELETE FROM collection_items WHERE tenant_id = $1 AND object_id = $2`, []any{tenantID, objectID}},
-			{`DELETE FROM index_generations WHERE tenant_id = $1 AND object_version_id IN
-			  (SELECT id FROM source_object_versions WHERE tenant_id = $1 AND object_id = $2)`, []any{tenantID, objectID}},
-			{`DELETE FROM chunks WHERE tenant_id = $1 AND object_version_id IN
-			  (SELECT id FROM source_object_versions WHERE tenant_id = $1 AND object_id = $2)`, []any{tenantID, objectID}},
-			{`DELETE FROM blocks WHERE tenant_id = $1 AND parsed_document_id IN
-			  (SELECT id FROM parsed_documents WHERE tenant_id = $1 AND object_version_id IN
-			   (SELECT id FROM source_object_versions WHERE tenant_id = $1 AND object_id = $2))`, []any{tenantID, objectID}},
-			{`DELETE FROM parsed_documents WHERE tenant_id = $1 AND object_version_id IN
-			  (SELECT id FROM source_object_versions WHERE tenant_id = $1 AND object_id = $2)`, []any{tenantID, objectID}},
-			{`DELETE FROM source_object_versions WHERE tenant_id = $1 AND object_id = $2`, []any{tenantID, objectID}},
-			{`DELETE FROM source_objects WHERE tenant_id = $1 AND id = $2`, []any{tenantID, objectID}},
-		}
-		for _, st := range stmts {
-			if _, err := tx.ExecContext(ctx, st.q, st.args...); err != nil {
-				return fmt.Errorf("delete object rows: %w", err)
-			}
-		}
-		return nil
-	})
 }
 
 // LiveCollectionSourceIDs returns the native source ids currently present in
@@ -931,11 +1064,12 @@ func (r *RAGRepo) ListPublishedGenerations(ctx context.Context, tenantID, collec
 
 func (r *RAGRepo) ListGenerationChunks(ctx context.Context, tenantID, collectionID, versionID string, generation int64) ([]rag.DocumentChunk, error) {
 	rows, err := r.db.SQL.QueryContext(ctx, `
-		SELECT id, object_version_id, collection_id, generation, ordinal, text,
-		       byte_start, byte_end, span_refs, block_path, locator, qdrant_point_id, created_at
-		FROM chunks
-		WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3 AND generation=$4
-		ORDER BY ordinal`, tenantID, collectionID, versionID, generation)
+		SELECT k.id, v.object_id, k.collection_id, k.generation, k.ordinal, k.text,
+		       k.byte_start, k.byte_end, k.span_refs, k.block_path, k.locator, k.qdrant_point_id, k.created_at
+		FROM chunks k
+		JOIN source_object_versions v ON v.tenant_id = k.tenant_id AND v.id = k.object_version_id
+		WHERE k.tenant_id=$1 AND k.collection_id=$2 AND k.object_version_id=$3 AND k.generation=$4
+		ORDER BY k.ordinal`, tenantID, collectionID, versionID, generation)
 	if err != nil {
 		return nil, fmt.Errorf("list generation chunks: %w", err)
 	}

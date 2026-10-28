@@ -5,33 +5,35 @@
         <a href="/dashboard" class="text-xl font-display font-bold gradient-text">Enclava</a>
         <div class="dashboard-nav-main" aria-label="Primary">
           <a href="/dashboard" class="dashboard-nav-link{{if eq .ActivePage "dashboard"}} active{{end}}">Dashboard</a>
-          <a href="/dashboard/extract" class="dashboard-nav-link{{if eq .ActivePage "extract"}} active{{end}}">Extract</a>
+          {{if .HasScope "extract"}}<a href="/dashboard/extract" class="dashboard-nav-link{{if eq .ActivePage "extract"}} active{{end}}">Extract</a>{{end}}
           <a href="/dashboard/documents" class="dashboard-nav-link{{if eq .ActivePage "documents"}} active{{end}}">Documents</a>
           {{if .KnowledgeReadable}}<a href="/dashboard/rag" class="dashboard-nav-link{{if eq .ActivePage "rag"}} active{{end}}">Knowledge</a>{{end}}
-          <a href="/dashboard/chatbots" class="dashboard-nav-link{{if eq .ActivePage "chatbots"}} active{{end}}">Assistants</a>
+          {{if .HasScope "chatbot"}}<a href="/dashboard/chatbots" class="dashboard-nav-link{{if eq .ActivePage "chatbots"}} active{{end}}">Assistants</a>{{end}}
           {{if .PlatformAdmin}}<a href="/dashboard/mcp" class="dashboard-nav-link{{if eq .ActivePage "mcp"}} active{{end}}">MCP</a>{{end}}
           {{if .ConnectorsManage}}<a href="/dashboard/connectors" class="dashboard-nav-link{{if eq .ActivePage "connectors"}} active{{end}}">Sources</a>{{end}}
             <summary class="dashboard-nav-link{{if eq .ActivePage "keys"}} active{{end}}{{if eq .ActivePage "budgets"}} active{{end}}" title="API Keys menu">
               API Keys
             </summary>
             <div class="dashboard-menu-panel">
-              <a href="/dashboard/keys" class="dashboard-menu-item{{if eq .ActivePage "keys"}} active{{end}}">Keys</a>
+              {{if .PlatformAdmin}}<a href="/dashboard/keys" class="dashboard-menu-item{{if eq .ActivePage "keys"}} active{{end}}">Keys</a>{{end}}
               <a href="/dashboard/budgets" class="dashboard-menu-item{{if eq .ActivePage "budgets"}} active{{end}}">Budgets</a>
             </div>
           </details>
-          <a href="/dashboard/analytics" class="dashboard-nav-link{{if eq .ActivePage "analytics"}} active{{end}}">Analytics</a>
+          {{if .PlatformAdmin}}<a href="/dashboard/analytics" class="dashboard-nav-link{{if eq .ActivePage "analytics"}} active{{end}}">Analytics</a>{{end}}
           <a href="/dashboard/identity" class="dashboard-nav-link{{if eq .ActivePage "identity"}} active{{end}}">Identity</a>
+          {{if or .PlatformAdmin (.HasScope "pricing.manage") (.HasScope "chatbot")}}
           <details class="dashboard-menu">
             <summary class="dashboard-nav-link{{if eq .ActivePage "providers"}} active{{end}}{{if eq .ActivePage "pricing"}} active{{end}}{{if eq .ActivePage "billing-audit"}} active{{end}}{{if eq .ActivePage "prompt-templates"}} active{{end}}" title="Operations menu">
               Operations
             </summary>
             <div class="dashboard-menu-panel">
-              <a href="/dashboard/providers" class="dashboard-menu-item{{if eq .ActivePage "providers"}} active{{end}}">Providers</a>
-              <a href="/dashboard/pricing" class="dashboard-menu-item{{if eq .ActivePage "pricing"}} active{{end}}">Pricing</a>
-              <a href="/dashboard/billing-audit" class="dashboard-menu-item{{if eq .ActivePage "billing-audit"}} active{{end}}">Billing Audit</a>
-              <a href="/dashboard/prompt-templates" class="dashboard-menu-item{{if eq .ActivePage "prompt-templates"}} active{{end}}">Prompt Templates</a>
+              {{if .HasScope "pricing.manage"}}<a href="/dashboard/providers" class="dashboard-menu-item{{if eq .ActivePage "providers"}} active{{end}}">Providers</a>{{end}}
+              {{if .HasScope "pricing.manage"}}<a href="/dashboard/pricing" class="dashboard-menu-item{{if eq .ActivePage "pricing"}} active{{end}}">Pricing</a>{{end}}
+              {{if .PlatformAdmin}}<a href="/dashboard/billing-audit" class="dashboard-menu-item{{if eq .ActivePage "billing-audit"}} active{{end}}">Billing Audit</a>{{end}}
+              {{if .HasScope "chatbot"}}<a href="/dashboard/prompt-templates" class="dashboard-menu-item{{if eq .ActivePage "prompt-templates"}} active{{end}}">Prompt Templates</a>{{end}}
             </div>
           </details>
+          {{end}}
         </div>
         <details class="dashboard-menu dashboard-mobile-menu">
           <summary class="dashboard-icon-button" title="Navigation menu" aria-label="Navigation menu">
@@ -41,19 +43,19 @@
           </summary>
           <div class="dashboard-menu-panel dashboard-menu-panel-wide">
             <a href="/dashboard" class="dashboard-menu-item{{if eq .ActivePage "dashboard"}} active{{end}}">Dashboard</a>
-            <a href="/dashboard/extract" class="dashboard-menu-item{{if eq .ActivePage "extract"}} active{{end}}">Extract</a>
+            {{if .HasScope "extract"}}<a href="/dashboard/extract" class="dashboard-menu-item{{if eq .ActivePage "extract"}} active{{end}}">Extract</a>{{end}}
             <a href="/dashboard/documents" class="dashboard-menu-item{{if eq .ActivePage "documents"}} active{{end}}">Documents</a>
             {{if .KnowledgeReadable}}<a href="/dashboard/rag" class="dashboard-menu-item{{if eq .ActivePage "rag"}} active{{end}}">Knowledge</a>{{end}}
-            <a href="/dashboard/chatbots" class="dashboard-menu-item{{if eq .ActivePage "chatbots"}} active{{end}}">Assistants</a>
+            {{if .HasScope "chatbot"}}<a href="/dashboard/chatbots" class="dashboard-menu-item{{if eq .ActivePage "chatbots"}} active{{end}}">Assistants</a>{{end}}
             {{if .ConnectorsManage}}<a href="/dashboard/connectors" class="dashboard-menu-item{{if eq .ActivePage "connectors"}} active{{end}}">Sources</a>{{end}}
             {{if .PlatformAdmin}}<a href="/dashboard/mcp" class="dashboard-menu-item{{if eq .ActivePage "mcp"}} active{{end}}">MCP Tools</a>{{end}}
-            <a href="/dashboard/keys" class="dashboard-menu-item{{if eq .ActivePage "keys"}} active{{end}}">API Keys</a>
+            {{if .PlatformAdmin}}<a href="/dashboard/keys" class="dashboard-menu-item{{if eq .ActivePage "keys"}} active{{end}}">API Keys</a>{{end}}
             <a href="/dashboard/budgets" class="dashboard-menu-item{{if eq .ActivePage "budgets"}} active{{end}}">Budgets</a>
-            <a href="/dashboard/analytics" class="dashboard-menu-item{{if eq .ActivePage "analytics"}} active{{end}}">Analytics</a>
-            <a href="/dashboard/providers" class="dashboard-menu-item{{if eq .ActivePage "providers"}} active{{end}}">Providers</a>
-            <a href="/dashboard/pricing" class="dashboard-menu-item{{if eq .ActivePage "pricing"}} active{{end}}">Pricing</a>
-            <a href="/dashboard/billing-audit" class="dashboard-menu-item{{if eq .ActivePage "billing-audit"}} active{{end}}">Billing Audit</a>
-            <a href="/dashboard/prompt-templates" class="dashboard-menu-item{{if eq .ActivePage "prompt-templates"}} active{{end}}">Prompt Templates</a>
+            {{if .PlatformAdmin}}<a href="/dashboard/analytics" class="dashboard-menu-item{{if eq .ActivePage "analytics"}} active{{end}}">Analytics</a>{{end}}
+            {{if .HasScope "pricing.manage"}}<a href="/dashboard/providers" class="dashboard-menu-item{{if eq .ActivePage "providers"}} active{{end}}">Providers</a>{{end}}
+            {{if .HasScope "pricing.manage"}}<a href="/dashboard/pricing" class="dashboard-menu-item{{if eq .ActivePage "pricing"}} active{{end}}">Pricing</a>{{end}}
+            {{if .PlatformAdmin}}<a href="/dashboard/billing-audit" class="dashboard-menu-item{{if eq .ActivePage "billing-audit"}} active{{end}}">Billing Audit</a>{{end}}
+            {{if .HasScope "chatbot"}}<a href="/dashboard/prompt-templates" class="dashboard-menu-item{{if eq .ActivePage "prompt-templates"}} active{{end}}">Prompt Templates</a>{{end}}
             <a href="/dashboard/identity" class="dashboard-menu-item{{if eq .ActivePage "identity"}} active{{end}}">Identity</a>
           </div>
         </details>

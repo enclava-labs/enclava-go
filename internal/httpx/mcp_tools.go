@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/mcp"
@@ -31,19 +32,22 @@ type mcpServerResponse struct {
 	Enabled           bool     `json:"enabled"`
 }
 
-type mcpApprovalResponse struct {
-	ServerID         string          `json:"server_id"`
-	ToolID           string          `json:"tool_id"`
-	ModelName        string          `json:"model_name"`
-	RemoteName       string          `json:"remote_name"`
-	InputSchema      json.RawMessage `json:"input_schema"`
-	OutputSchema     json.RawMessage `json:"output_schema"`
-	InputSchemaHash  string          `json:"input_schema_hash"`
-	OutputSchemaHash string          `json:"output_schema_hash"`
-	SchemaVersion    int64           `json:"schema_version"`
-	Revision         int64           `json:"revision"`
-	CallerScopes     []string        `json:"caller_scopes"`
-	Enabled          bool            `json:"enabled"`
+// mcpDiscoveryRow is the frozen §6.9 queue-row contract: durable state,
+// schemas, the approved baseline, field-level diffs and untrusted display
+// annotations. schema_version is the durable current version the PUT must
+// echo to approve.
+type mcpDiscoveryRow struct {
+	ToolID        string          `json:"tool_id"`
+	ModelName     string          `json:"model_name"`
+	RemoteName    string          `json:"remote_name"`
+	State         string          `json:"state"`
+	SchemaVersion int64           `json:"schema_version"`
+	InputSchema   json.RawMessage `json:"input_schema"`
+	OutputSchema  json.RawMessage `json:"output_schema"`
+	PriorSchema   json.RawMessage `json:"prior_schema"`
+	DiffFields    json.RawMessage `json:"diff_fields"`
+	Annotations   map[string]any  `json:"annotations"`
+	DiscoveredAt  time.Time       `json:"discovered_at"`
 }
 
 func (in mcpServerInput) server(tenantID, id string) mcp.Server {
@@ -74,12 +78,37 @@ func mcpServerJSON(server mcp.Server) mcpServerResponse {
 	return mcpServerResponse{ID: server.ID, Origin: server.Origin, EndpointPath: server.EndpointPath, CredentialRef: server.CredentialRef, AuthorizedPrivate: server.AuthorizedPrivate, AudienceScopes: server.AudienceScopes, Enabled: server.Enabled}
 }
 
-func mcpApprovalJSON(approval postgres.MCPToolApproval) mcpApprovalResponse {
-	return mcpApprovalResponse{ServerID: approval.ServerID, ToolID: approval.ToolID, ModelName: approval.ModelName, RemoteName: approval.RemoteName, InputSchema: approval.InputSchema, OutputSchema: approval.OutputSchema, InputSchemaHash: approval.InputSchemaHash, OutputSchemaHash: approval.OutputSchemaHash, SchemaVersion: approval.SchemaVersion, Revision: approval.Revision, CallerScopes: approval.CallerScopes, Enabled: approval.Enabled}
+// mcpAnnotationsWire surfaces the stored display hints with the MCP spec's
+// defaults made explicit. They are untrusted UI metadata — never authority.
+func mcpAnnotationsWire(an mcp.ToolAnnotations) map[string]any {
+	wire := map[string]any{
+		"read_only":   an.ReadOnlyHint != nil && *an.ReadOnlyHint,
+		"writes_data": an.DestructiveHint == nil || *an.DestructiveHint,
+		"idempotent":  an.IdempotentHint != nil && *an.IdempotentHint,
+		"open_world":  an.OpenWorldHint == nil || *an.OpenWorldHint,
+	}
+	if an.Title != "" {
+		wire["title"] = an.Title
+	}
+	return wire
 }
 
-func mcpToolJSON(tool mcp.DiscoveredTool) map[string]any {
-	return map[string]any{"name": tool.Name, "input_schema": tool.InputSchema, "output_schema": tool.OutputSchema}
+func mcpDiscoveryJSON(d postgres.MCPToolDiscovery) mcpDiscoveryRow {
+	return mcpDiscoveryRow{
+		ToolID: d.ToolID, ModelName: d.ModelName, RemoteName: d.RemoteName,
+		State: d.State, SchemaVersion: d.SchemaVersion,
+		InputSchema: d.InputSchema, OutputSchema: d.OutputSchema,
+		PriorSchema: d.PriorInputSchema, DiffFields: d.DiffFields,
+		Annotations: mcpAnnotationsWire(d.Annotations), DiscoveredAt: d.LastSeenAt,
+	}
+}
+
+func mcpDiscoveryRows(rows []postgres.MCPToolDiscovery) []mcpDiscoveryRow {
+	out := make([]mcpDiscoveryRow, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, mcpDiscoveryJSON(row))
+	}
+	return out
 }
 
 func (a *App) ConfigureMCP(repo *postgres.MCPToolsRepo, transport *mcp.StreamableHTTP) {
@@ -185,111 +214,77 @@ func (a *App) handleMCPServerByID(w http.ResponseWriter, r *http.Request, p auth
 			WriteOpenAIError(w, http.StatusBadGateway, "MCP discovery failed", "server_error", "mcp_discovery_failed")
 			return
 		}
-		// A discovered schema change or removed tool revokes the old revision.
-		discovered := make(map[string]mcp.DiscoveredTool, len(tools))
-		for _, tool := range tools {
-			discovered[tool.Name] = tool
-		}
-		approved, err := a.mcpRepo.ListApprovals(r.Context(), p.TenantID, serverID)
-		if err != nil {
-			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "mcp_approval_list_failed")
+		// The repo owns every state transition: server identity comes from
+		// the authenticated route row, so an empty snapshot still revokes
+		// exactly this server's vanished or changed approvals.
+		if err := a.mcpRepo.RecordDiscovery(r.Context(), p.TenantID, serverID, tools); err != nil {
+			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "mcp_discovery_persist_failed")
 			return
 		}
-		for _, old := range approved {
-			tool, ok := discovered[old.ToolID]
-			if !ok || old.InputSchemaHash != mcp.SchemaHash(tool.InputSchema) || old.OutputSchemaHash != mcp.SchemaHash(tool.OutputSchema) {
-				if err := a.mcpRepo.Revoke(r.Context(), p.TenantID, serverID, old.ToolID); err != nil {
-					WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "mcp_revoke_failed")
-					return
-				}
-			}
-		}
-		publicTools := make([]map[string]any, 0, len(tools))
-		for _, tool := range tools {
-			publicTools = append(publicTools, mcpToolJSON(tool))
-		}
-		WriteJSON(w, http.StatusOK, map[string]any{"tools": publicTools})
-		return
-	}
-	if len(parts) == 2 && parts[1] == "tools" && r.Method == http.MethodGet {
-		approvals, err := a.mcpRepo.ListAllApprovals(r.Context(), p.TenantID, serverID)
+		rows, err := a.mcpRepo.ListServerTools(r.Context(), p.TenantID, serverID)
 		if err != nil {
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "mcp_tools_list_failed")
 			return
 		}
-		response := make([]mcpApprovalResponse, 0, len(approvals))
-		for _, approval := range approvals {
-			response = append(response, mcpApprovalJSON(approval))
+		WriteJSON(w, http.StatusOK, map[string]any{"tools": mcpDiscoveryRows(rows)})
+		return
+	}
+	if len(parts) == 2 && parts[1] == "tools" && r.Method == http.MethodGet {
+		rows, err := a.mcpRepo.ListServerTools(r.Context(), p.TenantID, serverID)
+		if err != nil {
+			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "mcp_tools_list_failed")
+			return
 		}
-		WriteJSON(w, http.StatusOK, map[string]any{"tools": response})
+		WriteJSON(w, http.StatusOK, map[string]any{"tools": mcpDiscoveryRows(rows)})
 		return
 	}
 	if len(parts) == 3 && parts[1] == "tools" {
 		toolID := parts[2]
 		switch r.Method {
 		case http.MethodDelete:
-			if err := a.mcpRepo.Revoke(r.Context(), p.TenantID, serverID, toolID); err != nil {
-				http.NotFound(w, r)
+			// pending/changed -> durable rejected; approved -> revoked;
+			// rejected -> idempotent; gone/unknown -> 404.
+			if err := a.mcpRepo.RejectDiscovery(r.Context(), p.TenantID, serverID, toolID); err != nil {
+				if errors.Is(err, postgres.ErrMCPApprovalNotFound) {
+					http.NotFound(w, r)
+					return
+				}
+				WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "mcp_revoke_failed")
 				return
 			}
 			WriteJSON(w, http.StatusOK, map[string]any{"revoked": true, "tool_id": toolID})
 		case http.MethodPut:
-			if a.mcpTransport == nil {
-				WriteOpenAIError(w, http.StatusServiceUnavailable, "MCP transport is unavailable", "server_error", "mcp_unavailable")
-				return
-			}
+			// Approval never rediscovers: it installs the persisted schemas
+			// if and only if the reviewed schema_version still matches the
+			// durable current version — compare and install are one tx.
 			var input struct {
-				ModelName    string   `json:"model_name"`
-				CallerScopes []string `json:"caller_scopes"`
+				ModelName     string   `json:"model_name"`
+				CallerScopes  []string `json:"caller_scopes"`
+				SchemaVersion *int64   `json:"schema_version"`
 			}
 			if err := DecodeJSON(r, &input); err != nil {
 				WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_mcp_approval")
 				return
 			}
-			input.CallerScopes = normalizeMCPScopeList(input.CallerScopes)
-			if mcpBuiltinName(strings.TrimSpace(input.ModelName)) {
+			modelName := strings.TrimSpace(input.ModelName)
+			if modelName == "" || mcpBuiltinName(modelName) {
 				WriteOpenAIError(w, http.StatusBadRequest, "model_name conflicts with a built-in tool", "invalid_request_error", "invalid_mcp_approval")
 				return
 			}
-			server, err := a.mcpRepo.GetServer(r.Context(), p.TenantID, serverID)
-			if err != nil {
+			if input.SchemaVersion == nil || *input.SchemaVersion < 1 {
+				WriteOpenAIError(w, http.StatusBadRequest, "schema_version of the reviewed discovery row is required", "invalid_request_error", "invalid_mcp_approval")
+				return
+			}
+			approval, err := a.mcpRepo.ApproveDiscovery(r.Context(), p.TenantID, serverID, toolID, *input.SchemaVersion, modelName, normalizeMCPScopeList(input.CallerScopes))
+			switch {
+			case err == nil:
+			case errors.Is(err, postgres.ErrMCPSchemaChanged):
+				WriteOpenAIError(w, http.StatusConflict, "schema changed since review; rediscover and review again", "invalid_request_error", "schema_changed")
+				return
+			case errors.Is(err, postgres.ErrMCPApprovalNotFound):
 				http.NotFound(w, r)
 				return
-			}
-			discovered, err := a.mcpTransport.Discover(r.Context(), server)
-			if err != nil {
-				WriteOpenAIError(w, http.StatusBadGateway, "MCP discovery failed", "server_error", "mcp_discovery_failed")
-				return
-			}
-			var selected *mcp.DiscoveredTool
-			for i := range discovered {
-				if discovered[i].Name == toolID {
-					selected = &discovered[i]
-					break
-				}
-			}
-			if selected == nil {
-				http.NotFound(w, r)
-				return
-			}
-			version := int64(1)
-			old, oldErr := a.mcpRepo.GetApprovalAny(r.Context(), p.TenantID, serverID, toolID)
-			if oldErr == nil {
-				version = old.SchemaVersion
-				if old.InputSchemaHash != mcp.SchemaHash(selected.InputSchema) || old.OutputSchemaHash != mcp.SchemaHash(selected.OutputSchema) {
-					version++
-				}
-			} else if !errors.Is(oldErr, postgres.ErrMCPApprovalNotFound) {
-				WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "mcp_approval_lookup_failed")
-				return
-			}
-			approval := postgres.MCPToolApproval{
-				TenantID: p.TenantID, ServerID: serverID, ToolID: toolID,
-				ModelName: strings.TrimSpace(input.ModelName), RemoteName: selected.Name,
-				InputSchema: selected.InputSchema, OutputSchema: selected.OutputSchema,
-				SchemaVersion: version, CallerScopes: input.CallerScopes, Enabled: true,
-			}
-			if err := a.mcpRepo.Approve(r.Context(), approval); err != nil {
+			default:
 				WriteOpenAIError(w, http.StatusBadRequest, "invalid MCP approval", "invalid_request_error", "invalid_mcp_approval")
 				return
 			}

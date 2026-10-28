@@ -35,6 +35,9 @@ type Repository interface {
 	GetConversation(ctx context.Context, tenantID, id string) (Conversation, error)
 	AddMessage(ctx context.Context, m Message) error
 	ListMessages(ctx context.Context, tenantID, conversationID string) ([]Message, error)
+	// ListConversations returns the owner's newest-first conversation
+	// summaries under the opaque keyset cursor (own-only, admins included).
+	ListConversations(ctx context.Context, tenantID, ownerActorID string, limit int, cursor string) ([]ConversationSummary, string, error)
 }
 
 type RunRepository interface {
@@ -137,8 +140,15 @@ func actorKey(p auth.Principal) string {
 // chatbotAllowed is the single stored-grant bound for assistant access:
 // List/Get/run AND the Update/Delete mutations require it (D-25). Neither
 // platform.admin scope nor record ownership substitutes for a grant —
-// ownership only narrows mutations (chatbotOwnerAllowed).
+// ownership only narrows mutations (chatbotOwnerAllowed). The stored
+// audience is an ADDITIONAL restriction on top of grants (D-07/D-25): the
+// caller must be an audience member (or "*") unless they are the
+// platform.admin or the assistant owner — those bypass the audience term
+// only, never the grant check.
 func chatbotAllowed(p auth.Principal, bot Instance) bool {
+	if !chatbotOwnerAllowed(p, bot) && !contains(bot.Audience, actorKey(p)) && !contains(bot.Audience, "*") {
+		return false
+	}
 	ids := []string{bot.ID}
 	if ext := strings.TrimSpace(bot.ExternalID); ext != "" {
 		ids = append(ids, ext)
@@ -203,6 +213,14 @@ func (s *Service) Create(ctx context.Context, p auth.Principal, input CreateChat
 	if input.IsEnabled != nil {
 		enabled = *input.IsEnabled
 	}
+	audience, err := normalizeAudience(input.Audience)
+	if err != nil {
+		return Instance{}, err
+	}
+	if audience == nil {
+		// Omitted audience degrades safely to owner-only.
+		audience = []string{p.ActorID}
+	}
 	b := Instance{
 		TenantID:         p.TenantID,
 		ID:               id,
@@ -213,6 +231,7 @@ func (s *Service) Create(ctx context.Context, p auth.Principal, input CreateChat
 		Model:            model,
 		RAGCollectionIDs: normalizeStringList(input.RAGCollectionIDs),
 		Settings:         nonNilMap(input.Settings),
+		Audience:         audience,
 		ExternalID:       externalID,
 		IsEnabled:        enabled,
 		OwnerActorID:     p.ActorID,
@@ -223,8 +242,10 @@ func (s *Service) Create(ctx context.Context, p auth.Principal, input CreateChat
 	return s.repo.GetByID(ctx, p.TenantID, id)
 }
 
-// List returns only chatbots the principal's allowlists grant. An empty
-// allowlist denies; only explicit all-mode is unrestricted.
+// List returns only chatbots the principal's allowlists grant AND whose
+// stored audience admits them (owner/platform.admin bypass the audience
+// term only). An empty allowlist denies; only explicit all-mode is
+// unrestricted on the grant side.
 func (s *Service) List(ctx context.Context, p auth.Principal) ([]Instance, error) {
 	if err := requireTenant(p); err != nil {
 		return nil, err
@@ -296,6 +317,13 @@ func (s *Service) Update(ctx context.Context, p auth.Principal, id string, input
 	}
 	if input.RAGCollectionIDs != nil {
 		b.RAGCollectionIDs = normalizeStringList(input.RAGCollectionIDs)
+	}
+	if input.Audience != nil {
+		audience, err := normalizeAudience(input.Audience)
+		if err != nil {
+			return Instance{}, err
+		}
+		b.Audience = audience
 	}
 	if input.Settings != nil {
 		b.Settings = nonNilMap(input.Settings)
@@ -528,6 +556,118 @@ func (s *Service) ListConversation(ctx context.Context, p auth.Principal, conver
 		return ConversationView{}, err
 	}
 	return ConversationView{Conversation: conversation, Messages: messages}, nil
+}
+
+// ListAssistantToolBindings answers "which assistants use this tool"
+// (OA-26): each requested tool ID maps to the names of assistants whose
+// stored tool configuration references it, restricted to assistants the
+// caller may already see — a visibility-filtered read, never a bypass.
+func (s *Service) ListAssistantToolBindings(ctx context.Context, p auth.Principal, toolIDs []string) (map[string][]string, error) {
+	if err := requireTenant(p); err != nil {
+		return nil, err
+	}
+	want := make(map[string]struct{}, len(toolIDs))
+	for _, id := range toolIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			want[id] = struct{}{}
+		}
+	}
+	bindings := make(map[string][]string, len(want))
+	if len(want) == 0 {
+		return bindings, nil
+	}
+	bots, err := s.List(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	for _, bot := range bots {
+		for _, toolID := range configuredToolIDs(bot) {
+			if _, ok := want[toolID]; ok {
+				bindings[toolID] = append(bindings[toolID], bot.Name)
+			}
+		}
+	}
+	return bindings, nil
+}
+
+// maxTitleRunes bounds the server-derived conversation preview title.
+const maxTitleRunes = 80
+
+// ListConversations returns the caller's OWN conversations newest-first —
+// bound to actorKey(p) unconditionally, admins included; there is no owner
+// query parameter to widen it. Rows whose assistant the caller may no
+// longer see (grant or audience) are dropped after the read.
+func (s *Service) ListConversations(ctx context.Context, p auth.Principal, limit int, cursor string) ([]ConversationSummary, string, error) {
+	if err := requireTenant(p); err != nil {
+		return nil, "", err
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	bots := map[string]Instance{}
+	out := make([]ConversationSummary, 0, limit)
+	// A hidden row must never consume a page slot or end the listing: scan
+	// forward (bounded batches) until the page holds `limit` visible rows or
+	// the keyset is exhausted. `next` always resumes after the last row the
+	// scan actually consumed, visible or not.
+	next := ""
+	batches := 0
+	for len(out) < limit && batches < 10 {
+		batches++
+		batch, batchNext, err := s.repo.ListConversations(ctx, p.TenantID, actorKey(p), limit-len(out), cursor)
+		if err != nil {
+			if errors.Is(err, ErrInvalidCursor) {
+				return nil, "", invalidInput(err)
+			}
+			return nil, "", err
+		}
+		for _, summary := range batch {
+			bot, ok := bots[summary.ChatbotID]
+			if !ok {
+				bot, err = s.repo.GetByID(ctx, p.TenantID, summary.ChatbotID)
+				if err != nil {
+					continue // the assistant row is gone — so is its history
+				}
+				bots[summary.ChatbotID] = bot
+			}
+			if !chatbotAllowed(p, bot) {
+				continue
+			}
+			summary.Title = s.conversationTitle(ctx, p, summary.ID)
+			out = append(out, summary)
+		}
+		if batchNext == "" {
+			next = ""
+			break
+		}
+		cursor, next = batchNext, batchNext
+	}
+	return out, next, nil
+}
+
+// conversationTitle derives the preview from the first VISIBLE user message
+// under the authorizedHistory suppression rule: messages carrying input
+// refs but no evidence IDs, and messages whose evidence is revoked, never
+// contribute preview text.
+func (s *Service) conversationTitle(ctx context.Context, p auth.Principal, conversationID string) string {
+	messages, _, _, err := s.authorizedHistory(ctx, p, conversationID)
+	if err != nil {
+		return ""
+	}
+	for _, message := range messages {
+		if message.Role != "user" {
+			continue
+		}
+		content := strings.TrimSpace(message.Content)
+		if runes := []rune(content); len(runes) > maxTitleRunes {
+			return string(runes[:maxTitleRunes])
+		}
+		return content
+	}
+	return ""
 }
 
 func (s *Service) authorizedHistory(ctx context.Context, p auth.Principal, conversationID string) ([]Message, []source.ObjectRef, []string, error) {
@@ -901,6 +1041,30 @@ func normalizeExternalID(raw, fallback string) (string, error) {
 		return "", errors.New("external_id may contain only letters, numbers, hyphen, and underscore")
 	}
 	return raw, nil
+}
+
+// normalizeAudience trims and dedupes stored audience entries; empty
+// entries are rejected on the invalid-input path. A nil input stays nil so
+// Create can apply its owner-only default and Update can treat nil as
+// "unchanged".
+func normalizeAudience(entries []string) ([]string, error) {
+	if entries == nil {
+		return nil, nil
+	}
+	out := make([]string, 0, len(entries))
+	seen := map[string]struct{}{}
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			return nil, invalidInput(errors.New("audience entries must be non-empty actor IDs or \"*\""))
+		}
+		if _, ok := seen[entry]; ok {
+			continue
+		}
+		seen[entry] = struct{}{}
+		out = append(out, entry)
+	}
+	return out, nil
 }
 
 func normalizeStringList(values []string) []string {

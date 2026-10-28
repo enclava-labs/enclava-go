@@ -45,14 +45,21 @@ type Repository interface {
 	EnsureChunkProfile(ctx context.Context, tenantID, profileID string, size, overlap int) (chunkProfileVersionID string, err error)
 	SaveParsedDocument(ctx context.Context, parserVersion string, document source.Document) error
 	// Collection items and document projection (latest version + latest
-	// index generation state).
+	// index generation state). ListDocuments filters by validated status
+	// (all|ready|processing|failed|removed) in the same query; the failed /
+	// tenant-wide reads are raw internal projections — the service
+	// authorizes per principal BEFORE any caller sees rows.
 	AddCollectionItem(ctx context.Context, tenantID, collectionID, objectID, addedBy string) error
 	RemoveCollectionItem(ctx context.Context, tenantID, collectionID, objectID string) error
+	MarkCollectionItemRemoved(ctx context.Context, tenantID, collectionID, objectID string) error
 	ListCollectionItems(ctx context.Context, tenantID, collectionID string) ([]string, error)
-	ListDocuments(ctx context.Context, tenantID, collectionID string, limit, offset int) ([]Document, error)
+	ListDocuments(ctx context.Context, tenantID, collectionID, status string, limit, offset int) ([]Document, error)
+	ListFailedDocuments(ctx context.Context, tenantID string, limit, offset int) ([]Document, error)
+	ListTenantDocuments(ctx context.Context, tenantID string, limit, offset int) ([]Document, error)
+	CountDocuments(ctx context.Context, tenantID string, excludeRemoved bool) (int64, error)
 	LiveCollectionSourceIDs(ctx context.Context, tenantID, collectionID string) (map[string]struct{}, error)
 	GetDocument(ctx context.Context, tenantID, objectID string) (Document, error)
-	DeleteObjectRows(ctx context.Context, tenantID, objectID string) error
+	ListBlockLocators(ctx context.Context, tenantID string, blockIDs []string) (map[string]source.Locator, error)
 	ListPublishedGenerations(ctx context.Context, tenantID, collectionID string) ([]IndexGeneration, error)
 	ListGenerationChunks(ctx context.Context, tenantID, collectionID, versionID string, generation int64) ([]DocumentChunk, error)
 	SaveEvidence(ctx context.Context, record EvidenceRecord) error
@@ -298,12 +305,176 @@ func (s *Service) UploadDocument(ctx context.Context, p auth.Principal, collecti
 	return s.processNewDocument(ctx, p, c, input)
 }
 
-func (s *Service) ListDocuments(ctx context.Context, p auth.Principal, collectionID string, limit, offset int) ([]Document, error) {
+// validDocumentStatus covers the §6.7 status chips; unknown values are
+// caller errors, never silently widened.
+func validDocumentStatus(status string) bool {
+	switch status {
+	case DocumentStatusAll, DocumentStatusReady, DocumentStatusProcessing, DocumentStatusFailed, DocumentStatusRemoved:
+		return true
+	}
+	return false
+}
+
+// ListDocuments returns one page of the caller's AUTHORIZED document set:
+// per-document CanRead runs before pagination, so denied rows never consume
+// the caller's page and no title or count leaks (OA-21). rag.manage is not
+// an authorization bypass — a manage-scoped caller still sees only readable
+// documents; status=removed tombstone metadata is the one manage-gated view.
+func (s *Service) ListDocuments(ctx context.Context, p auth.Principal, collectionID, status string, limit, offset int) ([]Document, error) {
 	c, err := s.GetCollection(ctx, p, collectionID)
 	if err != nil {
 		return nil, err
 	}
-	return s.repo.ListDocuments(ctx, p.TenantID, c.ID, limit, offset)
+	status = strings.ToLower(strings.TrimSpace(status))
+	if status == "" {
+		status = DocumentStatusAll
+	}
+	if !validDocumentStatus(status) {
+		return nil, fmt.Errorf("%w: unknown document status %q", ErrInvalidInput, status)
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if status == DocumentStatusRemoved && !auth.HasScope(p, "rag.manage") && !auth.HasScope(p, "platform.admin") {
+		// Removed rows are unknown to non-managers, not an error.
+		return []Document{}, nil
+	}
+	batch := 4 * limit
+	if batch < 50 {
+		batch = 50
+	}
+	if batch > 400 {
+		batch = 400
+	}
+	var authorized []Document
+	wanted := offset + limit
+	for rawOffset := 0; len(authorized) < wanted; {
+		rows, err := s.repo.ListDocuments(ctx, p.TenantID, c.ID, status, batch, rawOffset)
+		if err != nil {
+			return nil, err
+		}
+		if len(rows) == 0 {
+			break
+		}
+		for _, d := range rows {
+			// Removed metadata is manage-gated above; live rows pass the
+			// same source authorization as every other content read.
+			if d.Status != DocumentStatusRemoved {
+				if err := s.authorizeDocumentRead(ctx, p, d); err != nil {
+					if errors.Is(err, source.ErrDenied) {
+						continue
+					}
+					return nil, err
+				}
+			}
+			authorized = append(authorized, d)
+		}
+		rawOffset += len(rows)
+		if len(rows) < batch {
+			break
+		}
+	}
+	if offset >= len(authorized) {
+		return []Document{}, nil
+	}
+	end := offset + limit
+	if end > len(authorized) {
+		end = len(authorized)
+	}
+	return authorized[offset:end], nil
+}
+
+// authorizeDocumentRead is the shared per-document read gate for list-style
+// projections: the same object-level CanRead every other content read uses.
+func (s *Service) authorizeDocumentRead(ctx context.Context, p auth.Principal, d Document) error {
+	obj, err := s.repo.GetObject(ctx, p.TenantID, d.ID)
+	if err != nil {
+		return err
+	}
+	return s.authorizer.CanRead(ctx, p, obj, source.ReadOptions{})
+}
+
+// ListFailedDocuments returns up to limit failed documents the caller may
+// read. The raw tenant-wide failure set is authorized BEFORE the limit, so
+// restricted failures filling the head cannot hide an authorized failure
+// deeper in the set — and rag.manage never bypasses source ACLs.
+func (s *Service) ListFailedDocuments(ctx context.Context, p auth.Principal, limit int) ([]Document, error) {
+	if err := requireTenant(p); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	batch := 4 * limit
+	if batch < 50 {
+		batch = 50
+	}
+	if batch > 400 {
+		batch = 400
+	}
+	var authorized []Document
+	for rawOffset := 0; len(authorized) < limit; {
+		rows, err := s.repo.ListFailedDocuments(ctx, p.TenantID, batch, rawOffset)
+		if err != nil {
+			return nil, err
+		}
+		if len(rows) == 0 {
+			break
+		}
+		for _, d := range rows {
+			if err := s.authorizeDocumentRead(ctx, p, d); err != nil {
+				if errors.Is(err, source.ErrDenied) {
+					continue
+				}
+				return nil, err
+			}
+			authorized = append(authorized, d)
+			if len(authorized) == limit {
+				break
+			}
+		}
+		rawOffset += len(rows)
+		if len(rows) < batch {
+			break
+		}
+	}
+	return authorized, nil
+}
+
+// CountDocuments counts the caller's authorized non-removed documents — the
+// KPI read for every role including managers; no tenant-wide count is
+// exposed through any capability.
+func (s *Service) CountDocuments(ctx context.Context, p auth.Principal) (int64, error) {
+	if err := requireTenant(p); err != nil {
+		return 0, err
+	}
+	var count int64
+	const batch = 200
+	for rawOffset := 0; ; rawOffset += batch {
+		rows, err := s.repo.ListTenantDocuments(ctx, p.TenantID, batch, rawOffset)
+		if err != nil {
+			return 0, err
+		}
+		if len(rows) == 0 {
+			break
+		}
+		for _, d := range rows {
+			if err := s.authorizeDocumentRead(ctx, p, d); err != nil {
+				if errors.Is(err, source.ErrDenied) {
+					continue
+				}
+				return 0, err
+			}
+			count++
+		}
+		if len(rows) < batch {
+			break
+		}
+	}
+	return count, nil
 }
 
 // LiveSourceIDs returns the source ids still present in the collection, so a
@@ -361,11 +532,14 @@ func (s *Service) DeleteDocument(ctx context.Context, p auth.Principal, document
 			return err
 		}
 	}
-	// Tombstone first: reads block immediately; row cleanup follows.
+	// Soft delete: the object tombstone blocks reads (and evidence) while
+	// the collection item keeps removed management metadata. Object/version
+	// rows are retained — the management Removed view never re-exposes
+	// content, so nothing is lost by keeping the records.
 	if err := s.repo.TombstoneObject(ctx, p.TenantID, doc.ID); err != nil {
 		return err
 	}
-	return s.repo.DeleteObjectRows(ctx, p.TenantID, doc.ID)
+	return s.repo.MarkCollectionItemRemoved(ctx, p.TenantID, doc.CollectionID, doc.ID)
 }
 
 func (s *Service) ReprocessDocument(ctx context.Context, p auth.Principal, documentID string) (UploadDocumentOutput, error) {
@@ -639,6 +813,37 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	if len(structuredChunks) == 0 {
 		return "", errors.New("document has no extractable text")
 	}
+	// HeaderPath is the real heading ancestry of the chunk's spans, read
+	// from the retained parsed blocks at materialization — never post-hoc
+	// parsing or invented headings.
+	blockByID := make(map[string]source.Block, len(document.Blocks))
+	for _, b := range document.Blocks {
+		blockByID[b.ID] = b
+	}
+	headerPathFor := func(spans []source.Span) string {
+		for _, span := range spans {
+			var parts []string
+			seen := map[string]struct{}{}
+			block, ok := blockByID[span.BlockID]
+			for ok {
+				if _, dup := seen[block.ID]; dup {
+					break
+				}
+				seen[block.ID] = struct{}{}
+				if block.Kind == "heading" && strings.TrimSpace(block.Text) != "" {
+					parts = append([]string{block.Text}, parts...)
+				}
+				if block.ParentID == "" {
+					break
+				}
+				block, ok = blockByID[block.ParentID]
+			}
+			if len(parts) > 0 {
+				return strings.Join(parts, " > ")
+			}
+		}
+		return ""
+	}
 	chunkTexts := make([]string, 0, len(structuredChunks))
 	for _, chunk := range structuredChunks {
 		chunkTexts = append(chunkTexts, chunk.Text)
@@ -681,6 +886,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 			ID: chunkID, DocumentID: obj.ID, CollectionID: c.ID, Generation: generation,
 			ChunkIndex: i, Content: chunkText, TokenCount: tokenEstimate(chunkText),
 			QdrantPointID: pointID, Metadata: map[string]any{"file_name": ver.OriginalFilename},
+			HeaderPath: headerPathFor(structuredChunks[i].Spans),
 		}
 		payload := map[string]any{
 			"tenant_id":     job.TenantID,

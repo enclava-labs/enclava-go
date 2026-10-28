@@ -2,6 +2,7 @@ package extract_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -620,7 +621,7 @@ func TestCrossTenantJobReadsDenyIdentically(t *testing.T) {
 	}
 
 	// Other actor's job list does not include this job.
-	list, total, err := f.svc.ListJobs(ctx, otherPrincipal, 20, 0)
+	list, total, err := f.svc.ListJobs(ctx, otherPrincipal, extract.OperationProcess, 20, 0)
 	if err != nil || len(list) != 0 || total != 0 {
 		t.Fatalf("other actor list: %d/%d %v", len(list), total, err)
 	}
@@ -912,5 +913,179 @@ func TestProcessBoundedByStoredTemplateGrants(t *testing.T) {
 		Bytes: []byte("invoice text"),
 	}); !errors.Is(err, extract.ErrForbidden) {
 		t.Fatalf("revoked template = %v, want ErrForbidden", err)
+	}
+}
+
+// TestListJobsExtractionOperationScope proves the extraction list and stats
+// count only extract.process/extract.vision for the owner: a document.preview
+// job in the same window never appears in rows or totals, explicit filters
+// isolate each member operation, foreign actors stay absent, and non-member
+// filter values are rejected (T-08-04-01/03).
+func TestListJobsExtractionOperationScope(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract")
+	f.seedTemplate(t, extract.Template{
+		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u",
+		DefaultModel: "priced-extract", Enabled: true,
+	})
+	submit := func(op, name, mime, content string) extract.ProcessOutput {
+		out, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
+			Operation: op, TemplateID: "invoice", FileName: name, MimeType: mime,
+			Bytes: []byte(content),
+		})
+		if err != nil {
+			t.Fatalf("submit %s job: %v", op, err)
+		}
+		return out
+	}
+	processOut := submit(extract.OperationProcess, "invoice.txt", "text/plain", "invoice text")
+	pngBytes, err := base64.StdEncoding.DecodeString(
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+	if err != nil {
+		t.Fatalf("decode png fixture: %v", err)
+	}
+	submit(extract.OperationVision, "scan.png", "image/png", string(pngBytes))
+
+	// A shared preview job owned by the same submitter — the contamination
+	// case Home's counters suffered before the operation predicate.
+	processRow, err := f.jobsSvc.Get(ctx, f.principal, processOut.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.jobsSvc.Enqueue(ctx, f.principal, jobs.EnqueueRequest{
+		Operation:      extract.OperationPreview,
+		IdempotencyKey: "scope-preview-fixture",
+		InputRef:       processRow.InputRef, InputHash: processRow.InputHash,
+		Policy: map[string]any{},
+	}); err != nil {
+		t.Fatalf("enqueue preview fixture: %v", err)
+	}
+
+	// Default list: the two extraction jobs only — the preview never surfaces.
+	list, total, err := f.svc.ListJobs(ctx, f.principal, "", 20, 0)
+	if err != nil || total != 2 || len(list) != 2 {
+		t.Fatalf("default list: %d/%d %v, want 2/2", len(list), total, err)
+	}
+	names := map[string]bool{}
+	for _, j := range list {
+		names[j.FileName] = true
+	}
+	if !names["invoice.txt"] || !names["scan.png"] || names[""] {
+		t.Fatalf("default list files=%v, want the process+vision fixtures only", names)
+	}
+
+	// Explicit filters isolate exactly one operation, totals follow the set.
+	for op, wantFile := range map[string]string{
+		extract.OperationProcess: "invoice.txt", extract.OperationVision: "scan.png",
+	} {
+		list, total, err = f.svc.ListJobs(ctx, f.principal, op, 20, 0)
+		if err != nil || total != 1 || len(list) != 1 {
+			t.Fatalf("filter %s: %d/%d %v, want 1/1", op, len(list), total, err)
+		}
+		if list[0].FileName != wantFile {
+			t.Fatalf("filter %s returned %s row", op, list[0].FileName)
+		}
+	}
+
+	// Closed set: bogus AND shared operation values are rejected.
+	for _, bogus := range []string{"bogus", extract.OperationPreview} {
+		if _, _, err := f.svc.ListJobs(ctx, f.principal, bogus, 20, 0); !errors.Is(err, extract.ErrInvalidOperation) {
+			t.Fatalf("filter %q = %v, want ErrInvalidOperation", bogus, err)
+		}
+	}
+
+	// Stats are extraction-only: the preview does not move either counter.
+	recent, totalStat, err := f.svc.JobStats(ctx, f.principal, time.Now().UTC().Add(-24*time.Hour))
+	if err != nil || recent != 2 || totalStat != 2 {
+		t.Fatalf("job stats: %d/%d %v, want 2/2", recent, totalStat, err)
+	}
+
+	// Another member of the same tenant sees none of these jobs.
+	otherUser := testdb.SeedUser(t, f.db, f.tenant, "scope-other@example.com", nil)
+	otherKey, _ := testdb.SeedAPIKey(t, f.db, f.tenant, testdb.SeedKeySpec{
+		Name: "scope-other-key", OwnerUserID: otherUser.ID, Scopes: []string{"extract"},
+	})
+	otherPrincipal, err := auth.NewService(postgres.NewIdentityRepo(f.db), "").Authenticate(ctx, otherKey)
+	if err != nil {
+		t.Fatalf("authenticate other: %v", err)
+	}
+	if list, total, err = f.svc.ListJobs(ctx, otherPrincipal, "", 20, 0); err != nil || len(list) != 0 || total != 0 {
+		t.Fatalf("foreign actor list: %d/%d %v", len(list), total, err)
+	}
+}
+
+// TestTemplateListingGrantAuthority pins the D-25 authority split: the
+// authoring list follows extract.manage, the executable picker follows ONLY
+// stored execution grants — manage never implies execution and grants never
+// imply administration (T-08-04-02).
+func TestTemplateListingGrantAuthority(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract")
+	for _, tpl := range []extract.Template{
+		{ID: "t1", Name: "Granted", SystemPrompt: "s", UserPrompt: "u", DefaultModel: "priced-extract", Enabled: true},
+		{ID: "t2", Name: "Unlisted", SystemPrompt: "s", UserPrompt: "u", DefaultModel: "priced-extract", Enabled: true},
+	} {
+		f.seedTemplate(t, tpl)
+	}
+	authSvc := auth.NewService(postgres.NewIdentityRepo(f.db), "")
+	principalFor := func(email string, scopes []string, grants auth.ResourceGrants) auth.Principal {
+		user := testdb.SeedUserWithGrants(t, f.db, f.tenant, email, scopes, grants)
+		p, err := authSvc.PrincipalForActor(ctx, f.tenant, user.ID)
+		if err != nil {
+			t.Fatalf("principal for %s: %v", email, err)
+		}
+		return p
+	}
+
+	// Zero-template-grant manager: full authoring list, EMPTY picker,
+	// execution denied — manage is not an implicit grant.
+	manager := principalFor("manager@example.com", []string{"extract", "extract.manage"}, auth.ResourceGrants{})
+	templates, err := f.svc.ListTemplates(ctx, manager)
+	if err != nil || len(templates) != 2 {
+		t.Fatalf("manager authoring list: %d %v, want 2 templates", len(templates), err)
+	}
+	if picker, err := f.svc.ListExecutableTemplates(ctx, manager); err != nil || len(picker) != 0 {
+		t.Fatalf("manager picker: %d %v, want empty", len(picker), err)
+	}
+	if _, err := f.svc.ProcessReader(ctx, manager, extract.ProcessInput{
+		TemplateID: "t1", FileName: "invoice.txt", MimeType: "text/plain", Bytes: []byte("x"),
+	}); !errors.Is(err, extract.ErrForbidden) {
+		t.Fatalf("manager process = %v, want ErrForbidden", err)
+	}
+
+	// Granted member: exactly the granted template in BOTH lists and usable.
+	granted := principalFor("granted@example.com", []string{"extract"},
+		auth.ResourceGrants{ExtractTemplates: auth.Allowlist{Items: []string{"t1"}}})
+	for name, list := range map[string]func() ([]extract.Template, error){
+		"authoring": func() ([]extract.Template, error) { return f.svc.ListTemplates(ctx, granted) },
+		"picker":    func() ([]extract.Template, error) { return f.svc.ListExecutableTemplates(ctx, granted) },
+	} {
+		templates, err := list()
+		if err != nil || len(templates) != 1 || templates[0].ID != "t1" {
+			t.Fatalf("granted member %s list: %+v %v, want [t1]", name, templates, err)
+		}
+	}
+	if _, err := f.svc.ProcessReader(ctx, granted, extract.ProcessInput{
+		TemplateID: "t1", FileName: "invoice.txt", MimeType: "text/plain", Bytes: []byte("invoice text"),
+	}); err != nil {
+		t.Fatalf("granted member process: %v", err)
+	}
+
+	// Ungranted member: both lists empty, execution denied.
+	ungranted := principalFor("ungranted@example.com", []string{"extract"}, auth.ResourceGrants{})
+	for name, list := range map[string]func() ([]extract.Template, error){
+		"authoring": func() ([]extract.Template, error) { return f.svc.ListTemplates(ctx, ungranted) },
+		"picker":    func() ([]extract.Template, error) { return f.svc.ListExecutableTemplates(ctx, ungranted) },
+	} {
+		if templates, err := list(); err != nil || len(templates) != 0 {
+			t.Fatalf("ungranted member %s list: %+v %v, want empty", name, templates, err)
+		}
+	}
+	if _, err := f.svc.ProcessReader(ctx, ungranted, extract.ProcessInput{
+		TemplateID: "t1", FileName: "invoice.txt", MimeType: "text/plain", Bytes: []byte("x"),
+	}); !errors.Is(err, extract.ErrForbidden) {
+		t.Fatalf("ungranted member process = %v, want ErrForbidden", err)
 	}
 }

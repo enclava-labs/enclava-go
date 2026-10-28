@@ -79,8 +79,8 @@
           </button>
         </div>
         <div class="flex items-center gap-3 text-sm pt-1">
-          <a href="/dashboard/keys" class="text-primary hover:underline">Manage keys</a>
-          <span class="text-muted-foreground opacity-40">·</span>
+          {{if .PlatformAdmin}}<a href="/dashboard/keys" class="text-primary hover:underline">Manage keys</a>
+          <span class="text-muted-foreground opacity-40">·</span>{{end}}
           <a href="/dashboard/budgets" class="text-primary hover:underline">Budgets</a>
           <span class="text-muted-foreground opacity-40">·</span>
           <a href="/api/v1/models" class="text-primary hover:underline">List models</a>

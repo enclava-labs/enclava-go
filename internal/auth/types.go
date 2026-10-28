@@ -18,6 +18,7 @@ type User struct {
 	Email         string
 	DisplayName   string
 	Status        string // "active" | "disabled"
+	Team          string // free-form team label; empty = no team
 	PasswordHash  string
 	PasswordSetAt *time.Time
 	LastLoginAt   *time.Time
@@ -42,6 +43,10 @@ type Role struct {
 	Scopes    []string
 	Grants    ResourceGrants
 	CreatedAt time.Time
+	// UpdatedAt is the optimistic-concurrency version stamp read by role
+	// writers; UpdateRoleAtomically refuses a write whose read version has
+	// been overtaken.
+	UpdatedAt time.Time
 }
 
 // ServiceAccount is a tenant-scoped non-human actor with its own scope set.

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -311,4 +312,213 @@ func newExtractService(t *testing.T, db *postgres.DB, tenant string, artRepo *po
 	svc := extractsvc.NewService(extractRepo, extractRepo, jobsRepo, jobsSvc, store, exec, endpoints, 5)
 	svc.SetSourceRepository(sources)
 	return svc, jobsSvc
+}
+
+// TestHandleJobsListOperationFilter drives GET /api/v1/extract/jobs?operation=
+// over the real repo predicates: the envelope keeps {jobs,total,limit,offset}
+// with totals describing the filtered set, a document.preview job never
+// surfaces, and non-member values are rejected with 400 invalid_operation.
+func TestHandleJobsListOperationFilter(t *testing.T) {
+	ctx := context.Background()
+	db := testdb.New(t)
+	tenant := testdb.SeedTenant(t, db, "extract-ops")
+	user := testdb.SeedUser(t, db, tenant, "ops@example.com", nil)
+	key, _ := testdb.SeedAPIKey(t, db, tenant, testdb.SeedKeySpec{
+		Name: "ops-key", OwnerUserID: user.ID, Scopes: []string{"extract"},
+	})
+	principal, err := auth.NewService(postgres.NewIdentityRepo(db), "").Authenticate(ctx, key)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	jobsRepo := postgres.NewJobsRepo(db)
+	artRepo := postgres.NewArtifactRepo(db)
+	store, err := artifacts.NewStore(filepath.Join(t.TempDir(), "durable"), filepath.Join(t.TempDir(), "scratch"), artRepo)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	svc, jobsSvc := newExtractService(t, db, tenant, artRepo, jobsRepo, store, &extractHandlerUpstream{}, "priced-extract")
+	if err := svc.UpsertTemplate(ctx, principal, extractsvc.Template{
+		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u",
+		DefaultModel: "priced-extract", Enabled: true,
+	}); err != nil {
+		t.Fatalf("template: %v", err)
+	}
+	out, err := svc.Process(ctx, principal, extractsvc.ProcessInput{
+		TemplateID: "invoice", FileName: "invoice.txt", MimeType: "text/plain", Bytes: []byte("invoice text"),
+	})
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	processRow, err := jobsSvc.Get(ctx, principal, out.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := jobsSvc.Enqueue(ctx, principal, jobs.EnqueueRequest{
+		Operation:      "document.preview",
+		IdempotencyKey: "handler-preview-fixture",
+		InputRef:       processRow.InputRef, InputHash: processRow.InputHash,
+		Policy: map[string]any{},
+	}); err != nil {
+		t.Fatalf("enqueue preview fixture: %v", err)
+	}
+	handlers := NewHandlers(svc, 5, nil)
+
+	list := func(query string) (int, string) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/extract/jobs"+query, nil)
+		rec := httptest.NewRecorder()
+		handlers.HandleJobsList(rec, req, principal)
+		return rec.Code, rec.Body.String()
+	}
+
+	status, body := list("?operation=extract.process")
+	if status != http.StatusOK {
+		t.Fatalf("process filter status=%d body=%s", status, body)
+	}
+	var out2 struct {
+		Jobs  []map[string]any `json:"jobs"`
+		Total int              `json:"total"`
+		Limit int              `json:"limit"`
+	}
+	if err := json.Unmarshal([]byte(body), &out2); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out2.Total != 1 || len(out2.Jobs) != 1 {
+		t.Fatalf("process filter: total=%d jobs=%d body=%s, want exactly the one process job", out2.Total, len(out2.Jobs), body)
+	}
+
+	status, body = list("?operation=extract.vision")
+	if err := json.Unmarshal([]byte(body), &out2); err != nil {
+		t.Fatalf("decode vision: %v", err)
+	}
+	if status != http.StatusOK || out2.Total != 0 || len(out2.Jobs) != 0 {
+		t.Fatalf("vision filter: status=%d total=%d jobs=%d", status, out2.Total, len(out2.Jobs))
+	}
+
+	// The shared preview job never moves the unscoped (default) totals either.
+	status, body = list("")
+	if err := json.Unmarshal([]byte(body), &out2); err != nil {
+		t.Fatalf("decode default: %v", err)
+	}
+	if status != http.StatusOK || out2.Total != 1 {
+		t.Fatalf("default list: status=%d total=%d body=%s, want 1", status, out2.Total, body)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/extract/jobs?operation=bogus", nil)
+	rec := httptest.NewRecorder()
+	handlers.HandleJobsList(rec, req, principal)
+	var errBody struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bogus operation status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &errBody); err != nil || errBody.Error.Code != "invalid_operation" {
+		t.Fatalf("bogus operation code=%q err=%v", errBody.Error.Code, err)
+	}
+}
+
+// TestHandleTemplateByIDManageVsGrant pins the endpoint authority split: a
+// zero-template-grant extract.manage caller lists authoring templates and
+// reads/edits by id but holds an EMPTY executable picker (manage≠execute,
+// D-25); a grant admits the GET only; no grant denies.
+func TestHandleTemplateByIDManageVsGrant(t *testing.T) {
+	ctx := context.Background()
+	db := testdb.New(t)
+	tenant := testdb.SeedTenant(t, db, "extract-split")
+	empty := []string{}
+	managerKey, _ := testdb.SeedAPIKey(t, db, tenant, testdb.SeedKeySpec{
+		Name: "manager-key", OwnerUserID: testdb.SeedUser(t, db, tenant, "mgr@example.com", nil).ID,
+		Scopes: []string{"extract", "extract.manage"}, AllowedTemplates: &empty,
+	})
+	grantedKey, _ := testdb.SeedAPIKey(t, db, tenant, testdb.SeedKeySpec{
+		Name: "granted-key", OwnerUserID: testdb.SeedUser(t, db, tenant, "granted@example.com", nil).ID,
+		Scopes: []string{"extract"}, AllowedTemplates: &[]string{"invoice"},
+	})
+	deniedKey, _ := testdb.SeedAPIKey(t, db, tenant, testdb.SeedKeySpec{
+		Name: "denied-key", OwnerUserID: testdb.SeedUser(t, db, tenant, "denied@example.com", nil).ID,
+		Scopes: []string{"extract"}, AllowedTemplates: &empty,
+	})
+	identityRepo := postgres.NewIdentityRepo(db)
+	authSvc := auth.NewService(identityRepo, "")
+	principalFor := func(key string) auth.Principal {
+		p, err := authSvc.Authenticate(ctx, key)
+		if err != nil {
+			t.Fatalf("authenticate: %v", err)
+		}
+		return p
+	}
+	manager, granted, denied := principalFor(managerKey), principalFor(grantedKey), principalFor(deniedKey)
+
+	jobsRepo := postgres.NewJobsRepo(db)
+	artRepo := postgres.NewArtifactRepo(db)
+	store, err := artifacts.NewStore(filepath.Join(t.TempDir(), "durable"), filepath.Join(t.TempDir(), "scratch"), artRepo)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	svc, _ := newExtractService(t, db, tenant, artRepo, jobsRepo, store, &extractHandlerUpstream{}, "priced-extract")
+	// The manager authors the template through the manage-gated service —
+	// no template grant involved.
+	if err := svc.UpsertTemplate(ctx, manager, extractsvc.Template{
+		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u", Enabled: true,
+	}); err != nil {
+		t.Fatalf("manager upsert: %v", err)
+	}
+	handlers := NewHandlers(svc, 5, nil)
+
+	// Zero-grant manager: authoring list full, picker empty.
+	templates, err := svc.ListTemplates(ctx, manager)
+	if err != nil || len(templates) != 1 {
+		t.Fatalf("manager authoring list: %d %v, want 1", len(templates), err)
+	}
+	if picker, err := svc.ListExecutableTemplates(ctx, manager); err != nil || len(picker) != 0 {
+		t.Fatalf("manager picker: %d %v, want empty", len(picker), err)
+	}
+
+	// GET: admitted for the manager (authoring) and the granted member.
+	for name, p := range map[string]auth.Principal{"manager": manager, "granted": granted} {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/extract/templates/invoice", nil)
+		rec := httptest.NewRecorder()
+		handlers.HandleTemplateByID(rec, req, p)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s GET status=%d body=%s", name, rec.Code, rec.Body.String())
+		}
+	}
+	// Ungranted member GET is denied.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/extract/templates/invoice", nil)
+	rec := httptest.NewRecorder()
+	handlers.HandleTemplateByID(rec, req, denied)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("ungranted GET status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// PUT: the manager succeeds with zero grants; the granted member is
+	// denied — execution grants never mutate.
+	putReq := httptest.NewRequest(http.MethodPut, "/api/v1/extract/templates/invoice",
+		strings.NewReader(`{"name":"Renamed"}`))
+	putRec := httptest.NewRecorder()
+	handlers.HandleTemplateByID(putRec, putReq, manager)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("manager PUT status=%d body=%s", putRec.Code, putRec.Body.String())
+	}
+	putReq = httptest.NewRequest(http.MethodPut, "/api/v1/extract/templates/invoice",
+		strings.NewReader(`{"name":"Hijacked"}`))
+	putRec = httptest.NewRecorder()
+	handlers.HandleTemplateByID(putRec, putReq, granted)
+	if putRec.Code != http.StatusForbidden {
+		t.Fatalf("granted PUT status=%d body=%s, want 403", putRec.Code, putRec.Body.String())
+	}
+	after, err := svc.GetTemplate(ctx, manager, "invoice")
+	if err != nil || after.Name != "Renamed" {
+		t.Fatalf("post-PUT template: %+v %v", after, err)
+	}
+
+	// Process still demands the grant: the manager cannot execute (regression
+	// against implicit execution from manage).
+	if _, err := svc.ProcessReader(ctx, manager, extractsvc.ProcessInput{
+		TemplateID: "invoice", FileName: "invoice.txt", MimeType: "text/plain", Bytes: []byte("x"),
+	}); !errors.Is(err, extractsvc.ErrForbidden) {
+		t.Fatalf("manager process = %v, want ErrForbidden", err)
+	}
 }

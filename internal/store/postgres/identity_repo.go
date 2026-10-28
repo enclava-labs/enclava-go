@@ -254,9 +254,9 @@ func (r *IdentityRepo) GetRole(ctx context.Context, tenantID, roleID string) (au
 	var raw json.RawMessage
 	var models, endpoints, assistants, templates json.RawMessage
 	err := r.db.QueryRowContext(ctx,
-		`SELECT id, name, scopes, `+roleGrantColumns+`, created_at FROM roles
+		`SELECT id, name, scopes, `+roleGrantColumns+`, created_at, updated_at FROM roles
 		 WHERE tenant_id = $1::uuid AND id = $2`,
-		tenantID, roleID).Scan(&role.ID, &role.Name, &raw, &models, &endpoints, &assistants, &templates, &role.CreatedAt)
+		tenantID, roleID).Scan(&role.ID, &role.Name, &raw, &models, &endpoints, &assistants, &templates, &role.CreatedAt, &role.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
 			return auth.Role{}, auth.ErrNotFound
@@ -266,19 +266,6 @@ func (r *IdentityRepo) GetRole(ctx context.Context, tenantID, roleID string) (au
 	role.Scopes = scopeSlice(raw)
 	role.Grants = scanRoleGrants(models, endpoints, assistants, templates)
 	return role, nil
-}
-
-// UnassignRole removes one membership row; the last-administrator guard lives
-// in the httpx layer, which checks the resulting holder counts.
-func (r *IdentityRepo) UnassignRole(ctx context.Context, tenantID, userID, roleID string) error {
-	_, err := r.db.ExecContext(ctx,
-		`DELETE FROM user_roles
-		 WHERE tenant_id = $1::uuid AND user_id = $2 AND role_id = $3`,
-		tenantID, userID, roleID)
-	if err != nil {
-		return fmt.Errorf("unassign role: %w", err)
-	}
-	return nil
 }
 
 // RoleUsers lists the users a role is assigned to (tenant-scoped).
@@ -302,16 +289,340 @@ func (r *IdentityRepo) RoleUsers(ctx context.Context, tenantID, roleID string) (
 	return out, rows.Err()
 }
 
+// --- atomic role administration writes --------------------------------------
+
+// Sentinel outcomes of the role-administration writes, mapped by the HTTP
+// layer: ErrStaleRole → 409 stale_role (client re-reads and retries),
+// ErrLastAdmin → 409 last_admin, ErrRoleHasMembers → 409 role_has_members.
+var (
+	ErrStaleRole      = errors.New("identity: role changed since it was read")
+	ErrLastAdmin      = errors.New("identity: write would remove the last usable platform.admin holder")
+	ErrRoleHasMembers = errors.New("identity: role still has members")
+)
+
+// roleHasScope reports whether a decoded scopes list carries the scope.
+func roleHasScope(scopes []string, scope string) bool {
+	for _, s := range scopes {
+		if s == scope {
+			return true
+		}
+	}
+	return false
+}
+
+// lockTenantAuthority takes the tenant-scoped advisory lock every
+// holder-removing identity write shares — one lock key per tenant, so
+// concurrent role/user/key authority mutations serialize and the
+// remaining-holder check and the mutation always commit together.
+func lockTenantAuthority(ctx context.Context, tx *sql.Tx, tenantID string) error {
+	if _, err := tx.ExecContext(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, tenantID); err != nil {
+		return fmt.Errorf("tenant authority lock: %w", err)
+	}
+	return nil
+}
+
+// countAdminHoldersTx counts usable scope holders inside an open transaction
+// — the in-transaction form of AdminHolderCounts with the contributions the
+// pending write removes excluded: excludeRoleID removes a whole role's
+// memberships, excludeRoleUserID one (role, user) pair, excludeUserID one
+// user across all roles, excludeServiceAccountID one service account's keys.
+func countAdminHoldersTx(ctx context.Context, tx *sql.Tx, tenantID, scope,
+	excludeRoleID, excludeRoleUserID, excludeUserID, excludeServiceAccountID string) (int, error) {
+	var users int
+	err := tx.QueryRowContext(ctx, `
+		SELECT count(DISTINCT ur.user_id) FROM user_roles ur
+		JOIN roles ro ON ro.tenant_id = ur.tenant_id AND ro.id = ur.role_id
+		JOIN users u ON u.tenant_id = ur.tenant_id AND u.id = ur.user_id
+		WHERE ur.tenant_id = $1::uuid AND u.status = 'active' AND ro.scopes ? $2
+		  AND NOT (ro.id = $3 AND ($4 = '' OR ur.user_id = $4))
+		  AND NOT ($5 <> '' AND ur.user_id = $5)`,
+		tenantID, scope, excludeRoleID, excludeRoleUserID, excludeUserID).Scan(&users)
+	if err != nil {
+		return 0, fmt.Errorf("count admin holders in tx: %w", err)
+	}
+	var keys int
+	err = tx.QueryRowContext(ctx, `
+		SELECT count(*) FROM api_keys k
+		LEFT JOIN users u ON u.tenant_id = k.tenant_id AND u.id = k.owner_user_id
+		LEFT JOIN service_accounts sa ON sa.tenant_id = k.tenant_id AND sa.id = k.service_account_id
+		WHERE k.tenant_id = $1::uuid AND k.revoked_at IS NULL
+		  AND (k.expires_at IS NULL OR k.expires_at > now())
+		  AND COALESCE(k.scopes -> 'items', '[]'::jsonb) ? $2
+		  AND COALESCE(u.status, sa.status, '') = 'active'
+		  AND ($3 = '' OR COALESCE(k.service_account_id, '') <> $3)`,
+		tenantID, scope, excludeServiceAccountID).Scan(&keys)
+	if err != nil {
+		return 0, fmt.Errorf("count admin keys in tx: %w", err)
+	}
+	return users + keys, nil
+}
+
+// scanRoleTx SELECTs one tenant role FOR UPDATE inside an open transaction —
+// the authoritative read every role-administration write merges onto;
+// auth.ErrNotFound when absent.
+func scanRoleTx(ctx context.Context, tx *sql.Tx, tenantID, roleID string) (auth.Role, error) {
+	var role auth.Role
+	var raw json.RawMessage
+	var models, endpoints, assistants, templates json.RawMessage
+	err := tx.QueryRowContext(ctx,
+		`SELECT id, name, scopes, `+roleGrantColumns+`, created_at, updated_at FROM roles
+		 WHERE tenant_id = $1::uuid AND id = $2
+		 FOR UPDATE`,
+		tenantID, roleID).Scan(&role.ID, &role.Name, &raw, &models, &endpoints,
+		&assistants, &templates, &role.CreatedAt, &role.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.Role{}, auth.ErrNotFound
+		}
+		return auth.Role{}, fmt.Errorf("lock role: %w", err)
+	}
+	role.Scopes = scopeSlice(raw)
+	role.Grants = scanRoleGrants(models, endpoints, assistants, templates)
+	return role, nil
+}
+
+// RoleUpdateDeltas carries a role PATCH's present fields — nil means the
+// stored value is left unchanged, present-including-empty replaces. The HTTP
+// request shape maps onto this in the handler; the merge itself happens
+// against the stored row inside UpdateRoleAtomically. Grants are per KIND
+// (09-07 contract): a nil kind delta leaves that stored grant unchanged, a
+// non-nil — even empty — replaces it.
+type RoleUpdateDeltas struct {
+	Name             *string
+	Scopes           *[]string
+	Models           *auth.Allowlist
+	Endpoints        *auth.Allowlist
+	Assistants       *auth.Allowlist
+	ExtractTemplates *auth.Allowlist
+}
+
+// UpdateRoleAtomically applies a role PATCH in one transaction: the
+// tenant-scoped authority advisory lock serializes every holder-removing
+// identity write; the stored role is re-read FOR UPDATE and the deltas merge
+// onto it (nil = unchanged), so the authority-removal decision is derived
+// from the commit-time row — never from the caller's pre-lock read. A row
+// whose updated_at advanced past readVersion refuses with ErrStaleRole, so a
+// delayed write can never overwrite a concurrent grant. When the merged
+// scopes drop platform.admin, the remaining-holder count runs inside the
+// same transaction and refuses with ErrLastAdmin unless another usable
+// holder (another role assignment or a live key) remains — two concurrent
+// removals cannot both pass the check and both commit.
+func (r *IdentityRepo) UpdateRoleAtomically(ctx context.Context, tenantID, roleID string, deltas RoleUpdateDeltas, readVersion time.Time) (auth.Role, error) {
+	var updated auth.Role
+	err := WithTx(ctx, r.db, func(tx *sql.Tx) error {
+		if err := lockTenantAuthority(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		stored, err := scanRoleTx(ctx, tx, tenantID, roleID)
+		if err != nil {
+			return err
+		}
+		if !readVersion.IsZero() && stored.UpdatedAt.After(readVersion) {
+			return ErrStaleRole
+		}
+		merged := stored
+		if deltas.Name != nil {
+			merged.Name = *deltas.Name
+		}
+		if deltas.Scopes != nil {
+			merged.Scopes = *deltas.Scopes
+		}
+		if deltas.Models != nil {
+			merged.Grants.Models = *deltas.Models
+		}
+		if deltas.Endpoints != nil {
+			merged.Grants.Endpoints = *deltas.Endpoints
+		}
+		if deltas.Assistants != nil {
+			merged.Grants.Assistants = *deltas.Assistants
+		}
+		if deltas.ExtractTemplates != nil {
+			merged.Grants.ExtractTemplates = *deltas.ExtractTemplates
+		}
+		if roleHasScope(stored.Scopes, auth.ScopePlatformAdmin) &&
+			!roleHasScope(merged.Scopes, auth.ScopePlatformAdmin) {
+			remaining, err := countAdminHoldersTx(ctx, tx, tenantID, auth.ScopePlatformAdmin, roleID, "", "", "")
+			if err != nil {
+				return err
+			}
+			if remaining == 0 {
+				return ErrLastAdmin
+			}
+		}
+		if err := updateRoleRowTx(ctx, tx, tenantID, merged); err != nil {
+			return err
+		}
+		updated = merged
+		return nil
+	})
+	if err != nil {
+		return auth.Role{}, err
+	}
+	return updated, nil
+}
+
+// updateRoleRowTx persists one merged role row and bumps the version stamp.
+func updateRoleRowTx(ctx context.Context, tx *sql.Tx, tenantID string, role auth.Role) error {
+	scopes, err := scopesJSON(role.Scopes)
+	if err != nil {
+		return fmt.Errorf("update role: marshal scopes: %w", err)
+	}
+	grants := roleGrantsDoc(role.Grants)
+	_, err = tx.ExecContext(ctx,
+		`UPDATE roles
+		 SET name = $3, scopes = $4::jsonb,
+		     allowed_models = $5::jsonb, allowed_endpoints = $6::jsonb,
+		     allowed_assistants = $7::jsonb, allowed_extract_templates = $8::jsonb,
+		     updated_at = now()
+		 WHERE tenant_id = $1::uuid AND id = $2`,
+		tenantID, role.ID, role.Name, scopes,
+		grants[0], grants[1], grants[2], grants[3])
+	if err != nil {
+		return fmt.Errorf("update role: %w", err)
+	}
+	return nil
+}
+
+// DeleteRoleIfUnused deletes a memberless role in one transaction: the
+// tenant authority lock plus the FOR UPDATE role read serialize against
+// concurrent membership writes (user_roles' foreign key takes a key-share on
+// the role row, which the locked read blocks), the NOT EXISTS delete is a
+// single atomic statement, and a role carrying platform.admin refuses with
+// ErrLastAdmin when no other usable holder would remain. Absent role →
+// auth.ErrNotFound; membered role → ErrRoleHasMembers.
+func (r *IdentityRepo) DeleteRoleIfUnused(ctx context.Context, tenantID, roleID string) error {
+	return WithTx(ctx, r.db, func(tx *sql.Tx) error {
+		if err := lockTenantAuthority(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		stored, err := scanRoleTx(ctx, tx, tenantID, roleID)
+		if err != nil {
+			return err
+		}
+		if roleHasScope(stored.Scopes, auth.ScopePlatformAdmin) {
+			remaining, err := countAdminHoldersTx(ctx, tx, tenantID, auth.ScopePlatformAdmin, roleID, "", "", "")
+			if err != nil {
+				return err
+			}
+			if remaining == 0 {
+				return ErrLastAdmin
+			}
+		}
+		res, err := tx.ExecContext(ctx,
+			`DELETE FROM roles
+			 WHERE tenant_id = $1::uuid AND id = $2
+			   AND NOT EXISTS (SELECT 1 FROM user_roles
+			                   WHERE tenant_id = $1::uuid AND role_id = $2)`,
+			tenantID, roleID)
+		if err != nil {
+			return fmt.Errorf("delete role: %w", err)
+		}
+		if n, err := res.RowsAffected(); err == nil && n == 0 {
+			return ErrRoleHasMembers
+		}
+		return nil
+	})
+}
+
+// UnassignRoleAtomically removes one membership under the tenant authority
+// lock; when the role carries platform.admin the remaining-holder count runs
+// inside the same transaction and refuses with ErrLastAdmin — the check and
+// the delete commit together, so a concurrent role edit cannot strand the
+// tenant between them.
+func (r *IdentityRepo) UnassignRoleAtomically(ctx context.Context, tenantID, userID, roleID string) error {
+	return WithTx(ctx, r.db, func(tx *sql.Tx) error {
+		if err := lockTenantAuthority(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		stored, err := scanRoleTx(ctx, tx, tenantID, roleID)
+		if err != nil {
+			return err
+		}
+		if roleHasScope(stored.Scopes, auth.ScopePlatformAdmin) {
+			remaining, err := countAdminHoldersTx(ctx, tx, tenantID, auth.ScopePlatformAdmin, roleID, userID, "", "")
+			if err != nil {
+				return err
+			}
+			if remaining == 0 {
+				return ErrLastAdmin
+			}
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM user_roles
+			 WHERE tenant_id = $1::uuid AND user_id = $2 AND role_id = $3`,
+			tenantID, userID, roleID); err != nil {
+			return fmt.Errorf("unassign role: %w", err)
+		}
+		return nil
+	})
+}
+
+// SetUserStatusAtomically updates one user's status under the tenant
+// authority lock; a deactivation refuses with ErrLastAdmin when the user is
+// the last usable platform.admin holder — the holder count and the status
+// write commit together.
+func (r *IdentityRepo) SetUserStatusAtomically(ctx context.Context, tenantID, userID, status string) error {
+	return WithTx(ctx, r.db, func(tx *sql.Tx) error {
+		if err := lockTenantAuthority(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		if status != "active" {
+			remaining, err := countAdminHoldersTx(ctx, tx, tenantID, auth.ScopePlatformAdmin, "", "", userID, "")
+			if err != nil {
+				return err
+			}
+			if remaining == 0 {
+				return ErrLastAdmin
+			}
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE users SET status = $3
+			 WHERE tenant_id = $1::uuid AND id = $2`,
+			tenantID, userID, status); err != nil {
+			return fmt.Errorf("update user status: %w", err)
+		}
+		return nil
+	})
+}
+
+// SetServiceAccountStatusAtomically updates one service account's status
+// under the tenant authority lock; a deactivation refuses with ErrLastAdmin
+// when the account's keys are the last usable platform.admin holders.
+func (r *IdentityRepo) SetServiceAccountStatusAtomically(ctx context.Context, tenantID, id, status string) error {
+	return WithTx(ctx, r.db, func(tx *sql.Tx) error {
+		if err := lockTenantAuthority(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		if status != "active" {
+			remaining, err := countAdminHoldersTx(ctx, tx, tenantID, auth.ScopePlatformAdmin, "", "", "", id)
+			if err != nil {
+				return err
+			}
+			if remaining == 0 {
+				return ErrLastAdmin
+			}
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE service_accounts SET status = $3
+			 WHERE tenant_id = $1::uuid AND id = $2`,
+			tenantID, id, status); err != nil {
+			return fmt.Errorf("update service account status: %w", err)
+		}
+		return nil
+	})
+}
+
 // --- users -----------------------------------------------------------------
 
-const userColumns = `id, tenant_id::text, email, display_name, status,
+const userColumns = `id, tenant_id::text, email, display_name, status, team,
 	password_hash, password_set_at, last_login_at, created_at`
 
 func scanUser(row rowScanner) (auth.User, error) {
 	var u auth.User
 	var passwordHash sql.NullString
 	err := row.Scan(&u.ID, &u.TenantID, &u.Email, &u.DisplayName, &u.Status,
-		&passwordHash, &u.PasswordSetAt, &u.LastLoginAt, &u.CreatedAt)
+		&u.Team, &passwordHash, &u.PasswordSetAt, &u.LastLoginAt, &u.CreatedAt)
 	if err != nil {
 		return auth.User{}, err
 	}
@@ -326,13 +637,27 @@ func (r *IdentityRepo) CreateUser(ctx context.Context, tenantID string, u auth.U
 	}
 	_, err := r.db.ExecContext(ctx,
 		`INSERT INTO users
-		 (tenant_id, id, email, display_name, status,
+		 (tenant_id, id, email, display_name, status, team,
 		  password_hash, password_set_at, last_login_at)
-		 VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8)`,
-		tenantID, u.ID, u.Email, u.DisplayName, status,
+		 VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		tenantID, u.ID, u.Email, u.DisplayName, status, u.Team,
 		nullStr(u.PasswordHash), u.PasswordSetAt, u.LastLoginAt)
 	if err != nil {
 		return fmt.Errorf("create user: %w", err)
+	}
+	return nil
+}
+
+// UpdateUserTeam rewrites the free-form team label (empty clears it — "No
+// team" is a first-class state); the label is trimmed and length-capped by
+// the HTTP layer before it reaches the store.
+func (r *IdentityRepo) UpdateUserTeam(ctx context.Context, tenantID, userID, team string) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE users SET team = $3
+		 WHERE tenant_id = $1::uuid AND id = $2`,
+		tenantID, userID, team)
+	if err != nil {
+		return fmt.Errorf("update user team: %w", err)
 	}
 	return nil
 }

@@ -126,6 +126,7 @@ func (allowContext) CanReadObject(context.Context, auth.Principal, string) bool 
 
 type chatFixture struct {
 	svc         *chatbot.Service
+	db          *postgres.DB
 	chatRepo    *postgres.ChatbotRepo
 	promptRepo  *postgres.PromptsRepo
 	sourceRepo  *postgres.SourceRepo
@@ -188,6 +189,7 @@ func newChatFixture(t *testing.T, searcher *fakeRAGSearcher, upstream *fakeChatU
 	svc := chatbot.NewService(chatRepo, promptRepo, searcher, executor)
 	return &chatFixture{
 		svc:         svc,
+		db:          db,
 		chatRepo:    chatRepo,
 		promptRepo:  promptRepo,
 		sourceRepo:  sourceRepo,
@@ -509,6 +511,9 @@ func TestPrepareChatCompletionEnforcesAllowedChatbots(t *testing.T) {
 		Name:       "Allowed Bot",
 		Model:      "chat-test-model",
 		ExternalID: "allowed_bot",
+		// This test is about grant allowlists — the tenant-wide audience
+		// keeps the audience term out of the picture.
+		Audience: []string{"*"},
 	})
 	if err != nil {
 		t.Fatalf("create chatbot: %v", err)
@@ -571,8 +576,11 @@ func TestResumeConversationRequiresOwnerOrAdmin(t *testing.T) {
 	}
 	conversationID := started.Conversation.ID
 
-	if _, err := f.svc.PrepareChatCompletion(ctx, other, "resume_bot", resumeBody(t, conversationID, "intrude"), false); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("expected sql.ErrNoRows for other actor, got %v", err)
+	// The other actor holds an all-assistants grant but is outside the
+	// bot's (owner-only default) audience — denied before the
+	// conversation-owner check even runs.
+	if _, err := f.svc.PrepareChatCompletion(ctx, other, "resume_bot", resumeBody(t, conversationID, "intrude"), false); !errors.Is(err, chatbot.ErrChatbotNotAllowed) {
+		t.Fatalf("expected audience denial for other actor, got %v", err)
 	}
 	messages, err := f.chatRepo.ListMessages(ctx, f.tenantA, conversationID)
 	if err != nil {
@@ -776,6 +784,11 @@ func TestChatbotAccessBoundByStoredGrants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create bot: %v", err)
 	}
+	// This plan's audience term defaults to owner-only; the grant matrix
+	// below exercises grants, so the creator opens the audience tenant-wide.
+	if _, err := svc.Update(ctx, creatorP, bot.ID, chatbot.UpdateChatbotInput{Audience: []string{"*"}}); err != nil {
+		t.Fatalf("open audience: %v", err)
+	}
 	bot2, err := svc.Create(ctx, creatorP, chatbot.CreateChatbotInput{
 		Name: "Unlisted Bot", Model: "chat-test-model",
 	})
@@ -874,5 +887,681 @@ func TestChatbotAccessBoundByStoredGrants(t *testing.T) {
 	}
 	if err := svc.Delete(ctx, revokedOwnerP, bot.ID); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("revoked owner delete = %v, want ErrNoRows", err)
+	}
+}
+
+// runWorkerFixture wires the real postgres seams (chatbots, runs, jobs) with
+// the scripted executor, so worker admission and every privileged refresh
+// exercise the CURRENT bot row, never the frozen snapshot.
+type runWorkerFixture struct {
+	svc      *chatbot.Service
+	chatRepo *postgres.ChatbotRepo
+	runsRepo *postgres.ChatbotRunsRepo
+	jobSvc   *jobs.Service
+	executor *scriptExecutor
+	tenant   string
+	botID    string
+}
+
+func newRunWorkerFixture(t *testing.T, responses []string, onDispatch func(n int)) *runWorkerFixture {
+	t.Helper()
+	db := testdb.New(t)
+	tenant := testdb.SeedTenant(t, db, "run-aud")
+	chatRepo := postgres.NewChatbotRepo(db)
+	runsRepo := postgres.NewChatbotRunsRepo(db)
+	jobSvc := jobs.NewService(postgres.NewJobsRepo(db), 0)
+	executor := &scriptExecutor{responses: responses, onDispatch: onDispatch}
+	svc := chatbot.NewService(chatRepo, postgres.NewPromptsRepo(db), nil, executor)
+	svc.ConfigureRuns(runsRepo, jobSvc, nil, runPrincipalResolver{})
+	return &runWorkerFixture{svc: svc, chatRepo: chatRepo, runsRepo: runsRepo, jobSvc: jobSvc, executor: executor, tenant: tenant}
+}
+
+// scriptExecutor is the model-dispatch seam: scripted response bodies plus a
+// hook that runs at dispatch time (e.g. a concurrent audience edit).
+type scriptExecutor struct {
+	responses  []string
+	onDispatch func(n int)
+	dispatches int32
+}
+
+func (e *scriptExecutor) Execute(ctx context.Context, p auth.Principal, req inference.Request) (*inference.Result, error) {
+	n := atomic.AddInt32(&e.dispatches, 1)
+	if e.onDispatch != nil {
+		e.onDispatch(int(n))
+	}
+	if len(e.responses) == 0 {
+		return nil, errors.New("no scripted model response left")
+	}
+	body := e.responses[0]
+	e.responses = e.responses[1:]
+	return &inference.Result{Body: io.NopCloser(strings.NewReader(body))}, nil
+}
+
+// runPrincipalResolver plays the current-authority seam: CurrentPrincipal
+// returns the frozen principal unchanged (per-request grant rebuild happens
+// upstream of the worker), PrincipalForActor resolves the assistant owner.
+type runPrincipalResolver struct{}
+
+func (runPrincipalResolver) CurrentPrincipal(ctx context.Context, frozen auth.Principal) (auth.Principal, error) {
+	return frozen, nil
+}
+
+func (runPrincipalResolver) PrincipalForActor(ctx context.Context, tenantID, actorID string) (auth.Principal, error) {
+	return auth.Principal{TenantID: tenantID, ActorID: actorID}, nil
+}
+
+const (
+	runWorkerOwner  = "owner_actor_1"
+	runWorkerMember = "member_actor_1"
+	runWorkerDone   = `{"choices":[{"message":{"role":"assistant","content":"all done"},"finish_reason":"stop"}]}`
+	runWorkerTool   = `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call-1","type":"function","function":{"name":"knowledge.search","arguments":"{\"query\":\"q\"}"}}]}}]}`
+)
+
+func runWorkerPrincipals(tenant string) (member, owner, admin auth.Principal) {
+	member = auth.Principal{TenantID: tenant, ActorID: runWorkerMember, AllowedModelsAll: true, AllowedChatbotsAll: true, AllowedAgentsAll: true}
+	owner = member
+	owner.ActorID = runWorkerOwner
+	admin = member
+	admin.ActorID = "admin_actor_1"
+	admin.Scopes = map[string]struct{}{auth.ScopePlatformAdmin: {}}
+	return member, owner, admin
+}
+
+func seedAudienceBot(t *testing.T, repo *postgres.ChatbotRepo, tenant string, audience []string) chatbot.Instance {
+	t.Helper()
+	bot := chatbot.Instance{
+		TenantID: tenant, ID: newRunTestID("cb"), ExternalID: newRunTestID("ext"),
+		Name: "Audience Bot", Model: "chat-test-model", IsEnabled: true,
+		OwnerActorID: runWorkerOwner, Audience: audience,
+	}
+	if err := repo.Create(context.Background(), bot); err != nil {
+		t.Fatalf("seed bot: %v", err)
+	}
+	return bot
+}
+
+func newRunTestID(prefix string) string {
+	return prefix + "_" + fmt.Sprint(time.Now().UnixNano())
+}
+
+// narrowAudience simulates the concurrent admin edit: the member leaves the
+// CURRENT stored audience (explicit [] = locked to owner+platform.admin).
+func narrowAudience(t *testing.T, repo *postgres.ChatbotRepo, tenant, botID string) {
+	t.Helper()
+	bot, err := repo.GetByID(context.Background(), tenant, botID)
+	if err != nil {
+		t.Fatalf("reload bot: %v", err)
+	}
+	bot.Audience = []string{}
+	if err := repo.Update(context.Background(), bot); err != nil {
+		t.Fatalf("narrow audience: %v", err)
+	}
+}
+
+func leaseRunJob(t *testing.T, jobSvc *jobs.Service) *jobs.Claim {
+	t.Helper()
+	claim, err := jobSvc.Lease(context.Background(), "worker-aud-test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease job: %v", err)
+	}
+	if claim == nil {
+		t.Fatal("no runnable job leased")
+	}
+	return claim
+}
+
+// TestRunWorkerMidRunAudienceRemovalAbortsBeforeDispatch: the member leaves
+// the audience while the FIRST model dispatch is in flight, before its tool
+// call may execute. The next refreshPrincipal must fail the run so that
+// NEITHER the tool call NOR any further model dispatch executes.
+func TestRunWorkerMidRunAudienceRemovalAbortsBeforeDispatch(t *testing.T) {
+	ctx := context.Background()
+	var f *runWorkerFixture
+	f = newRunWorkerFixture(t, []string{runWorkerTool}, func(n int) {
+		if n == 1 {
+			narrowAudience(t, f.chatRepo, f.tenant, f.botID)
+		}
+	})
+	member, _, _ := runWorkerPrincipals(f.tenant)
+	bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+	f.botID = bot.ID
+
+	run, err := f.svc.StartRun(ctx, member, bot.ID, chatbot.AssistantRunInput{Input: "use the tool"})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+
+	_, handlerErr := f.svc.JobHandler()(ctx, leaseRunJob(t, f.jobSvc), nil)
+	if handlerErr == nil {
+		t.Fatal("mid-run audience removal must fail the run")
+	}
+	if got := atomic.LoadInt32(&f.executor.dispatches); got != 1 {
+		t.Fatalf("post-removal dispatches = %d, want exactly the first dispatch", got)
+	}
+	attempts, err := f.runsRepo.ListRunAttempts(ctx, f.tenant, run.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].Kind != "model" || attempts[0].Status != "succeeded" {
+		t.Fatalf("attempt rows after removal = %#v err=%v, want one succeeded model attempt and zero tool rows", attempts, err)
+	}
+	stored, err := f.runsRepo.GetRun(ctx, f.tenant, run.ID)
+	if err != nil || stored.Status != jobs.StatusFailed || !strings.Contains(stored.Error, "not allowed") {
+		t.Fatalf("failed run row = %#v err=%v, want failed with denial error", stored, err)
+	}
+}
+
+// TestRunWorkerAdmissionRejectsAudienceRemoval: a run queued by an audience
+// member whose audience is removed before the worker claims the job fails
+// at admission — the frozen snapshot never authorizes, and the run row
+// never reaches running.
+func TestRunWorkerAdmissionRejectsAudienceRemoval(t *testing.T) {
+	ctx := context.Background()
+	f := newRunWorkerFixture(t, []string{runWorkerDone}, nil)
+	member, _, _ := runWorkerPrincipals(f.tenant)
+	bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+
+	run, err := f.svc.StartRun(ctx, member, bot.ID, chatbot.AssistantRunInput{Input: "queued then narrowed"})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	narrowAudience(t, f.chatRepo, f.tenant, bot.ID)
+
+	_, handlerErr := f.svc.JobHandler()(ctx, leaseRunJob(t, f.jobSvc), nil)
+	if !errors.Is(handlerErr, chatbot.ErrChatbotNotAllowed) {
+		t.Fatalf("admission error = %v, want ErrChatbotNotAllowed", handlerErr)
+	}
+	if got := atomic.LoadInt32(&f.executor.dispatches); got != 0 {
+		t.Fatalf("denied run dispatched %d times", got)
+	}
+	if attempts, err := f.runsRepo.ListRunAttempts(ctx, f.tenant, run.ID); err != nil || len(attempts) != 0 {
+		t.Fatalf("denied run recorded attempts: %#v err=%v", attempts, err)
+	}
+	stored, err := f.runsRepo.GetRun(ctx, f.tenant, run.ID)
+	if err != nil || stored.Status != jobs.StatusQueued {
+		t.Fatalf("queued run row = %#v err=%v, want still queued (never executed)", stored, err)
+	}
+}
+
+// TestRetainedRunReadsEnforceCurrentAudience: after a completed run, removal
+// from the audience hides the retained run, its attempts and the whole
+// conversation replay from the former member; owner and platform.admin keep
+// access regardless of the audience term.
+func TestRetainedRunReadsEnforceCurrentAudience(t *testing.T) {
+	ctx := context.Background()
+	f := newRunWorkerFixture(t, []string{runWorkerDone}, nil)
+	member, owner, admin := runWorkerPrincipals(f.tenant)
+	bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+
+	run, err := f.svc.StartRun(ctx, member, bot.ID, chatbot.AssistantRunInput{Input: "completed then hidden"})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	completedID, handlerErr := f.svc.JobHandler()(ctx, leaseRunJob(t, f.jobSvc), nil)
+	if handlerErr != nil || completedID != run.ID {
+		t.Fatalf("handler = %q err=%v, want completed run", completedID, handlerErr)
+	}
+	if _, err := f.svc.GetRun(ctx, member, run.ID); err != nil {
+		t.Fatalf("member read before removal: %v", err)
+	}
+	if attempts, err := f.svc.RunAttempts(ctx, member, run.ID); err != nil || len(attempts) != 1 {
+		t.Fatalf("attempts before removal = %#v err=%v", attempts, err)
+	}
+
+	narrowAudience(t, f.chatRepo, f.tenant, bot.ID)
+
+	if _, err := f.svc.GetRun(ctx, member, run.ID); !errors.Is(err, chatbot.ErrRunNotFound) {
+		t.Fatalf("GetRun after removal = %v, want ErrRunNotFound", err)
+	}
+	if _, err := f.svc.RunAttempts(ctx, member, run.ID); !errors.Is(err, chatbot.ErrRunNotFound) {
+		t.Fatalf("RunAttempts after removal = %v, want ErrRunNotFound", err)
+	}
+	if _, err := f.svc.ListConversation(ctx, member, run.ConversationID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("replay after removal = %v, want not-found", err)
+	}
+	if _, err := f.svc.GetRun(ctx, admin, run.ID); err != nil {
+		t.Fatalf("platform.admin read after removal: %v", err)
+	}
+	// The bot owner runs and reads even though they never joined the
+	// audience — the audience term never restricts the owner.
+	ownerRun, err := f.svc.StartRun(ctx, owner, bot.ID, chatbot.AssistantRunInput{Input: "owner still allowed"})
+	if err != nil {
+		t.Fatalf("owner start run on locked bot: %v", err)
+	}
+	if _, err := f.svc.GetRun(ctx, owner, ownerRun.ID); err != nil {
+		t.Fatalf("owner read on locked bot: %v", err)
+	}
+}
+
+// TestRunWorkerPositivePathWithAudienceMember: an audience member in good
+// standing runs to completion with real attempt rows.
+func TestRunWorkerPositivePathWithAudienceMember(t *testing.T) {
+	ctx := context.Background()
+	f := newRunWorkerFixture(t, []string{runWorkerDone}, nil)
+	member, _, _ := runWorkerPrincipals(f.tenant)
+	bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+
+	run, err := f.svc.StartRun(ctx, member, bot.ID, chatbot.AssistantRunInput{Input: "hello assistant"})
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	if run.Status != jobs.StatusQueued {
+		t.Fatalf("queued status = %q", run.Status)
+	}
+	completedID, handlerErr := f.svc.JobHandler()(ctx, leaseRunJob(t, f.jobSvc), nil)
+	if handlerErr != nil || completedID != run.ID {
+		t.Fatalf("handler = %q err=%v, want completed run", completedID, handlerErr)
+	}
+	// The direct handler call leaves the JOB transition to the runner; the
+	// run row itself is the worker's outcome record.
+	got, err := f.runsRepo.GetRun(ctx, f.tenant, run.ID)
+	if err != nil {
+		t.Fatalf("get completed run: %v", err)
+	}
+	if got.Status != jobs.StatusSucceeded || got.Output != "all done" {
+		t.Fatalf("completed run = %#v", got)
+	}
+	if _, err := f.svc.GetRun(ctx, member, run.ID); err != nil {
+		t.Fatalf("member read of completed run: %v", err)
+	}
+	if attempts, err := f.svc.RunAttempts(ctx, member, run.ID); err != nil || len(attempts) != 1 || attempts[0].Status != "succeeded" {
+		t.Fatalf("attempts = %#v err=%v", attempts, err)
+	}
+}
+
+// TestAssistantAudienceIntersectsWithGrants: the stored audience is an
+// additional restriction on top of D-25 grants — never an expansion. Owner
+// and platform.admin bypass the audience term only; grants still bind.
+func TestAssistantAudienceIntersectsWithGrants(t *testing.T) {
+	ctx := context.Background()
+	db := testdb.New(t)
+	repo := postgres.NewIdentityRepo(db)
+	tenant := testdb.SeedTenant(t, db, "aud-chat")
+	authSvc := auth.NewService(repo, "")
+	svc := chatbot.NewService(postgres.NewChatbotRepo(db), postgres.NewPromptsRepo(db), nil, nil)
+	svc.ConfigureRuns(postgres.NewChatbotRunsRepo(db), jobs.NewService(postgres.NewJobsRepo(db), 0), nil, authSvc)
+
+	creator := testdb.SeedUserWithGrants(t, db, tenant, "aud-creator@example.com",
+		[]string{auth.ScopePlatformAdmin},
+		auth.ResourceGrants{Models: auth.Allowlist{All: true}, Assistants: auth.Allowlist{All: true}})
+	creatorP, err := authSvc.PrincipalForActor(ctx, tenant, creator.ID)
+	if err != nil {
+		t.Fatalf("creator principal: %v", err)
+	}
+	userFor := func(t *testing.T, email string, scopes []string, grants auth.ResourceGrants) auth.User {
+		t.Helper()
+		return testdb.SeedUserWithGrants(t, db, tenant, email, scopes, grants)
+	}
+	principalOf := func(t *testing.T, user auth.User) auth.Principal {
+		t.Helper()
+		p, err := authSvc.PrincipalForActor(ctx, tenant, user.ID)
+		if err != nil {
+			t.Fatalf("principal for %s: %v", user.Email, err)
+		}
+		return p
+	}
+	memberScopes := []string{"chatbot"}
+	modelsAll := auth.ResourceGrants{Models: auth.Allowlist{All: true}}
+	memberGrantedUser := userFor(t, "aud-member@example.com", memberScopes,
+		auth.ResourceGrants{Models: auth.Allowlist{All: true}, Assistants: auth.Allowlist{Items: []string{"set-at-create"}}})
+	memberGranted := principalOf(t, memberGrantedUser)
+	memberAllGrant := principalOf(t, userFor(t, "aud-member-all@example.com", memberScopes,
+		auth.ResourceGrants{Models: auth.Allowlist{All: true}, Assistants: auth.Allowlist{All: true}}))
+	memberNoGrant := principalOf(t, userFor(t, "aud-member-nogrant@example.com", memberScopes, modelsAll))
+	adminAll := principalOf(t, userFor(t, "aud-admin@example.com", []string{auth.ScopePlatformAdmin},
+		auth.ResourceGrants{Models: auth.Allowlist{All: true}, Assistants: auth.Allowlist{All: true}}))
+
+	// botShared admits exactly the granted member; botLocked is explicit [];
+	// botWildcard is tenant-wide. Omitted audience defaults to owner-only.
+	botShared, err := svc.Create(ctx, creatorP, chatbot.CreateChatbotInput{
+		Name: "Shared Bot", Model: "chat-test-model",
+		Audience: []string{memberGranted.ActorID},
+	})
+	if err != nil {
+		t.Fatalf("create shared bot: %v", err)
+	}
+	botLocked, err := svc.Create(ctx, creatorP, chatbot.CreateChatbotInput{
+		Name: "Locked Bot", Model: "chat-test-model", Audience: []string{},
+	})
+	if err != nil {
+		t.Fatalf("create locked bot: %v", err)
+	}
+	botWildcard, err := svc.Create(ctx, creatorP, chatbot.CreateChatbotInput{
+		Name: "Wildcard Bot", Model: "chat-test-model", Audience: []string{"*"},
+	})
+	if err != nil {
+		t.Fatalf("create wildcard bot: %v", err)
+	}
+	botDefault, err := svc.Create(ctx, creatorP, chatbot.CreateChatbotInput{
+		Name: "Default Bot", Model: "chat-test-model",
+	})
+	if err != nil {
+		t.Fatalf("create default bot: %v", err)
+	}
+	// Point the granted member's item grant at the real assistant.
+	if _, err := db.SQL.ExecContext(ctx,
+		`UPDATE roles SET allowed_assistants = $3::jsonb
+		 WHERE tenant_id = $1::uuid AND id IN (SELECT role_id FROM user_roles WHERE user_id = $2)`,
+		tenant, memberGrantedUser.ID, `{"mode":"list","items":["`+botShared.ID+`"]}`); err != nil {
+		t.Fatalf("repoint grant: %v", err)
+	}
+	memberGranted = principalOf(t, memberGrantedUser)
+
+	// Stored audiences round-trip.
+	for _, want := range []struct {
+		id       string
+		name     string
+		audience []string
+	}{
+		{botShared.ID, botShared.Name, []string{memberGranted.ActorID}},
+		{botLocked.ID, botLocked.Name, []string{}},
+		{botWildcard.ID, botWildcard.Name, []string{"*"}},
+		{botDefault.ID, botDefault.Name, []string{creatorP.ActorID}},
+	} {
+		got, err := svc.Get(ctx, creatorP, want.id)
+		if err != nil {
+			t.Fatalf("get %s: %v", want.name, err)
+		}
+		if fmt.Sprint(got.Audience) != fmt.Sprint(want.audience) {
+			t.Fatalf("%s audience = %#v, want %#v", want.name, got.Audience, want.audience)
+		}
+	}
+
+	// A real item grant INSIDE the audience succeeds everywhere. The member
+	// sees exactly the shared bot: the wildcard bot still needs its own
+	// grant — the audience never expands the grant side.
+	list, err := svc.List(ctx, memberGranted)
+	if err != nil || len(list) != 1 || list[0].ID != botShared.ID {
+		t.Fatalf("granted member list = %#v err=%v, want exactly the shared bot", list, err)
+	}
+	if _, err := svc.Get(ctx, memberGranted, botShared.ID); err != nil {
+		t.Fatalf("granted member get: %v", err)
+	}
+	if _, err := svc.StartRun(ctx, memberGranted, botShared.ID, chatbot.AssistantRunInput{Input: "hello"}); err != nil {
+		t.Fatalf("audience member start run (fixture must really run): %v", err)
+	}
+
+	// The same member outside a restrictive audience is denied on Get, run
+	// and list even though the item grant matches... the locked bot admits
+	// nobody but owner/admin.
+	if _, err := svc.Get(ctx, memberGranted, botLocked.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("locked bot get = %v, want ErrNoRows", err)
+	}
+	if _, err := svc.StartRun(ctx, memberGranted, botLocked.ID, chatbot.AssistantRunInput{Input: "no"}); !errors.Is(err, chatbot.ErrChatbotNotAllowed) {
+		t.Fatalf("locked bot start run = %v, want ErrChatbotNotAllowed", err)
+	}
+	// A role-level ALL-assistants grant does not bypass a restrictive
+	// audience either.
+	if list, err := svc.List(ctx, memberAllGrant); err != nil || len(list) != 1 || list[0].ID != botWildcard.ID {
+		t.Fatalf("all-grant member list = %#v err=%v, want only the wildcard bot", list, err)
+	}
+	if _, err := svc.Get(ctx, memberAllGrant, botLocked.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("all-grant member locked get = %v, want ErrNoRows", err)
+	}
+	if _, err := svc.StartRun(ctx, memberAllGrant, botLocked.ID, chatbot.AssistantRunInput{Input: "no"}); !errors.Is(err, chatbot.ErrChatbotNotAllowed) {
+		t.Fatalf("all-grant member locked start run = %v, want ErrChatbotNotAllowed", err)
+	}
+	// Audience alone never expands grants: the wildcard bot still denies an
+	// ungranted member.
+	if _, err := svc.Get(ctx, memberNoGrant, botWildcard.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("ungranted member wildcard get = %v, want ErrNoRows", err)
+	}
+	if _, err := svc.StartRun(ctx, memberNoGrant, botWildcard.ID, chatbot.AssistantRunInput{Input: "no"}); !errors.Is(err, chatbot.ErrChatbotNotAllowed) {
+		t.Fatalf("ungranted member wildcard start run = %v, want ErrChatbotNotAllowed", err)
+	}
+	// platform.admin WITH the stored grant bypasses the audience term.
+	if _, err := svc.Get(ctx, adminAll, botLocked.ID); err != nil {
+		t.Fatalf("granted admin locked get: %v", err)
+	}
+
+	// Owner mutates the audience; empty entries are rejected on the 400 path.
+	if _, err := svc.Update(ctx, creatorP, botLocked.ID, chatbot.UpdateChatbotInput{Audience: []string{" new-member ", "new-member", "*"}}); err != nil {
+		t.Fatalf("owner audience update: %v", err)
+	}
+	got, err := svc.Get(ctx, creatorP, botLocked.ID)
+	if err != nil || fmt.Sprint(got.Audience) != fmt.Sprint([]string{"new-member", "*"}) {
+		t.Fatalf("trimmed/deduped audience = %#v err=%v", got.Audience, err)
+	}
+	if _, err := svc.Update(ctx, creatorP, botLocked.ID, chatbot.UpdateChatbotInput{Audience: []string{"valid", ""}}); !errors.Is(err, chatbot.ErrInvalidInput) {
+		t.Fatalf("empty audience entry = %v, want ErrInvalidInput", err)
+	}
+	if _, err := svc.Create(ctx, creatorP, chatbot.CreateChatbotInput{
+		Name: "Bad Bot", Model: "chat-test-model", Audience: []string{""},
+	}); !errors.Is(err, chatbot.ErrInvalidInput) {
+		t.Fatalf("empty audience create = %v, want ErrInvalidInput", err)
+	}
+	// Nil audience on update leaves the stored audience unchanged.
+	if _, err := svc.Update(ctx, creatorP, botLocked.ID, chatbot.UpdateChatbotInput{Name: new("Locked Bot Renamed")}); err != nil {
+		t.Fatalf("nil-audience update: %v", err)
+	}
+	if got, err := svc.Get(ctx, creatorP, botLocked.ID); err != nil || fmt.Sprint(got.Audience) != fmt.Sprint([]string{"new-member", "*"}) {
+		t.Fatalf("audience changed on nil update = %#v err=%v", got.Audience, err)
+	}
+}
+
+// seedConversation is the direct-row seam for list tests: conversations and
+// messages with explicit ownership, bypassing the run/completion writers.
+func seedConversation(t *testing.T, f *chatFixture, chatbotID, owner, firstUserContent string) chatbot.Conversation {
+	t.Helper()
+	ctx := context.Background()
+	conv := chatbot.Conversation{
+		TenantID: f.tenantA, ID: "conv_" + newRunTestID("id"), ChatbotID: chatbotID, OwnerActorID: owner,
+	}
+	if err := f.chatRepo.CreateConversation(ctx, conv); err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+	if firstUserContent != "" {
+		if err := f.chatRepo.AddMessage(ctx, chatbot.Message{
+			TenantID: f.tenantA, ID: newRunTestID("msg"), ConversationID: conv.ID,
+			Role: "user", Content: firstUserContent, OwnerActorID: owner,
+		}); err != nil {
+			t.Fatalf("seed message: %v", err)
+		}
+	}
+	return conv
+}
+
+// TestServiceListConversationsOwnScopeVisibilityAndTitles covers the OA-13
+// service contract: own-only for members AND admins, hidden-assistant rows
+// dropped, evidence-visibility-suppressed titles, newest-first keyset
+// pagination and 400-class malformed cursors.
+func TestServiceListConversationsOwnScopeVisibilityAndTitles(t *testing.T) {
+	ctx := context.Background()
+	searcher := &fakeRAGSearcher{evidenceID: "evidence-current"}
+	f := newChatFixture(t, searcher, nil)
+	creator := openPrincipal(f.tenantA)
+	member := openPrincipal(f.tenantA)
+	member.ActorID = "member_actor"
+	member.AllowedChatbots = map[string]struct{}{}
+	admin := adminPrincipal(f.tenantA)
+
+	botVisible, err := f.svc.Create(ctx, creator, chatbot.CreateChatbotInput{
+		Name: "Visible Bot", Model: "chat-test-model", Audience: []string{member.ActorID},
+	})
+	if err != nil {
+		t.Fatalf("create visible bot: %v", err)
+	}
+	botHidden, err := f.svc.Create(ctx, creator, chatbot.CreateChatbotInput{
+		Name: "Hidden Bot", Model: "chat-test-model", Audience: []string{},
+	})
+	if err != nil {
+		t.Fatalf("create hidden bot: %v", err)
+	}
+	member.AllowedChatbots = map[string]struct{}{botVisible.ID: {}, botHidden.ID: {}}
+
+	convVisible := seedConversation(t, f, botVisible.ID, member.ActorID, "first visible message")
+	convHidden := seedConversation(t, f, botHidden.ID, member.ActorID, "hidden history")
+	convOther := seedConversation(t, f, botVisible.ID, "someone_else", "not mine")
+	long := strings.Repeat("x", 120)
+	convLong := seedConversation(t, f, botVisible.ID, member.ActorID, long)
+	// The suppressed row's FIRST user message carries input refs without
+	// evidence ids — it must never contribute preview text.
+	convSuppressed := seedConversation(t, f, botVisible.ID, member.ActorID, "")
+	if err := f.chatRepo.AddMessage(ctx, chatbot.Message{
+		TenantID: f.tenantA, ID: newRunTestID("msg"), ConversationID: convSuppressed.ID,
+		Role: "user", Content: "secret preview", OwnerActorID: member.ActorID,
+		InputRefs: []source.ObjectRef{{ObjectID: "doc_1"}},
+	}); err != nil {
+		t.Fatalf("seed suppressed message: %v", err)
+	}
+	// The revoked row's FIRST user message carries evidence ids; once the
+	// evidence is revoked the preview must vanish.
+	convRevoked := seedConversation(t, f, botVisible.ID, member.ActorID, "")
+	if err := f.chatRepo.AddMessage(ctx, chatbot.Message{
+		TenantID: f.tenantA, ID: newRunTestID("msg"), ConversationID: convRevoked.ID,
+		Role: "user", Content: "evidence-backed preview", OwnerActorID: member.ActorID,
+		EvidenceIDs: []string{"evidence-current"},
+	}); err != nil {
+		t.Fatalf("seed evidence message: %v", err)
+	}
+
+	// Own-only: the member sees exactly their visible-bot conversations.
+	summaries, next, err := f.svc.ListConversations(ctx, member, 50, "")
+	if err != nil || next != "" {
+		t.Fatalf("member list = %#v next=%q err=%v", summaries, next, err)
+	}
+	byID := map[string]chatbot.ConversationSummary{}
+	for _, summary := range summaries {
+		byID[summary.ID] = summary
+	}
+	if _, ok := byID[convHidden.ID]; ok {
+		t.Fatal("hidden-assistant conversation leaked into the list")
+	}
+	if _, ok := byID[convOther.ID]; ok {
+		t.Fatal("another member's conversation leaked into the list")
+	}
+	visible := byID[convVisible.ID]
+	if visible.ChatbotID != botVisible.ID || visible.AssistantName != "Visible Bot" || visible.Title != "first visible message" {
+		t.Fatalf("visible summary = %#v", visible)
+	}
+	if visible.UpdatedAt.Before(visible.CreatedAt) {
+		t.Fatalf("updated_at %v before created_at %v", visible.UpdatedAt, visible.CreatedAt)
+	}
+	if got := byID[convLong.ID].Title; len([]rune(got)) != 80 {
+		t.Fatalf("long title truncated to %d runes, want 80", len([]rune(got)))
+	}
+	// InputRefs without evidence IDs never contribute preview text.
+	if got := byID[convSuppressed.ID].Title; got != "" {
+		t.Fatalf("suppressed title = %q, want empty", got)
+	}
+	// Evidence-backed previews vanish once the evidence is revoked.
+	if got := byID[convRevoked.ID].Title; got != "evidence-backed preview" {
+		t.Fatalf("evidence-backed title = %q", got)
+	}
+	searcher.revoked = true
+	summaries, _, err = f.svc.ListConversations(ctx, member, 50, "")
+	if err != nil {
+		t.Fatalf("member list after revocation: %v", err)
+	}
+	for _, summary := range summaries {
+		if summary.ID == convRevoked.ID && summary.Title != "" {
+			t.Fatalf("revoked-evidence title = %q, want empty", summary.Title)
+		}
+	}
+
+	// Own-only for admins too: the admin has no conversations of their own.
+	adminSummaries, _, err := f.svc.ListConversations(ctx, admin, 20, "")
+	if err != nil || len(adminSummaries) != 0 {
+		t.Fatalf("admin list = %#v err=%v, want own-only empty", adminSummaries, err)
+	}
+
+	// Keyset pagination: newest-first, disjoint pages, deterministic end.
+	newest := seedConversation(t, f, botVisible.ID, member.ActorID, "newest one")
+	if err := bumpConversationCreatedAt(t, f, []string{convVisible.ID, convHidden.ID, convLong.ID, convSuppressed.ID, convRevoked.ID}); err != nil {
+		t.Fatalf("age conversations: %v", err)
+	}
+	var paged []string
+	cursor := ""
+	for range 10 {
+		summaries, next, err := f.svc.ListConversations(ctx, member, 2, cursor)
+		if err != nil {
+			t.Fatalf("list page: %v", err)
+		}
+		for _, summary := range summaries {
+			paged = append(paged, summary.ID)
+		}
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	// Rows aged together share created_at; ties break by id DESC, and ids
+	// are allocated from an increasing clock — so the aged block reads in
+	// reverse seed order. The hidden bot's conversation never appears.
+	wantOrder := []string{newest.ID, convRevoked.ID, convSuppressed.ID, convLong.ID, convVisible.ID}
+	if fmt.Sprint(paged) != fmt.Sprint(wantOrder) {
+		t.Fatalf("paged order = %v, want %v", paged, wantOrder)
+	}
+	seen := map[string]bool{}
+	for _, id := range paged {
+		if seen[id] {
+			t.Fatalf("conversation %s appeared on two pages", id)
+		}
+		seen[id] = true
+	}
+	if _, _, err := f.svc.ListConversations(ctx, member, 20, "not-a-cursor"); !errors.Is(err, chatbot.ErrInvalidInput) {
+		t.Fatalf("malformed cursor = %v, want ErrInvalidInput", err)
+	}
+}
+
+// bumpConversationCreatedAt ages conversations into the past so the seeded
+// newest row sorts first; rows aged together share created_at, making the
+// (created_at, id) tie-break deterministic.
+func bumpConversationCreatedAt(t *testing.T, f *chatFixture, ids []string) error {
+	t.Helper()
+	_, err := f.db.SQL.ExecContext(context.Background(),
+		`UPDATE conversations SET created_at = '2020-01-01T00:00:00Z'::timestamptz
+		 WHERE tenant_id = $1::uuid AND id = ANY($2)`, f.tenantA, ids)
+	return err
+}
+
+// TestListAssistantToolBindingsVisibility covers the OA-26 used_by read:
+// only assistants the caller may see (grant AND audience) contribute names,
+// and unknown tools return an empty binding list.
+func TestListAssistantToolBindingsVisibility(t *testing.T) {
+	ctx := context.Background()
+	f := newChatFixture(t, nil, nil)
+	creator := openPrincipal(f.tenantA)
+	member := openPrincipal(f.tenantA)
+	member.ActorID = "member_actor"
+	member.AllowedChatbotsAll = false
+	member.AllowedAgentsAll = false
+
+	botUsing, err := f.svc.Create(ctx, creator, chatbot.CreateChatbotInput{
+		Name: "Tool Bot", Model: "chat-test-model", Audience: []string{member.ActorID},
+		Settings: map[string]any{"tools": []any{"mcp_search"}},
+	})
+	if err != nil {
+		t.Fatalf("create tool bot: %v", err)
+	}
+	if _, err := f.svc.Create(ctx, creator, chatbot.CreateChatbotInput{
+		Name: "Hidden Tool Bot", Model: "chat-test-model", Audience: []string{},
+		Settings: map[string]any{"tools": []any{"mcp_search"}},
+	}); err != nil {
+		t.Fatalf("create hidden tool bot: %v", err)
+	}
+
+	// An ungranted member sees nothing, even for a tool they "know".
+	bindings, err := f.svc.ListAssistantToolBindings(ctx, member, []string{"mcp_search", "other_tool"})
+	if err != nil {
+		t.Fatalf("ungranted bindings: %v", err)
+	}
+	if len(bindings) != 0 {
+		t.Fatalf("ungranted member bindings = %#v", bindings)
+	}
+
+	member.AllowedChatbots = map[string]struct{}{botUsing.ID: {}}
+	bindings, err = f.svc.ListAssistantToolBindings(ctx, member, []string{"mcp_search", "other_tool"})
+	if err != nil {
+		t.Fatalf("granted bindings: %v", err)
+	}
+	if got := bindings["mcp_search"]; len(got) != 1 || got[0] != "Tool Bot" {
+		t.Fatalf("mcp_search bindings = %#v, want exactly the visible tool bot", got)
+	}
+	if _, ok := bindings["other_tool"]; ok {
+		t.Fatalf("unknown tool leaked a binding: %#v", bindings)
+	}
+
+	// The owner sees both configured bots for the tool.
+	ownerBindings, err := f.svc.ListAssistantToolBindings(ctx, creator, []string{"mcp_search"})
+	if err != nil || len(ownerBindings["mcp_search"]) != 2 {
+		t.Fatalf("owner bindings = %#v err=%v, want both bots", ownerBindings, err)
 	}
 }

@@ -2,9 +2,30 @@ package extract
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
+
+// TestJobOperationsResolvesMemberFacingSet pins the closed ?operation= set:
+// empty means the member-facing extraction pair, a member isolates it, and
+// anything else — including shared operations like document.preview — is
+// rejected rather than silently widened.
+func TestJobOperationsResolvesMemberFacingSet(t *testing.T) {
+	ops, err := jobOperations("")
+	if err != nil || len(ops) != 2 {
+		t.Fatalf("default ops=%v err=%v, want process+vision", ops, err)
+	}
+	ops, err = jobOperations(" " + OperationProcess + " ")
+	if err != nil || len(ops) != 1 || ops[0] != OperationProcess {
+		t.Fatalf("explicit ops=%v err=%v, want [extract.process]", ops, err)
+	}
+	for _, bogus := range []string{"bogus", "document.preview", "extract.preview"} {
+		if _, err := jobOperations(bogus); !errors.Is(err, ErrInvalidOperation) {
+			t.Fatalf("jobOperations(%q) = %v, want ErrInvalidOperation", bogus, err)
+		}
+	}
+}
 
 func TestParseJSONBodyCodeFencePreservesNumber(t *testing.T) {
 	got, err := parseJSONBody("```json\n{\"a\":9007199254740993.0001}\n```")

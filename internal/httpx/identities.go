@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"enclava-go/internal/auth"
+	"enclava-go/internal/store/postgres"
 )
 
 // --- request/response documents -------------------------------------------
@@ -28,6 +29,9 @@ type identityUserRequest struct {
 	Password    string   `json:"password,omitempty"`
 	Status      string   `json:"status,omitempty"`
 	RoleIDs     []string `json:"role_ids,omitempty"`
+	// Team is pointer-typed so a PATCH can distinguish absent (unchanged)
+	// from explicit empty (clear — "No team" is a first-class state).
+	Team *string `json:"team,omitempty"`
 }
 
 type identityPasswordRequest struct {
@@ -72,6 +76,7 @@ func redactUser(u auth.User, roles []auth.Role) map[string]any {
 		"email":           u.Email,
 		"display_name":    u.DisplayName,
 		"status":          u.Status,
+		"team":            u.Team,
 		"password_set":    u.PasswordSetAt != nil,
 		"password_set_at": u.PasswordSetAt,
 		"last_login_at":   u.LastLoginAt,
@@ -156,6 +161,18 @@ func resourceGrantsFromRequest(dto *roleGrantsDTO) auth.ResourceGrants {
 		Assistants:       decode(dto.Assistants),
 		ExtractTemplates: decode(dto.ExtractTemplates),
 	}
+}
+
+// grantDelta decodes one grant envelope field for a role PATCH: a nil raw
+// field is absent from the envelope (stored grant unchanged); a present
+// field — explicit null or an empty item list included — replaces with its
+// decoded allowlist (deny).
+func grantDelta(raw json.RawMessage) *auth.Allowlist {
+	if raw == nil {
+		return nil
+	}
+	items, all := auth.DecodeAllowlist(raw)
+	return new(auth.Allowlist{Items: sortedItems(items), All: all})
 }
 
 // grantCoveredByCaller reports whether one stored grant document stays
@@ -312,11 +329,27 @@ func (a *App) handleIdentityUsers(w http.ResponseWriter, r *http.Request, princi
 			WriteOpenAIError(w, http.StatusBadRequest, "password is required", "invalid_request_error", "missing_password")
 			return
 		}
+		team := ""
+		if req.Team != nil {
+			team = strings.TrimSpace(*req.Team)
+			if len(team) > 80 {
+				WriteOpenAIError(w, http.StatusBadRequest, "team must be at most 80 characters", "invalid_request_error", "invalid_team")
+				return
+			}
+		}
 		// Administrator-controlled enrollment only — there is no public signup.
 		user, err := a.authSvc.CreateUser(r.Context(), principal, principal.TenantID, email, strings.TrimSpace(req.DisplayName), req.Password)
 		if err != nil {
 			a.writeIdentityError(w, err, "user_create_failed")
 			return
+		}
+		if team != "" {
+			if err := a.identity.UpdateUserTeam(r.Context(), principal.TenantID, user.ID, team); err != nil {
+				log.Printf("update user team %s: %v", user.ID, err)
+				WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "user_create_failed")
+				return
+			}
+			user.Team = team
 		}
 		for _, roleID := range req.RoleIDs {
 			if !a.assignRoleChecked(w, r, principal, user.ID, roleID, false) {
@@ -447,14 +480,24 @@ func (a *App) handleIdentityUser(w http.ResponseWriter, r *http.Request, princip
 			WriteOpenAIError(w, http.StatusBadRequest, "status must be 'active' or 'disabled'", "invalid_request_error", "invalid_status")
 			return
 		}
-		if status != "" && status != "active" && user.Status == "active" && a.userIsAdmin(r, principal.TenantID, user.ID) {
-			// Disabling an administrator cannot remove the tenant's last one.
-			if !a.lastAdminExcluded(w, r, principal.TenantID, user.ID, nil) {
+		var team string
+		if req.Team != nil {
+			team = strings.TrimSpace(*req.Team)
+			if len(team) > 80 {
+				WriteOpenAIError(w, http.StatusBadRequest, "team must be at most 80 characters", "invalid_request_error", "invalid_team")
 				return
 			}
 		}
+		// Disabling an administrator cannot remove the tenant's last one —
+		// the remaining-holder check and the status write commit together
+		// under the tenant authority lock.
 		if status != "" && status != user.Status {
-			if err := a.identity.UpdateUserStatus(r.Context(), principal.TenantID, user.ID, status); err != nil {
+			if status != "active" && user.Status == "active" && a.userIsAdmin(r, principal.TenantID, user.ID) {
+				if err := a.identity.SetUserStatusAtomically(r.Context(), principal.TenantID, user.ID, status); err != nil {
+					a.writeRoleWriteError(w, err, "user_update_failed")
+					return
+				}
+			} else if err := a.identity.UpdateUserStatus(r.Context(), principal.TenantID, user.ID, status); err != nil {
 				log.Printf("update user status %s: %v", user.ID, err)
 				WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "user_update_failed")
 				return
@@ -465,6 +508,13 @@ func (a *App) handleIdentityUser(w http.ResponseWriter, r *http.Request, princip
 				if err := a.authSvc.RevokeUserSessions(r.Context(), principal.TenantID, user.ID, "user disabled"); err != nil {
 					log.Printf("revoke sessions for disabled user %s: %v", user.ID, err)
 				}
+			}
+		}
+		if req.Team != nil {
+			if err := a.identity.UpdateUserTeam(r.Context(), principal.TenantID, user.ID, team); err != nil {
+				log.Printf("update user team %s: %v", user.ID, err)
+				WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "user_update_failed")
+				return
 			}
 		}
 		updated, err := a.identity.GetUser(r.Context(), principal.TenantID, user.ID)
@@ -511,26 +561,11 @@ func (a *App) assignRoleChecked(w http.ResponseWriter, r *http.Request, principa
 }
 
 func (a *App) unassignRoleChecked(w http.ResponseWriter, r *http.Request, principal auth.Principal, user auth.User, roleID string) {
-	role, err := a.identity.GetRole(r.Context(), principal.TenantID, roleID)
-	if err != nil {
-		a.writeIdentityError(w, err, "role_fetch_failed")
-		return
-	}
-	removesAdmin := user.Status == "active"
-	if removesAdmin {
-		removesAdmin = false
-		for _, s := range role.Scopes {
-			if s == auth.ScopePlatformAdmin {
-				removesAdmin = true
-			}
-		}
-	}
-	if removesAdmin && !a.lastAdminExcluded(w, r, principal.TenantID, user.ID, nil) {
-		return
-	}
-	if err := a.identity.UnassignRole(r.Context(), principal.TenantID, user.ID, roleID); err != nil {
-		log.Printf("unassign role %s from %s: %v", roleID, user.ID, err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "role_unassign_failed")
+	// The remaining-holder check and the delete commit together under the
+	// tenant authority lock — removing an admin role membership can never
+	// strand the tenant between check and write (409 last_admin).
+	if err := a.identity.UnassignRoleAtomically(r.Context(), principal.TenantID, user.ID, roleID); err != nil {
+		a.writeRoleWriteError(w, err, "role_unassign_failed")
 		return
 	}
 	WriteJSON(w, http.StatusOK, map[string]any{"assigned": false, "user_id": user.ID, "role_id": roleID})
@@ -695,8 +730,115 @@ func (a *App) handleIdentityRoleByID(w http.ResponseWriter, r *http.Request, pri
 			return
 		}
 		WriteJSON(w, http.StatusOK, roleDTO(role, userIDs))
+	case http.MethodPatch:
+		a.handleIdentityRolePatch(w, r, principal, role)
+	case http.MethodDelete:
+		a.handleIdentityRoleDelete(w, r, principal, role.ID)
 	default:
 		WriteMethodNotAllowed(w)
+	}
+}
+
+// handleIdentityRolePatch applies a role update (OA-20): absent fields stay
+// unchanged, present-including-empty replace. The handler validates the
+// deltas and bounds the merged result by the caller's own authority — the
+// caller is never handed a merged role to write; UpdateRoleAtomically
+// re-derives the merge and the authority-removal decision from the STORED row
+// under the tenant authority lock and refuses an overtaken read (409
+// stale_role), so a delayed PATCH can never overwrite a concurrent grant.
+func (a *App) handleIdentityRolePatch(w http.ResponseWriter, r *http.Request, principal auth.Principal, role auth.Role) {
+	var req identityRoleRequest
+	if err := DecodeJSON(r, &req); err != nil {
+		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
+		return
+	}
+	var deltas postgres.RoleUpdateDeltas
+	if req.Name != "" {
+		name := strings.TrimSpace(req.Name)
+		if name == "" {
+			WriteOpenAIError(w, http.StatusBadRequest, "name cannot be empty", "invalid_request_error", "invalid_name")
+			return
+		}
+		deltas.Name = new(name)
+	}
+	if req.Scopes != nil {
+		deltas.Scopes = new(req.Scopes)
+	}
+	if req.Grants != nil {
+		deltas.Models = grantDelta(req.Grants.Models)
+		deltas.Endpoints = grantDelta(req.Grants.Endpoints)
+		deltas.Assistants = grantDelta(req.Grants.Assistants)
+		deltas.ExtractTemplates = grantDelta(req.Grants.ExtractTemplates)
+	}
+	// Provisional subset bound on the merged result the caller can see; the
+	// locked transaction refuses the write outright when the stored row has
+	// moved (409 stale_role), so this read can never mint unheld authority.
+	merged := role
+	if deltas.Name != nil {
+		merged.Name = *deltas.Name
+	}
+	if deltas.Scopes != nil {
+		merged.Scopes = *deltas.Scopes
+	}
+	if deltas.Models != nil {
+		merged.Grants.Models = *deltas.Models
+	}
+	if deltas.Endpoints != nil {
+		merged.Grants.Endpoints = *deltas.Endpoints
+	}
+	if deltas.Assistants != nil {
+		merged.Grants.Assistants = *deltas.Assistants
+	}
+	if deltas.ExtractTemplates != nil {
+		merged.Grants.ExtractTemplates = *deltas.ExtractTemplates
+	}
+	if !scopesSubsetOfCaller(principal, merged.Scopes) {
+		WriteForbidden(w, "role scopes must be a subset of the caller's scopes")
+		return
+	}
+	if !roleGrantsSubsetOfCaller(principal, merged.Grants) {
+		WriteForbidden(w, "role grants exceed the caller's resource authority")
+		return
+	}
+	updated, err := a.identity.UpdateRoleAtomically(r.Context(), principal.TenantID, role.ID, deltas, role.UpdatedAt)
+	if err != nil {
+		a.writeRoleWriteError(w, err, "role_update_failed")
+		return
+	}
+	userIDs, err := a.identity.RoleUsers(r.Context(), principal.TenantID, role.ID)
+	if err != nil {
+		log.Printf("role users %s: %v", role.ID, err)
+		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "roles_list_failed")
+		return
+	}
+	WriteJSON(w, http.StatusOK, roleDTO(updated, userIDs))
+}
+
+// handleIdentityRoleDelete refuses a membered role (409 role_has_members),
+// the tenant's last platform.admin grantor (409 last_admin) and absent or
+// foreign-tenant roles (404) — the member check, the holder check and the
+// delete commit atomically inside DeleteRoleIfUnused.
+func (a *App) handleIdentityRoleDelete(w http.ResponseWriter, r *http.Request, principal auth.Principal, roleID string) {
+	if err := a.identity.DeleteRoleIfUnused(r.Context(), principal.TenantID, roleID); err != nil {
+		a.writeRoleWriteError(w, err, "role_delete_failed")
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": roleID})
+}
+
+// writeRoleWriteError maps the role-administration sentinels onto their HTTP
+// outcomes; everything else falls through to the identity error mapping
+// (auth.ErrNotFound → 404, scope denials → 403, store failures → 500).
+func (a *App) writeRoleWriteError(w http.ResponseWriter, err error, code string) {
+	switch {
+	case errors.Is(err, postgres.ErrStaleRole):
+		WriteOpenAIError(w, http.StatusConflict, "role changed since it was read — reload and retry", "invalid_request_error", "stale_role")
+	case errors.Is(err, postgres.ErrLastAdmin):
+		WriteOpenAIError(w, http.StatusConflict, "operation would remove the last usable administrator", "invalid_request_error", "last_admin")
+	case errors.Is(err, postgres.ErrRoleHasMembers):
+		WriteOpenAIError(w, http.StatusConflict, "role still has members", "invalid_request_error", "role_has_members")
+	default:
+		a.writeIdentityError(w, err, code)
 	}
 }
 
@@ -780,22 +922,25 @@ func (a *App) handleIdentityServiceAccountByID(w http.ResponseWriter, r *http.Re
 			return
 		}
 		if status != "" && status != "active" && sa.Status == "active" {
-			// A disabled service account takes its keys down with it; if those
-			// keys held the tenant's last admin grant the write is refused.
+			// A disabled service account takes its keys down with it; if
+			// those keys held the tenant's last admin grant the write is
+			// refused — the holder count and the status write commit
+			// together under the tenant authority lock.
 			keys, err := a.identity.ListAPIKeys(r.Context(), principal.TenantID)
 			if err != nil {
 				log.Printf("list keys for service account guard: %v", err)
 				WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "api_keys_list_failed")
 				return
 			}
-			excluded := map[string]bool{}
 			for _, k := range keys {
 				if k.ServiceAccountID == sa.ID && k.RevokedAt == nil && keyRecordHasScope(k, auth.ScopePlatformAdmin) {
-					excluded[k.ID] = true
+					if err := a.identity.SetServiceAccountStatusAtomically(r.Context(), principal.TenantID, sa.ID, status); err != nil {
+						a.writeRoleWriteError(w, err, "service_account_update_failed")
+						return
+					}
+					sa.Status = status
+					break
 				}
-			}
-			if len(excluded) > 0 && !a.lastAdminExcluded(w, r, principal.TenantID, "", excluded) {
-				return
 			}
 		}
 		if status != "" && status != sa.Status {

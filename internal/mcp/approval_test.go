@@ -4,10 +4,59 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 
 	"enclava-go/internal/auth"
 )
+
+// TestSchemaDigestCanonical pins the digest contract every MCP site shares:
+// key order, whitespace and numeric formatting must not change the digest,
+// because schemas live in jsonb and are re-read reformatted.
+func TestSchemaDigestCanonical(t *testing.T) {
+	base := json.RawMessage(`{"a":1,"b":[2,{"c":"x"}],"d":{"e":true,"f":null}}`)
+	reordered := json.RawMessage("{\n  \"b\": [2, {\"c\": \"x\"}],\n  \"d\": {\"f\": null, \"e\": true},\n  \"a\": 1.0\n}")
+	if SchemaDigest(base) != SchemaDigest(reordered) {
+		t.Fatal("jsonb-equivalent schemas produced different digests")
+	}
+	if SchemaDigest(base) == SchemaDigest(json.RawMessage(`{"a":2,"b":[2,{"c":"x"}],"d":{"e":true,"f":null}}`)) {
+		t.Fatal("semantically different schemas share a digest")
+	}
+	if SchemaDigest(base) == SchemaDigest(json.RawMessage(`{"a":1,"b":[2,{"c":"y"}],"d":{"e":true,"f":null}}`)) {
+		t.Fatal("nested change shares a digest")
+	}
+	for _, lit := range []string{`1e2`, `100.00`, `1.0e2`, `100`} {
+		if SchemaDigest(json.RawMessage(`{"n":`+lit+`}`)) != SchemaDigest(json.RawMessage(`{"n":100}`)) {
+			t.Errorf("number literal %s not value-normalized", lit)
+		}
+	}
+	if SchemaDigest(json.RawMessage(`{"n":0.001}`)) != SchemaDigest(json.RawMessage(`{"n":1e-3}`)) {
+		t.Error("fractional exponent normalization broken")
+	}
+	invalid := json.RawMessage(`{"a":`)
+	if SchemaDigest(invalid) == SchemaDigest(json.RawMessage(`{"a":1}`)) {
+		t.Error("invalid input collided with a valid schema digest")
+	}
+	if SchemaDigest(invalid) != SchemaDigest(json.RawMessage(`{"a":`)) {
+		t.Error("identical invalid inputs must hash deterministically")
+	}
+	if len(SchemaDigest(base)) != 64 {
+		t.Fatalf("digest length %d", len(SchemaDigest(base)))
+	}
+}
+
+func TestDiffSchemaFieldsReportsTopLevelChanges(t *testing.T) {
+	old := json.RawMessage(`{"type":"object","properties":{"keep":{"type":"string"},"typed":{"type":"number"},"gone":{"type":"string"}},"required":["keep"]}`)
+	next := json.RawMessage(`{"type":"object","properties":{"keep":{"type":"string"},"typed":{"type":"string"},"added":{"type":"boolean"}}}`)
+	got := DiffSchemaFields(old, next)
+	want := []SchemaFieldDiff{{Field: "added", Change: "added"}, {Field: "gone", Change: "removed"}, {Field: "typed", Change: "type_changed"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("diff=%v want=%v", got, want)
+	}
+	if got := DiffSchemaFields(old, old); len(got) != 0 {
+		t.Fatalf("identical schemas diffed: %v", got)
+	}
+}
 
 func TestOriginBindingAndSchemaValidation(t *testing.T) {
 	for _, tc := range []struct {
@@ -78,8 +127,8 @@ func (tr *testTransport) Call(context.Context, Server, Approval, string, json.Ra
 
 func TestInvokeRequiresCurrentApprovalAndCallerScope(t *testing.T) {
 	a := Approval{TenantID: "t", ServerID: "s", ToolID: "x", RemoteName: "remote-hostile-name", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Enabled: true, CallerScopes: []string{"mcp.use"}}
-	a.InputSchemaHash = SchemaHash(a.InputSchema)
-	a.OutputSchemaHash = SchemaHash(a.OutputSchema)
+	a.InputSchemaHash = SchemaDigest(a.InputSchema)
+	a.OutputSchemaHash = SchemaDigest(a.OutputSchema)
 	repo := testRepo{Server{TenantID: "t", ID: "s", Origin: "https://mcp.test", Enabled: true, AudienceScopes: []string{"assistant.use"}}, a}
 	caller := &testCaller{}
 	transport := &testTransport{}

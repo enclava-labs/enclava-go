@@ -8,6 +8,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -633,9 +635,12 @@ func TestIdentityRoleCreateGrantsBounded(t *testing.T) {
 		}
 	}
 	botRepo := postgres.NewChatbotRepo(f.db)
+	// Audience "*" is tenant-wide (D-07): the audience term intersects on top
+	// of grants, so these fixtures isolate the grants-only visibility this
+	// test proves.
 	for _, b := range []chatbot.Instance{
-		{TenantID: f.tenant, ID: "bot1", ExternalID: "bot1", Name: "Bot One", IsEnabled: true},
-		{TenantID: f.tenant, ID: "bot2", ExternalID: "bot2", Name: "Bot Two", IsEnabled: true},
+		{TenantID: f.tenant, ID: "bot1", ExternalID: "bot1", Name: "Bot One", IsEnabled: true, Audience: []string{"*"}},
+		{TenantID: f.tenant, ID: "bot2", ExternalID: "bot2", Name: "Bot Two", IsEnabled: true, Audience: []string{"*"}},
 	} {
 		if err := botRepo.Create(ctx, b); err != nil {
 			t.Fatalf("seed chatbot %s: %v", b.ID, err)
@@ -805,5 +810,700 @@ func TestIdentityRoleCreateGrantsBounded(t *testing.T) {
 		`{"email":"created@example.com","password":"created-pass","role_ids":["`+wideRoleID+`"]}`, limitedSess, limitedCSRF)
 	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "resource authority") {
 		t.Fatalf("create-user role_ids escalation expected 403, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// --- plan 08-02: role PATCH/DELETE (OA-20) + users.team ---------------------
+
+// revokeAdminKeys revokes every platform.admin key in the fixture tenant and
+// strips the fixture admin@example.com membership, so the test-seeded roles
+// are the only remaining platform.admin holders — the precondition the
+// last-admin regressions need (the fixture key and the fixture user would
+// otherwise always be surviving holders).
+func revokeAdminKeys(t *testing.T, f *identityFixture) {
+	t.Helper()
+	keys, err := f.repo.ListAPIKeys(context.Background(), f.tenant)
+	if err != nil {
+		t.Fatalf("list keys: %v", err)
+	}
+	for _, k := range keys {
+		if keyRecordHasScope(k, auth.ScopePlatformAdmin) {
+			if err := f.repo.RevokeAPIKey(context.Background(), f.tenant, k.ID, time.Now().UTC()); err != nil {
+				t.Fatalf("revoke admin key %s: %v", k.ID, err)
+			}
+		}
+	}
+	if _, err := f.db.SQL.ExecContext(context.Background(),
+		`DELETE FROM user_roles ur USING users u
+		 WHERE ur.user_id = u.id AND u.tenant_id = $1::uuid AND u.email = $2`,
+		f.tenant, "admin@example.com"); err != nil {
+		t.Fatalf("strip fixture admin membership: %v", err)
+	}
+}
+
+// roleIDForUser returns the user's first assigned role id.
+func roleIDForUser(t *testing.T, f *identityFixture, userID string) string {
+	t.Helper()
+	roles, err := f.repo.RolesForUser(context.Background(), f.tenant, userID)
+	if err != nil || len(roles) == 0 {
+		t.Fatalf("roles for %s: %v (%d roles)", userID, err, len(roles))
+	}
+	return roles[0].ID
+}
+
+// roleHasScope reports whether a decoded scopes list carries the scope
+// (httpx-side twin of the repo helper).
+func roleHasScope(scopes []string, scope string) bool {
+	for _, s := range scopes {
+		if s == scope {
+			return true
+		}
+	}
+	return false
+}
+
+func errorCode(t *testing.T, body string) string {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("decode error body %q: %v", body, err)
+	}
+	errObj, _ := doc["error"].(map[string]any)
+	code, _ := errObj["code"].(string)
+	return code
+}
+
+// TestIdentityRolePatchMergeDeleteAndBounds proves the PATCH/DELETE role
+// contract: merge semantics (absent unchanged, present-including-empty
+// replaces), caller-bounded scopes and grants, the platform.admin route gate,
+// membered-delete refusal and cross-tenant 404s.
+func TestIdentityRolePatchMergeDeleteAndBounds(t *testing.T) {
+	f := newIdentityFixture(t)
+	ctx := context.Background()
+	path := "/api/v1/identities/roles/"
+
+	rec := f.admin(t, http.MethodPost, "/api/v1/identities/roles",
+		`{"name":"ops","scopes":["platform.admin"],"grants":{"models":{"mode":"list","items":["m1"]},"endpoints":{"mode":"list","items":["ep1"]}}}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create role: %d %s", rec.Code, rec.Body.String())
+	}
+	roleID := decodeJSON(t, rec)["id"].(string)
+
+	getRole := func() map[string]any {
+		t.Helper()
+		rec := f.admin(t, http.MethodGet, path+roleID, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("role GET: %d %s", rec.Code, rec.Body.String())
+		}
+		return decodeJSON(t, rec)
+	}
+	before := getRole()
+
+	// Name-only PATCH: scopes and grants byte-identical, name trimmed.
+	rec = f.admin(t, http.MethodPatch, path+roleID, `{"name":"  ops renamed  "}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("name patch: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := decodeJSON(t, rec); got["name"] != "ops renamed" {
+		t.Fatalf("patched name = %v", got["name"])
+	}
+	after := getRole()
+	if !reflect.DeepEqual(after["grants"], before["grants"]) {
+		t.Fatalf("name-only patch changed grants: %v", after["grants"])
+	}
+	if !reflect.DeepEqual(after["scopes"], before["scopes"]) {
+		t.Fatalf("name-only patch changed scopes: %v", after["scopes"])
+	}
+
+	// Explicit empty scopes list clears; explicit list restores.
+	rec = f.admin(t, http.MethodPatch, path+roleID, `{"scopes":[]}`)
+	if rec.Code != http.StatusOK || len(getRole()["scopes"].([]any)) != 0 {
+		t.Fatalf("scopes clear: %d %s %v", rec.Code, rec.Body.String(), getRole()["scopes"])
+	}
+	rec = f.admin(t, http.MethodPatch, path+roleID, `{"scopes":["platform.admin"]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scopes restore: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Explicit empty items clear one grant kind; other kinds stay.
+	rec = f.admin(t, http.MethodPatch, path+roleID, `{"grants":{"models":{"mode":"list","items":[]}}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("models clear: %d %s", rec.Code, rec.Body.String())
+	}
+	grants := getRole()["grants"].(map[string]any)
+	items, all := auth.DecodeAllowlist(grantDocBytes(t, grants["models"]))
+	if all || len(items) != 0 {
+		t.Fatalf("models grant not cleared: %v", grants["models"])
+	}
+	if got, _ := auth.DecodeAllowlist(grantDocBytes(t, grants["endpoints"])); len(got) != 1 {
+		t.Fatalf("endpoints grant must survive the models-only clear: %v", grants["endpoints"])
+	}
+
+	// A new envelope replaces only the kinds it carries; absent kinds keep
+	// their stored grant.
+	rec = f.admin(t, http.MethodPatch, path+roleID, `{"grants":{"models":{"mode":"list","items":["m1"]}}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("envelope replace: %d %s", rec.Code, rec.Body.String())
+	}
+	grants = getRole()["grants"].(map[string]any)
+	if got, all := auth.DecodeAllowlist(grantDocBytes(t, grants["models"])); all || len(got) != 1 {
+		t.Fatalf("models grant = %v", grants["models"])
+	}
+	if got, all := auth.DecodeAllowlist(grantDocBytes(t, grants["endpoints"])); all || len(got) != 1 {
+		t.Fatalf("absent endpoints kind must keep its stored grant: %v", grants["endpoints"])
+	}
+
+	// Whitespace-only names are refused.
+	rec = f.admin(t, http.MethodPatch, path+roleID, `{"name":"   "}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("blank name patch: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// The platform.admin route gate: a member session cannot PATCH/DELETE.
+	memberSess, memberCSRF := loginUserWithGrants(t, f, "gate-member@example.com", []string{"chatbot"}, auth.ResourceGrants{}, "gate-pass")
+	rec = sessionDo(t, f.app, http.MethodPatch, path+roleID, `{"name":"nope"}`, memberSess, memberCSRF)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("member patch expected 403, got %d %s", rec.Code, rec.Body.String())
+	}
+	rec = sessionDo(t, f.app, http.MethodDelete, path+roleID, "", memberSess, memberCSRF)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("member delete expected 403, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Caller-bounded PATCH: a limited admin session cannot raise grants or
+	// scopes beyond its own authority — not even on its own role.
+	limitedSess, limitedCSRF := loginUserWithGrants(t, f, "limited-admin@example.com", []string{auth.ScopePlatformAdmin},
+		auth.ResourceGrants{Models: auth.Allowlist{Items: []string{"m9"}}}, "limited-pass")
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/identities/roles",
+		`{"name":"limited-role","scopes":[],"grants":{"models":{"mode":"list","items":["m9"]}}}`, limitedSess, limitedCSRF)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("limited role create: %d %s", rec.Code, rec.Body.String())
+	}
+	limitedRole := decodeJSON(t, rec)["id"].(string)
+	for _, tc := range []struct{ label, body string }{
+		{"item beyond caller", `{"grants":{"models":{"mode":"list","items":["m1"]}}}`},
+		{"mode:all beyond caller", `{"grants":{"models":{"mode":"all"}}}`},
+		{"scope beyond caller", `{"scopes":["pricing.manage"]}`},
+	} {
+		rec = sessionDo(t, f.app, http.MethodPatch, path+limitedRole, tc.body, limitedSess, limitedCSRF)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s patch expected 403, got %d %s", tc.label, rec.Code, rec.Body.String())
+		}
+	}
+
+	// DELETE a membered role → 409 role_has_members; the role survives.
+	target := testdb.SeedUser(t, f.db, f.tenant, "doomed-member@example.com", nil)
+	rec = f.admin(t, http.MethodPut, "/api/v1/identities/users/"+target.ID+"/roles/"+roleID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("assign member: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = f.admin(t, http.MethodDelete, path+roleID, "")
+	if rec.Code != http.StatusConflict || errorCode(t, rec.Body.String()) != "role_has_members" {
+		t.Fatalf("membered delete: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := f.admin(t, http.MethodGet, path+roleID, ""); got.Code != http.StatusOK {
+		t.Fatalf("membered role must survive refusal, got %d", got.Code)
+	}
+
+	// DELETE an empty role → 200; it and every later look is 404.
+	rec = f.admin(t, http.MethodPost, "/api/v1/identities/roles", `{"name":"empty-role","scopes":[]}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("empty role create: %d %s", rec.Code, rec.Body.String())
+	}
+	emptyID := decodeJSON(t, rec)["id"].(string)
+	rec = f.admin(t, http.MethodDelete, path+emptyID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("empty role delete: %d %s", rec.Code, rec.Body.String())
+	}
+	if deleted := decodeJSON(t, rec); deleted["deleted"] != true || deleted["id"] != emptyID {
+		t.Fatalf("delete body = %v", deleted)
+	}
+	if rec := f.admin(t, http.MethodGet, path+emptyID, ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("deleted role GET: %d", rec.Code)
+	}
+	if rec := f.admin(t, http.MethodDelete, path+emptyID, ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("deleted role DELETE: %d", rec.Code)
+	}
+
+	// PUT is not part of the frozen contract.
+	if rec := f.admin(t, http.MethodPut, path+roleID, `{}`); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("role PUT: %d", rec.Code)
+	}
+
+	// Cross-tenant role ids are indistinguishable 404s on both verbs.
+	other := testdb.SeedTenant(t, f.db, "patch-foreign-tenant")
+	if err := f.repo.CreateRole(ctx, other, auth.Role{ID: "role_foreign", Name: "foreign", Scopes: []string{auth.ScopePlatformAdmin}}); err != nil {
+		t.Fatalf("seed foreign role: %v", err)
+	}
+	rec = f.admin(t, http.MethodPatch, path+"role_foreign", `{"name":"x"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("foreign role patch: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = f.admin(t, http.MethodDelete, path+"role_foreign", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("foreign role delete: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestRolePatchTakesEffectOnNextRequest proves edits are runtime-effective:
+// the member's next principal rebuild carries the new stored union (D-25),
+// asserted through AuthenticateSession AND a real allowed read.
+func TestRolePatchTakesEffectOnNextRequest(t *testing.T) {
+	f := newIdentityFixture(t)
+	ctx := context.Background()
+
+	endpointsRepo := postgres.NewEndpointsRepo(f.db)
+	for _, ep := range []struct{ id, alias string }{{"ep1", "m1"}, {"ep2", "m2"}} {
+		if err := endpointsRepo.Create(ctx, inference.Endpoint{
+			ID: ep.id, TenantID: f.tenant, Protocol: "openai_compatible",
+			BaseOrigin:   "https://" + ep.id + ".upstream.test",
+			Capabilities: []string{inference.CapabilityChat, inference.ModelCapabilityPrefix + ep.alias},
+			Enabled:      true,
+		}); err != nil {
+			t.Fatalf("seed endpoint %s: %v", ep.id, err)
+		}
+	}
+	memberSess, _ := loginUserWithGrants(t, f, "rt-member@example.com", []string{"models.list"},
+		auth.ResourceGrants{
+			Models:    auth.Allowlist{Items: []string{"m1"}},
+			Endpoints: auth.Allowlist{Items: []string{"ep1"}},
+		}, "rt-pass")
+	// The widening PATCHer must hold every scope and grant the patched role
+	// carries — f.admin's key is platform.admin-only, so the subset bounds
+	// would rightly refuse the role's models.list scope. This admin does.
+	patchSess, patchCSRF := loginUserWithGrants(t, f, "rt-admin@example.com",
+		[]string{auth.ScopePlatformAdmin, "models.list"},
+		auth.ResourceGrants{
+			Models:    auth.Allowlist{All: true},
+			Endpoints: auth.Allowlist{All: true},
+		}, "rt-admin-pass")
+	member, err := f.repo.GetUserByEmail(ctx, f.tenant, "rt-member@example.com")
+	if err != nil {
+		t.Fatalf("fetch member: %v", err)
+	}
+	roleID := roleIDForUser(t, f, member.ID)
+
+	rec := sessionDo(t, f.app, http.MethodGet, "/v1/models", "", memberSess, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("baseline models list: %d %s", rec.Code, rec.Body.String())
+	}
+	var modelList struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &modelList); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	if len(modelList.Data) != 1 || modelList.Data[0].ID != "m1" {
+		t.Fatalf("baseline grants wrong: %v", modelList.Data)
+	}
+
+	// Admin PATCH widens the role's stored union.
+	rec = sessionDo(t, f.app, http.MethodPatch, "/api/v1/identities/roles/"+roleID,
+		`{"grants":{"models":{"mode":"list","items":["m1","m2"]},"endpoints":{"mode":"list","items":["ep1","ep2"]}}}`, patchSess, patchCSRF)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("grants widen: %d %s", rec.Code, rec.Body.String())
+	}
+	p, err := f.app.authSvc.AuthenticateSession(ctx, memberSess.Value)
+	if err != nil {
+		t.Fatalf("rebuild principal: %v", err)
+	}
+	if !auth.ModelAllowed(p, "m2") || !auth.EndpointAllowed(p, "ep2") {
+		t.Fatalf("edited grants must apply on the next request: %+v", p)
+	}
+	rec = sessionDo(t, f.app, http.MethodGet, "/v1/models", "", memberSess, nil)
+	if err := json.Unmarshal(rec.Body.Bytes(), &modelList); err != nil {
+		t.Fatalf("decode widened models: %v", err)
+	}
+	if len(modelList.Data) != 2 {
+		t.Fatalf("widened grants not live: %v", modelList.Data)
+	}
+
+	// Explicit empty items clear the grant on the next request, too.
+	rec = sessionDo(t, f.app, http.MethodPatch, "/api/v1/identities/roles/"+roleID,
+		`{"grants":{"models":{"mode":"list","items":[]}}}`, patchSess, patchCSRF)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("models clear: %d %s", rec.Code, rec.Body.String())
+	}
+	p, err = f.app.authSvc.AuthenticateSession(ctx, memberSess.Value)
+	if err != nil {
+		t.Fatalf("rebuild principal after clear: %v", err)
+	}
+	if auth.ModelAllowed(p, "m2") {
+		t.Fatalf("cleared grant still allowed: %+v", p)
+	}
+}
+
+// TestRolePatchStripLastAdminRefused proves the role-wide last-admin guard:
+// stripping platform.admin from the only granting role is a 409 that persists
+// nothing, and the identical edit passes once a second holder exists.
+func TestRolePatchStripLastAdminRefused(t *testing.T) {
+	f := newIdentityFixture(t)
+	ctx := context.Background()
+	revokeAdminKeys(t, f)
+
+	sess, csrf := loginUserWithGrants(t, f, "sole-admin@example.com", []string{auth.ScopePlatformAdmin}, auth.ResourceGrants{}, "sole-pass")
+	sole, err := f.repo.GetUserByEmail(ctx, f.tenant, "sole-admin@example.com")
+	if err != nil {
+		t.Fatalf("fetch sole admin: %v", err)
+	}
+	roleID := roleIDForUser(t, f, sole.ID)
+
+	rec := sessionDo(t, f.app, http.MethodPatch, "/api/v1/identities/roles/"+roleID, `{"scopes":[]}`, sess, csrf)
+	if rec.Code != http.StatusConflict || errorCode(t, rec.Body.String()) != "last_admin" {
+		t.Fatalf("sole-admin strip: %d %s", rec.Code, rec.Body.String())
+	}
+	got, err := f.repo.GetRole(ctx, f.tenant, roleID)
+	if err != nil || !roleHasScope(got.Scopes, auth.ScopePlatformAdmin) {
+		t.Fatalf("refused strip must not persist: %+v %v", got, err)
+	}
+
+	// A second role carrying platform.admin makes the same edit legal.
+	testdb.SeedUser(t, f.db, f.tenant, "sole-admin-2@example.com", []string{auth.ScopePlatformAdmin})
+	rec = sessionDo(t, f.app, http.MethodPatch, "/api/v1/identities/roles/"+roleID, `{"scopes":[]}`, sess, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("strip with second holder: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestRoleLastAdminConcurrentStripRace is the deterministic two-removal
+// regression: two concurrent PATCHes stripping platform.admin from the two
+// last admin roles must resolve to exactly one success and one 409
+// last_admin, never to a tenant without a usable holder.
+func TestRoleLastAdminConcurrentStripRace(t *testing.T) {
+	f := newIdentityFixture(t)
+	ctx := context.Background()
+	revokeAdminKeys(t, f)
+
+	sessA, csrfA := loginUserWithGrants(t, f, "race-a@example.com", []string{auth.ScopePlatformAdmin}, auth.ResourceGrants{}, "race-a-pass")
+	sessB, csrfB := loginUserWithGrants(t, f, "race-b@example.com", []string{auth.ScopePlatformAdmin}, auth.ResourceGrants{}, "race-b-pass")
+	userA, err := f.repo.GetUserByEmail(ctx, f.tenant, "race-a@example.com")
+	if err != nil {
+		t.Fatalf("fetch A: %v", err)
+	}
+	userB, err := f.repo.GetUserByEmail(ctx, f.tenant, "race-b@example.com")
+	if err != nil {
+		t.Fatalf("fetch B: %v", err)
+	}
+	r1 := roleIDForUser(t, f, userA.ID)
+	r2 := roleIDForUser(t, f, userB.ID)
+
+	type outcome struct {
+		code int
+		body string
+	}
+	start := make(chan struct{})
+	results := make(chan outcome, 2)
+	patch := func(sess, csrf *http.Cookie, roleID string) {
+		<-start
+		rec := sessionDo(t, f.app, http.MethodPatch, "/api/v1/identities/roles/"+roleID, `{"scopes":[]}`, sess, csrf)
+		results <- outcome{rec.Code, rec.Body.String()}
+	}
+	go patch(sessA, csrfA, r1)
+	go patch(sessB, csrfB, r2)
+	close(start)
+
+	ok, conflict := 0, 0
+	for i := 0; i < 2; i++ {
+		o := <-results
+		switch {
+		case o.code == http.StatusOK:
+			ok++
+		case o.code == http.StatusConflict && errorCode(t, o.body) == "last_admin":
+			conflict++
+		default:
+			t.Fatalf("unexpected race outcome: %d %s", o.code, o.body)
+		}
+	}
+	if ok != 1 || conflict != 1 {
+		t.Fatalf("race must yield exactly one success and one 409, got %d/%d", ok, conflict)
+	}
+	users, keys, err := f.repo.AdminHolderCounts(ctx, f.tenant, auth.ScopePlatformAdmin)
+	if err != nil {
+		t.Fatalf("holder counts: %v", err)
+	}
+	if len(users)+len(keys) < 1 {
+		t.Fatalf("concurrent removals stranded the tenant: users=%v keys=%v", users, keys)
+	}
+}
+
+// TestRoleDeleteVsAdminStripRace proves concurrent role-DELETE and
+// admin-scope-removal cannot both pass the remaining-holder check.
+func TestRoleDeleteVsAdminStripRace(t *testing.T) {
+	f := newIdentityFixture(t)
+	ctx := context.Background()
+	revokeAdminKeys(t, f)
+
+	sessA, csrfA := loginUserWithGrants(t, f, "delrace-a@example.com", []string{auth.ScopePlatformAdmin}, auth.ResourceGrants{}, "delrace-a-pass")
+	// B's retained authority is a wildcard-scope role: HasScope grants it
+	// platform.admin, but the holder count matches literal platform.admin
+	// roles only, so A's role stays the tenant's sole counted holder and
+	// exactly one of the two contested removals can commit — deterministically
+	// in either interleaving, with B never losing authority mid-race.
+	sessB, csrfB := loginUserWithGrants(t, f, "delrace-b@example.com", []string{"*"}, auth.ResourceGrants{}, "delrace-b-pass")
+	userA, err := f.repo.GetUserByEmail(ctx, f.tenant, "delrace-a@example.com")
+	if err != nil {
+		t.Fatalf("fetch A: %v", err)
+	}
+	r1 := roleIDForUser(t, f, userA.ID)
+	// Memberless second admin role, created through the bounded API.
+	rec := sessionDo(t, f.app, http.MethodPost, "/api/v1/identities/roles",
+		`{"name":"race-empty","scopes":["platform.admin"]}`, sessB, csrfB)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("seed empty admin role: %d %s", rec.Code, rec.Body.String())
+	}
+	r2 := decodeJSON(t, rec)["id"].(string)
+
+	type outcome struct {
+		code int
+		body string
+	}
+	start := make(chan struct{})
+	results := make(chan outcome, 2)
+	go func() {
+		<-start
+		rec := sessionDo(t, f.app, http.MethodDelete, "/api/v1/identities/roles/"+r2, "", sessA, csrfA)
+		results <- outcome{rec.Code, rec.Body.String()}
+	}()
+	go func() {
+		<-start
+		rec := sessionDo(t, f.app, http.MethodPatch, "/api/v1/identities/roles/"+r1, `{"scopes":[]}`, sessB, csrfB)
+		results <- outcome{rec.Code, rec.Body.String()}
+	}()
+	close(start)
+
+	ok, conflict := 0, 0
+	for i := 0; i < 2; i++ {
+		o := <-results
+		switch {
+		case o.code == http.StatusOK:
+			ok++
+		case o.code == http.StatusConflict && errorCode(t, o.body) == "last_admin":
+			conflict++
+		default:
+			t.Fatalf("unexpected race outcome: %d %s", o.code, o.body)
+		}
+	}
+	if ok != 1 || conflict != 1 {
+		t.Fatalf("delete-vs-strip race must yield exactly one success, got %d/%d", ok, conflict)
+	}
+	users, keys, err := f.repo.AdminHolderCounts(ctx, f.tenant, auth.ScopePlatformAdmin)
+	if err != nil {
+		t.Fatalf("holder counts: %v", err)
+	}
+	if len(users)+len(keys) < 1 {
+		t.Fatalf("race stranded the tenant: users=%v keys=%v", users, keys)
+	}
+}
+
+// TestRoleStaleWriteRefusedAndMergeFromStoredRow proves the delayed-write
+// interleaving: a name-only PATCH parked past a concurrent admin move either
+// re-derives from the commit-time stored row or refuses 409 stale_role — the
+// stale scopes are never written back and the moved admin grant stays intact.
+func TestRoleStaleWriteRefusedAndMergeFromStoredRow(t *testing.T) {
+	f := newIdentityFixture(t)
+	ctx := context.Background()
+	revokeAdminKeys(t, f)
+
+	holder := testdb.SeedUser(t, f.db, f.tenant, "stale-holder@example.com", []string{auth.ScopePlatformAdmin})
+	target := roleIDForUser(t, f, holder.ID)
+	heirUser := testdb.SeedUser(t, f.db, f.tenant, "stale-heir@example.com", []string{auth.ScopePlatformAdmin})
+	heir := roleIDForUser(t, f, heirUser.ID)
+
+	// The delayed write's pre-lock read predates the admin move below.
+	read, err := f.repo.GetRole(ctx, f.tenant, target)
+	if err != nil {
+		t.Fatalf("read role: %v", err)
+	}
+
+	// The admin move: grant platform.admin on the heir role, strip it from
+	// the target — each an atomic locked write (zero readVersion = blind).
+	if _, err := f.repo.UpdateRoleAtomically(ctx, f.tenant, heir,
+		postgres.RoleUpdateDeltas{Scopes: new([]string{auth.ScopePlatformAdmin})}, time.Time{}); err != nil {
+		t.Fatalf("grant admin on heir: %v", err)
+	}
+	if _, err := f.repo.UpdateRoleAtomically(ctx, f.tenant, target,
+		postgres.RoleUpdateDeltas{Scopes: new([]string{})}, time.Time{}); err != nil {
+		t.Fatalf("strip admin from target: %v", err)
+	}
+
+	// The parked name-only PATCH replays with the stale readVersion →
+	// ErrStaleRole; it must never commit over the moved authority.
+	if _, err := f.repo.UpdateRoleAtomically(ctx, f.tenant, target,
+		postgres.RoleUpdateDeltas{Name: new("renamed-late")}, read.UpdatedAt); !errors.Is(err, postgres.ErrStaleRole) {
+		t.Fatalf("delayed name-only write must refuse as stale, got %v", err)
+	}
+	got, err := f.repo.GetRole(ctx, f.tenant, target)
+	if err != nil {
+		t.Fatalf("reread role: %v", err)
+	}
+	if got.Name == "renamed-late" {
+		t.Fatalf("stale write committed: %+v", got)
+	}
+	if roleHasScope(got.Scopes, auth.ScopePlatformAdmin) {
+		t.Fatalf("stale write restored admin scopes: %+v", got)
+	}
+
+	// A fresh read commits the name-only merge with scopes byte-identical to
+	// the commit-time stored row — the moved admin grant stays intact.
+	fresh, err := f.repo.GetRole(ctx, f.tenant, heir)
+	if err != nil {
+		t.Fatalf("read heir: %v", err)
+	}
+	renamed, err := f.repo.UpdateRoleAtomically(ctx, f.tenant, heir,
+		postgres.RoleUpdateDeltas{Name: new("moved-admin")}, fresh.UpdatedAt)
+	if err != nil {
+		t.Fatalf("fresh name-only write: %v", err)
+	}
+	if renamed.Name != "moved-admin" || !reflect.DeepEqual(renamed.Scopes, fresh.Scopes) {
+		t.Fatalf("name-only write changed scopes: %+v vs %+v", renamed.Scopes, fresh.Scopes)
+	}
+	if !roleHasScope(renamed.Scopes, auth.ScopePlatformAdmin) {
+		t.Fatalf("moved admin grant lost: %+v", renamed)
+	}
+	users, keys, err := f.repo.AdminHolderCounts(ctx, f.tenant, auth.ScopePlatformAdmin)
+	if err != nil {
+		t.Fatalf("holder counts: %v", err)
+	}
+	if len(users)+len(keys) < 1 {
+		t.Fatalf("tenant stranded: users=%v keys=%v", users, keys)
+	}
+
+	// The handler maps the sentinels onto their 409 codes.
+	for _, tc := range []struct {
+		err  error
+		code string
+	}{
+		{postgres.ErrStaleRole, "stale_role"},
+		{postgres.ErrLastAdmin, "last_admin"},
+		{postgres.ErrRoleHasMembers, "role_has_members"},
+	} {
+		rec := httptest.NewRecorder()
+		f.app.writeRoleWriteError(rec, tc.err, "role_update_failed")
+		if rec.Code != http.StatusConflict || errorCode(t, rec.Body.String()) != tc.code {
+			t.Fatalf("sentinel %v mapped to %d %s, want 409 %s", tc.err, rec.Code, rec.Body.String(), tc.code)
+		}
+	}
+}
+
+// TestRoleAssignDeleteRaceSafeOutcome proves the atomic delete never leaves a
+// membership pointing at a deleted role: the assign-vs-delete race resolves
+// to either role+member or neither, never a dangling assignment.
+func TestRoleAssignDeleteRaceSafeOutcome(t *testing.T) {
+	f := newIdentityFixture(t)
+	ctx := context.Background()
+	member := testdb.SeedUser(t, f.db, f.tenant, "assign-race@example.com", nil)
+
+	for i := 0; i < 6; i++ {
+		roleID := fmt.Sprintf("role_race_%d", i)
+		role := auth.Role{ID: roleID, Name: "race-" + roleID, Scopes: []string{"chatbot"}, Grants: auth.ResourceGrants{}}
+		if err := f.repo.CreateRole(ctx, f.tenant, role); err != nil {
+			t.Fatalf("create %s: %v", roleID, err)
+		}
+		assignErr := make(chan error, 1)
+		deleteErr := make(chan error, 1)
+		go func() { assignErr <- f.repo.AssignRole(ctx, f.tenant, member.ID, roleID) }()
+		go func() { deleteErr <- f.repo.DeleteRoleIfUnused(ctx, f.tenant, roleID) }()
+		aErr, dErr := <-assignErr, <-deleteErr
+
+		_, gErr := f.repo.GetRole(ctx, f.tenant, roleID)
+		members, mErr := f.repo.RoleUsers(ctx, f.tenant, roleID)
+		if mErr != nil {
+			t.Fatalf("role users %s: %v", roleID, mErr)
+		}
+		switch {
+		case errors.Is(gErr, auth.ErrNotFound):
+			// Delete won: no membership may outlive the role, and the losing
+			// assign must have failed the foreign key (safe refusal).
+			if len(members) != 0 {
+				t.Fatalf("membership outlived deleted role %s", roleID)
+			}
+			if aErr == nil {
+				t.Fatalf("assign onto deleted role %s must fail", roleID)
+			}
+		case gErr != nil:
+			t.Fatalf("get role %s: %v", roleID, gErr)
+		default:
+			// Assign won: the delete must have refused the membered role.
+			if len(members) != 1 {
+				t.Fatalf("role %s survived without its membership", roleID)
+			}
+			if !errors.Is(dErr, postgres.ErrRoleHasMembers) {
+				t.Fatalf("delete of membered role %s must refuse, got %v", roleID, dErr)
+			}
+		}
+	}
+}
+
+// TestIdentityUserTeamAttribute proves users.team persists through create and
+// PATCH, reads back through the repo and every user DTO, allows the empty
+// state and enforces the 80-char cap.
+func TestIdentityUserTeamAttribute(t *testing.T) {
+	f := newIdentityFixture(t)
+	ctx := context.Background()
+
+	rec := f.admin(t, http.MethodPost, "/api/v1/identities/users",
+		`{"email":"teamed@example.com","password":"pw-123456","team":"  platform  "}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create teamed user: %d %s", rec.Code, rec.Body.String())
+	}
+	created := decodeJSON(t, rec)
+	if created["team"] != "platform" {
+		t.Fatalf("create response team = %v", created["team"])
+	}
+	userID := created["id"].(string)
+	u, err := f.repo.GetUserByEmail(ctx, f.tenant, "teamed@example.com")
+	if err != nil || u.Team != "platform" {
+		t.Fatalf("repo team readback: %q %v", u.Team, err)
+	}
+
+	patch := func(body string) map[string]any {
+		t.Helper()
+		rec := f.admin(t, http.MethodPatch, "/api/v1/identities/users/"+userID, body)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("team patch %s: %d %s", body, rec.Code, rec.Body.String())
+		}
+		return decodeJSON(t, rec)
+	}
+	if got := patch(`{"team":"payments"}`); got["team"] != "payments" {
+		t.Fatalf("patched team = %v", got["team"])
+	}
+	if u, err := f.repo.GetUser(ctx, f.tenant, userID); err != nil || u.Team != "payments" {
+		t.Fatalf("repo team readback after patch: %q %v", u.Team, err)
+	}
+	// Explicit empty clears ("No team" is a first-class state); absent leaves
+	// the stored value unchanged.
+	if got := patch(`{"team":""}`); got["team"] != "" {
+		t.Fatalf("cleared team = %v", got["team"])
+	}
+	if got := patch(`{"display_name":"Renamed"}`); got["team"] != "" {
+		t.Fatalf("absent team must be unchanged, got %v", got["team"])
+	}
+	if got := patch(`{"team":"ops"}`); got["team"] != "ops" {
+		t.Fatalf("re-set team = %v", got["team"])
+	}
+	rec = f.admin(t, http.MethodPatch, "/api/v1/identities/users/"+userID,
+		`{"team":"`+strings.Repeat("x", 81)+`"}`)
+	if rec.Code != http.StatusBadRequest || errorCode(t, rec.Body.String()) != "invalid_team" {
+		t.Fatalf("oversized team: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// The list DTO carries the stored team.
+	rec = f.admin(t, http.MethodGet, "/api/v1/identities/users", "")
+	for _, row := range decodeJSON(t, rec)["users"].([]any) {
+		if m := row.(map[string]any); m["id"] == userID && m["team"] != "ops" {
+			t.Fatalf("users list team = %v", m["team"])
+		}
+	}
+
+	// Creating without a team stores the empty state.
+	rec = f.admin(t, http.MethodPost, "/api/v1/identities/users",
+		`{"email":"noteam@example.com","password":"pw-123456"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create plain user: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := decodeJSON(t, rec)["team"]; got != "" {
+		t.Fatalf("default team = %v", got)
 	}
 }

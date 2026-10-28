@@ -7,9 +7,11 @@ import (
 )
 
 const (
+	DocumentStatusAll        = "all"
 	DocumentStatusProcessing = "processing"
 	DocumentStatusReady      = "ready"
 	DocumentStatusFailed     = "failed"
+	DocumentStatusRemoved    = "removed"
 
 	DefaultChunkSize    = 1000
 	DefaultChunkOverlap = 150

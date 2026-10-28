@@ -20,6 +20,9 @@ var (
 	ErrNotFound = errors.New("extract: not found")
 	// ErrForbidden denies a principal that exists but lacks the resource grant.
 	ErrForbidden = errors.New("extract: forbidden")
+	// ErrInvalidOperation rejects an ?operation= value outside the
+	// member-facing extraction set (extract.process|extract.vision).
+	ErrInvalidOperation = errors.New("extract: invalid operation")
 )
 
 // ProcessInput is one extraction request. Bytes are streamed into a durable

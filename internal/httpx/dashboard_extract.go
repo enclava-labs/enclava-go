@@ -48,12 +48,17 @@ func (a *App) handleDashboardExtractTemplates(w http.ResponseWriter, r *http.Req
 		}
 		WriteJSON(w, http.StatusOK, map[string]any{"templates": templates})
 	case http.MethodPost:
-		if a.extractSvc == nil {
-			WriteJSON(w, http.StatusNotImplemented, map[string]any{"error": "extract not configured"})
-			return
-		}
 		p, ok := a.extractPrincipal(w, r)
 		if !ok {
+			return
+		}
+		// Template writes map to the API's extract.manage scope.
+		if !auth.HasScope(p, "extract.manage") {
+			WriteForbidden(w, "missing required scope: extract.manage")
+			return
+		}
+		if a.extractSvc == nil {
+			WriteJSON(w, http.StatusNotImplemented, map[string]any{"error": "extract not configured"})
 			return
 		}
 		var payload extract.Template
@@ -158,12 +163,17 @@ func (a *App) handleDashboardExtractResetDefaults(w http.ResponseWriter, r *http
 // handleDashboardExtractSettings handles GET (fetch) and PUT (update) for extract settings.
 func (a *App) handleDashboardExtractSettings(w http.ResponseWriter, r *http.Request) {
 	setNoStoreHeaders(w)
-	if a.extractSvc == nil {
-		WriteJSON(w, http.StatusNotImplemented, map[string]any{"error": "extract settings not configured"})
-		return
-	}
 	p, ok := a.extractPrincipal(w, r)
 	if !ok {
+		return
+	}
+	// Settings writes map to the API's extract.manage scope.
+	if r.Method == http.MethodPut && !auth.HasScope(p, "extract.manage") {
+		WriteForbidden(w, "missing required scope: extract.manage")
+		return
+	}
+	if a.extractSvc == nil {
+		WriteJSON(w, http.StatusNotImplemented, map[string]any{"error": "extract settings not configured"})
 		return
 	}
 	switch r.Method {
@@ -322,7 +332,7 @@ func (a *App) handleDashboardExtractJobs(w http.ResponseWriter, r *http.Request)
 			offset = n
 		}
 	}
-	jobsList, total, err := a.extractSvc.ListJobs(r.Context(), p, limit, offset)
+	jobsList, total, err := a.extractSvc.ListJobs(r.Context(), p, "", limit, offset)
 	if err != nil {
 		log.Printf("dashboard: list extract jobs: %v", err)
 		WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})

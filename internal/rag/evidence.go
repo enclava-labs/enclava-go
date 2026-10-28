@@ -53,6 +53,11 @@ func (s *Service) ResolveEvidence(ctx context.Context, p auth.Principal, ids []s
 		if resolution.NativeLink == "" {
 			resolution.NativeLink = safeNativeLink(stringFromPayload(provenance, "source_uri"))
 		}
+		locations, err := s.evidenceLocations(ctx, p.TenantID, record.SpanRefs)
+		if err != nil {
+			return nil, err
+		}
+		resolution.Locations = locations
 		if s.artifacts != nil && version.ArtifactRef != "" {
 			resolution.RetainedCopyLabel = "retained copy"
 			resolution.RetainedCopyURL = "/api/v1/rag/evidence/" + url.PathEscape(record.ID) + "/copy"
@@ -119,6 +124,42 @@ func (s *Service) ReadEvidence(ctx context.Context, p auth.Principal, id string)
 		}, nil
 	}
 	return EvidenceText{}, source.ErrDenied
+}
+
+// evidenceLocations resolves span block IDs against the retained parsed
+// blocks — the single locator-resolution path for evidence views. Only
+// persisted locator fields (page/box/table/clause/section) surface; blocks
+// that were never parsed resolve to nothing and are never invented.
+func (s *Service) evidenceLocations(ctx context.Context, tenantID string, spans []source.Span) ([]source.Locator, error) {
+	var blockIDs []string
+	seen := make(map[string]struct{}, len(spans))
+	for _, span := range spans {
+		if span.BlockID == "" {
+			continue
+		}
+		if _, dup := seen[span.BlockID]; dup {
+			continue
+		}
+		seen[span.BlockID] = struct{}{}
+		blockIDs = append(blockIDs, span.BlockID)
+	}
+	if len(blockIDs) == 0 {
+		return nil, nil
+	}
+	locators, err := s.repo.ListBlockLocators(ctx, tenantID, blockIDs)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]source.Locator, 0, len(blockIDs))
+	for _, id := range blockIDs {
+		if locator, ok := locators[id]; ok {
+			out = append(out, locator)
+		}
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 func (s *Service) authorizedEvidenceSource(ctx context.Context, p auth.Principal, record EvidenceRecord) (source.Object, source.ObjectVersion, error) {

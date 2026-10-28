@@ -256,6 +256,7 @@ func newFixture(t *testing.T) *fixture {
 		UserID:              user.ID,
 		CredentialID:        "key_test",
 		CredentialKind:      auth.CredentialKindAPIKey,
+		Scopes:              map[string]struct{}{"rag": {}, "rag.manage": {}},
 		AllowedModelsAll:    true,
 		AllowedEndpointsAll: true,
 	}
@@ -300,7 +301,7 @@ func (f *fixture) runNextJob(t *testing.T) {
 
 func (f *fixture) docStatus(t *testing.T, collectionID, docID string) rag.Document {
 	t.Helper()
-	docs, err := f.svc.ListDocuments(context.Background(), f.principal, collectionID, 100, 0)
+	docs, err := f.svc.ListDocuments(context.Background(), f.principal, collectionID, rag.DocumentStatusAll, 100, 0)
 	if err != nil {
 		t.Fatalf("list documents: %v", err)
 	}
@@ -651,5 +652,227 @@ func TestImportArtifactInheritsSourceRestrictions(t *testing.T) {
 	if len(version.Restrictions) != 1 || len(version.Restrictions[0].DeniedCapabilities) != 1 ||
 		version.Restrictions[0].DeniedCapabilities[0] != inference.CapabilityEmbeddings {
 		t.Fatalf("imported restrictions = %+v", version.Restrictions)
+	}
+}
+
+// runNextJobExpectingFailure leases the next queued job, runs the embed
+// handler (which must error) and settles the job failed — the durable
+// failure the document projection must surface truthfully.
+func (f *fixture) runNextJobExpectingFailure(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	claim, err := f.jobs.Lease(ctx, "test-worker", time.Minute)
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if claim == nil {
+		t.Fatal("no job to lease")
+	}
+	if _, err := f.svc.JobHandler()(ctx, claim, nil); err == nil {
+		_ = claim.Fail(ctx, errors.New("expected failure"), jobs.FailureFatal)
+		t.Fatal("expected embed attempt to fail")
+	} else if failErr := claim.Fail(ctx, err, jobs.FailureFatal); failErr != nil {
+		t.Fatalf("settle failed job: %v", failErr)
+	}
+}
+
+func newScopedUser(t *testing.T, f *fixture, email string, scopes ...string) auth.Principal {
+	t.Helper()
+	user := testdb.SeedUser(t, f.db, f.tenant, email, nil)
+	scopesMap := make(map[string]struct{}, len(scopes))
+	for _, s := range scopes {
+		scopesMap[s] = struct{}{}
+	}
+	return auth.Principal{TenantID: f.tenant, ActorID: user.ID, UserID: user.ID, ActorKind: auth.ActorKindUser, Scopes: scopesMap}
+}
+
+func TestServiceListDocumentsAuthorizedPagination(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	member := newScopedUser(t, f, "member-list@example.test", "rag")
+	manager := newScopedUser(t, f, "manager-list@example.test", "rag", "rag.manage")
+
+	// Three shared documents (explicit member audience) interleaved with two
+	// restricted ones (uploader-only audience). Object audiences match exact
+	// actor IDs — collection visibility never widens source reads.
+	shared, restricted := []string{}, []string{}
+	for i, spec := range []struct {
+		name     string
+		audience []string
+		ids      *[]string
+	}{
+		{"shared-a.txt", []string{f.principal.ActorID, member.ActorID}, &shared},
+		{"restricted-a.txt", []string{f.principal.ActorID}, &restricted},
+		{"shared-b.txt", []string{f.principal.ActorID, member.ActorID}, &shared},
+		{"shared-c.txt", []string{f.principal.ActorID, member.ActorID}, &shared},
+		{"restricted-b.txt", []string{f.principal.ActorID}, &restricted},
+	} {
+		out, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+			FileName: spec.name, MimeType: "text/plain",
+			Bytes: []byte(fmt.Sprintf("enclava document %d content", i)), Audience: spec.audience,
+		})
+		if err != nil {
+			t.Fatalf("upload %s: %v", spec.name, err)
+		}
+		*spec.ids = append(*spec.ids, out.Document.ID)
+	}
+
+	listIDs := func(p auth.Principal, status string, limit, offset int) []string {
+		t.Helper()
+		docs, err := f.svc.ListDocuments(ctx, p, c.ID, status, limit, offset)
+		if err != nil {
+			t.Fatalf("list documents: %v", err)
+		}
+		ids := make([]string, 0, len(docs))
+		for _, d := range docs {
+			ids = append(ids, d.ID)
+		}
+		return ids
+	}
+
+	// Member pagination describes the AUTHORIZED set: denied rows never
+	// consume page slots and no restricted title leaks.
+	seen := map[string]bool{}
+	for _, offset := range []int{0, 2, 4} {
+		page := listIDs(member, rag.DocumentStatusAll, 2, offset)
+		if len(page) > 2 {
+			t.Fatalf("page larger than limit: %#v", page)
+		}
+		for _, id := range page {
+			if seen[id] {
+				t.Fatalf("document %s repeated across pages", id)
+			}
+			seen[id] = true
+			for _, denied := range restricted {
+				if id == denied {
+					t.Fatalf("restricted document %s leaked to member page %d", id, offset)
+				}
+			}
+		}
+	}
+	if len(seen) != len(shared) {
+		t.Fatalf("member pages saw %d documents, want the %d shared ones: %#v", len(seen), len(shared), seen)
+	}
+	if beyond := listIDs(member, rag.DocumentStatusAll, 2, len(shared)); len(beyond) != 0 {
+		t.Fatalf("authorized pagination ran past the authorized set: %#v", beyond)
+	}
+
+	// rag.manage never bypasses source authorization: a manage-scoped caller
+	// without audience membership sees nothing — no titles, no counts.
+	if got := listIDs(manager, rag.DocumentStatusAll, 50, 0); len(got) != 0 {
+		t.Fatalf("manage-scoped caller saw %d unauthorized documents: %#v", len(got), got)
+	}
+	// The owner (and audience member) sees everything.
+	if got := listIDs(f.principal, rag.DocumentStatusAll, 50, 0); len(got) != len(shared)+len(restricted) {
+		t.Fatalf("owner saw %d documents, want %d: %#v", len(got), len(shared)+len(restricted), got)
+	}
+
+	// Unknown statuses are caller errors, and removed rows are unknown to
+	// non-managers (silently, not an error).
+	if _, err := f.svc.ListDocuments(ctx, f.principal, c.ID, "bogus", 10, 0); !errors.Is(err, rag.ErrInvalidInput) {
+		t.Fatalf("unknown status must be ErrInvalidInput, got %v", err)
+	}
+	if removed := listIDs(member, rag.DocumentStatusRemoved, 10, 0); len(removed) != 0 {
+		t.Fatalf("removed rows leaked to member: %#v", removed)
+	}
+
+	// Soft delete: the member's set shrinks, the management Removed view
+	// carries tombstone metadata only, and re-reading is denied.
+	if err := f.svc.DeleteDocument(ctx, f.principal, shared[0]); err != nil {
+		t.Fatalf("delete document: %v", err)
+	}
+	if got := listIDs(member, rag.DocumentStatusAll, 50, 0); len(got) != len(shared)-1 {
+		t.Fatalf("member still lists removed document: %#v", got)
+	}
+	removedDocs, err := f.svc.ListDocuments(ctx, f.principal, c.ID, rag.DocumentStatusRemoved, 10, 0)
+	if err != nil || len(removedDocs) != 1 {
+		t.Fatalf("management removed view: %v %#v", err, removedDocs)
+	}
+	if removedDocs[0].Status != rag.DocumentStatusRemoved || removedDocs[0].TextHash != "" ||
+		removedDocs[0].QdrantPointCount != 0 || len(removedDocs[0].Metadata) != 0 {
+		t.Fatalf("removed view must be metadata-only: %#v", removedDocs[0])
+	}
+	if _, _, err := f.svc.DownloadDocument(ctx, f.principal, shared[0]); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("removed document must read as absent, got %v", err)
+	}
+}
+
+func TestServiceFailedDocumentsAndCountAreAuthorized(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+
+	member := newScopedUser(t, f, "member-fail@example.test", "rag")
+	manager := newScopedUser(t, f, "manager-fail@example.test", "rag", "rag.manage")
+	// One restricted failure (uploader-only audience) and one shared failure
+	// (member audience); whitespace-only payloads fail the embed with "no
+	// extractable text".
+	_, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "restricted-fail.txt", MimeType: "text/plain",
+		Bytes: []byte("   \n"), Audience: []string{f.principal.ActorID},
+	})
+	if err != nil {
+		t.Fatalf("upload restricted failure: %v", err)
+	}
+	sharedDoc, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "shared-fail.txt", MimeType: "text/plain", Bytes: []byte("   \n"),
+		Audience: []string{f.principal.ActorID, member.ActorID},
+	})
+	if err != nil {
+		t.Fatalf("upload shared failure: %v", err)
+	}
+	f.runNextJobExpectingFailure(t)
+	f.runNextJobExpectingFailure(t)
+
+	failedDocs, err := f.svc.ListDocuments(ctx, f.principal, c.ID, rag.DocumentStatusFailed, 10, 0)
+	if err != nil || len(failedDocs) != 2 {
+		t.Fatalf("owner failed list: %v %#v", err, failedDocs)
+	}
+	for _, d := range failedDocs {
+		if d.Status != rag.DocumentStatusFailed || d.ErrorMessage == "" {
+			t.Fatalf("failed row must carry the job error: %#v", d)
+		}
+	}
+	if ready, err := f.svc.ListDocuments(ctx, f.principal, c.ID, rag.DocumentStatusReady, 10, 0); err != nil || len(ready) != 0 {
+		t.Fatalf("failed rows must not surface as ready: %v %#v", err, ready)
+	}
+
+	// Authorized failure aggregates: the restricted failure is absent for the
+	// member AND for the manage-scoped caller — rag.manage never bypasses,
+	// and without any audience membership the manager sees no failure at all.
+	assertAuthorizedFailures := func(p auth.Principal, wantID string) {
+		t.Helper()
+		failed, err := f.svc.ListFailedDocuments(ctx, p, 10)
+		if err != nil {
+			t.Fatalf("list failed documents: %v", err)
+		}
+		if len(failed) != 1 || failed[0].ID != wantID {
+			t.Fatalf("authorized failures = %#v, want only %s", failed, wantID)
+		}
+	}
+	assertAuthorizedFailures(member, sharedDoc.Document.ID)
+	managerFailed, err := f.svc.ListFailedDocuments(ctx, manager, 10)
+	if err != nil || len(managerFailed) != 0 {
+		t.Fatalf("manage-scoped caller must see no unauthorized failures: %v %#v", err, managerFailed)
+	}
+	ownerFailed, err := f.svc.ListFailedDocuments(ctx, f.principal, 10)
+	if err != nil || len(ownerFailed) != 2 {
+		t.Fatalf("owner failures: %v %#v", err, ownerFailed)
+	}
+
+	// The authorized document count matches the authorized list for every
+	// role — restricted rows never count.
+	count, err := f.svc.CountDocuments(ctx, member)
+	if err != nil || count != 1 {
+		t.Fatalf("member count = %d, %v (want the 1 shared document)", count, err)
+	}
+	managerCount, err := f.svc.CountDocuments(ctx, manager)
+	if err != nil || managerCount != 0 {
+		t.Fatalf("manage-scoped count = %d, %v; manage must not bypass source ACLs", managerCount, err)
+	}
+	ownerCount, err := f.svc.CountDocuments(ctx, f.principal)
+	if err != nil || ownerCount != 2 {
+		t.Fatalf("owner count = %d, %v (want 2)", ownerCount, err)
 	}
 }
