@@ -1,6 +1,7 @@
 package rag
 
 import (
+	"io"
 	"time"
 
 	"enclava-go/internal/source"
@@ -22,7 +23,7 @@ const (
 // for tenant-wide read) decoded to/from the stored audience JSON list.
 type Collection struct {
 	TenantID              string         `json:"-"`
-	ChunkProfileVersionID string         `json:"-"`
+	ChunkProfileVersionID string         `json:"chunk_profile_version_id,omitempty"`
 	ID                    string         `json:"id"`
 	Name                  string         `json:"name"`
 	Description           string         `json:"description,omitempty"`
@@ -112,30 +113,37 @@ type StoredResult struct {
 }
 
 type CreateCollectionInput struct {
-	Name           string         `json:"name"`
-	Description    string         `json:"description,omitempty"`
-	EmbeddingModel string         `json:"embedding_model,omitempty"`
-	ChunkSize      int            `json:"chunk_size,omitempty"`
-	ChunkOverlap   int            `json:"chunk_overlap,omitempty"`
-	ACL            map[string]any `json:"acl,omitempty"`
-	Metadata       map[string]any `json:"metadata,omitempty"`
+	Name                  string         `json:"name"`
+	Description           string         `json:"description,omitempty"`
+	EmbeddingModel        string         `json:"embedding_model,omitempty"`
+	ChunkProfileVersionID *string        `json:"chunk_profile_version_id,omitempty"`
+	ChunkSize             int            `json:"chunk_size,omitempty"`
+	ChunkOverlap          int            `json:"chunk_overlap,omitempty"`
+	ACL                   map[string]any `json:"acl,omitempty"`
+	Metadata              map[string]any `json:"metadata,omitempty"`
 }
 
 type UpdateCollectionInput struct {
-	Name           *string        `json:"name,omitempty"`
-	Description    *string        `json:"description,omitempty"`
-	EmbeddingModel *string        `json:"embedding_model,omitempty"`
-	ChunkSize      *int           `json:"chunk_size,omitempty"`
-	ChunkOverlap   *int           `json:"chunk_overlap,omitempty"`
-	ACL            map[string]any `json:"acl,omitempty"`
-	Metadata       map[string]any `json:"metadata,omitempty"`
-	IsActive       *bool          `json:"is_active,omitempty"`
+	Name                  *string        `json:"name,omitempty"`
+	Description           *string        `json:"description,omitempty"`
+	EmbeddingModel        *string        `json:"embedding_model,omitempty"`
+	ChunkProfileVersionID *string        `json:"chunk_profile_version_id,omitempty"`
+	ChunkSize             *int           `json:"chunk_size,omitempty"`
+	ChunkOverlap          *int           `json:"chunk_overlap,omitempty"`
+	ACL                   map[string]any `json:"acl,omitempty"`
+	Metadata              map[string]any `json:"metadata,omitempty"`
+	IsActive              *bool          `json:"is_active,omitempty"`
 }
 
 type UploadDocumentInput struct {
-	FileName       string                     `json:"file_name"`
-	MimeType       string                     `json:"mime_type"`
-	Bytes          []byte                     `json:"-"`
+	FileName string `json:"file_name"`
+	MimeType string `json:"mime_type"`
+	Bytes    []byte `json:"-"`
+	// Reader streams the document into the durable artifact writer without
+	// buffering a max-size upload; SizeBytes carries the declared part size.
+	// When Reader is set, Bytes is ignored.
+	Reader         io.Reader                  `json:"-"`
+	SizeBytes      int64                      `json:"-"`
 	SourceType     string                     `json:"source_type,omitempty"`
 	SourceID       string                     `json:"source_id,omitempty"`
 	SourceURI      string                     `json:"source_uri,omitempty"`
@@ -178,6 +186,25 @@ type SearchResult struct {
 	FileName        string         `json:"file_name,omitempty"`
 	HeaderPath      string         `json:"header_path,omitempty"`
 	Metadata        map[string]any `json:"-"`
+	// SourceKind comes from stored connection/source provenance (never
+	// object.Kind); CollectionName and Locations drive the §6.4 result rows.
+	SourceKind     string           `json:"source_kind,omitempty"`
+	CollectionName string           `json:"collection_name,omitempty"`
+	Locations      []source.Locator `json:"locations,omitempty"`
+}
+
+// SearchReadableResult is the bounded cross-collection search page: fused
+// results plus post-authorization source-kind facets over exactly the
+// returned set.
+type SearchReadableResult struct {
+	Results []SearchResult `json:"results"`
+	Facets  []SourceFacet  `json:"facets"`
+}
+
+// SourceFacet counts fused results by canonical source kind.
+type SourceFacet struct {
+	SourceKind string `json:"source_kind"`
+	Count      int    `json:"count"`
 }
 
 type EvidenceRecord struct {

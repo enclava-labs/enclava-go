@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -19,56 +20,73 @@ type queryClient interface {
 	Query(context.Context, string, QueryInput) ([]QdrantSearchPoint, error)
 }
 
-func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInput) ([]SearchResult, error) {
-	query := strings.TrimSpace(input.Query)
-	if query == "" {
-		return nil, errors.New("query is required")
+// ErrSearchWorkExceeded reports that the authorized enumeration/work bound
+// was hit with unexamined rows remaining — never a silent first-N truncation.
+// The HTTP layer maps it to a 400-class `search_scope_too_large`.
+var ErrSearchWorkExceeded = errors.New("search scope exceeds the authorized work bound")
+
+// SearchWorkBudget bounds the object/generation authorization work one
+// collection may spend per search. It is a var so tests can tighten it.
+var SearchWorkBudget = 2000
+
+// Bounds for the cross-collection search page.
+const (
+	maxSearchCollections = 20
+	defaultSearchLimit   = 20
+	maxSearchLimit       = 50
+	maxQueryRunes        = 512
+	rrfConstant          = 60
+)
+
+// authorizedCandidate is one fully authorized, currently-published object
+// version inside a collection.
+type authorizedCandidate struct {
+	generation IndexGeneration
+	object     source.Object
+	version    source.ObjectVersion
+}
+
+// authorizedCandidates streams a collection's published generations in a
+// deterministic order and authorizes object/version/document reads for each,
+// up to the work budget. It reports how many generations were examined
+// (authorized or denied — both spend real reads). When more published
+// generations exist than the budget allows examining it returns
+// ErrSearchWorkExceeded; when the authorized set is exhausted first, results
+// are complete.
+func (s *Service) authorizedCandidates(ctx context.Context, p auth.Principal, collection Collection, workBudget int) ([]authorizedCandidate, int, error) {
+	if workBudget <= 0 || workBudget > SearchWorkBudget {
+		workBudget = SearchWorkBudget
 	}
-	if input.Mode == "" {
-		input.Mode = QueryHybrid
-	}
-	if input.Mode != QueryHybrid && input.Mode != QueryLexical && input.Mode != QuerySemantic {
-		return nil, fmt.Errorf("unsupported search mode %q", input.Mode)
-	}
-	collection, err := s.GetCollection(ctx, p, strings.TrimSpace(input.CollectionID))
+	// Fetch one row beyond the budget: its presence is the truthful signal
+	// that unexamined rows remain.
+	generations, err := s.repo.ListPublishedGenerationsBounded(ctx, p.TenantID, collection.ID, workBudget+1)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	objectIDs, err := s.repo.ListCollectionItems(ctx, p.TenantID, collection.ID)
-	if err != nil {
-		return nil, err
+	if len(generations) > workBudget {
+		return nil, 0, fmt.Errorf("%w: collection %s has more published documents than the %d-object search bound", ErrSearchWorkExceeded, collection.ID, workBudget)
 	}
-	generations, err := s.repo.ListPublishedGenerations(ctx, p.TenantID, collection.ID)
-	if err != nil {
-		return nil, err
-	}
-	items := make(map[string]bool, len(objectIDs))
-	for _, id := range objectIDs {
-		items[id] = true
-	}
-	current := make(map[string]IndexGeneration)
-	refs := make([]source.ObjectRef, 0, len(generations))
+	examined := 0
+	candidates := make([]authorizedCandidate, 0, len(generations))
 	for _, generation := range generations {
-		if !items[generation.ObjectID] || generation.State != "published" || generation.Tombstoned {
-			continue
-		}
+		examined++
 		object, err := s.repo.GetObject(ctx, p.TenantID, generation.ObjectID)
 		if denied, failure := deniedOrFailed(err); denied {
 			continue
 		} else if failure != nil {
-			return nil, failure
+			return nil, examined, failure
 		}
 		err = s.authorizer.CanRead(ctx, p, object, source.ReadOptions{})
 		if denied, failure := deniedOrFailed(err); denied {
 			continue
 		} else if failure != nil {
-			return nil, failure
+			return nil, examined, failure
 		}
 		version, err := s.repo.GetObjectVersion(ctx, p.TenantID, generation.ObjectID, object.ObservedSeq)
 		if denied, failure := deniedOrFailed(err); denied {
 			continue
 		} else if failure != nil {
-			return nil, failure
+			return nil, examined, failure
 		}
 		if versionRowID(version) != generation.ObjectVersionID {
 			continue
@@ -77,19 +95,70 @@ func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInpu
 		if denied, failure := deniedOrFailed(err); denied {
 			continue
 		} else if failure != nil {
-			return nil, failure
+			return nil, examined, failure
 		}
 		doc, err := s.repo.GetDocument(ctx, p.TenantID, generation.ObjectID)
 		if denied, failure := deniedOrFailed(err); denied {
 			continue
 		} else if failure != nil {
-			return nil, failure
+			return nil, examined, failure
 		}
 		if doc.Status != DocumentStatusReady || doc.ObjectVersionID != generation.ObjectVersionID {
 			continue
 		}
-		current[generation.ObjectVersionID] = generation
-		refs = append(refs, source.ObjectRef{TenantID: p.TenantID, ObjectID: object.ID, ObservedSeq: version.ObservedSeq})
+		candidates = append(candidates, authorizedCandidate{generation: generation, object: object, version: version})
+	}
+	return candidates, examined, nil
+}
+
+func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInput) ([]SearchResult, error) {
+	if err := validateSearchQueryMode(input.Query, input.Mode); err != nil {
+		return nil, err
+	}
+	collection, err := s.GetCollection(ctx, p, strings.TrimSpace(input.CollectionID))
+	if err != nil {
+		return nil, err
+	}
+	candidates, _, err := s.authorizedCandidates(ctx, p, collection, 0)
+	if err != nil {
+		return nil, err
+	}
+	results, err := s.searchCollection(ctx, p, collection, input, candidates)
+	if err != nil {
+		return nil, err
+	}
+	// Evidence persists only for results that survive selection, so
+	// discarded hits never strand unreachable evidence rows.
+	if err := s.persistResultEvidence(ctx, p, results); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func validateSearchQueryMode(query string, mode QueryMode) error {
+	if strings.TrimSpace(query) == "" {
+		return fmt.Errorf("%w: query is required", ErrInvalidInput)
+	}
+	if mode == "" {
+		return nil
+	}
+	if mode != QueryHybrid && mode != QueryLexical && mode != QuerySemantic {
+		return fmt.Errorf("%w: unsupported search mode %q", ErrInvalidInput, mode)
+	}
+	return nil
+}
+
+// searchCollection runs one authorized, bounded collection search over the
+// pre-authorized candidates: embed, query the vector store within the
+// published-generation filter and re-check every returned point against the
+// candidate set before materializing results.
+func (s *Service) searchCollection(ctx context.Context, p auth.Principal, collection Collection, input SearchInput, candidates []authorizedCandidate) ([]SearchResult, error) {
+	query := strings.TrimSpace(input.Query)
+	current := make(map[string]authorizedCandidate, len(candidates))
+	refs := make([]source.ObjectRef, 0, len(candidates))
+	for _, candidate := range candidates {
+		current[candidate.generation.ObjectVersionID] = candidate
+		refs = append(refs, source.ObjectRef{TenantID: p.TenantID, ObjectID: candidate.object.ID, ObservedSeq: candidate.version.ObservedSeq})
 	}
 	if len(current) == 0 {
 		return []SearchResult{}, nil
@@ -98,8 +167,8 @@ func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInpu
 		query = s.rewriteQuery(ctx, p, query, refs, input.RewriteModel)
 	}
 	filterGenerations := make([]IndexGeneration, 0, len(current))
-	for _, generation := range current {
-		filterGenerations = append(filterGenerations, generation)
+	for _, candidate := range current {
+		filterGenerations = append(filterGenerations, candidate.generation)
 	}
 	filter := FilterBuilder(p.TenantID, filterGenerations, input.Filter)
 	var vector []float64
@@ -122,6 +191,7 @@ func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInpu
 	}
 	var points []QdrantSearchPoint
 	if client, ok := s.vectorStore.(queryClient); ok {
+		var err error
 		if qdrant, ok := s.vectorStore.(*QdrantClient); ok && input.Mode == QueryHybrid {
 			hasSparse, _, err := qdrant.collectionVectors(ctx, collection.QdrantCollection)
 			if err != nil {
@@ -132,24 +202,24 @@ func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInpu
 			} else {
 				points, err = client.Query(ctx, collection.QdrantCollection, QueryInput{Mode: input.Mode, DenseVector: vector, LexicalText: query, Filter: filter, Limit: limit})
 			}
-			if err != nil {
-				return nil, err
-			}
 		} else {
 			points, err = client.Query(ctx, collection.QdrantCollection, QueryInput{Mode: input.Mode, DenseVector: vector, LexicalText: query, Filter: filter, Limit: limit})
-			if err != nil {
-				return nil, err
-			}
+		}
+		if err != nil {
+			return nil, err
 		}
 	} else {
 		if input.Mode == QueryLexical {
 			return nil, errors.New("lexical search is unavailable for this vector store")
 		}
+		var err error
 		points, err = s.vectorStore.SearchHybrid(ctx, collection.QdrantCollection, vector, SparseVector{}, limit, filter)
 		if err != nil {
 			return nil, err
 		}
 	}
+	// Canonical source kinds resolve once per connection per collection.
+	connectionKinds := make(map[string]string)
 	results := make([]SearchResult, 0, len(points))
 	chunkCache := make(map[string]map[string]DocumentChunk)
 	for _, point := range points {
@@ -157,36 +227,9 @@ func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInpu
 		objectID := stringFromPayload(payload, "document_id")
 		versionID := stringFromPayload(payload, "object_version_id")
 		generation := int64FromAny(payload["generation"])
-		allowed, ok := current[versionID]
-		if !ok || allowed.ObjectID != objectID || allowed.Generation != generation {
+		candidate, ok := current[versionID]
+		if !ok || candidate.generation.ObjectID != objectID || candidate.generation.Generation != generation {
 			continue
-		}
-		object, err := s.repo.GetObject(ctx, p.TenantID, objectID)
-		if denied, failure := deniedOrFailed(err); denied {
-			continue
-		} else if failure != nil {
-			return nil, failure
-		}
-		err = s.authorizer.CanRead(ctx, p, object, source.ReadOptions{})
-		if denied, failure := deniedOrFailed(err); denied {
-			continue
-		} else if failure != nil {
-			return nil, failure
-		}
-		version, err := s.repo.GetObjectVersion(ctx, p.TenantID, objectID, object.ObservedSeq)
-		if denied, failure := deniedOrFailed(err); denied {
-			continue
-		} else if failure != nil {
-			return nil, failure
-		}
-		if versionRowID(version) != versionID {
-			continue
-		}
-		err = s.authorizer.CanReadVersion(ctx, p, object, version, source.ReadOptions{})
-		if denied, failure := deniedOrFailed(err); denied {
-			continue
-		} else if failure != nil {
-			return nil, failure
 		}
 		chunkID := stringFromPayload(payload, "chunk_id")
 		key := versionID + "\x00" + fmt.Sprint(generation)
@@ -206,24 +249,268 @@ func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInpu
 		if !found {
 			continue
 		}
-		results = append(results, SearchResult{DocumentID: objectID, CollectionID: collection.ID, ObjectVersionID: versionID, ChunkID: chunkID, Generation: generation, Spans: chunk.SpanRefs, ObservedSeq: version.ObservedSeq, ChunkStart: chunk.ChunkIndex, ChunkEnd: chunk.ChunkIndex, Score: point.Score, Content: chunk.Content, SourceURI: stringFromPayload(payload, "source_uri"), FileName: stringFromPayload(payload, "file_name"), HeaderPath: chunk.HeaderPath, Metadata: chunk.Metadata})
+		results = append(results, SearchResult{DocumentID: objectID, CollectionID: collection.ID, ObjectVersionID: versionID, ChunkID: chunkID, Generation: generation, Spans: chunk.SpanRefs, ObservedSeq: candidate.version.ObservedSeq, ChunkStart: chunk.ChunkIndex, ChunkEnd: chunk.ChunkIndex, Score: point.Score, Content: chunk.Content, SourceURI: stringFromPayload(payload, "source_uri"), FileName: stringFromPayload(payload, "file_name"), HeaderPath: chunk.HeaderPath, Metadata: chunk.Metadata, CollectionName: collection.Name, SourceKind: s.sourceKindFor(ctx, p.TenantID, candidate, connectionKinds)})
 	}
 	if input.SelectSections && strings.TrimSpace(input.SectionModel) != "" && len(results) > 0 {
 		results = s.selectSections(ctx, p, results, refs, input.SectionModel)
 	}
-	// Evidence persists only for results that survive selection, so
-	// discarded hits never strand unreachable evidence rows.
+	return results, nil
+}
+
+// sourceKindFor resolves the canonical source kind of a candidate: the
+// source_kind recorded in version provenance, else the connection kind, else
+// the provenance kind — never object.Kind (often just "document").
+func (s *Service) sourceKindFor(ctx context.Context, tenantID string, candidate authorizedCandidate, connectionKinds map[string]string) string {
+	var prov map[string]any
+	_ = json.Unmarshal([]byte(candidate.version.Provenance), &prov)
+	if kind := stringFromPayload(prov, "source_kind"); kind != "" {
+		return kind
+	}
+	if candidate.object.ConnectionID != "" {
+		if kind, ok := connectionKinds[candidate.object.ConnectionID]; ok {
+			return kind
+		}
+		kind := ""
+		if conn, err := s.repo.GetConnection(ctx, tenantID, candidate.object.ConnectionID); err == nil {
+			kind = conn.Kind
+		}
+		connectionKinds[candidate.object.ConnectionID] = kind
+		if kind != "" {
+			return kind
+		}
+	}
+	if kind := stringFromPayload(prov, "kind"); kind != "" {
+		return kind
+	}
+	return "unknown"
+}
+
+// SearchReadable searches every collection the caller may read (or the
+// readable subset named by explicit IDs) and fuses the per-collection ranked
+// lists with reciprocal rank fusion — rank positions are comparable across
+// collections, raw scores never are. Facet counts describe exactly the fused
+// bounded result set after authorization: denied collections contribute
+// neither results nor counts.
+func (s *Service) SearchReadable(ctx context.Context, p auth.Principal, query string, mode QueryMode, collectionIDs []string, limit int) (SearchReadableResult, error) {
+	if strings.TrimSpace(query) == "" {
+		return SearchReadableResult{}, fmt.Errorf("%w: query is required", ErrInvalidInput)
+	}
+	if utf8.RuneCountInString(query) > maxQueryRunes {
+		return SearchReadableResult{}, fmt.Errorf("%w: query exceeds %d characters", ErrInvalidInput, maxQueryRunes)
+	}
+	if mode == "" {
+		mode = QueryHybrid
+	}
+	if mode != QueryHybrid && mode != QueryLexical && mode != QuerySemantic {
+		return SearchReadableResult{}, fmt.Errorf("%w: unsupported search mode %q", ErrInvalidInput, mode)
+	}
+	if limit <= 0 {
+		limit = defaultSearchLimit
+	}
+	if limit > maxSearchLimit {
+		limit = maxSearchLimit
+	}
+	perCollection := 4 * limit
+	if perCollection > 100 {
+		perCollection = 100
+	}
+	readable, err := s.ListCollections(ctx, p)
+	if err != nil {
+		return SearchReadableResult{}, err
+	}
+	selected, err := selectReadableCollections(readable, collectionIDs)
+	if err != nil {
+		return SearchReadableResult{}, err
+	}
+	lists := make([]rankedSearchList, 0, len(selected))
+	remaining := SearchWorkBudget
+	for _, collection := range selected {
+		if remaining <= 0 {
+			return SearchReadableResult{}, fmt.Errorf("%w: the request exceeded the %d-object aggregate search bound", ErrSearchWorkExceeded, SearchWorkBudget)
+		}
+		budget := remaining
+		if budget > SearchWorkBudget {
+			budget = SearchWorkBudget
+		}
+		candidates, examined, err := s.authorizedCandidates(ctx, p, collection, budget)
+		if err != nil {
+			return SearchReadableResult{}, err
+		}
+		remaining -= examined
+		results, err := s.searchCollection(ctx, p, collection, SearchInput{Query: query, Mode: mode, Limit: perCollection}, candidates)
+		if err != nil {
+			return SearchReadableResult{}, err
+		}
+		if len(results) > 0 {
+			lists = append(lists, rankedSearchList{results: results})
+		}
+	}
+	results := fuseRankedResults(lists, limit)
+	// Evidence persists only for results that survive fusion, and locations
+	// resolve once over the fused set — the same retained-block path the
+	// evidence views use.
+	if err := s.persistResultEvidence(ctx, p, results); err != nil {
+		return SearchReadableResult{}, err
+	}
+	locations, err := s.resultLocations(ctx, p.TenantID, results)
+	if err != nil {
+		return SearchReadableResult{}, err
+	}
+	for i := range results {
+		results[i].Locations = locations[i]
+	}
+	facets := sourceKindFacets(results)
+	return SearchReadableResult{Results: results, Facets: facets}, nil
+}
+
+// selectReadableCollections applies the explicit-ID rule: an explicit
+// collection_ids entry is caller-supplied, so an unknown or unauthorized ID
+// is denied outright; an absent selection means every readable collection.
+func selectReadableCollections(readable []Collection, collectionIDs []string) ([]Collection, error) {
+	explicit := make([]string, 0, len(collectionIDs))
+	seen := make(map[string]struct{}, len(collectionIDs))
+	for _, id := range collectionIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		explicit = append(explicit, id)
+	}
+	if len(explicit) == 0 {
+		if len(readable) > maxSearchCollections {
+			return nil, fmt.Errorf("%w: %d readable collections exceed the %d-collection search bound", ErrSearchWorkExceeded, len(readable), maxSearchCollections)
+		}
+		return readable, nil
+	}
+	if len(explicit) > maxSearchCollections {
+		return nil, fmt.Errorf("%w: %d collection_ids exceed the %d-collection search bound", ErrSearchWorkExceeded, len(explicit), maxSearchCollections)
+	}
+	byID := make(map[string]Collection, len(readable))
+	for _, c := range readable {
+		byID[c.ID] = c
+	}
+	selected := make([]Collection, 0, len(explicit))
+	for _, id := range explicit {
+		c, ok := byID[id]
+		if !ok {
+			return nil, source.ErrDenied
+		}
+		selected = append(selected, c)
+	}
+	return selected, nil
+}
+
+// rankedSearchList is one collection's bounded ranked results.
+type rankedSearchList struct{ results []SearchResult }
+
+// fuseRankedResults merges per-collection ranked lists with reciprocal rank
+// fusion and a deterministic tie-break (list order, then rank) — the fused
+// order never depends on map iteration or raw cross-collection scores.
+func fuseRankedResults(lists []rankedSearchList, limit int) []SearchResult {
+	type key struct {
+		collectionID string
+		versionID    string
+		chunkID      string
+	}
+	scores := make(map[key]float64)
+	order := make(map[key]int)
+	for listIndex, list := range lists {
+		for rank, result := range list.results {
+			id := key{result.CollectionID, result.ObjectVersionID, result.ChunkID}
+			scores[id] += 1 / float64(rrfConstant+rank+1)
+			if _, seen := order[id]; !seen {
+				order[id] = listIndex<<32 | rank
+			}
+		}
+	}
+	results := make([]SearchResult, 0, len(scores))
+	for id := range scores {
+		listIndex := int(uint64(order[id]) >> 32)
+		rank := int(uint64(order[id]) & 0xffffffff)
+		results = append(results, lists[listIndex].results[rank])
+	}
+	sort.Slice(results, func(i, j int) bool {
+		ki := key{results[i].CollectionID, results[i].ObjectVersionID, results[i].ChunkID}
+		kj := key{results[j].CollectionID, results[j].ObjectVersionID, results[j].ChunkID}
+		if scores[ki] != scores[kj] {
+			return scores[ki] > scores[kj]
+		}
+		return order[ki] < order[kj]
+	})
+	if len(results) > limit {
+		results = results[:limit]
+	}
+	return results
+}
+
+// persistResultEvidence mints server evidence for every surviving result.
+func (s *Service) persistResultEvidence(ctx context.Context, p auth.Principal, results []SearchResult) error {
 	for i := range results {
 		if results[i].ChunkID == "" {
 			continue
 		}
 		evidence := EvidenceRecord{TenantID: p.TenantID, ID: newID("evidence"), CollectionID: results[i].CollectionID, ObjectID: results[i].DocumentID, ObjectVersionID: results[i].ObjectVersionID, ObservedSeq: results[i].ObservedSeq, Generation: results[i].Generation, ChunkID: results[i].ChunkID, SpanRefs: results[i].Spans}
 		if err := s.repo.SaveEvidence(ctx, evidence); err != nil {
-			return nil, err
+			return err
 		}
 		results[i].EvidenceID = evidence.ID
 	}
-	return results, nil
+	return nil
+}
+
+// resultLocations batch-resolves span block locators over the fused result
+// set — the same retained-block resolution the evidence views use; blocks
+// that were never parsed resolve to nothing and are never invented.
+func (s *Service) resultLocations(ctx context.Context, tenantID string, results []SearchResult) ([][]source.Locator, error) {
+	blockIDs := make([]string, 0, len(results))
+	seen := make(map[string]struct{})
+	for _, result := range results {
+		for _, span := range result.Spans {
+			if span.BlockID == "" {
+				continue
+			}
+			if _, dup := seen[span.BlockID]; dup {
+				continue
+			}
+			seen[span.BlockID] = struct{}{}
+			blockIDs = append(blockIDs, span.BlockID)
+		}
+	}
+	if len(blockIDs) == 0 {
+		return nil, nil
+	}
+	locators, err := s.repo.ListBlockLocators(ctx, tenantID, blockIDs)
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]source.Locator, len(results))
+	for i, result := range results {
+		for _, span := range result.Spans {
+			if locator, ok := locators[span.BlockID]; ok {
+				out[i] = append(out[i], locator)
+			}
+		}
+	}
+	return out, nil
+}
+
+// sourceKindFacets counts the fused result set by canonical source kind,
+// ordered by kind for a deterministic payload.
+func sourceKindFacets(results []SearchResult) []SourceFacet {
+	counts := make(map[string]int, len(results))
+	for _, result := range results {
+		counts[result.SourceKind]++
+	}
+	facets := make([]SourceFacet, 0, len(counts))
+	for kind, count := range counts {
+		facets = append(facets, SourceFacet{SourceKind: kind, Count: count})
+	}
+	sort.Slice(facets, func(i, j int) bool { return facets[i].SourceKind < facets[j].SourceKind })
+	return facets
 }
 
 // BuildContext rechecks each source and expands to adjacent and parent-path chunks from its published generation.

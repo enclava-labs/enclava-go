@@ -164,6 +164,9 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/api/v1/providers/", a.authenticated("pricing.manage", a.handleProviderByID))
 	a.mux.HandleFunc("/api/v1/processing-restrictions", a.authenticated("pricing.manage", a.handleProcessingRestrictions))
 	a.mux.HandleFunc("/api/v1/rag/collections", a.authenticated("rag", a.handleRAGCollections))
+	// 08-08: bounded multi-collection search page — fused results plus
+	// post-authorization source-kind facets over exactly the readable set.
+	a.mux.HandleFunc("/api/v1/rag/search", a.authenticated("rag", a.handleRAGSearchReadable))
 	a.mux.HandleFunc("/api/v1/knowledge/imports", a.authenticated("rag", a.handleRAGImports))
 	a.mux.HandleFunc("/api/v1/rag/collections/", a.authenticated("rag", a.handleRAGCollectionByID))
 	a.mux.HandleFunc("/api/v1/rag/documents/", a.authenticated("rag", a.handleRAGDocumentByID))

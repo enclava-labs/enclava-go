@@ -97,9 +97,13 @@ func (r *RAGRepo) InsertCollection(ctx context.Context, c rag.Collection) error 
 	if err != nil {
 		return fmt.Errorf("marshal collection audience: %w", err)
 	}
-	profileVersionID, err := r.EnsureChunkProfile(ctx, c.TenantID, "rag-"+c.ID, c.ChunkSize, c.ChunkOverlap)
-	if err != nil {
-		return err
+	profileVersionID := c.ChunkProfileVersionID
+	if profileVersionID == "" {
+		// No validated selection supplied: keep the legacy default of one
+		// owned fixed/row-wise profile version for the collection.
+		if profileVersionID, err = r.EnsureChunkProfile(ctx, c.TenantID, "rag-"+c.ID, c.ChunkSize, c.ChunkOverlap); err != nil {
+			return err
+		}
 	}
 	_, err = r.db.SQL.ExecContext(ctx, `
 		INSERT INTO knowledge_collections
@@ -723,7 +727,10 @@ func (r *RAGRepo) ReplaceVersionChunksAndStage(ctx context.Context, tenantID, co
 			VALUES ($1, $2, $3, $4, $5, 'staging', NULLIF($6, ''), COALESCE(
 			    (SELECT artifact_ref FROM source_object_versions
 			     WHERE tenant_id=$1 AND id=$4), ''))
-			ON CONFLICT (tenant_id, collection_id, object_version_id, generation) DO NOTHING`,
+			ON CONFLICT (tenant_id, collection_id, object_version_id, generation) DO UPDATE
+			  SET chunk_profile_version_id = COALESCE(NULLIF(EXCLUDED.chunk_profile_version_id, ''),
+			                                          index_generations.chunk_profile_version_id)
+			  WHERE index_generations.state = 'staging'`,
 			tenantID, newPGID("idxgen"), collectionID, versionID, generation, profileVersionID)
 		if err != nil {
 			return fmt.Errorf("stage generation: %w", err)
@@ -1034,19 +1041,41 @@ func (r *RAGRepo) CompleteIndexReconciliation(ctx context.Context, item rag.Inde
 }
 
 func (r *RAGRepo) ListPublishedGenerations(ctx context.Context, tenantID, collectionID string) ([]rag.IndexGeneration, error) {
-	rows, err := r.db.SQL.QueryContext(ctx, `
-		SELECT g.collection_id, c.qdrant_collection, o.id, g.object_version_id,
-		       g.generation, g.state, false
-		FROM index_generations g
-		JOIN source_object_versions v ON v.tenant_id=g.tenant_id AND v.id=g.object_version_id
-		JOIN source_objects o ON o.tenant_id=v.tenant_id AND o.id=v.object_id
-		JOIN knowledge_collections c ON c.tenant_id=g.tenant_id AND c.id=g.collection_id
-		WHERE g.tenant_id=$1 AND g.collection_id=$2 AND g.state='published'
-		  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL AND o.observed_seq=v.observed_seq`,
-		tenantID, collectionID)
+	rows, err := r.db.SQL.QueryContext(ctx, listPublishedGenerationsQuery+` WHERE g.tenant_id=$1 AND g.collection_id=$2 AND g.state='published'
+	  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL AND o.observed_seq=v.observed_seq
+	  ORDER BY g.object_version_id, g.generation`, tenantID, collectionID)
 	if err != nil {
 		return nil, fmt.Errorf("list published generations: %w", err)
 	}
+	return scanPublishedGenerations(rows)
+}
+
+// ListPublishedGenerationsBounded caps enumeration work for the search
+// paths: deterministic order, only live collection members, hard LIMIT.
+func (r *RAGRepo) ListPublishedGenerationsBounded(ctx context.Context, tenantID, collectionID string, limit int) ([]rag.IndexGeneration, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	rows, err := r.db.SQL.QueryContext(ctx, listPublishedGenerationsQuery+`
+		JOIN collection_items ci ON ci.tenant_id=g.tenant_id AND ci.collection_id=g.collection_id AND ci.object_id=o.id
+		WHERE g.tenant_id=$1 AND g.collection_id=$2 AND g.state='published'
+		  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL AND o.observed_seq=v.observed_seq
+		ORDER BY g.object_version_id, g.generation LIMIT $3`, tenantID, collectionID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list bounded published generations: %w", err)
+	}
+	return scanPublishedGenerations(rows)
+}
+
+const listPublishedGenerationsQuery = `
+	SELECT g.collection_id, c.qdrant_collection, o.id, g.object_version_id,
+	       g.generation, g.state, false
+	FROM index_generations g
+	JOIN source_object_versions v ON v.tenant_id=g.tenant_id AND v.id=g.object_version_id
+	JOIN source_objects o ON o.tenant_id=v.tenant_id AND o.id=v.object_id
+	JOIN knowledge_collections c ON c.tenant_id=g.tenant_id AND c.id=g.collection_id`
+
+func scanPublishedGenerations(rows *sql.Rows) ([]rag.IndexGeneration, error) {
 	defer rows.Close()
 	var result []rag.IndexGeneration
 	for rows.Next() {
@@ -1060,6 +1089,16 @@ func (r *RAGRepo) ListPublishedGenerations(ctx context.Context, tenantID, collec
 		return nil, fmt.Errorf("iterate published generations: %w", err)
 	}
 	return result, nil
+}
+
+// GetChunkProfile returns one immutable profile version row; a missing or
+// foreign-tenant row maps to rag.ErrProfileNotFound (caller-input class).
+func (r *RAGRepo) GetChunkProfile(ctx context.Context, tenantID, id string) (source.ChunkProfile, error) {
+	p, err := NewChunkProfilesRepo(r.db).Get(ctx, tenantID, id)
+	if errors.Is(err, ErrChunkProfileNotFound) {
+		return source.ChunkProfile{}, rag.ErrProfileNotFound
+	}
+	return p, err
 }
 
 func (r *RAGRepo) ListGenerationChunks(ctx context.Context, tenantID, collectionID, versionID string, generation int64) ([]rag.DocumentChunk, error) {

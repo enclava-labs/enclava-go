@@ -2,11 +2,10 @@ package rag
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 	"time"
@@ -24,6 +23,11 @@ const (
 	OperationIngest = "rag.ingest"
 	OperationAccess = "rag.access"
 )
+
+// ErrProfileNotFound marks a chunk_profile_version_id that does not exist in
+// the calling tenant — a caller-input failure (HTTP 400), distinct from
+// infrastructure errors.
+var ErrProfileNotFound = errors.New("chunk profile version not found")
 
 // Repository is the tenant-scoped persistence boundary for rag.Service over
 // the canonical source/object/version/domain schema. Implemented by
@@ -61,6 +65,13 @@ type Repository interface {
 	GetDocument(ctx context.Context, tenantID, objectID string) (Document, error)
 	ListBlockLocators(ctx context.Context, tenantID string, blockIDs []string) (map[string]source.Locator, error)
 	ListPublishedGenerations(ctx context.Context, tenantID, collectionID string) ([]IndexGeneration, error)
+	// ListPublishedGenerationsBounded is the deterministic, LIMIT-bounded
+	// read the search paths use to cap enumeration work; it joins collection
+	// items so only live members are examined. limit must be > 0.
+	ListPublishedGenerationsBounded(ctx context.Context, tenantID, collectionID string, limit int) ([]IndexGeneration, error)
+	// GetChunkProfile returns one immutable chunk profile version row for
+	// the tenant, or ErrProfileNotFound.
+	GetChunkProfile(ctx context.Context, tenantID, id string) (source.ChunkProfile, error)
 	ListGenerationChunks(ctx context.Context, tenantID, collectionID, versionID string, generation int64) ([]DocumentChunk, error)
 	SaveEvidence(ctx context.Context, record EvidenceRecord) error
 	GetEvidence(ctx context.Context, tenantID, id string) (EvidenceRecord, error)
@@ -158,30 +169,49 @@ func (s *Service) CreateCollection(ctx context.Context, p auth.Principal, input 
 		embeddingModel = s.defaultEmbeddingModel
 	}
 	id := newID("ragcol")
-	profileVersionID, err := s.repo.EnsureChunkProfile(ctx, p.TenantID, "rag-"+id, chunkSize, chunkOverlap)
-	if err != nil {
-		return Collection{}, err
+	profileVersionID := ""
+	if input.ChunkProfileVersionID != nil {
+		profileVersionID = strings.TrimSpace(*input.ChunkProfileVersionID)
 	}
-	_ = profileVersionID
 	c := Collection{
-		TenantID:         p.TenantID,
-		ID:               id,
-		Name:             name,
-		Description:      strings.TrimSpace(input.Description),
-		OwnerActorID:     p.ActorID,
-		QdrantCollection: "rag_" + safeCollectionName(id),
-		EmbeddingModel:   embeddingModel,
-		ChunkSize:        chunkSize,
-		ChunkOverlap:     chunkOverlap,
-		ACL:              normalizeACL(input.ACL),
-		Audience:         collectionAudience(input.ACL),
-		Metadata:         nonNilMap(input.Metadata),
-		IsActive:         true,
+		TenantID:              p.TenantID,
+		ID:                    id,
+		Name:                  name,
+		Description:           strings.TrimSpace(input.Description),
+		OwnerActorID:          p.ActorID,
+		QdrantCollection:      "rag_" + safeCollectionName(id),
+		EmbeddingModel:        embeddingModel,
+		ChunkSize:             chunkSize,
+		ChunkOverlap:          chunkOverlap,
+		ChunkProfileVersionID: profileVersionID,
+		ACL:                   normalizeACL(input.ACL),
+		Audience:              collectionAudience(input.ACL),
+		Metadata:              nonNilMap(input.Metadata),
+		IsActive:              true,
+	}
+	if c.ChunkProfileVersionID != "" {
+		// An explicit immutable profile version is validated and frozen onto
+		// the collection; InsertCollection honors it instead of minting one.
+		if err := s.validateChunkProfileVersion(ctx, p.TenantID, c.ChunkProfileVersionID); err != nil {
+			return Collection{}, err
+		}
 	}
 	if err := s.repo.InsertCollection(ctx, c); err != nil {
 		return Collection{}, err
 	}
 	return s.repo.GetCollection(ctx, p.TenantID, id)
+}
+
+// validateChunkProfileVersion accepts only a real immutable version row in
+// the tenant — a profile family ID or a foreign-tenant ID is invalid input.
+func (s *Service) validateChunkProfileVersion(ctx context.Context, tenantID, id string) error {
+	if _, err := s.repo.GetChunkProfile(ctx, tenantID, id); err != nil {
+		if errors.Is(err, ErrProfileNotFound) {
+			return fmt.Errorf("%w: unknown chunk_profile_version_id %q", ErrInvalidInput, id)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Service) ListCollections(ctx context.Context, p auth.Principal) ([]Collection, error) {
@@ -262,6 +292,19 @@ func (s *Service) UpdateCollection(ctx context.Context, p auth.Principal, id str
 	if input.ACL != nil {
 		c.ACL = normalizeACL(input.ACL)
 		c.Audience = collectionAudience(input.ACL)
+	}
+	if input.ChunkProfileVersionID != nil {
+		// §6.7 Settings selector: the validated immutable version is stored
+		// on the collection; already-published evidence is only re-chunked
+		// when a document is explicitly reprocessed.
+		versionID := strings.TrimSpace(*input.ChunkProfileVersionID)
+		if versionID == "" {
+			return Collection{}, fmt.Errorf("%w: chunk_profile_version_id must name an immutable version", ErrInvalidInput)
+		}
+		if err := s.validateChunkProfileVersion(ctx, p.TenantID, versionID); err != nil {
+			return Collection{}, err
+		}
+		c.ChunkProfileVersionID = versionID
 	}
 	if input.Metadata != nil {
 		c.Metadata = input.Metadata
@@ -578,13 +621,15 @@ func (s *Service) ReprocessDocument(ctx context.Context, p auth.Principal, docum
 // ---------------------------------------------------------------------
 // Ingest: durable artifact + object/version row + fenced embed job.
 
+// processNewDocument persists bytes BEFORE the object version row and the
+// embed job exist: Reader and Bytes callers share one artifact-writer path,
+// and the persisted version metadata comes from the finalized artifact ref
+// (its SHA256/ByteSize are measured over the streamed bytes) — never a
+// second digest over an in-memory slice.
 func (s *Service) processNewDocument(ctx context.Context, p auth.Principal, c Collection, input UploadDocumentInput) (UploadDocumentOutput, error) {
 	input.FileName = strings.TrimSpace(filepath.Base(input.FileName))
 	if input.FileName == "." || input.FileName == "" {
 		return UploadDocumentOutput{}, errors.New("file_name is required")
-	}
-	if len(input.Bytes) == 0 {
-		return UploadDocumentOutput{}, errors.New("document is empty")
 	}
 	if s.artifacts == nil || s.jobs == nil {
 		return UploadDocumentOutput{}, errors.New("rag: durable ingest pipeline is not configured")
@@ -601,7 +646,6 @@ func (s *Service) processNewDocument(ctx context.Context, p auth.Principal, c Co
 		sourceID = newID("upload")
 	}
 
-	// Persist bytes BEFORE the object version row and the embed job exist.
 	w, ref, err := s.artifacts.Begin(ctx, artifacts.Meta{
 		Ref:      artifacts.Ref{TenantID: p.TenantID, Kind: artifacts.KindOriginal},
 		MimeType: input.MimeType,
@@ -609,7 +653,12 @@ func (s *Service) processNewDocument(ctx context.Context, p auth.Principal, c Co
 	if err != nil {
 		return UploadDocumentOutput{}, fmt.Errorf("begin document artifact: %w", err)
 	}
-	if _, err := w.Write(input.Bytes); err != nil {
+	if input.Reader != nil {
+		_, err = io.Copy(w, input.Reader)
+	} else {
+		_, err = w.Write(input.Bytes)
+	}
+	if err != nil {
 		_ = w.Abort(ctx)
 		return UploadDocumentOutput{}, fmt.Errorf("write document artifact: %w", err)
 	}
@@ -617,6 +666,14 @@ func (s *Service) processNewDocument(ctx context.Context, p auth.Principal, c Co
 		return UploadDocumentOutput{}, fmt.Errorf("finalize document artifact: %w", err)
 	}
 	ref = w.Ref()
+	// Emptiness is validated on the FINALIZED artifact. Finalize has already
+	// set the writer done — Abort cannot remove the bytes now, so delete the
+	// unreferenced artifact through the store; no version row or embed job
+	// exists yet, so nothing else dangles.
+	if ref.ByteSize == 0 {
+		_ = s.artifacts.Delete(ctx, ref)
+		return UploadDocumentOutput{}, fmt.Errorf("%w: document is empty", ErrInvalidInput)
+	}
 
 	// Audience-mode object: the uploader plus the collection's audience can
 	// read; collection manage rights gate mutation.
@@ -646,7 +703,6 @@ func (s *Service) processNewDocument(ctx context.Context, p auth.Principal, c Co
 	if provenanceKind == "" {
 		provenanceKind = "upload"
 	}
-	sum := sha256.Sum256(input.Bytes)
 	prov, _ := json.Marshal(map[string]any{
 		"kind": provenanceKind, "input_artifact_ref": input.InputArtifact,
 		"result_job_id": input.ResultJobID, "result_artifact_ref": input.ResultArtifact,
@@ -657,8 +713,8 @@ func (s *Service) processNewDocument(ctx context.Context, p auth.Principal, c Co
 		ObjectID:         obj.ID,
 		ObservedSeq:      obj.ObservedSeq + 1,
 		ArtifactRef:      ref.ID,
-		SHA256:           hex.EncodeToString(sum[:]),
-		ByteSize:         int64(len(input.Bytes)),
+		SHA256:           ref.SHA256,
+		ByteSize:         ref.ByteSize,
 		MimeType:         input.MimeType,
 		OriginalFilename: input.FileName,
 		Provenance:       string(prov),
@@ -697,6 +753,9 @@ func (s *Service) enqueueEmbed(ctx context.Context, p auth.Principal, c Collecti
 	if err := s.repo.ReplaceVersionChunksAndStage(ctx, p.TenantID, c.ID, objectID, versionID, seq, generation, "" /* profile bound at attempt */, nil); err != nil {
 		return err
 	}
+	// The collection's immutable chunk profile version is FROZEN into the
+	// job policy: a later UpdateCollection to a different version cannot
+	// retcon a queued run.
 	_, _, err := s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
 		TenantID:       p.TenantID,
 		Operation:      OperationEmbed,
@@ -707,13 +766,12 @@ func (s *Service) enqueueEmbed(ctx context.Context, p auth.Principal, c Collecti
 		},
 		InputRef: versionID,
 		Policy: map[string]any{
-			"collection_id":   c.ID,
-			"object_id":       objectID,
-			"observed_seq":    seq,
-			"generation":      generation,
-			"embedding_model": c.EmbeddingModel,
-			"chunk_size":      c.ChunkSize,
-			"chunk_overlap":   c.ChunkOverlap,
+			"collection_id":            c.ID,
+			"object_id":                objectID,
+			"observed_seq":             seq,
+			"generation":               generation,
+			"embedding_model":          c.EmbeddingModel,
+			"chunk_profile_version_id": c.ChunkProfileVersionID,
 		},
 	})
 	return err
@@ -796,15 +854,28 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	if err := s.repo.SaveParsedDocument(ctx, parserVersion, document); err != nil {
 		return "", err
 	}
-	profileFamily := "rag-" + c.ID + "-structured"
-	profileVersionID, err := s.repo.EnsureChunkProfile(ctx, job.TenantID, profileFamily, c.ChunkSize, c.ChunkOverlap)
+	profileVersionID := stringFromPayload(job.Policy, "chunk_profile_version_id")
+	if profileVersionID == "" {
+		// Queued before the freeze landed: fall back to the collection's
+		// stored immutable version, never a hardcoded profile.
+		profileVersionID = c.ChunkProfileVersionID
+	}
+	if profileVersionID == "" {
+		return "", errors.New("collection has no chunk profile version")
+	}
+	// The FROZEN immutable version row drives chunking: its real boundary
+	// strategy, table handling and sizes — not the collection's current
+	// selection and not a fixed/row-wise construction.
+	profileRow, err := s.repo.GetChunkProfile(ctx, job.TenantID, profileVersionID)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("load frozen chunk profile %s: %w", profileVersionID, err)
 	}
 	profile := source.ChunkProfile{
-		ID: profileVersionID, ProfileID: profileFamily, Version: 1,
-		SizeCodePoints: c.ChunkSize, OverlapCodePoints: c.ChunkOverlap,
-		BoundaryStrategy: "fixed", TableHandling: "row-wise",
+		ID: profileRow.ID, ProfileID: profileRow.ProfileID, Version: profileRow.Version,
+		SizeCodePoints: profileRow.SizeCodePoints, OverlapCodePoints: profileRow.OverlapCodePoints,
+		BoundaryStrategy: profileRow.BoundaryStrategy, TableHandling: profileRow.TableHandling,
+		IncludeParents: profileRow.IncludeParents, PreserveClauses: profileRow.PreserveClauses,
+		PreserveAuthorship: profileRow.PreserveAuthorship,
 	}
 	structuredChunks, err := extract.Chunk(document, profile)
 	if err != nil {

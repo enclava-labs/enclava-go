@@ -3,6 +3,8 @@ package rag
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -83,6 +85,107 @@ func TestBuildContextDeduplicatesExactSpansAndMarksDenied(t *testing.T) {
 }
 
 type denyContextObject string
+
+// ---------------------------------------------------------------------
+// 08-08 pure units: canonical source kinds, rank fusion, selection rules.
+
+// TestSourceKindFallbackChain pins the canonical-kind resolution: provenance
+// source_kind → connection kind → provenance kind → unknown, never
+// object.Kind (often just "document").
+func TestSourceKindFallbackChain(t *testing.T) {
+	svc := &Service{}
+	candidate := func(provenance, connectionID string) authorizedCandidate {
+		return authorizedCandidate{
+			object:  source.Object{TenantID: "t", ID: "o", Kind: "document", ConnectionID: connectionID},
+			version: source.ObjectVersion{Provenance: provenance},
+		}
+	}
+	cache := map[string]string{"conn_kind": "slack"}
+	cases := []struct {
+		name      string
+		candidate authorizedCandidate
+		cache     map[string]string
+		want      string
+	}{
+		{"provenance source_kind wins", candidate(`{"source_kind":"github"}`, "conn_kind"), cache, "github"},
+		{"connection kind next", candidate(`{}`, "conn_kind"), cache, "slack"},
+		{"provenance kind last", candidate(`{"kind":"generated"}`, ""), cache, "generated"},
+		{"unknown never object.Kind", candidate(`{}`, ""), cache, "unknown"},
+	}
+	for _, tc := range cases {
+		if got := svc.sourceKindFor(context.Background(), "t", tc.candidate, tc.cache); got != tc.want {
+			t.Fatalf("%s: sourceKindFor=%q want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestSourceKindFacetsComposition(t *testing.T) {
+	results := []SearchResult{
+		{SourceKind: "notion"},
+		{SourceKind: "upload"},
+		{SourceKind: "notion"},
+	}
+	facets := sourceKindFacets(results)
+	if len(facets) != 2 || facets[0] != (SourceFacet{SourceKind: "notion", Count: 2}) || facets[1] != (SourceFacet{SourceKind: "upload", Count: 1}) {
+		t.Fatalf("facets must be deterministic and count the exact set: %#v", facets)
+	}
+}
+
+func TestFuseRankedResultsDeterministic(t *testing.T) {
+	makeList := func(ids ...string) rankedSearchList {
+		results := make([]SearchResult, 0, len(ids))
+		for _, id := range ids {
+			results = append(results, SearchResult{DocumentID: id, ChunkID: id + "_chunk"})
+		}
+		return rankedSearchList{results: results}
+	}
+	first := fuseRankedResults([]rankedSearchList{makeList("a", "b"), makeList("c", "d")}, 10)
+	second := fuseRankedResults([]rankedSearchList{makeList("b", "a"), makeList("d", "c")}, 10)
+	if len(first) != 4 || len(second) != 4 {
+		t.Fatalf("fused sizes %d/%d, want all four", len(first), len(second))
+	}
+	// Equal RRF contributions tie-break by list order then rank — the fused
+	// order never depends on map iteration or raw cross-collection scores.
+	if first[0].DocumentID != "a" || second[0].DocumentID != "b" {
+		t.Fatalf("top rank must follow list order tie-break: %s / %s", first[0].DocumentID, second[0].DocumentID)
+	}
+	if capped := fuseRankedResults([]rankedSearchList{makeList("a", "b", "c")}, 2); len(capped) != 2 {
+		t.Fatalf("fused set must honor the limit, got %d", len(capped))
+	}
+}
+
+func TestSelectReadableCollectionsRules(t *testing.T) {
+	readable := []Collection{{ID: "a"}, {ID: "b"}}
+	// Absent selection means every readable collection.
+	selected, err := selectReadableCollections(readable, []string{" ", ""})
+	if err != nil || len(selected) != 2 {
+		t.Fatalf("absent selection = %#v err=%v", selected, err)
+	}
+	// Explicit unknown/unauthorized IDs are denied, never silently filtered.
+	if _, err := selectReadableCollections(readable, []string{"zzz"}); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("explicit unknown id = %v, want ErrDenied", err)
+	}
+	// Duplicate explicit IDs collapse before the cap.
+	selected, err = selectReadableCollections(readable, []string{"a", "a"})
+	if err != nil || len(selected) != 1 {
+		t.Fatalf("deduped explicit selection = %#v err=%v", selected, err)
+	}
+	// Over the collection-count bound is an explicit error.
+	many := make([]string, maxSearchCollections+1)
+	for i := range many {
+		many[i] = fmt.Sprintf("c%d", i)
+	}
+	if _, err := selectReadableCollections(readable, many); !errors.Is(err, ErrSearchWorkExceeded) {
+		t.Fatalf("over-cap explicit ids = %v, want ErrSearchWorkExceeded", err)
+	}
+	wide := make([]Collection, maxSearchCollections+1)
+	for i := range wide {
+		wide[i] = Collection{ID: fmt.Sprintf("w%d", i)}
+	}
+	if _, err := selectReadableCollections(wide, nil); !errors.Is(err, ErrSearchWorkExceeded) {
+		t.Fatalf("over-cap readable set = %v, want ErrSearchWorkExceeded", err)
+	}
+}
 
 func (d denyContextObject) CanReadObject(_ context.Context, _ auth.Principal, id string) bool {
 	return id != string(d)

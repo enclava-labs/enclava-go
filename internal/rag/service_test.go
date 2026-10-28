@@ -2,6 +2,8 @@ package rag_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -874,5 +876,511 @@ func TestServiceFailedDocumentsAndCountAreAuthorized(t *testing.T) {
 	ownerCount, err := f.svc.CountDocuments(ctx, f.principal)
 	if err != nil || ownerCount != 2 {
 		t.Fatalf("owner count = %d, %v (want 2)", ownerCount, err)
+	}
+}
+
+// ---------------------------------------------------------------------
+// 08-08: bounded readable search, reader upload, extraction import, profile
+// freeze.
+
+// refRecordingExecutor records the input-ref fan-out of every embedding
+// request — the executor Inputs slice is the billing/authorization surface.
+type refRecordingExecutor struct {
+	refCounts []int
+}
+
+func (e *refRecordingExecutor) Execute(ctx context.Context, p auth.Principal, req inference.Request) (*inference.Result, error) {
+	e.refCounts = append(e.refCounts, len(req.Inputs))
+	body := `{"object":"list","data":[{"index":0,"embedding":[1,2,3]}],"usage":{"prompt_tokens":1,"total_tokens":1}}`
+	return &inference.Result{Body: io.NopCloser(strings.NewReader(body))}, nil
+}
+
+// stageSearchDoc stages an authorized published document with one chunk and
+// registers its point with the fake vector store.
+func (f *fixture) stageSearchDoc(t *testing.T, collection rag.Collection, objectID, content, provenance string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := f.repo.UpsertObject(ctx, source.Object{
+		TenantID: f.tenant, ID: objectID, Kind: "document", NativeID: "native-" + objectID,
+		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: f.principal.ActorID,
+		Audience: []string{f.principal.ActorID, "*"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repo.InsertObjectVersion(ctx, f.tenant, source.ObjectVersion{
+		ObjectID: objectID, ObservedSeq: 1, ArtifactRef: "art_" + objectID, SHA256: "sha_" + objectID,
+		ByteSize: int64(len(content)), MimeType: "text/plain", OriginalFilename: objectID + ".txt",
+		Provenance: provenance,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repo.AddCollectionItem(ctx, f.tenant, collection.ID, objectID, f.principal.ActorID); err != nil {
+		t.Fatal(err)
+	}
+	parsed := source.Document{
+		Ref: source.ObjectRef{TenantID: f.tenant, ObjectID: objectID, ObservedSeq: 1},
+		Blocks: []source.Block{
+			{ID: "blk_" + objectID, Ordinal: 0, Kind: "paragraph", Text: content, ByteStart: 0, ByteEnd: len(content),
+				Locator: source.Locator{Page: new(3)}},
+		},
+	}
+	if err := f.repo.SaveParsedDocument(ctx, "rag-structured-v1", parsed); err != nil {
+		t.Fatal(err)
+	}
+	profileID, err := f.repo.EnsureChunkProfile(ctx, f.tenant, "rag-"+collection.ID+"-structured", 200, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunkID := "chk_" + objectID
+	chunks := []rag.DocumentChunk{{
+		ID: chunkID, DocumentID: objectID, CollectionID: collection.ID, Generation: 1,
+		ChunkIndex: 0, Content: content, TokenCount: 4,
+		SpanRefs: []source.Span{{Ref: parsed.Ref, BlockID: "blk_" + objectID, ByteStart: 0, ByteEnd: 5}},
+	}}
+	if err := f.repo.ReplaceVersionChunksAndStage(ctx, f.tenant, collection.ID, objectID, objectID+"#1", 1, 1, profileID, chunks); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repo.MarkGenerationState(ctx, f.tenant, collection.ID, objectID+"#1", 1, "published"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.vector.UpsertPoints(ctx, collection.QdrantCollection, []rag.QdrantPoint{{
+		ID: "pt_" + objectID, Payload: map[string]any{
+			"tenant_id": f.tenant, "document_id": objectID, "object_version_id": objectID + "#1",
+			"generation": int64(1), "chunk_id": chunkID, "file_name": objectID + ".txt",
+			"source_uri": "urn:test:" + objectID, "content": content, "access_enabled": true,
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSearchReadableAuthorizedFusionAndFacets: denied collections contribute
+// neither results nor facets; explicit caller-supplied IDs are denied, never
+// silently filtered; results carry canonical source kinds, collection names
+// and resolved locations; facet counts equal the returned composition.
+func TestSearchReadableAuthorizedFusionAndFacets(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	allowed, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{Name: "allowed", ACL: map[string]any{"public": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{Name: "second", ACL: map[string]any{"public": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outsider := auth.Principal{TenantID: f.tenant, ActorID: "actor_other", UserID: "actor_other", ActorKind: auth.ActorKindUser}
+	denied, err := f.svc.CreateCollection(ctx, outsider, rag.CreateCollectionInput{Name: "denied"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.stageSearchDoc(t, allowed, "obj_allow", "fusion readable alpha", `{"kind":"upload"}`)
+	f.stageSearchDoc(t, second, "obj_second", "fusion readable beta", `{"source_kind":"notion"}`)
+	f.stageSearchDoc(t, denied, "obj_secret", "fusion secret gamma", `{}`)
+
+	result, err := f.svc.SearchReadable(ctx, f.principal, "fusion readable", rag.QueryLexical, nil, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Results) != 2 {
+		t.Fatalf("results=%d, want 2 with the denied collection excluded: %#v", len(result.Results), result.Results)
+	}
+	kinds := map[string]string{}
+	for _, r := range result.Results {
+		kinds[r.CollectionID] = r.SourceKind
+		if r.CollectionName == "" || r.SourceKind == "" || r.EvidenceID == "" {
+			t.Fatalf("result missing presentation fields: %#v", r)
+		}
+		if len(r.Locations) == 0 || r.Locations[0].Page == nil || *r.Locations[0].Page != 3 {
+			t.Fatalf("locations not resolved from retained blocks: %#v", r.Locations)
+		}
+	}
+	if kinds[allowed.ID] != "upload" || kinds[second.ID] != "notion" {
+		t.Fatalf("source kinds must come from provenance, not object.Kind: %#v", kinds)
+	}
+	if len(result.Facets) != 2 {
+		t.Fatalf("facets=%#v, want upload+notion over the authorized set", result.Facets)
+	}
+
+	if _, err := f.svc.SearchReadable(ctx, f.principal, "fusion", rag.QueryLexical, []string{denied.ID}, 5); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("explicit denied collection = %v, want ErrDenied", err)
+	}
+	if _, err := f.svc.SearchReadable(ctx, f.principal, "fusion", rag.QueryLexical, []string{"ragcol_missing"}, 5); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("explicit unknown collection = %v, want ErrDenied", err)
+	}
+	narrow, err := f.svc.SearchReadable(ctx, f.principal, "fusion readable", rag.QueryLexical, []string{second.ID}, 20)
+	if err != nil || len(narrow.Results) != 1 || narrow.Results[0].CollectionID != second.ID {
+		t.Fatalf("explicit readable selection = %#v err=%v", narrow, err)
+	}
+	if len(narrow.Facets) != 1 || narrow.Facets[0].SourceKind != "notion" || narrow.Facets[0].Count != 1 {
+		t.Fatalf("explicit selection facets=%#v", narrow.Facets)
+	}
+}
+
+// TestSearchReadableLimitBoundsFacets: facet counts describe exactly the
+// returned, limit-bounded composition.
+func TestSearchReadableLimitBoundsFacets(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	collection, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{Name: "limitless", ACL: map[string]any{"public": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		f.stageSearchDoc(t, collection, fmt.Sprintf("obj_lim_%d", i), fmt.Sprintf("limit content %d", i), `{"kind":"upload"}`)
+	}
+	result, err := f.svc.SearchReadable(ctx, f.principal, "limit content", rag.QueryLexical, nil, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Results) != 2 || len(result.Facets) != 1 || result.Facets[0].Count != 2 || result.Facets[0].SourceKind != "upload" {
+		t.Fatalf("bounded results=%d facets=%#v, want 2 results and one upload facet of 2", len(result.Results), result.Facets)
+	}
+}
+
+// TestSearchWorkBoundsAndRefFanOut: the object/work bound is explicit (never
+// silent first-N) and the executor input-ref fan-out stays within the
+// authorized-candidate bound.
+func TestSearchWorkBoundsAndRefFanOut(t *testing.T) {
+	db := testdb.New(t)
+	tenant := testdb.SeedTenant(t, db, "rag-bounds")
+	user := testdb.SeedUser(t, db, tenant, "rag-bounds@example.test", nil)
+	repo := postgres.NewRAGRepo(db)
+	vector := newFakeVectorStore()
+	recorder := &refRecordingExecutor{}
+	svc := rag.NewService(repo, vector, recorder, "embed-test", nil, nil)
+	p := auth.Principal{TenantID: tenant, ActorID: user.ID, UserID: user.ID, ActorKind: auth.ActorKindUser,
+		Scopes: map[string]struct{}{"rag": {}, "rag.manage": {}}}
+	f := &fixture{db: db, svc: svc, repo: repo, vector: vector, tenant: tenant, principal: p}
+	ctx := context.Background()
+	collection, err := svc.CreateCollection(ctx, p, rag.CreateCollectionInput{Name: "bounded", ACL: map[string]any{"public": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		f.stageSearchDoc(t, collection, fmt.Sprintf("obj_w_%d", i), fmt.Sprintf("bounded work %d", i), `{}`)
+	}
+	previous := rag.SearchWorkBudget
+	defer func() { rag.SearchWorkBudget = previous }()
+	rag.SearchWorkBudget = 2
+
+	// Over budget → explicit error on the single-collection path...
+	if _, err := svc.Search(ctx, p, rag.SearchInput{CollectionID: collection.ID, Query: "bounded", Mode: rag.QueryHybrid}); !errors.Is(err, rag.ErrSearchWorkExceeded) {
+		t.Fatalf("over-budget search = %v, want ErrSearchWorkExceeded", err)
+	}
+	// ...and on the cross-collection path.
+	if _, err := svc.SearchReadable(ctx, p, "bounded", rag.QueryHybrid, nil, 5); !errors.Is(err, rag.ErrSearchWorkExceeded) {
+		t.Fatalf("over-budget readable search = %v, want ErrSearchWorkExceeded", err)
+	}
+	if len(recorder.refCounts) != 0 {
+		t.Fatalf("over-budget request must not reach the executor: %#v", recorder.refCounts)
+	}
+
+	// Under budget, the search is complete and the executor input-ref
+	// fan-out is exactly the authorized candidate set.
+	rag.SearchWorkBudget = 10
+	results, err := svc.Search(ctx, p, rag.SearchInput{CollectionID: collection.ID, Query: "bounded", Mode: rag.QueryHybrid})
+	if err != nil || len(results) != 3 {
+		t.Fatalf("under-budget search results=%d err=%v", len(results), err)
+	}
+	if len(recorder.refCounts) != 1 || recorder.refCounts[0] != 3 {
+		t.Fatalf("executor ref fan-out = %#v, want one call carrying 3 refs", recorder.refCounts)
+	}
+
+	// The aggregate budget binds across collections of one request: with a
+	// budget of 3 total, a 3-document collection consumes it and any further
+	// collection becomes an explicit error, not silent omission.
+	rag.SearchWorkBudget = 3
+	extra, err := svc.CreateCollection(ctx, p, rag.CreateCollectionInput{Name: "extra", ACL: map[string]any{"public": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.stageSearchDoc(t, extra, "obj_extra", "bounded extra work", `{}`)
+	if _, err := svc.SearchReadable(ctx, p, "bounded", rag.QueryHybrid, nil, 10); !errors.Is(err, rag.ErrSearchWorkExceeded) {
+		t.Fatalf("aggregate budget = %v, want ErrSearchWorkExceeded", err)
+	}
+	if total := recorder.refCounts[len(recorder.refCounts)-1]; total > 3 {
+		t.Fatalf("per-call ref fan-out %d exceeded the bound", total)
+	}
+}
+
+// TestServiceUploadReaderStreamsAndPersistsRefMetadata: the Reader path
+// streams into the same artifact writer, and the persisted version row
+// carries the finalized ref's real digest and size.
+func TestServiceUploadReaderStreamsAndPersistsRefMetadata(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	content := "enclava reader streamed upload content"
+	upload, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "reader.txt", MimeType: "text/plain", Reader: strings.NewReader(content),
+	})
+	if err != nil {
+		t.Fatalf("reader upload: %v", err)
+	}
+	var sha256Hex string
+	var byteSize int64
+	if err := f.db.SQL.QueryRowContext(ctx, `SELECT content_sha256, byte_size FROM source_object_versions WHERE tenant_id=$1 AND object_id=$2`,
+		f.tenant, upload.Document.ID).Scan(&sha256Hex, &byteSize); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(content))
+	if sha256Hex != hex.EncodeToString(sum[:]) || byteSize != int64(len(content)) {
+		t.Fatalf("persisted version metadata sha=%s size=%d, want the streamed bytes' digest/%d", sha256Hex, byteSize, len(content))
+	}
+	_, blob, err := f.svc.DownloadDocument(ctx, f.principal, upload.Document.ID)
+	if err != nil || string(blob) != content {
+		t.Fatalf("retained artifact round-trip: %q err=%v", blob, err)
+	}
+	// The enqueued embed job references the real object version and carries
+	// the frozen profile version.
+	job, err := f.jobs.Lease(ctx, "test-worker", time.Minute)
+	if err != nil || job == nil {
+		t.Fatalf("no embed job enqueued: %v", err)
+	}
+	if job.Job().InputRef != fmt.Sprintf("%s#1", upload.Document.ID) {
+		t.Fatalf("embed job input ref = %q", job.Job().InputRef)
+	}
+	if job.Job().Policy["chunk_profile_version_id"] != c.ChunkProfileVersionID {
+		t.Fatalf("embed job profile = %#v, want frozen %q", job.Job().Policy["chunk_profile_version_id"], c.ChunkProfileVersionID)
+	}
+	if _, err := f.svc.JobHandler()(ctx, job, nil); err != nil {
+		t.Fatalf("worker on streamed upload: %v", err)
+	}
+	if _, err := job.Complete(ctx, fmt.Sprintf("%s#1", upload.Document.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if doc := f.docStatus(t, c.ID, upload.Document.ID); doc.Status != rag.DocumentStatusReady {
+		t.Fatalf("streamed upload did not index: %s", doc.Status)
+	}
+}
+
+// TestServiceUploadEmptyReaderLeavesNothing: the emptiness check runs on the
+// FINALIZED artifact; the rejected upload deletes the finalized bytes and
+// leaves no version row and no queued job.
+func TestServiceUploadEmptyReaderLeavesNothing(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "empty.txt", MimeType: "text/plain", Reader: strings.NewReader(""),
+	}); err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("empty reader upload = %v, want an emptiness error", err)
+	}
+	var versions int
+	if err := f.db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM source_object_versions WHERE tenant_id=$1`, f.tenant).Scan(&versions); err != nil {
+		t.Fatal(err)
+	}
+	if versions != 0 {
+		t.Fatalf("%d version rows survived an empty upload", versions)
+	}
+	var finals int
+	if err := f.db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM artifacts WHERE tenant_id=$1 AND state='final'`, f.tenant).Scan(&finals); err != nil {
+		t.Fatal(err)
+	}
+	if finals != 0 {
+		t.Fatalf("%d final artifacts survived an empty upload", finals)
+	}
+	if claim, err := f.jobs.Lease(ctx, "test-worker", time.Minute); err != nil || claim != nil {
+		t.Fatalf("empty upload enqueued work: claim=%v err=%v", claim, err)
+	}
+	// The Bytes path keeps its pre-finalize rejection semantics.
+	if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{FileName: "b.txt", MimeType: "text/plain"}); err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("empty bytes upload = %v, want an emptiness error", err)
+	}
+}
+
+// TestExtractionResultImportEndToEnd: a succeeded extract.process job's
+// result artifact imports into a writable collection with preserved
+// provenance; duplicates return the same document; non-owned and failed jobs
+// are denied.
+func TestExtractionResultImportEndToEnd(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+
+	// The input artifact must still resolve to a readable source object.
+	inputContent := "extract source document body"
+	w, inputRef, err := f.store.Begin(ctx, artifacts.Meta{Ref: artifacts.Ref{TenantID: f.tenant, Kind: artifacts.KindOriginal}, MimeType: "text/plain"}, time.Minute, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte(inputContent)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Finalize(ctx); err != nil {
+		t.Fatal(err)
+	}
+	inputRef = w.Ref()
+	if _, err := f.repo.UpsertObject(ctx, source.Object{TenantID: f.tenant, ID: "extract_source", Kind: "upload", NativeID: "extract-native",
+		AuthorizationMode: source.AuthorizationOwner, OwnerActorID: f.principal.ActorID, ObservedSeq: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repo.InsertObjectVersion(ctx, f.tenant, source.ObjectVersion{ObjectID: "extract_source", ObservedSeq: 1,
+		ArtifactRef: inputRef.ID, SHA256: inputRef.SHA256, ByteSize: inputRef.ByteSize, MimeType: "text/plain", OriginalFilename: "source.txt"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A succeeded extract.process job with a stored JSON result artifact.
+	resultDoc := []byte(`{"id":"res_1","data":{"summary":"extracted"}}`)
+	rw, resultRef, err := f.store.Begin(ctx, artifacts.Meta{Ref: artifacts.Ref{TenantID: f.tenant, Kind: artifacts.KindResult}, MimeType: "application/json"}, time.Minute, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rw.Write(resultDoc); err != nil {
+		t.Fatal(err)
+	}
+	if err := rw.Finalize(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resultRef = rw.Ref()
+	job, _, err := f.jobs.Enqueue(ctx, f.principal, jobs.EnqueueRequest{
+		TenantID: f.tenant, Operation: "extract.process", IdempotencyKey: "extract-import-1",
+		InputRef: inputRef.ID, Policy: map[string]any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := f.jobs.Lease(ctx, "test-worker", time.Minute)
+	if err != nil || claim == nil {
+		t.Fatalf("lease extraction job: %v", err)
+	}
+	if _, err := claim.Complete(ctx, resultRef.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := f.svc.ImportStoredResult(ctx, f.principal, rag.ImportResultInput{CollectionID: c.ID, ResultJobID: job.ID})
+	if err != nil {
+		t.Fatalf("extraction import: %v", err)
+	}
+	if out.Document.CollectionID != c.ID || out.Document.SourceType != "generated" || out.Document.FileName != "extraction-result.json" {
+		t.Fatalf("imported document shape: %#v", out.Document)
+	}
+	duplicate, err := f.svc.ImportStoredResult(ctx, f.principal, rag.ImportResultInput{CollectionID: c.ID, ResultJobID: job.ID})
+	if err != nil || duplicate.Document.ID != out.Document.ID {
+		t.Fatalf("duplicate import = %#v err=%v, want the same document", duplicate, err)
+	}
+
+	// A job owned by someone else is indistinguishable from absent.
+	other := auth.Principal{TenantID: f.tenant, ActorID: "actor_other", UserID: "actor_other", ActorKind: auth.ActorKindUser}
+	if _, err := f.svc.ImportStoredResult(ctx, other, rag.ImportResultInput{CollectionID: c.ID, ResultJobID: job.ID}); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("non-owned import = %v, want ErrDenied", err)
+	}
+	// A failed job is denied.
+	failed, _, err := f.jobs.Enqueue(ctx, f.principal, jobs.EnqueueRequest{
+		TenantID: f.tenant, Operation: "extract.process", IdempotencyKey: "extract-import-2",
+		InputRef: inputRef.ID, Policy: map[string]any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedClaim, err := f.jobs.Lease(ctx, "test-worker", time.Minute)
+	if err != nil || failedClaim == nil {
+		t.Fatal("no failed-job claim")
+	}
+	if err := failedClaim.Fail(ctx, errors.New("boom"), jobs.FailureFatal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.svc.ImportStoredResult(ctx, f.principal, rag.ImportResultInput{CollectionID: c.ID, ResultJobID: failed.ID}); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("failed-job import = %v, want ErrDenied", err)
+	}
+}
+
+// TestProfileFreezeAcrossSettingsChange: the collection's immutable profile
+// version is frozen into the queued embed job — switching the collection to a
+// different existing version can never retcon the queued run.
+func TestProfileFreezeAcrossSettingsChange(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	profiles := postgres.NewChunkProfilesRepo(f.db)
+	profileA, err := profiles.Create(ctx, f.tenant, source.ChunkProfile{
+		ProfileID: "profile-a", SizeCodePoints: 80, OverlapCodePoints: 10,
+		BoundaryStrategy: "fixed", TableHandling: "row-wise",
+	}, f.principal.ActorID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profileB, err := profiles.Create(ctx, f.tenant, source.ChunkProfile{
+		ProfileID: "profile-b", SizeCodePoints: 2000, OverlapCodePoints: 10,
+		BoundaryStrategy: "fixed", TableHandling: "row-wise",
+	}, f.principal.ActorID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aID, bID := profileA.ID, profileB.ID
+	c, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{
+		Name: "frozen", ChunkProfileVersionID: &aID, ACL: map[string]any{"public": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ChunkProfileVersionID != aID {
+		t.Fatalf("create ignored chunk_profile_version_id: %q", c.ChunkProfileVersionID)
+	}
+	content := strings.Repeat("enclava freeze probe sentence. ", 12) // ~384 code points
+	upload, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "freeze.txt", MimeType: "text/plain", Bytes: []byte(content),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := f.jobs.Lease(ctx, "test-worker", time.Minute)
+	if err != nil || queued == nil {
+		t.Fatal("no queued embed job")
+	}
+	if queued.Job().Policy["chunk_profile_version_id"] != aID {
+		t.Fatalf("queued job profile = %#v, want frozen A", queued.Job().Policy["chunk_profile_version_id"])
+	}
+
+	// Switch the collection to existing profile B AFTER enqueueing.
+	updated, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{ChunkProfileVersionID: &bID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.ChunkProfileVersionID != bID {
+		t.Fatalf("update ignored chunk_profile_version_id: %q", updated.ChunkProfileVersionID)
+	}
+
+	// Execute the queued worker: the produced chunks must reflect A's real
+	// settings (80-code-point chunks), bound to A — never B.
+	if _, err := f.svc.JobHandler()(ctx, queued, nil); err != nil {
+		t.Fatalf("frozen-profile embed: %v", err)
+	}
+	if _, err := queued.Complete(ctx, fmt.Sprintf("%s#1", upload.Document.ID)); err != nil {
+		t.Fatal(err)
+	}
+	var generationProfile string
+	if err := f.db.SQL.QueryRowContext(ctx, `
+		SELECT g.chunk_profile_version_id FROM index_generations g
+		WHERE g.tenant_id=$1 AND g.collection_id=$2 AND g.object_version_id=$3`,
+		f.tenant, c.ID, upload.Document.ID+"#1").Scan(&generationProfile); err != nil {
+		t.Fatal(err)
+	}
+	if generationProfile != aID {
+		t.Fatalf("generation bound to %q, want frozen A %q", generationProfile, aID)
+	}
+	chunks, err := f.repo.ListGenerationChunks(ctx, f.tenant, c.ID, upload.Document.ID+"#1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) < 3 {
+		t.Fatalf("chunks=%d, want profile A's 80-code-point chunking (B would yield 1)", len(chunks))
+	}
+	for _, chunk := range chunks {
+		if len([]rune(chunk.Content)) > 80 {
+			t.Fatalf("chunk exceeds A's size: %d code points", len([]rune(chunk.Content)))
+		}
+	}
+
+	// Unknown and foreign profile versions are caller errors.
+	if _, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{
+		Name: "broken", ChunkProfileVersionID: &[]string{"cpv_missing"}[0],
+	}); !errors.Is(err, rag.ErrInvalidInput) {
+		t.Fatalf("invalid profile version = %v, want ErrInvalidInput", err)
+	}
+	if _, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{
+		ChunkProfileVersionID: &[]string{"cpv_missing"}[0],
+	}); !errors.Is(err, rag.ErrInvalidInput) {
+		t.Fatalf("invalid profile update = %v, want ErrInvalidInput", err)
 	}
 }

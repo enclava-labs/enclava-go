@@ -62,8 +62,21 @@ func (s *Service) ImportArtifact(ctx context.Context, p auth.Principal, input Im
 	})
 }
 
+// validImportOperation covers the stored job operations whose completed
+// results may be imported into knowledge: document previews and the
+// extract.process / extract.vision extraction results ("Add to knowledge").
+func validImportOperation(operation string) bool {
+	switch operation {
+	case "document.preview", "extract.process", "extract.vision":
+		return true
+	}
+	return false
+}
+
 // ImportStoredResult imports only a completed result belonging to the caller;
 // its original input must independently remain readable at import time.
+// ResultJobID is a JOB ID — the wire field `result_ref` keeps its name for
+// compatibility but always names a durable job row.
 func (s *Service) ImportStoredResult(ctx context.Context, p auth.Principal, input ImportResultInput) (UploadDocumentOutput, error) {
 	if s.jobs == nil || s.artifacts == nil || input.ResultJobID == "" {
 		return UploadDocumentOutput{}, fmt.Errorf("%w: result job is required", ErrInvalidInput)
@@ -80,7 +93,7 @@ func (s *Service) ImportStoredResult(ctx context.Context, p auth.Principal, inpu
 		return UploadDocumentOutput{}, source.ErrDenied
 	}
 	result, err := s.repo.GetStoredResult(ctx, p.TenantID, input.ResultJobID)
-	if err != nil || job.Status != "succeeded" || result.Status != "succeeded" || result.ResultRef == "" || result.InputRef == "" || result.Operation != "document.preview" {
+	if err != nil || job.Status != "succeeded" || result.Status != "succeeded" || result.ResultRef == "" || result.InputRef == "" || !validImportOperation(result.Operation) {
 		return UploadDocumentOutput{}, source.ErrDenied
 	}
 	var restrictions []source.SourceRestriction
@@ -112,8 +125,13 @@ func (s *Service) ImportStoredResult(ctx context.Context, p auth.Principal, inpu
 	if err != nil {
 		return UploadDocumentOutput{}, fmt.Errorf("read result artifact: %w", err)
 	}
+	fileName, mimeType := "generated-result.txt", "text/plain"
+	if result.Operation == "extract.process" || result.Operation == "extract.vision" {
+		// Extraction result artifacts are the durable JSON result view.
+		fileName, mimeType = "extraction-result.json", "application/json"
+	}
 	return s.importBytes(ctx, p, input.CollectionID, input.ResultJobID, "generated", UploadDocumentInput{
-		FileName: "generated-result.txt", MimeType: "text/plain", Bytes: data,
+		FileName: fileName, MimeType: mimeType, Bytes: data,
 		SourceType: "generated", SourceID: input.ResultJobID, ProvenanceKind: "generated",
 		InputArtifact: result.InputRef, ResultJobID: input.ResultJobID,
 		ResultArtifact: result.ResultRef, Audience: []string{p.ActorID}, Restrictions: restrictions,
