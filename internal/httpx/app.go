@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -267,9 +269,9 @@ func (a *App) authenticated(scope string, next func(http.ResponseWriter, *http.R
 		now := time.Now().UTC()
 		if a.rl != nil {
 			if !a.enforceRateLimits(w, a.unauthenticatedRateLimitKey(r, apiKey), now, []rateLimitCheck{
-				{limit: preAuthRateLimitPerMinute, window: time.Minute},
-				{limit: preAuthRateLimitPerHour, window: time.Hour},
-				{limit: preAuthRateLimitPerDay, window: 24 * time.Hour},
+				{limit: envRateLimit("ENCLAVA_PREAUTH_RATE_LIMIT_PER_MINUTE", preAuthRateLimitPerMinute), window: time.Minute},
+				{limit: envRateLimit("ENCLAVA_PREAUTH_RATE_LIMIT_PER_HOUR", preAuthRateLimitPerHour), window: time.Hour},
+				{limit: envRateLimit("ENCLAVA_PREAUTH_RATE_LIMIT_PER_DAY", preAuthRateLimitPerDay), window: 24 * time.Hour},
 			}) {
 				return
 			}
@@ -351,6 +353,18 @@ func (a *App) enforceRateLimits(w http.ResponseWriter, key string, now time.Time
 		}
 	}
 	return true
+}
+
+// envRateLimit reads an operator-tunable pre-auth budget from the
+// environment, falling back to the compiled default. Zero disables the
+// check (enforceRateLimits skips limits <= 0).
+func envRateLimit(name string, def int64) int64 {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return def
 }
 
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {

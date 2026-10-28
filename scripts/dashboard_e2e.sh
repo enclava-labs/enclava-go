@@ -120,7 +120,9 @@ log "stubs: llm=$E2E_LLM_URL mcp=$E2E_MCP_URL connector=$E2E_CONNECTOR_URL"
 # 3. Build + bootstrap the "bootstrap" tenant. The printed password/API key
 #    are captured to the data dir, never echoed.
 log "building enclava"
-make build >/dev/null
+# Same command as the Makefile build target; invoked directly so the script
+# runs on hosts without make.
+CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o enclava ./cmd/enclava
 
 export DATABASE_URL="$APP_DSN"
 export ENCLAVA_DATA_DIR="$DATA_DIR/app"
@@ -131,6 +133,11 @@ export OPENAI_COMPATIBLE_API_KEY="e2e-test-key"
 export QDRANT_URL
 export DEFAULT_EMBEDDING_MODEL="e2e-embed"
 export SESSION_TENANT_SLUG="bootstrap"
+# The whole 193-test browser run originates from one loopback IP; the
+# default pre-auth budget is sized for real multi-client traffic.
+export ENCLAVA_PREAUTH_RATE_LIMIT_PER_MINUTE=100000
+export ENCLAVA_PREAUTH_RATE_LIMIT_PER_HOUR=1000000
+export ENCLAVA_PREAUTH_RATE_LIMIT_PER_DAY=10000000
 export CONNECTOR_GITHUB_E2E="e2e-github-token"
 export SSL_CERT_FILE="$CONNECTOR_CA_FILE"
 export NODE_EXTRA_CA_CERTS="$CONNECTOR_CA_FILE"
@@ -187,7 +194,11 @@ set +e
 npx playwright test --workers=1 $E2E_PROJECTS
 PW_CODE=$?
 set -e
-log "playwright exit $PW_CODE"
+if [ "$PW_CODE" -ne 0 ] && [ -f "$DATA_DIR/app.log" ]; then
+	cp "$DATA_DIR/app.log" test-results/e2e-app.log 2>/dev/null || true
+	echo "[dashboard-e2e] app log preserved at test-results/e2e-app.log (tail follows)" >&2
+	tail -40 "$DATA_DIR/app.log" >&2 || true
+fi
 
 # Teardown runs in the EXIT trap (Qdrant first, then schema drop); a
 # teardown failure forces its own nonzero exit via QDRANT_FAILURE.

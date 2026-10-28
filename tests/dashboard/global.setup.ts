@@ -51,13 +51,17 @@ async function uploadAndReady(collectionID: string, fileName: string, content: s
   const form = new FormData();
   form.append('file', new Blob([Buffer.from(content)], { type: 'text/plain' }), fileName);
   await api('POST', `/api/v1/rag/collections/${collectionID}/documents`, form);
-  await expect
-    .poll(async () => {
-      const list = await api<{ documents?: Array<{ file_name: string; status: string }> }>(
-        'GET', `/api/v1/rag/collections/${collectionID}/documents?status=ready`);
-      return (list.documents || []).some((d) => d.file_name === fileName);
-    }, { timeout: 90_000, message: `${fileName} never reached ready — the ingest pipeline failed` })
-    .toBe(true);
+	await expect
+		.poll(async () => {
+			const list = await api<{ documents?: Array<{ file_name: string; status: string; error_message?: string }> }>(
+				'GET', `/api/v1/rag/collections/${collectionID}/documents`);
+			const doc = (list.documents || []).find((d) => d.file_name === fileName);
+			if (doc && doc.status === 'failed') {
+				throw new Error(`${fileName} ingest FAILED: ${doc.error_message || 'no error recorded'}`);
+			}
+			return doc?.status === 'ready' || false;
+		}, { timeout: 90_000, message: `${fileName} never appeared in the collection — the upload or ingest pipeline failed` })
+		.toBe(true);
 }
 
 test('seed: stubs reachable, data seeded, three sessions minted', async ({ page }) => {
@@ -106,6 +110,22 @@ test('seed: stubs reachable, data seeded, three sessions minted', async ({ page 
   await page.goto(`${BASE}/dashboard/extract`);
   await expect(page.locator('#content')).toContainText('administrator');
   await page.context().clearCookies();
+
+  // ── Pricing: the env endpoint's chat model priced on every required unit
+  //    (model-subject rows so the alt model stays unpriced for the
+  //    Set-price flow), embeddings priced BEFORE any upload — the embed
+  //    worker reserves on dispatch, and an unpriced unit fails the ingest
+  //    job for real ──
+  const price = async (subjectID: string, capability: string, unit: string, rate: number) =>
+    api('POST', '/api/v1/admin/pricing', {
+      subject_type: 'model', subject_id: subjectID, capability,
+      unit, rate_micros: rate, unit_quantity: 1_000_000, currency: 'USD',
+    });
+  await price(CHAT_MODEL, 'chat', 'input', 2_500_000);
+  await price(CHAT_MODEL, 'chat', 'output', 5_000_000);
+  await price(CHAT_MODEL, 'chat', 'cached_input', 1_250_000);
+  await price(EMBED_MODEL, 'embeddings', 'input', 500_000);
+  await price(EMBED_MODEL, 'embeddings', 'cached_input', 250_000);
 
   // ── Collections + documents (Qdrant required; names recorded for the
   //    wrapper's teardown) ──
@@ -165,6 +185,7 @@ test('seed: stubs reachable, data seeded, three sessions minted', async ({ page 
   // ── Extraction template bound to the deliberately unpriced model — the
   //    202→worker-failure cases rely on the price reserve, never a mock ──
   const tpl = await api<{ id: string }>('POST', '/api/v1/extract/templates', {
+    id: 'tpl-e2e-fields',
     name: 'E2E Fields',
     system_prompt: 'Extract fields.',
     user_prompt: 'Return JSON.',
@@ -196,19 +217,6 @@ test('seed: stubs reachable, data seeded, three sessions minted', async ({ page 
     schema_version: echoRow.schema_version,
   });
 
-  // ── Pricing: the env endpoint's chat model priced on every required unit
-  //    (model-subject rows so the alt model stays unpriced for the
-  //    Set-price flow), embeddings priced for document ingest ──
-  const price = async (subjectID: string, capability: string, unit: string, rate: number) =>
-    api('POST', '/api/v1/admin/pricing', {
-      subject_type: 'model', subject_id: subjectID, capability,
-      unit, rate_micros: rate, unit_quantity: 1_000_000, currency: 'USD',
-    });
-  await price(CHAT_MODEL, 'chat', 'input', 2_500_000);
-  await price(CHAT_MODEL, 'chat', 'output', 5_000_000);
-  await price(CHAT_MODEL, 'chat', 'cached_input', 1_250_000);
-  await price(EMBED_MODEL, 'embeddings', 'input', 500_000);
-  await price(EMBED_MODEL, 'embeddings', 'cached_input', 250_000);
 
   // ── D-25 grants: explicit mode:list allowlists naming only the seeded
   //    items — never mode:all, never platform.admin ──
