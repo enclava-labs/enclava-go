@@ -11,11 +11,25 @@ import (
 	"log"
 	"net/http"
 	"strings"
+
+	"enclava-go/internal/auth"
 )
+
+// dashboardLoginData is the login-form model SessionAuth builds at each
+// failure/render site; dashboardLoginView wraps it for auth/login.tmpl.
+type dashboardLoginData struct {
+	Email            string
+	Error            string
+	ReturnTo         string
+	Providers        []auth.OIDCProvider
+	LinkToken        string
+	LinkProviderName string
+	LinkEmail        string
+}
 
 // dashboardLoginView wraps dashboardLoginData for auth/login.tmpl: the
 // standalone document adds the org name and theme class without touching the
-// shared dashboard.go type or any of its builders.
+// shared login-data type or any of its builders.
 type dashboardLoginView struct {
 	dashboardLoginData
 	Org   string

@@ -53,13 +53,14 @@ async function login(page: Page) {
   await page.waitForURL('**/dashboard');
 }
 
-// The gallery page (07-04) is the only served shell page this phase.
-async function openGallery(page: Page) {
-  const res = await page.goto(`${BASE}/dashboard/gallery`);
+// Any rendered shell page carries the #toast/#drawer surface these cases
+// exercise; Home is the always-registered one (the dev gallery is deleted).
+async function openHome(page: Page) {
+  const res = await page.goto(`${BASE}/dashboard`);
   if (!res || res.status() !== 200) {
     throw new Error(
-      `the gallery page (07-04) is not served at ${BASE}/dashboard/gallery — run the ` +
-      `server with ENCLAVA_DEV_GALLERY=1 and a seeded tenant; got status ${res ? res.status() : 'none'}`,
+      `the dashboard Home page is not served at ${BASE}/dashboard — run the ` +
+      `server with a seeded tenant; got status ${res ? res.status() : 'none'}`,
     );
   }
   await expect(page.locator('#toast')).toHaveCount(1);
@@ -75,7 +76,7 @@ test('serves app.js as a non-empty JavaScript asset', async ({ request }) => {
 
 test('Enclava.api sources X-CSRF-Token from the enclava_csrf cookie; FormData goes raw', async ({ page }) => {
   await login(page);
-  await openGallery(page);
+  await openHome(page);
 
   let headers: Record<string, string> = {};
   await page.route('**/api/v1/__shell-probe', async (route) => {
@@ -104,7 +105,7 @@ test('Enclava.api sources X-CSRF-Token from the enclava_csrf cookie; FormData go
 
 test('api() on 401 navigates to login with the decoded return_to target', async ({ page }) => {
   await login(page);
-  await openGallery(page);
+  await openHome(page);
 
   await page.route('**/api/v1/__shell-probe', (route) =>
     route.fulfill({ status: 401, contentType: 'application/json', body: '{"error":{"message":"expired"}}' }),
@@ -113,12 +114,12 @@ test('api() on 401 navigates to login with the decoded return_to target', async 
     window.Enclava.api('POST', '/api/v1/__shell-probe', {}).catch(() => {}),
   );
   await page.waitForURL(/\/dashboard\/login/);
-  expect(new URL(page.url()).searchParams.get('return_to')).toBe('/dashboard/gallery');
+  expect(new URL(page.url()).searchParams.get('return_to')).toBe('/dashboard');
 });
 
 test('403 and network failures toast and never inject a rejected fragment', async ({ page }) => {
   await login(page);
-  await openGallery(page);
+  await openHome(page);
 
   await page.route('**/dashboard/partials/__shell-nope', (route) =>
     route.fulfill({ status: 403, contentType: 'application/json', body: '{"error":{"message":"nope"}}' }),
@@ -141,7 +142,7 @@ test('403 and network failures toast and never inject a rejected fragment', asyn
 
 test('refresh() dispatches on body and hx-trigger="refresh from:body" re-issues its GET', async ({ page }) => {
   await login(page);
-  await openGallery(page);
+  await openHome(page);
 
   const fired = await page.evaluate(() =>
     new Promise<number>((resolve) => {
@@ -170,7 +171,7 @@ test('refresh() dispatches on body and hx-trigger="refresh from:body" re-issues 
 
 test('drawer traps focus, Esc closes and focus returns to the opener', async ({ page }) => {
   await login(page);
-  await openGallery(page);
+  await openHome(page);
 
   await page.evaluate(() => {
     const opener = document.createElement('button');
@@ -198,7 +199,7 @@ test('drawer traps focus, Esc closes and focus returns to the opener', async ({ 
 
 test('evidence:open routes into the shared #drawer with htmx headers; evidence:close clears it', async ({ page }) => {
   await login(page);
-  await openGallery(page);
+  await openHome(page);
   // Default routing case: no chat evidence column exists on this page.
   await page.evaluate(() =>
     document.querySelectorAll('.evidence-panel').forEach((n) => n.remove()),

@@ -4,7 +4,7 @@
 // names its page. The frozen FuncMap names — statusPill statusLabel statusTone
 // term relTime absTime money count icon spark bars mark — are the only helpers
 // templates may call (D-21). The legacy dashboardTemplateFS/dashboardTemplates
-// set is untouched until OA-41 deletes it.
+// set was deleted at OA-41.
 package httpx
 
 import (

@@ -1,8 +1,9 @@
-// dashboard_authz_test.go — dashboard session routes must enforce the same
-// scopes as the equivalent /api/v1 endpoints: key management, tenant-wide
-// reads and *.manage mutations are refused for members that only hold a
-// session. Regression coverage for the report that any signed-in user could
-// mint platform.admin keys, mutate every tenant key, and read admin pages.
+// dashboard_authz_test.go — authorization regression coverage on the
+// post-cutover surface: new /dashboard/* pages and partials enforce their
+// capability gates per role, /api/v1 endpoints keep their scope checks, and
+// deleted old-surface URLs stay 404. Regression coverage for the report that
+// any signed-in user could mint platform.admin keys, mutate every tenant
+// key, and read admin pages.
 
 package httpx
 
