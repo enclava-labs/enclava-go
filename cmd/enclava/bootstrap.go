@@ -26,6 +26,50 @@ var bootstrapAdminScopes = []string{
 	"chatbot", "chatbot.manage", "connectors.manage", "pricing.manage",
 }
 
+// bootstrapMemberScopes is the §3.2 member scope set; knowledge_manager adds
+// the four manage scopes on top.
+var bootstrapMemberScopes = []string{
+	"models.list", "chat.completions", "embeddings.create", "responses",
+	"chatbot", "rag", "extract",
+}
+
+// Stored grant documents (D-25): admin is the ONLY all-grant seed; every
+// other default role stores explicit empty deny lists — an invited
+// non-admin holds zero AI resources until an admin selects items (OA-20/28).
+const (
+	grantAllDoc  = `{"mode":"all"}`
+	grantDenyDoc = `{"mode":"list","items":[]}`
+)
+
+// bootstrapRole is one seeded default role: its §3.2 scope list plus the
+// explicit grant documents written to the four allowed_* columns
+// (allowed_models, allowed_endpoints, allowed_assistants,
+// allowed_extract_templates).
+type bootstrapRole struct {
+	id     string
+	name   string
+	scopes []string
+	grants [4]string
+}
+
+var bootstrapRoles = []bootstrapRole{
+	{
+		id: "role_admin", name: "admin", scopes: bootstrapAdminScopes,
+		grants: [4]string{grantAllDoc, grantAllDoc, grantAllDoc, grantAllDoc},
+	},
+	{
+		id:   "role_knowledge_manager",
+		name: "knowledge_manager",
+		scopes: append(append([]string{}, bootstrapMemberScopes...),
+			"rag.manage", "connectors.manage", "chatbot.manage", "extract.manage"),
+		grants: [4]string{grantDenyDoc, grantDenyDoc, grantDenyDoc, grantDenyDoc},
+	},
+	{
+		id: "role_member", name: "member", scopes: bootstrapMemberScopes,
+		grants: [4]string{grantDenyDoc, grantDenyDoc, grantDenyDoc, grantDenyDoc},
+	},
+}
+
 // runBootstrap implements `enclava bootstrap` — the operator-only first-login
 // path (AUTH-01). It creates the first tenant and an admin user with a
 // generated password printed exactly once. There is no fixed credential and
@@ -66,7 +110,6 @@ func runBootstrap(ctx context.Context, args []string) error {
 		return fmt.Errorf("hash password: %w", err)
 	}
 	userID := "user_" + randHex(12)
-	roleID := "role_admin"
 	now := time.Now().UTC()
 
 	var apiKey string
@@ -79,11 +122,15 @@ func runBootstrap(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("create tenant %q (refuses an existing slug): %w", *tenantSlug, err)
 		}
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO roles (tenant_id, id, name, scopes)
-			 VALUES ($1::uuid, $2, 'admin', $3::jsonb)`,
-			tenantID, roleID, roleScopesJSON(bootstrapAdminScopes)); err != nil {
-			return fmt.Errorf("create admin role: %w", err)
+		for _, role := range bootstrapRoles {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO roles (tenant_id, id, name, scopes,
+				 allowed_models, allowed_endpoints, allowed_assistants, allowed_extract_templates)
+				 VALUES ($1::uuid, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb)`,
+				tenantID, role.id, role.name, roleScopesJSON(role.scopes),
+				role.grants[0], role.grants[1], role.grants[2], role.grants[3]); err != nil {
+				return fmt.Errorf("create %s role: %w", role.name, err)
+			}
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO users
@@ -96,7 +143,7 @@ func runBootstrap(ctx context.Context, args []string) error {
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO user_roles (tenant_id, user_id, role_id)
 			 VALUES ($1::uuid, $2, $3)`,
-			tenantID, userID, roleID); err != nil {
+			tenantID, userID, bootstrapRoles[0].id); err != nil {
 			return fmt.Errorf("assign admin role: %w", err)
 		}
 		if *issueKey {

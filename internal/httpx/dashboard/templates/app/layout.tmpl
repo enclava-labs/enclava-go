@@ -1,0 +1,62 @@
+{{define "page"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.PageTitle}} · {{.Org}}</title>
+<link rel="stylesheet" href="/dashboard/static/app.css">
+<script src="/dashboard/static/htmx.min.js" defer></script>
+<script src="/dashboard/static/app.js" defer></script>
+{{if .Module}}<script src="/dashboard/static/pages/{{.Module}}.js" defer></script>{{end}}
+</head>
+<body class="{{.Theme}}" data-caps="{{.CapsAttr}}">
+<div class="app" id="app">
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="mobilebar">
+    <button type="button" class="iconbtn mobile-menu" data-action="toggle-nav" aria-label="Open menu">{{icon "menu"}}</button>
+    <span class="brand-mark">E</span>
+    <b>{{.Org}}</b>
+    <span class="mobile-status {{.Conf.MobileTone}}" title="{{.Conf.StatusTitle}}"></span>
+    <span class="avatar">{{.User.Initials}}</span>
+  </div>
+  <aside class="sidebar" id="sidebar">
+    <button type="button" class="org" aria-label="{{.Org}}"><span class="brand-mark">E</span><span class="orgname">{{.Org}}</span><span class="chev">⌄</span></button>
+    <nav class="navgroups" id="nav">
+{{range .Nav}}      <div class="group">
+        <div class="group-title">{{.Title}}</div>
+{{range .Items}}        <a class="navlink{{if .Active}} active{{end}}" href="{{.Href}}"{{if .Active}} aria-current="page"{{end}}>{{icon .Icon}}<span class="navlabel">{{.Label}}</span>{{if .Admin}}<span class="lockhint" title="Visible to admins">{{icon "lock"}}</span>{{end}}</a>
+{{end}}      </div>
+{{end}}      <button type="button" class="iconbtn desktop-collapse" data-action="desktop-collapse" title="Collapse sidebar">{{icon "chevronLeft"}}</button>
+    </nav>
+    <div class="sidebar-bottom">
+      <button type="button" class="conf-card{{if .Conf.Total}}{{if lt .Conf.Verified .Conf.Total}} warn{{end}}{{else}} none{{end}}" data-action="conf-pop" aria-haspopup="dialog" aria-expanded="false" aria-controls="pop">
+        <span class="conf-title">{{icon "shield"}}<strong>Confidential{{if .Conf.Total}} · {{.Conf.Verified}}/{{.Conf.Total}} verified{{end}}</strong></span>
+        <small class="conf-copy">{{if .Conf.Total}}Checked {{relTime .Conf.CheckedAt}}{{else}}No confidential endpoints{{end}}</small>
+      </button>
+      <div class="userrow">
+        <span class="avatar">{{.User.Initials}}</span>
+        <div class="usertext"><b>{{.User.Name}}</b><span>{{.User.RoleLabel}}</span></div>
+        <button type="button" class="user-menu" data-action="user-menu" aria-label="User menu" aria-haspopup="dialog" aria-expanded="false" aria-controls="pop"><span aria-hidden="true">···</span></button>
+      </div>
+    </div>
+  </aside>
+  <main class="main"><div class="content" id="content">{{template "content" .}}</div></main>
+</div>
+{{template "drawer-shell" .}}
+<template id="conf-pop-tpl">
+  <p class="muted">Endpoints marked confidential only dispatch after the enclave proves its identity{{if .Conf.Total}} — {{.Conf.Verified}} of {{.Conf.Total}} verified, last checked {{relTime .Conf.CheckedAt}}{{end}}.</p>
+{{if .Can.ModelsManage}}  <div class="stack">
+{{range .Conf.Endpoints}}    <div class="row"><span>{{.Label}}</span>{{statusPill "confidential" .State.String}}{{if .VerifiedAt}}<span class="muted">Checked {{relTime .VerifiedAt}}</span>{{end}}{{if .LastError}}<span class="muted">{{.LastError}}</span>{{end}}</div>
+{{end}}  </div>
+{{end}}</template>
+<template id="user-menu-tpl">
+  <div class="stack">
+    <a class="navlink" href="/dashboard/account">{{icon "users"}}<span class="navlabel">Account</span></a>
+    <button type="button" class="navlink" data-action="theme">{{icon "sun"}}<span class="navlabel">Theme</span></button>
+    <form method="post" action="/dashboard/logout">
+      <button type="submit" class="navlink">{{icon "logout"}}<span class="navlabel">Sign out</span></button>
+    </form>
+  </div>
+</template>
+</body>
+</html>{{end}}

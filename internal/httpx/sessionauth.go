@@ -53,7 +53,12 @@ func (s *SessionAuth) tenantID(r *http.Request) (string, error) {
 func (s *SessionAuth) renderLogin(w http.ResponseWriter, r *http.Request, data dashboardLoginData) {
 	setNoStoreHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.templates.ExecuteTemplate(w, "login.tmpl", data); err != nil {
+	view := dashboardLoginView{
+		dashboardLoginData: data,
+		Org:                s.orgName(r.Context()),
+		Theme:              themeClass(r),
+	}
+	if err := s.templates.ExecuteTemplate(w, "login.tmpl", view); err != nil {
 		log.Printf("failed to render login page: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "login_render_failed")
 	}

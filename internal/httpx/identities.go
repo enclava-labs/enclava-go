@@ -4,14 +4,16 @@
 // confirmation. Tenant and actor always come from the verified principal —
 // request JSON carries payload only, never authority. Privilege escalation is
 // denied twice: the route requires platform.admin and every grant written
-// (role scopes, service-account scopes, key scopes) must be a subset of the
-// calling principal's own scopes.
+// (role scopes AND role resource grants, service-account scopes, key scopes)
+// must be a subset of the calling principal's own authority.
 package httpx
 
 import (
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -34,8 +36,20 @@ type identityPasswordRequest struct {
 }
 
 type identityRoleRequest struct {
-	Name   string   `json:"name,omitempty"`
-	Scopes []string `json:"scopes"`
+	Name   string         `json:"name,omitempty"`
+	Scopes []string       `json:"scopes"`
+	Grants *roleGrantsDTO `json:"grants,omitempty"`
+}
+
+// roleGrantsDTO is the canonical grant envelope for the roles HTTP surface:
+// each field carries the stored {"mode":"all"}/{"mode":"list","items":[...]}
+// document verbatim, in and out — there is no alternate request or response
+// shape. Absent/null/malformed fields decode deny (the storage contract).
+type roleGrantsDTO struct {
+	Models           json.RawMessage `json:"models,omitempty"`
+	Endpoints        json.RawMessage `json:"endpoints,omitempty"`
+	Assistants       json.RawMessage `json:"assistants,omitempty"`
+	ExtractTemplates json.RawMessage `json:"extract_templates,omitempty"`
 }
 
 type identityServiceAccountRequest struct {
@@ -49,7 +63,9 @@ type identityLinkRequest struct {
 	Password  string `json:"password"`
 }
 
-// redactUser strips the password hash before rendering.
+// redactUser strips the password hash before rendering. Roles render through
+// the canonical roleDTO so every user-bearing output carries the same grant
+// document shape as the roles API.
 func redactUser(u auth.User, roles []auth.Role) map[string]any {
 	out := map[string]any{
 		"id":              u.ID,
@@ -60,7 +76,7 @@ func redactUser(u auth.User, roles []auth.Role) map[string]any {
 		"password_set_at": u.PasswordSetAt,
 		"last_login_at":   u.LastLoginAt,
 		"created_at":      u.CreatedAt,
-		"roles":           roles,
+		"roles":           roleDTOList(roles),
 	}
 	return out
 }
@@ -100,6 +116,105 @@ func scopesSubsetOfCaller(caller auth.Principal, granted []string) bool {
 		}
 	}
 	return true
+}
+
+// allowlistDocJSON encodes an Allowlist as the canonical stored grant
+// document — the HTTP write-side of auth.DecodeAllowlist.
+func allowlistDocJSON(a auth.Allowlist) json.RawMessage {
+	items := make(map[string]struct{}, len(a.Items))
+	for _, id := range a.Items {
+		items[id] = struct{}{}
+	}
+	return auth.EncodeAllowlist(items, a.All)
+}
+
+// sortedItems renders a decoded item set as the sorted slice the Allowlist
+// storage type carries.
+func sortedItems(items map[string]struct{}) []string {
+	out := make([]string, 0, len(items))
+	for id := range items {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// resourceGrantsFromRequest decodes a request's grant documents into the
+// stored ResourceGrants shape; a nil envelope or absent/null/malformed field
+// decodes deny — never unrestricted.
+func resourceGrantsFromRequest(dto *roleGrantsDTO) auth.ResourceGrants {
+	decode := func(raw json.RawMessage) auth.Allowlist {
+		items, all := auth.DecodeAllowlist(raw)
+		return auth.Allowlist{Items: sortedItems(items), All: all}
+	}
+	if dto == nil {
+		return auth.ResourceGrants{}
+	}
+	return auth.ResourceGrants{
+		Models:           decode(dto.Models),
+		Endpoints:        decode(dto.Endpoints),
+		Assistants:       decode(dto.Assistants),
+		ExtractTemplates: decode(dto.ExtractTemplates),
+	}
+}
+
+// grantCoveredByCaller reports whether one stored grant document stays
+// inside the caller's authority: a mode:"all" document only where the
+// caller's matching *All flag is set, every item individually covered
+// otherwise. Shared by the role and key-grant bounds — one semantic.
+func grantCoveredByCaller(callerAll bool, covers func(string) bool, a auth.Allowlist) bool {
+	if a.All {
+		return callerAll
+	}
+	for _, id := range a.Items {
+		if !covers(id) {
+			return false
+		}
+	}
+	return true
+}
+
+// roleGrantsSubsetOfCaller denies creating or assigning role grants beyond
+// the managing caller's own resource authority (D-25). Assistants are one
+// stored kind feeding both chatbots and agents, so items pass on either.
+func roleGrantsSubsetOfCaller(caller auth.Principal, g auth.ResourceGrants) bool {
+	return grantCoveredByCaller(caller.AllowedModelsAll, func(id string) bool { return auth.ModelAllowed(caller, id) }, g.Models) &&
+		grantCoveredByCaller(caller.AllowedEndpointsAll, func(id string) bool { return auth.EndpointAllowed(caller, id) }, g.Endpoints) &&
+		grantCoveredByCaller(caller.AllowedChatbotsAll && caller.AllowedAgentsAll,
+			func(id string) bool { return auth.ChatbotAllowed(caller, id) || auth.AgentAllowed(caller, id) }, g.Assistants) &&
+		grantCoveredByCaller(caller.AllowedExtractTemplatesAll, func(id string) bool { return auth.ExtractTemplateAllowed(caller, id) }, g.ExtractTemplates)
+}
+
+// roleDTO renders one role for HTTP — the single canonical shape for every
+// role-bearing output (list/get/create, nested user roles and /me). Grants
+// are re-encoded from role.Grants, so each emitted document round-trips
+// through DecodeAllowlist unchanged.
+func roleDTO(role auth.Role, userIDs []string) map[string]any {
+	out := map[string]any{
+		"id":     role.ID,
+		"name":   role.Name,
+		"scopes": role.Scopes,
+		"grants": map[string]any{
+			"models":            allowlistDocJSON(role.Grants.Models),
+			"endpoints":         allowlistDocJSON(role.Grants.Endpoints),
+			"assistants":        allowlistDocJSON(role.Grants.Assistants),
+			"extract_templates": allowlistDocJSON(role.Grants.ExtractTemplates),
+		},
+		"created_at": role.CreatedAt,
+	}
+	if userIDs != nil {
+		out["user_ids"] = userIDs
+	}
+	return out
+}
+
+// roleDTOList renders roles without membership expansion.
+func roleDTOList(roles []auth.Role) []map[string]any {
+	out := make([]map[string]any, 0, len(roles))
+	for _, ro := range roles {
+		out = append(out, roleDTO(ro, nil))
+	}
+	return out
 }
 
 // lastAdminExcluded denies mutations that would remove the tenant's last
@@ -262,7 +377,7 @@ func (a *App) handleIdentityUserByID(w http.ResponseWriter, r *http.Request, pri
 				WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "roles_list_failed")
 				return
 			}
-			WriteJSON(w, http.StatusOK, map[string]any{"roles": roles})
+			WriteJSON(w, http.StatusOK, map[string]any{"roles": roleDTOList(roles)})
 			return
 		}
 		if len(segs) != 3 {
@@ -376,6 +491,12 @@ func (a *App) assignRoleChecked(w http.ResponseWriter, r *http.Request, principa
 	}
 	if !scopesSubsetOfCaller(principal, role.Scopes) {
 		WriteForbidden(w, "role grants scopes the caller does not hold")
+		return false
+	}
+	// Assigning an existing role is itself a grant of that role's resource
+	// authority — it can never widen the caller's own (D-25).
+	if !roleGrantsSubsetOfCaller(principal, role.Grants) {
+		WriteForbidden(w, "role grants exceed the caller's resource authority")
 		return false
 	}
 	if err := a.identity.AssignRole(r.Context(), principal.TenantID, userID, roleID); err != nil {
@@ -513,10 +634,7 @@ func (a *App) handleIdentityRoles(w http.ResponseWriter, r *http.Request, princi
 				WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "roles_list_failed")
 				return
 			}
-			out = append(out, map[string]any{
-				"id": ro.ID, "name": ro.Name, "scopes": ro.Scopes,
-				"user_ids": userIDs, "created_at": ro.CreatedAt,
-			})
+			out = append(out, roleDTO(ro, userIDs))
 		}
 		WriteJSON(w, http.StatusOK, map[string]any{"roles": out})
 	case http.MethodPost:
@@ -534,15 +652,20 @@ func (a *App) handleIdentityRoles(w http.ResponseWriter, r *http.Request, princi
 			WriteForbidden(w, "role scopes must be a subset of the caller's scopes")
 			return
 		}
-		role := auth.Role{ID: NewID("role"), Name: name, Scopes: req.Scopes}
+		// Deny by default: an absent grants envelope stores explicit empty
+		// deny lists — never nil→all (that legacy nil→all is keys-only).
+		grants := resourceGrantsFromRequest(req.Grants)
+		if !roleGrantsSubsetOfCaller(principal, grants) {
+			WriteForbidden(w, "role grants exceed the caller's resource authority")
+			return
+		}
+		role := auth.Role{ID: NewID("role"), Name: name, Scopes: req.Scopes, Grants: grants}
 		if err := a.identity.CreateRole(r.Context(), principal.TenantID, role); err != nil {
 			log.Printf("create role: %v", err)
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "role_create_failed")
 			return
 		}
-		WriteJSON(w, http.StatusCreated, map[string]any{
-			"id": role.ID, "name": role.Name, "scopes": role.Scopes,
-		})
+		WriteJSON(w, http.StatusCreated, roleDTO(role, nil))
 	default:
 		WriteMethodNotAllowed(w)
 	}
@@ -571,10 +694,7 @@ func (a *App) handleIdentityRoleByID(w http.ResponseWriter, r *http.Request, pri
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "roles_list_failed")
 			return
 		}
-		WriteJSON(w, http.StatusOK, map[string]any{
-			"id": role.ID, "name": role.Name, "scopes": role.Scopes,
-			"user_ids": userIDs, "created_at": role.CreatedAt,
-		})
+		WriteJSON(w, http.StatusOK, roleDTO(role, userIDs))
 	default:
 		WriteMethodNotAllowed(w)
 	}

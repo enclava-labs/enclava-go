@@ -11,11 +11,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"enclava-go/internal/auth"
+	"enclava-go/internal/chatbot"
+	"enclava-go/internal/connectors"
+	"enclava-go/internal/inference"
+	"enclava-go/internal/jobs"
+	"enclava-go/internal/prompts"
+	"enclava-go/internal/rag"
 	"enclava-go/internal/store/postgres"
 	"enclava-go/internal/testdb"
 )
@@ -43,9 +50,20 @@ func newIdentityFixture(t *testing.T) *identityFixture {
 		Scopes:      []string{auth.ScopePlatformAdmin},
 	})
 	authSvc := auth.NewService(repo, "")
-	sessionAuth := NewSessionAuth(authSvc, auth.NewOIDCService(repo, nil), time.Hour, dashboardTemplates, "bootstrap")
-	app := NewApp(authSvc, nil, "", nil, repo, nil, nil, nil, nil, nil, nil, nil, nil,
-		"sha256", "", "enc_", nil, sessionAuth, 1, false, nil, nil, GateConfig{}, nil, nil)
+	sessionAuth := NewSessionAuth(authSvc, auth.NewOIDCService(repo, nil), time.Hour, DashboardAuthTemplates(), "bootstrap")
+	// Every service the grant matrix touches is real, so inner manage
+	// checks execute (the production nil-service guards stay in place and
+	// unreachable).
+	jobsRepo := postgres.NewJobsRepo(db)
+	jobsSvc := jobs.NewService(jobsRepo, 0)
+	sourceRepo := postgres.NewSourceRepo(db)
+	ragSvc := rag.NewService(postgres.NewRAGRepo(db), nil, nil, "", nil, jobsSvc)
+	chatSvc := chatbot.NewService(postgres.NewChatbotRepo(db), postgres.NewPromptsRepo(db), ragSvc, nil)
+	promptSvc := prompts.NewService(postgres.NewPromptsRepo(db), chatSvc)
+	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepo)
+	app := NewApp(authSvc, nil, "", nil, repo, nil, ragSvc, promptSvc, chatSvc, connectorSvc, nil, nil, postgres.NewEndpointsRepo(db),
+		"sha256", "", "enc_", nil, sessionAuth, 1, false, nil, nil, GateConfig{}, sourceRepo, postgres.NewArtifactRepo(db))
+	app.ConfigureMCP(postgres.NewMCPToolsRepo(db), nil)
 	return &identityFixture{app: app, repo: repo, db: db, tenant: tenant, adminKey: key}
 }
 
@@ -487,5 +505,305 @@ func TestLastAdminGuardAndKeyScopeSubset(t *testing.T) {
 	}
 	if second["secret_key"] == "" {
 		t.Fatalf("one-time secret must be returned on create")
+	}
+}
+
+// grantDocBytes renders one emitted grant document back to bytes so it can
+// round-trip through auth.DecodeAllowlist exactly as a client would.
+func grantDocBytes(t *testing.T, doc any) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal grant doc %v: %v", doc, err)
+	}
+	return raw
+}
+
+// assertDenyDocs asserts a grants envelope carries the canonical explicit
+// deny document on all four kinds — decodes deny, never all.
+func assertDenyDocs(t *testing.T, grants any, label string) {
+	t.Helper()
+	m, ok := grants.(map[string]any)
+	if !ok {
+		t.Fatalf("%s grants not an object: %v", label, grants)
+	}
+	for _, kind := range []string{"models", "endpoints", "assistants", "extract_templates"} {
+		doc, ok := m[kind]
+		if !ok {
+			t.Fatalf("%s grants missing %q: %v", label, kind, m)
+		}
+		items, all := auth.DecodeAllowlist(grantDocBytes(t, doc))
+		if all || len(items) != 0 {
+			t.Fatalf("%s grants[%s] = %v, want explicit deny document", label, kind, doc)
+		}
+	}
+}
+
+// TestIdentityRoleCreateGrantsBounded proves the canonical role grant
+// contract end to end: canonical write→store→read→principal documents,
+// deny-by-default, caller-bounded writes on create AND assignment, and real
+// consumer enforcement (/v1/models intersection, /api/v1/chatbots list).
+func TestIdentityRoleCreateGrantsBounded(t *testing.T) {
+	f := newIdentityFixture(t)
+	ctx := context.Background()
+
+	// (a) mode:all round-trip — the canonical write→store→read→principal
+	// path only; consumer proof stays separate below.
+	rec := f.admin(t, http.MethodPost, "/api/v1/identities/roles",
+		`{"name":"all-roundtrip","scopes":["platform.admin"],"grants":{"models":{"mode":"list","items":["m1"]},"assistants":{"mode":"all"}}}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("all-grant role create: %d %s", rec.Code, rec.Body.String())
+	}
+	created := decodeJSON(t, rec)
+	roleID := created["id"].(string)
+	wantList := map[string]any{"mode": "list", "items": []any{"m1"}}
+	wantAll := map[string]any{"mode": "all"}
+	grants := created["grants"].(map[string]any)
+	if !reflect.DeepEqual(grants["models"], wantList) || !reflect.DeepEqual(grants["assistants"], wantAll) {
+		t.Fatalf("create response grants = %v", grants)
+	}
+	// The omitted kinds carry explicit deny documents, never nil→all.
+	assertDenyDocs(t, map[string]any{
+		"models": `{"mode":"list","items":[]}`, "endpoints": grants["endpoints"],
+		"assistants": `{"mode":"list","items":[]}`, "extract_templates": grants["extract_templates"],
+	}, "create response omitted kinds")
+	if _, all := auth.DecodeAllowlist(grantDocBytes(t, grants["endpoints"])); all {
+		t.Fatalf("omitted endpoints must store explicit deny, got %v", grants["endpoints"])
+	}
+	if _, all := auth.DecodeAllowlist(grantDocBytes(t, grants["extract_templates"])); all {
+		t.Fatalf("omitted extract_templates must store explicit deny, got %v", grants["extract_templates"])
+	}
+
+	rec = f.admin(t, http.MethodGet, "/api/v1/identities/roles/"+roleID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("role GET: %d %s", rec.Code, rec.Body.String())
+	}
+	echoed := decodeJSON(t, rec)["grants"].(map[string]any)
+	if !reflect.DeepEqual(echoed["models"], wantList) || !reflect.DeepEqual(echoed["assistants"], wantAll) {
+		t.Fatalf("role GET grants = %v", echoed)
+	}
+
+	roundtrip := testdb.SeedUser(t, f.db, f.tenant, "roundtrip@example.com", nil)
+	setPassword(t, f.repo, f.tenant, roundtrip.ID, "round-pass")
+	rec = f.admin(t, http.MethodPost, "/api/v1/identities/users/"+roundtrip.ID+"/roles/"+roleID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("assign all-grant role: %d %s", rec.Code, rec.Body.String())
+	}
+	principal, err := f.app.authSvc.AuthenticatePassword(ctx, f.tenant, "roundtrip@example.com", "round-pass")
+	if err != nil {
+		t.Fatalf("authenticate roundtrip user: %v", err)
+	}
+	if !auth.ModelAllowed(principal, "m1") || auth.ModelAllowed(principal, "m2") {
+		t.Fatalf("stored model grant wrong: m1=%v m2=%v", auth.ModelAllowed(principal, "m1"), auth.ModelAllowed(principal, "m2"))
+	}
+	if !principal.AllowedChatbotsAll || !principal.AllowedAgentsAll ||
+		!auth.ChatbotAllowed(principal, "any-bot") || !auth.AgentAllowed(principal, "any-bot") {
+		t.Fatalf("assistants mode:all did not reach the principal: %+v", principal)
+	}
+	if auth.EndpointAllowed(principal, "ep1") || auth.ExtractTemplateAllowed(principal, "t1") {
+		t.Fatalf("absent grant kinds must deny: %+v", principal)
+	}
+
+	// (b) LIMITED-CONSUMER proof — nonempty explicit lists on ALL FOUR
+	// kinds, enforced through the real consumers. The member's grants must
+	// supply BOTH the model alias AND its endpoint: permittedModels
+	// intersects endpoint and model grants.
+	consumerSess, _ := loginUserWithGrants(t, f, "consumer@example.com",
+		[]string{"models.list", "chatbot"},
+		auth.ResourceGrants{
+			Models:           auth.Allowlist{Items: []string{"m1"}},
+			Endpoints:        auth.Allowlist{Items: []string{"ep1"}},
+			Assistants:       auth.Allowlist{Items: []string{"bot1"}},
+			ExtractTemplates: auth.Allowlist{Items: []string{"t1"}},
+		}, "consumer-pass")
+	consumer, err := f.repo.GetUserByEmail(ctx, f.tenant, "consumer@example.com")
+	if err != nil {
+		t.Fatalf("fetch consumer: %v", err)
+	}
+
+	endpointsRepo := postgres.NewEndpointsRepo(f.db)
+	for _, ep := range []struct{ id, alias string }{{"ep1", "m1"}, {"ep2", "m2"}} {
+		if err := endpointsRepo.Create(ctx, inference.Endpoint{
+			ID: ep.id, TenantID: f.tenant, Protocol: "openai_compatible",
+			BaseOrigin:   "https://" + ep.id + ".upstream.test",
+			Capabilities: []string{inference.CapabilityChat, inference.ModelCapabilityPrefix + ep.alias},
+			Enabled:      true,
+		}); err != nil {
+			t.Fatalf("seed endpoint %s: %v", ep.id, err)
+		}
+	}
+	botRepo := postgres.NewChatbotRepo(f.db)
+	for _, b := range []chatbot.Instance{
+		{TenantID: f.tenant, ID: "bot1", ExternalID: "bot1", Name: "Bot One", IsEnabled: true},
+		{TenantID: f.tenant, ID: "bot2", ExternalID: "bot2", Name: "Bot Two", IsEnabled: true},
+	} {
+		if err := botRepo.Create(ctx, b); err != nil {
+			t.Fatalf("seed chatbot %s: %v", b.ID, err)
+		}
+	}
+
+	rec = sessionDo(t, f.app, http.MethodGet, "/v1/models", "", consumerSess, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("consumer models list: %d %s", rec.Code, rec.Body.String())
+	}
+	var modelList struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &modelList); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	if len(modelList.Data) != 1 || modelList.Data[0].ID != "m1" {
+		t.Fatalf("endpoint+model intersection wrong, got %v", modelList.Data)
+	}
+	if rec := sessionDo(t, f.app, http.MethodGet, "/v1/models/m2", "", consumerSess, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("ungranted model expected 404, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = sessionDo(t, f.app, http.MethodGet, "/api/v1/chatbots", "", consumerSess, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("consumer chatbots list: %d %s", rec.Code, rec.Body.String())
+	}
+	var botList struct {
+		Chatbots []chatbot.Instance `json:"chatbots"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &botList); err != nil {
+		t.Fatalf("decode chatbots: %v", err)
+	}
+	if len(botList.Chatbots) != 1 || botList.Chatbots[0].ID != "bot1" {
+		t.Fatalf("assistant grant filter wrong, got %+v", botList.Chatbots)
+	}
+	if rec := sessionDo(t, f.app, http.MethodGet, "/api/v1/chatbots/bot2", "", consumerSess, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("ungranted chatbot expected 404, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// REVOCATION on the SAME session: the stored document is the single
+	// source — the union is rebuilt per request, no re-login needed.
+	if _, err := f.db.SQL.ExecContext(ctx,
+		`UPDATE roles SET allowed_models='{"mode":"list","items":[]}'::jsonb
+		 WHERE tenant_id = $1::uuid AND id IN (SELECT role_id FROM user_roles WHERE user_id = $2)`,
+		f.tenant, consumer.ID); err != nil {
+		t.Fatalf("revoke models grant: %v", err)
+	}
+	rec = sessionDo(t, f.app, http.MethodGet, "/v1/models", "", consumerSess, nil)
+	if err := json.Unmarshal(rec.Body.Bytes(), &modelList); err != nil {
+		t.Fatalf("decode models after revocation: %v", err)
+	}
+	if len(modelList.Data) != 0 {
+		t.Fatalf("revoked model grant still visible: %v", modelList.Data)
+	}
+
+	// (c) LIMITED-caller rejection table through a real role-backed session:
+	// an endpoint-denied API-key caller would be rejected by the endpoint
+	// prefilter before the handler, so only sessions prove this bound.
+	limitedSess, limitedCSRF := loginUserWithGrants(t, f, "grant-admin@example.com",
+		[]string{auth.ScopePlatformAdmin},
+		auth.ResourceGrants{
+			Models:           auth.Allowlist{Items: []string{"m1"}},
+			Endpoints:        auth.Allowlist{Items: []string{"ep1"}},
+			Assistants:       auth.Allowlist{Items: []string{"bot1"}},
+			ExtractTemplates: auth.Allowlist{Items: []string{"t1"}},
+		}, "limited-pass")
+	postRole := func(body string) *httptest.ResponseRecorder {
+		return sessionDo(t, f.app, http.MethodPost, "/api/v1/identities/roles", body, limitedSess, limitedCSRF)
+	}
+	for _, tc := range []struct{ kind, body string }{
+		{"models", `{"name":"over-models","scopes":[],"grants":{"models":{"mode":"list","items":["m2"]}}}`},
+		{"endpoints", `{"name":"over-endpoints","scopes":[],"grants":{"endpoints":{"mode":"list","items":["ep2"]}}}`},
+		{"assistants", `{"name":"over-assistants","scopes":[],"grants":{"assistants":{"mode":"list","items":["bot2"]}}}`},
+		{"extract_templates", `{"name":"over-templates","scopes":[],"grants":{"extract_templates":{"mode":"list","items":["t2"]}}}`},
+		{"models mode:all", `{"name":"over-all","scopes":[],"grants":{"models":{"mode":"all"}}}`},
+	} {
+		rec := postRole(tc.body)
+		if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "resource authority") {
+			t.Fatalf("out-of-authority %s create: expected 403 resource-authority refusal, got %d %s", tc.kind, rec.Code, rec.Body.String())
+		}
+	}
+	// The positive anchor: exactly the granted items on every kind → 201.
+	rec = postRole(`{"name":"in-authority","scopes":[],"grants":{` +
+		`"models":{"mode":"list","items":["m1"]},` +
+		`"endpoints":{"mode":"list","items":["ep1"]},` +
+		`"assistants":{"mode":"list","items":["bot1"]},` +
+		`"extract_templates":{"mode":"list","items":["t1"]}}}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("in-authority role create: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// (d) POST with no grants stores explicit deny — real deny, not display.
+	rec = f.admin(t, http.MethodPost, "/api/v1/identities/roles", `{"name":"deny-default","scopes":[]}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("deny-default role create: %d %s", rec.Code, rec.Body.String())
+	}
+	denyRole := decodeJSON(t, rec)
+	denyRoleID := denyRole["id"].(string)
+	assertDenyDocs(t, denyRole["grants"], "create response")
+	rec = f.admin(t, http.MethodGet, "/api/v1/identities/roles/"+denyRoleID, "")
+	assertDenyDocs(t, decodeJSON(t, rec)["grants"], "role GET")
+	rec = f.admin(t, http.MethodGet, "/api/v1/identities/roles", "")
+	for _, ro := range decodeJSON(t, rec)["roles"].([]any) {
+		if m := ro.(map[string]any); m["id"] == denyRoleID {
+			assertDenyDocs(t, m["grants"], "roles list")
+		}
+	}
+
+	denied := testdb.SeedUser(t, f.db, f.tenant, "denied@example.com", nil)
+	setPassword(t, f.repo, f.tenant, denied.ID, "denied-pass")
+	rec = f.admin(t, http.MethodPost, "/api/v1/identities/users/"+denied.ID+"/roles/"+denyRoleID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("assign deny role: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// (e) DTO-canonical assertions on EVERY role output.
+	rec = f.admin(t, http.MethodGet, "/api/v1/identities/users/"+denied.ID, "")
+	userRoles := decodeJSON(t, rec)["roles"].([]any)
+	if len(userRoles) != 1 {
+		t.Fatalf("users GET roles = %v", userRoles)
+	}
+	assertDenyDocs(t, userRoles[0].(map[string]any)["grants"], "users GET")
+	rec = f.admin(t, http.MethodGet, "/api/v1/identities/users/"+denied.ID+"/roles", "")
+	assertDenyDocs(t, decodeJSON(t, rec)["roles"].([]any)[0].(map[string]any)["grants"], "membership roles list")
+	deniedSess, _ := login(t, f.app, "denied@example.com", "denied-pass")
+	rec = sessionDo(t, f.app, http.MethodGet, "/api/v1/identities/me", "", deniedSess, nil)
+	meRoles := decodeJSON(t, rec)["roles"].([]any)
+	if len(meRoles) != 1 {
+		t.Fatalf("/me roles = %v", meRoles)
+	}
+	assertDenyDocs(t, meRoles[0].(map[string]any)["grants"], "/me")
+
+	principal, err = f.app.authSvc.AuthenticatePassword(ctx, f.tenant, "denied@example.com", "denied-pass")
+	if err != nil {
+		t.Fatalf("authenticate denied user: %v", err)
+	}
+	if auth.ModelAllowed(principal, "m1") || auth.EndpointAllowed(principal, "ep1") ||
+		auth.ChatbotAllowed(principal, "bot1") || auth.AgentAllowed(principal, "bot1") ||
+		auth.ExtractTemplateAllowed(principal, "t1") {
+		t.Fatalf("deny-default role must yield zero resource authority: %+v", principal)
+	}
+
+	// (f) assignRoleChecked bound: assigning an existing role can never
+	// widen the caller's resource authority — direct membership AND the
+	// create-user role_ids path.
+	rec = f.admin(t, http.MethodPost, "/api/v1/identities/roles",
+		`{"name":"wide-role","scopes":[],"grants":{"models":{"mode":"list","items":["m2"]}}}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("wide role create: %d %s", rec.Code, rec.Body.String())
+	}
+	wideRoleID := decodeJSON(t, rec)["id"].(string)
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/identities/users/"+denied.ID+"/roles/"+wideRoleID, "", limitedSess, limitedCSRF)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "resource authority") {
+		t.Fatalf("out-of-authority assignment expected 403, got %d %s", rec.Code, rec.Body.String())
+	}
+	rec = f.admin(t, http.MethodPost, "/api/v1/identities/roles",
+		`{"name":"narrow-role","scopes":[],"grants":{"models":{"mode":"list","items":["m1"]}}}`)
+	narrowRoleID := decodeJSON(t, rec)["id"].(string)
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/identities/users/"+denied.ID+"/roles/"+narrowRoleID, "", limitedSess, limitedCSRF)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("in-authority assignment expected 200, got %d %s", rec.Code, rec.Body.String())
+	}
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/identities/users",
+		`{"email":"created@example.com","password":"created-pass","role_ids":["`+wideRoleID+`"]}`, limitedSess, limitedCSRF)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "resource authority") {
+		t.Fatalf("create-user role_ids escalation expected 403, got %d %s", rec.Code, rec.Body.String())
 	}
 }

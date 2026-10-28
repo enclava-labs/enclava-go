@@ -257,7 +257,7 @@ func main() {
 
 	// Browser dashboard login runs on the server-session handlers from 01-12;
 	// the configured slug resolves per request so `enclava bootstrap` order is free.
-	sessionAuth := httpx.NewSessionAuth(authSvc, auth.NewOIDCService(identityRepo, auth.EnvSecretResolver), cfg.SessionTTL, httpx.DashboardTemplates(), cfg.SessionTenantSlug)
+	sessionAuth := httpx.NewSessionAuth(authSvc, auth.NewOIDCService(identityRepo, auth.EnvSecretResolver), cfg.SessionTTL, httpx.DashboardAuthTemplates(), cfg.SessionTenantSlug)
 
 	app := httpx.NewApp(
 		authSvc,

@@ -156,21 +156,11 @@ type dashboardExtractData struct {
 	Templates  []extract.Template
 }
 
-func (a *App) registerDashboardRoutes() {
-	a.mux.Handle("/dashboard/static/", http.StripPrefix("/dashboard/static/", http.FileServer(http.FS(dashboardStaticFiles))))
-	a.mux.HandleFunc("/dashboard/login", a.sessionAuth.HandleLogin)
-	a.mux.HandleFunc("/dashboard/logout", a.sessionAuth.HandleLogout)
-	a.mux.HandleFunc("/auth/oidc/link", a.sessionAuth.HandleLinkIdentity)
-	a.mux.HandleFunc("/auth/oidc/", func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/start"):
-			a.sessionAuth.HandleOIDCStart(w, r)
-		case strings.HasSuffix(r.URL.Path, "/callback"):
-			a.sessionAuth.HandleOIDCCallback(w, r)
-		default:
-			http.NotFound(w, r)
-		}
-	})
+// registerLegacyDashboardRoutes registers the pre-phase-7 dashboard partials
+// and pages only — static/auth routes live in dashboard_shell.go now; the
+// /dashboard/ subtree stays the phase-6 404 catch-all until each page phase
+// replaces its own registration (deletions ride WITH the replacement).
+func (a *App) registerLegacyDashboardRoutes() {
 	// Dashboard data endpoints carry the same scope as the equivalent
 	// /api/v1 route — session sign-in alone never widens what a member may
 	// read or change. Mutating POST branches keep an additional *.manage
@@ -598,6 +588,13 @@ func (a *App) createDashboardAPIKey(w http.ResponseWriter, r *http.Request, tena
 		a.renderDashboardKeys(w, r.Context(), tenantID, "Key scopes must be a subset of your scopes")
 		return
 	}
+	// The form carries no grant fields, so the built record requests
+	// mode:all on every resource — only a caller holding all of them may
+	// mint it (D-25).
+	if !principalCoversKeyGrants(principal, key) {
+		a.renderDashboardKeys(w, r.Context(), tenantID, "Key resource grants exceed your authority")
+		return
+	}
 	plaintext, prefix, hash, usedAlgo, err := a.generateKey(a.apiKeyPrefix, a.apiKeyAlgo, a.apiKeyPepper)
 	if err != nil {
 		log.Printf("failed to generate dashboard API key: %v", err)
@@ -626,6 +623,16 @@ func (a *App) toggleDashboardAPIKey(w http.ResponseWriter, r *http.Request, tena
 	if err != nil {
 		a.renderDashboardKeys(w, r.Context(), tenantID, "API key not found")
 		return
+	}
+	// Bound only the ACTIVATE edge: re-arming re-opens the key's stored
+	// grants, so they must sit inside the operator's own authority.
+	// Deactivation stays free — disabling never grants anything.
+	if !key.IsActive {
+		principal, _ := auth.PrincipalFromContext(r.Context())
+		if !principalCoversKeyGrants(principal, key) {
+			a.renderDashboardKeys(w, r.Context(), tenantID, "Key resource grants exceed your authority")
+			return
+		}
 	}
 	key.IsActive = !key.IsActive
 	if err := a.identity.UpdateAPIKey(r.Context(), tenantID, key); err != nil {
@@ -659,6 +666,14 @@ func (a *App) regenerateDashboardAPIKey(w http.ResponseWriter, r *http.Request, 
 	key, err := a.identity.GetAPIKey(r.Context(), tenantID, id)
 	if err != nil {
 		a.renderDashboardKeys(w, r.Context(), tenantID, "API key not found")
+		return
+	}
+	// A regenerated secret re-arms the key immediately: refuse before any
+	// secret is generated or stored when the stored grants exceed the
+	// operator's authority — KeyPrefix/KeyHash/IsActive stay untouched.
+	principal, _ := auth.PrincipalFromContext(r.Context())
+	if !principalCoversKeyGrants(principal, key) {
+		a.renderDashboardKeys(w, r.Context(), tenantID, "Key resource grants exceed your authority")
 		return
 	}
 

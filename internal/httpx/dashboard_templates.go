@@ -59,42 +59,50 @@ var dashboardBaseFuncs = template.FuncMap{
 }
 
 var (
-	dashboardBaseOnce sync.Once
-	dashboardBaseSet  *template.Template
-	dashboardBaseErr  error
+	dashboardBaseGlobsOnce sync.Once
+	dashboardBaseGlobs     []string
+	dashboardBaseGlobsErr  error
 )
 
-// dashboardBaseTemplates parses the shared app tree once: layout.tmpl plus the
-// components/ and partials/ globs. Globs matching zero files are skipped —
-// partials/ legitimately has no files until 07-03, and ParseFS rejects empty
-// matches. Layout.tmpl not existing yet is fine: the base builds lazily at the
-// first page request.
-func dashboardBaseTemplates() (*template.Template, error) {
-	dashboardBaseOnce.Do(func() {
+// dashboardBaseGlobList resolves the shared app-tree globs once: layout.tmpl
+// plus the components/ and partials/ globs. Globs matching zero files are
+// skipped — partials/ legitimately starts empty and ParseFS rejects empty
+// matches.
+func dashboardBaseGlobList() ([]string, error) {
+	dashboardBaseGlobsOnce.Do(func() {
 		globs := []string{
 			"dashboard/templates/app/layout.tmpl",
 			"dashboard/templates/app/components/*.tmpl",
 			"dashboard/templates/app/partials/*.tmpl",
 		}
-		var present []string
 		for _, g := range globs {
 			if m, err := fs.Glob(dashboardAppTemplateFS, g); err == nil && len(m) > 0 {
-				present = append(present, g)
+				dashboardBaseGlobs = append(dashboardBaseGlobs, g)
 			}
 		}
-		if len(present) == 0 {
-			dashboardBaseErr = fmt.Errorf("dashboard app templates: no layout, components or partials found")
-			return
+		if len(dashboardBaseGlobs) == 0 {
+			dashboardBaseGlobsErr = fmt.Errorf("dashboard app templates: no layout, components or partials found")
 		}
-		t := template.New("app").Funcs(dashboardBaseFuncs)
-		for _, g := range present {
-			if t, dashboardBaseErr = t.ParseFS(dashboardAppTemplateFS, g); dashboardBaseErr != nil {
-				return
-			}
-		}
-		dashboardBaseSet = t
 	})
-	return dashboardBaseSet, dashboardBaseErr
+	return dashboardBaseGlobs, dashboardBaseGlobsErr
+}
+
+// dashboardBaseTemplates parses a fresh copy of the shared app tree for tests
+// and one-off inspection. Page rendering goes through the cached
+// dashboardTemplateSet; this helper never caches because html/template trees
+// cannot be reused across executions via Clone.
+func dashboardBaseTemplates() (*template.Template, error) {
+	globs, err := dashboardBaseGlobList()
+	if err != nil {
+		return nil, err
+	}
+	set := template.New("app").Funcs(dashboardBaseFuncs)
+	for _, g := range globs {
+		if set, err = set.ParseFS(dashboardAppTemplateFS, g); err != nil {
+			return nil, err
+		}
+	}
+	return set, nil
 }
 
 type dashboardTemplateSetEntry struct {
@@ -105,11 +113,13 @@ type dashboardTemplateSetEntry struct {
 var dashboardTemplateSets sync.Map // page name → dashboardTemplateSetEntry
 
 // dashboardTemplateSet is the single entry page handlers (07-03
-// renderDashboard/renderDashboardFragment) call through: parse-once base,
-// clone per page, page file parsed into the clone. Safe for concurrent use —
-// at most one build per page, and a parse error is cached (restart to pick up
-// template fixes). 07-03 executes the result into a buffer before any 200
-// (P7-10); the cloned set is the primitive that contract needs.
+// renderDashboard/renderDashboardFragment) call through. Each page parses the
+// shared tree plus its own file into a FRESH template — html/template shares
+// trees on Clone and refuses to Clone a set that has already executed, so a
+// parse-once/clone-per-page scheme deadlocks on the second page after the
+// first render. Sets are cached per page; a parse error is cached (restart to
+// pick up template fixes). 07-03 executes the result into a buffer before any
+// 200 (P7-10).
 func dashboardTemplateSet(page string) (*template.Template, error) {
 	if v, ok := dashboardTemplateSets.Load(page); ok {
 		e := v.(dashboardTemplateSetEntry)
@@ -127,13 +137,15 @@ func dashboardBuildTemplateSet(page string) dashboardTemplateSetEntry {
 	if _, err := fs.Stat(dashboardAppTemplateFS, pagePath); err != nil {
 		return dashboardTemplateSetEntry{err: fmt.Errorf("dashboard page %q: %w", page, os.ErrNotExist)}
 	}
-	base, err := dashboardBaseTemplates()
+	globs, err := dashboardBaseGlobList()
 	if err != nil {
 		return dashboardTemplateSetEntry{err: fmt.Errorf("dashboard page %q: %w", page, err)}
 	}
-	set, err := base.Clone()
-	if err != nil {
-		return dashboardTemplateSetEntry{err: fmt.Errorf("dashboard page %q: %w", page, err)}
+	set := template.New("app").Funcs(dashboardBaseFuncs)
+	for _, g := range globs {
+		if set, err = set.ParseFS(dashboardAppTemplateFS, g); err != nil {
+			return dashboardTemplateSetEntry{err: fmt.Errorf("dashboard page %q: %w", page, err)}
+		}
 	}
 	src, err := fs.ReadFile(dashboardAppTemplateFS, pagePath)
 	if err != nil {

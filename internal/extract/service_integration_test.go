@@ -846,3 +846,71 @@ func TestProcessAdmissionLimitCountsOnlyQueuedAndRunning(t *testing.T) {
 		t.Fatalf("terminal job still counted: %v", err)
 	}
 }
+
+// TestProcessBoundedByStoredTemplateGrants proves the stored role grant
+// document is the extract template gate's single source (R2): a principal
+// whose role grants extract_templates [t1] passes the gate for t1 and fails
+// for unlisted t2, and a SQL revocation denies t1 on the next request with
+// no re-login — the per-request union, not a cached credential.
+func TestProcessBoundedByStoredTemplateGrants(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract")
+	for _, tpl := range []extract.Template{
+		{ID: "t1", Name: "Granted", SystemPrompt: "s", UserPrompt: "u", DefaultModel: "priced-extract", Enabled: true},
+		{ID: "t2", Name: "Unlisted", SystemPrompt: "s", UserPrompt: "u", DefaultModel: "priced-extract", Enabled: true},
+	} {
+		f.seedTemplate(t, tpl)
+	}
+
+	user := testdb.SeedUserWithGrants(t, f.db, f.tenant, "granted@example.com",
+		[]string{"extract"},
+		auth.ResourceGrants{ExtractTemplates: auth.Allowlist{Items: []string{"t1"}}})
+	authSvc := auth.NewService(postgres.NewIdentityRepo(f.db), "")
+	principal, err := authSvc.PrincipalForActor(ctx, f.tenant, user.ID)
+	if err != nil {
+		t.Fatalf("principal for granted user: %v", err)
+	}
+
+	// Granted template runs past the template gate: the extraction job row
+	// exists before Process returns (same seam as
+	// TestProcessPersistsInputArtifactAndJobRow).
+	out, err := f.svc.Process(ctx, principal, extract.ProcessInput{
+		TemplateID: "t1", FileName: "invoice.txt", MimeType: "text/plain",
+		Bytes: []byte("invoice text"),
+	})
+	if err != nil {
+		t.Fatalf("granted template process: %v", err)
+	}
+	job, err := f.jobsSvc.Get(ctx, principal, out.JobID)
+	if err != nil || job.Operation != extract.OperationProcess || job.InputRef == "" {
+		t.Fatalf("granted template job row missing: job=%+v err=%v", job, err)
+	}
+
+	// Unlisted template denies at the gate.
+	if _, err := f.svc.Process(ctx, principal, extract.ProcessInput{
+		TemplateID: "t2", FileName: "invoice.txt", MimeType: "text/plain",
+		Bytes: []byte("invoice text"),
+	}); !errors.Is(err, extract.ErrForbidden) {
+		t.Fatalf("unlisted template = %v, want ErrForbidden", err)
+	}
+
+	// SQL revocation on the stored document denies the SAME template on the
+	// next request — the principal union is rebuilt per request, no re-login.
+	if _, err := f.db.SQL.ExecContext(ctx,
+		`UPDATE roles SET allowed_extract_templates='{"mode":"list","items":[]}'::jsonb
+		 WHERE tenant_id = $1::uuid AND id IN (SELECT role_id FROM user_roles WHERE user_id = $2)`,
+		f.tenant, user.ID); err != nil {
+		t.Fatalf("revoke template grant: %v", err)
+	}
+	principal, err = authSvc.PrincipalForActor(ctx, f.tenant, user.ID)
+	if err != nil {
+		t.Fatalf("reload principal: %v", err)
+	}
+	if _, err := f.svc.Process(ctx, principal, extract.ProcessInput{
+		TemplateID: "t1", FileName: "invoice.txt", MimeType: "text/plain",
+		Bytes: []byte("invoice text"),
+	}); !errors.Is(err, extract.ErrForbidden) {
+		t.Fatalf("revoked template = %v, want ErrForbidden", err)
+	}
+}

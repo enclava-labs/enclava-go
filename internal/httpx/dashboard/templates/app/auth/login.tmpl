@@ -1,0 +1,49 @@
+{{define "login.tmpl"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sign in · {{.Org}}</title>
+<link rel="stylesheet" href="/dashboard/static/app.css">
+</head>
+<body class="{{.Theme}}">
+<main class="authwrap">
+  <div class="card">
+    <div class="row"><span class="brand-mark">E</span><b>{{.Org}}</b></div>
+    {{if .Error}}<p class="field-error" role="alert">{{.Error}}</p>{{end}}
+    {{if .LinkToken}}
+    <p class="card-title">Link your {{.LinkProviderName}} account</p>
+    <p class="desc">Sign-in with {{.LinkProviderName}} isn't connected to an account yet. Confirm the account's credentials to link it.</p>
+    <form method="post" action="/auth/oidc/link" autocomplete="off">
+      <input type="hidden" name="link_token" value="{{.LinkToken}}">
+      <input type="hidden" name="return_to" value="{{.ReturnTo}}">
+      <p><label class="label" for="link-email">Email</label>
+      <input class="field" type="email" id="link-email" name="email" required autocomplete="username" value="{{.LinkEmail}}"></p>
+      <p><label class="label" for="link-password">Password</label>
+      <input class="field" type="password" id="link-password" name="password" required autocomplete="current-password" autofocus></p>
+      <button class="btn primary" type="submit">Link account</button>
+    </form>
+    {{else}}
+    {{if .Providers}}
+    <div class="stack">
+      {{range .Providers}}
+      <a class="btn" href="/auth/oidc/{{.ID}}/start{{if $.ReturnTo}}?return_to={{$.ReturnTo | urlquery}}{{end}}">Continue with {{.Name}}</a>
+      {{end}}
+    </div>
+    <p class="muted">or</p>
+    {{end}}
+    <form method="post" action="/dashboard/login" autocomplete="off">
+      <input type="hidden" name="return_to" value="{{.ReturnTo}}">
+      <p><label class="label" for="email">Email</label>
+      <input class="field" type="email" id="email" name="email" required autocomplete="username" autofocus value="{{.Email}}"></p>
+      <p><label class="label" for="password">Password</label>
+      <input class="field" type="password" id="password" name="password" required autocomplete="current-password"></p>
+      <button class="btn primary" type="submit">Sign in</button>
+    </form>
+    {{end}}
+    <p class="muted">Secure, confidential AI processing for your organisation.</p>
+  </div>
+</main>
+</body>
+</html>
+{{end}}

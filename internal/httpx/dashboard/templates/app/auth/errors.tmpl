@@ -1,0 +1,43 @@
+{{define "error-403"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>You don't have access to this page · {{.Org}}</title>
+<link rel="stylesheet" href="/dashboard/static/app.css">
+</head>
+<body class="{{.Theme}}">
+<main class="authwrap">
+  <div class="card">
+    <div class="row"><span class="brand-mark">E</span><b>{{.Org}}</b></div>
+    <h1>You don't have access to this page</h1>
+    <p class="desc">Your account doesn't hold the capability this page requires.</p>
+    <a class="btn primary" href="/dashboard">Home</a>
+    <p class="muted">If you need this page, ask a workspace administrator for access.</p>
+  </div>
+</main>
+</body>
+</html>
+{{end}}
+
+{{define "error-404"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Page not found · {{.Org}}</title>
+<link rel="stylesheet" href="/dashboard/static/app.css">
+</head>
+<body class="{{.Theme}}">
+<main class="authwrap">
+  <div class="card">
+    <div class="row"><span class="brand-mark">E</span><b>{{.Org}}</b></div>
+    <h1>Page not found</h1>
+    <p class="desc">The page you followed doesn't exist or may have moved.</p>
+    <a class="btn primary" href="/dashboard">Home</a>
+    <p class="muted">Check the address, or head back to your workspace home.</p>
+  </div>
+</main>
+</body>
+</html>
+{{end}}

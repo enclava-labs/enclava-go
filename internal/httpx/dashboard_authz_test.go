@@ -107,7 +107,16 @@ func TestDashboardKeyCreateScopeSubsetAndDefaults(t *testing.T) {
 		}
 	}
 
-	sess, csrf := loginUser(t, f, "boss@example.com", []string{auth.ScopePlatformAdmin}, "admin-pass")
+	// The permitted "boss" issuer carries explicit mode:all grants — an
+	// unrestricted issuer keeps the legacy omitted→all mint behavior, while
+	// zero-grant admin denial is covered by the new grants-bound deny cases.
+	bossGrants := auth.ResourceGrants{
+		Models:           auth.Allowlist{All: true},
+		Endpoints:        auth.Allowlist{All: true},
+		Assistants:       auth.Allowlist{All: true},
+		ExtractTemplates: auth.Allowlist{All: true},
+	}
+	sess, csrf := loginUserWithGrants(t, f, "boss@example.com", []string{auth.ScopePlatformAdmin}, bossGrants, "admin-pass")
 
 	// A scope the caller holds mints fine.
 	rec := sessionForm(t, f.app, http.MethodPost, "/dashboard/partials/keys",

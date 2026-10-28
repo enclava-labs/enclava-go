@@ -20,14 +20,42 @@ import (
 // hold. A mode:"all" scope grant stores no items at all (DecodeAllowlist
 // decodes it to the empty set), so listing items never grants scope "*".
 func (a *App) writeScopeSubsetError(w http.ResponseWriter, principal auth.Principal, scopes json.RawMessage) bool {
+	if !principalCoversScopes(principal, scopes) {
+		WriteForbidden(w, "key scopes must be a subset of the caller's scopes")
+		return false
+	}
+	return true
+}
+
+// principalCoversScopes is writeScopeSubsetError's check without the write:
+// every granted scope item must be held by the issuing principal. Dashboard
+// key creation applies it so the browser form cannot mint scopes the
+// signed-in operator does not hold.
+func principalCoversScopes(principal auth.Principal, scopes json.RawMessage) bool {
 	items, _ := auth.DecodeAllowlist(scopes)
 	for s := range items {
 		if !auth.HasScope(principal, s) {
-			WriteForbidden(w, "key scopes must be a subset of the caller's scopes")
 			return false
 		}
 	}
 	return true
+}
+
+// principalCoversKeyGrants is the resource counterpart of
+// principalCoversScopes: every stored grant document on the record must sit
+// inside the caller's own resource authority, with mode:"all" allowed only
+// where the caller's matching *All flag is set. AllowedIPs is excluded —
+// IPs stay credential-scoped legacy semantics roles never grant.
+func principalCoversKeyGrants(caller auth.Principal, k auth.APIKeyRecord) bool {
+	covered := func(raw json.RawMessage, callerAll bool, covers func(string) bool) bool {
+		items, all := auth.DecodeAllowlist(raw)
+		return grantCoveredByCaller(callerAll, covers, auth.Allowlist{Items: sortedItems(items), All: all})
+	}
+	return covered(k.AllowedModels, caller.AllowedModelsAll, func(id string) bool { return auth.ModelAllowed(caller, id) }) &&
+		covered(k.AllowedEndpoints, caller.AllowedEndpointsAll, func(id string) bool { return auth.EndpointAllowed(caller, id) }) &&
+		covered(k.AllowedTemplates, caller.AllowedExtractTemplatesAll, func(id string) bool { return auth.ExtractTemplateAllowed(caller, id) }) &&
+		covered(k.AllowedChatbots, caller.AllowedChatbotsAll, func(id string) bool { return auth.ChatbotAllowed(caller, id) }) &&
+		covered(k.AllowedAgents, caller.AllowedAgentsAll, func(id string) bool { return auth.AgentAllowed(caller, id) })
 }
 
 // lastAdminKeyExcluded refuses to revoke/deactivate the tenant's last usable
@@ -125,6 +153,12 @@ func (a *App) handleAdminAPIKeys(w http.ResponseWriter, r *http.Request, princip
 		if !a.writeScopeSubsetError(w, principal, record.Scopes) {
 			return
 		}
+		// adminGrantJSON(nil) encodes mode:all, so a resource-limited caller
+		// must send explicit in-authority lists — omitted grants would widen.
+		if !principalCoversKeyGrants(principal, record) {
+			WriteForbidden(w, "key resource grants exceed the caller's authority")
+			return
+		}
 		if err := a.identity.CreateAPIKey(r.Context(), principal.TenantID, record); err != nil {
 			log.Printf("failed to create api key: %v", err)
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "api_key_create_failed")
@@ -174,6 +208,12 @@ func (a *App) handleAdminAPIKeyByID(w http.ResponseWriter, r *http.Request, prin
 		key, err := a.identity.GetAPIKey(r.Context(), principal.TenantID, id)
 		if err != nil {
 			a.writeKeyFetchError(w, err)
+			return
+		}
+		// Regeneration re-arms the stored grants immediately — refuse before
+		// any secret is generated or stored when they exceed the caller.
+		if !principalCoversKeyGrants(principal, key) {
+			WriteForbidden(w, "key resource grants exceed the caller's authority")
 			return
 		}
 		plaintext, prefix, hash, usedAlgo, err := a.generateKey(a.apiKeyPrefix, a.apiKeyAlgo, a.apiKeyPepper)
@@ -251,6 +291,12 @@ func (a *App) handleAdminAPIKeyByID(w http.ResponseWriter, r *http.Request, prin
 			a.writeKeyFetchError(w, err)
 			return
 		}
+		// Restoring re-arms the stored grants — a key wider than the caller
+		// is never reactivated by them.
+		if !principalCoversKeyGrants(principal, key) {
+			WriteForbidden(w, "key resource grants exceed the caller's authority")
+			return
+		}
 		key.IsActive = true
 		key.RevokedAt = nil
 		if err := a.identity.UpdateAPIKey(r.Context(), principal.TenantID, key); err != nil {
@@ -294,6 +340,12 @@ func (a *App) handleAdminAPIKeyByID(w http.ResponseWriter, r *http.Request, prin
 		}
 		applyAdminPatch(&key, req)
 		if !a.writeScopeSubsetError(w, principal, key.Scopes) {
+			return
+		}
+		// The whole resulting record is checked: an unlisted or all-widening
+		// patch can never slip past by only patching one field.
+		if !principalCoversKeyGrants(principal, key) {
+			WriteForbidden(w, "key resource grants exceed the caller's authority")
 			return
 		}
 		if req.IsActive != nil && !*req.IsActive && !a.lastAdminKeyExcluded(w, r, principal, key) {
