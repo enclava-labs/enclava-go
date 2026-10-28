@@ -21,3 +21,7 @@ playwright-report/
 to-delete/
 
 .planning/debug/
+
+# dashboard-e2e artifacts
+tests/dashboard/.auth/
+tests/dashboard/screenshots/

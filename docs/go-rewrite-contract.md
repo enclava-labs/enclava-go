@@ -57,6 +57,15 @@ PostgreSQL reservations enforce applicable tenant and billing-subject budget lim
 ## Capability and assurance boundaries
 
 An endpoint is usable only for its configured protocol, capabilities, origin, credentials and authorization. A configured private endpoint is not automatically confidential; ordinary TLS is not attestation. Attested/confidential assurance is reported only when the selected provider supports and verifies it. Failed required verification denies dispatch. The application makes no guarantee about endpoint availability, provider data handling, deployment hardening, or regulatory compliance.
+## Option A dashboard (v1.1)
+
+The dashboard is the Option A grouped-sidebar surface: server-rendered Go templates (`templates/app/`), htmx fragments, one hand-written stylesheet (`app.css`) and one shared client (`app.js` exposing `window.Enclava`). There are no redirects or aliases from the retired URLs; the old templates, scripts, styles and smoke tooling are deleted. Dashboard handlers only render — every write is a `fetch` to `/api/v1` with the session cookie and CSRF header.
+
+Authorization is server-enforced through one capability table (`internal/httpx/dashboard_caps.go`): each capability mirrors the scope gate of the `/api/v1` route serving the same data, `platform.admin` grants no feature capability, and every page/partial registers through `requireCap`/`capSession` (session → CSRF → capability). Templates read only the per-request `Caps` booleans; hiding a control is presentation, the API check is the authority. Unknown `/dashboard/*` paths render the 404 page.
+
+Role-bound AI resources (models, endpoints, assistants, extraction templates) are explicit stored allowlists on roles (`{"mode":"all"/"list"}` documents, migration 023); session authority is the union of the assigned roles' grants — never an implicit `platform.admin`. Default seeded roles: Admin (all scopes + mode:all), Knowledge manager and Member (explicit empty grants — deny by default until an admin grants). Key issuance and re-arming (create/patch/regenerate/restore and any activation) is bounded by the caller's resource authority; pure deactivation stays free.
+
+New screen-facing reads/writes added in v1.1: `GET /api/v1/conversations` (own-only keyset), run steps + observed route on run reads, `POST /api/v1/agent-runs` accepting server-resolved `evidence_ids`, `GET /api/v1/rag/evidence/{id}/passage`, `POST /api/v1/rag/search` (bounded cross-collection, explicit `search_scope_too_large` beyond the work budget), multipart `POST /api/v1/rag/collections/{id}/documents`, `?status=` document filtering with soft-delete `removed`, `PATCH`/`DELETE /api/v1/identities/roles/{id}` (atomic last-admin protection), `POST`/`PATCH /api/v1/admin/budgets`, and the durable MCP discovery queue with versioned approvals (409 on stale review). Home attention/activity aggregates read only source-authorized service projections — `rag.manage` never bypasses source ACLs.
 
 ## Current verification evidence and prerequisites
 
