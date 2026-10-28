@@ -22,7 +22,7 @@
   <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button>
 </div>
 <div class="stepper" aria-label="Add source steps">
-  <span class="step active" data-step-dot="1">1 Provider</span>
+  <span class="step active" data-step-dot="1" aria-current="step">1 Provider</span>
   <span class="step" data-step-dot="2">2 Connect</span>
   <span class="step" data-step-dot="3">3 Access</span>
   <span class="step" data-step-dot="4">4 Destination</span>
@@ -31,11 +31,11 @@
 
 <div class="section" data-step-pane="1">
   <div class="tilegrid">
-    <button type="button" class="tile" data-action="sources:provider" data-provider="slack">{{icon "chat"}}<b>Slack</b><span class="subline">Channel messages</span></button>
-    <button type="button" class="tile" data-action="sources:provider" data-provider="teams">{{icon "users"}}<b>Microsoft Teams</b><span class="subline">Channels and chats</span></button>
-    <button type="button" class="tile" data-action="sources:provider" data-provider="github">{{icon "command"}}<b>GitHub</b><span class="subline">Repository files</span></button>
-    <button type="button" class="tile" data-action="sources:provider" data-provider="notion">{{icon "file"}}<b>Notion</b><span class="subline">Pages and subpages</span></button>
-    <button type="button" class="tile" data-action="sources:provider" data-provider="google_drive">{{icon "upload"}}<b>Google Drive</b><span class="subline">Shared folders</span></button>
+    <button type="button" class="tile" data-action="sources:provider" data-provider="slack" aria-pressed="false">{{icon "chat"}}<b>Slack</b><span class="subline">Channel messages</span></button>
+    <button type="button" class="tile" data-action="sources:provider" data-provider="teams" aria-pressed="false">{{icon "users"}}<b>Microsoft Teams</b><span class="subline">Channels and chats</span></button>
+    <button type="button" class="tile" data-action="sources:provider" data-provider="github" aria-pressed="false">{{icon "command"}}<b>GitHub</b><span class="subline">Repository files</span></button>
+    <button type="button" class="tile" data-action="sources:provider" data-provider="notion" aria-pressed="false">{{icon "file"}}<b>Notion</b><span class="subline">Pages and subpages</span></button>
+    <button type="button" class="tile" data-action="sources:provider" data-provider="google_drive" aria-pressed="false">{{icon "upload"}}<b>Google Drive</b><span class="subline">Shared folders</span></button>
   </div>
   <span class="field-error" data-wizard-error hidden></span>
 </div>

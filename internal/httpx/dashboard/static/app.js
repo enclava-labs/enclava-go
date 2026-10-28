@@ -218,6 +218,8 @@
     t.textContent = '';
     t.classList.add('show');
     if (kind) t.classList.add(kind);
+    if (kind === 'error') t.setAttribute('role', 'alert');
+    else t.removeAttribute('role');
     const span = document.createElement('span');
     span.textContent = msg || '';
     t.appendChild(span);
@@ -292,9 +294,18 @@
     toast('success', 'Copied to clipboard');
   }
 
-  // ── Shared overlay machinery (drawer + modal): focus trap, Esc/backdrop ──
-
+  // ── Shared overlay machinery (drawer + modal + popover + mobile nav/ ──
+  // chats): focus trap, Esc/backdrop close, focus returns to the opener,
   let overlayOpener = null;
+
+  // restoreFocus returns focus to the opener when the released overlay still
+  // held it — a click that already moved focus elsewhere is never stolen.
+  function restoreFocus(opener, hadFocus) {
+    if (opener && document.contains(opener) &&
+        (hadFocus || document.activeElement === document.body)) {
+      opener.focus();
+    }
+  }
 
   function drawerOpen() {
     const d = el('drawer');
@@ -314,9 +325,18 @@
     const drawer = el('drawer');
     if (!drawer) return;
     closePopover();
+    closeMobileNav(false);
+    closeMobileChats(false);
     drawer.innerHTML = html;
     drawer.setAttribute('role', 'dialog');
     drawer.setAttribute('aria-modal', 'true');
+    const title = drawer.querySelector('h2');
+    if (title) {
+      if (!title.id) title.id = 'drawer-title';
+      drawer.setAttribute('aria-labelledby', title.id);
+    } else {
+      drawer.removeAttribute('aria-labelledby');
+    }
     drawer.setAttribute('tabindex', '-1');
     drawer.classList.toggle('modal', !!modal);
     drawer.classList.add('open');
@@ -358,23 +378,27 @@
     return !!(p && !p.hidden);
   }
 
-  function closePopover() {
+  function closePopover(restore) {
     const p = el('pop');
     if (!p || p.hidden) return;
+    const hadFocus = p.contains(document.activeElement);
     p.hidden = true;
     p.innerHTML = '';
     p.style.left = '';
     p.style.top = '';
     if (popAnchorEl) {
       popAnchorEl.setAttribute('aria-expanded', 'false');
+      if (restore !== false) restoreFocus(popAnchorEl, hadFocus);
       popAnchorEl = null;
     }
   }
 
   function popover(anchor, source) {
     const pop = el('pop');
-    if (!pop) return;
     closePopover();
+    closeDrawer();
+    closeMobileNav(false);
+    closeMobileChats(false);
     let html = source;
     if (typeof source === 'string' && source.charAt(0) === '#') {
       const tpl = document.querySelector(source);
@@ -398,8 +422,96 @@
     if (first) first.focus();
   }
 
+  // ── Mobile overlays (<760): the sidebar-as-drawer nav and the chat ──
+  // history sheet get the same trap/Esc/outside-close/return treatment.
+
+  let mobileNavOpener = null;
+  let mobileChatsOpener = null;
+
+  function mobileNavOpen() {
+    return document.body.classList.contains('mobile-open');
+  }
+
+  function openMobileNav(opener) {
+    if (mobileNavOpen()) return;
+    closePopover();
+    closeDrawer();
+    closeMobileChats(false);
+    mobileNavOpener = opener || document.querySelector('.mobile-menu');
+    document.body.classList.add('mobile-open');
+    const menu = document.querySelector('.mobile-menu');
+    if (menu) menu.setAttribute('aria-expanded', 'true');
+    const first = visibleFocusables(document.querySelector('.sidebar'))[0];
+    if (first) first.focus();
+  }
+
+  function closeMobileNav(restore) {
+    if (!mobileNavOpen()) return;
+    const hadFocus = !!document.querySelector('.sidebar') &&
+      document.querySelector('.sidebar').contains(document.activeElement);
+    document.body.classList.remove('mobile-open');
+    const menu = document.querySelector('.mobile-menu');
+    if (menu) menu.setAttribute('aria-expanded', 'false');
+    if (restore !== false) restoreFocus(mobileNavOpener, hadFocus);
+    mobileNavOpener = null;
+  }
+
+  function mobileChatsOpen() {
+    const l = document.querySelector('.mobile-chats-list');
+    return !!(l && l.classList.contains('open'));
+  }
+
+  function openMobileChats(opener) {
+    const list = document.querySelector('.mobile-chats-list');
+    if (!list || list.classList.contains('open')) return;
+    closePopover();
+    closeDrawer();
+    closeMobileNav(false);
+    mobileChatsOpener = opener || null;
+    list.classList.add('open');
+    if (mobileChatsOpener) mobileChatsOpener.setAttribute('aria-expanded', 'true');
+    const first = visibleFocusables(list)[0];
+    if (first) first.focus();
+  }
+
+  function closeMobileChats(restore) {
+    const list = document.querySelector('.mobile-chats-list');
+    if (!list || !list.classList.contains('open')) return;
+    const hadFocus = list.contains(document.activeElement);
+    list.classList.remove('open');
+    if (mobileChatsOpener) mobileChatsOpener.setAttribute('aria-expanded', 'false');
+    if (restore !== false) restoreFocus(mobileChatsOpener, hadFocus);
+    mobileChatsOpener = null;
+  }
+
+  // trapTab cycles Tab/Shift+Tab inside an open overlay; extra = the opener
+  // itself when it must stay inside the cycle (mobile menu/chat toggles
+  // that live outside their panels). It lands in document order.
+  function trapTab(e, container, extra) {
+    if (!container) return;
+    const focusables = visibleFocusables(container);
+    if (extra && document.contains(extra)) {
+      const pos = container.compareDocumentPosition(extra);
+      if (pos & Node.DOCUMENT_POSITION_PRECEDING) focusables.unshift(extra);
+      else if (pos & Node.DOCUMENT_POSITION_FOLLOWING) focusables.push(extra);
+    }
+    if (!focusables.length) {
+      e.preventDefault();
+      if (container.getAttribute('tabindex') !== null) container.focus();
+      return;
+    }
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    const active = document.activeElement;
+    if (focusables.indexOf(active) === -1) { e.preventDefault(); first.focus(); }
+    else if (e.shiftKey && active === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && active === last) { e.preventDefault(); first.focus(); }
+  }
+
   // ── Evidence: shared routing — chat's own column ≥1280 / sheet <760, the ──
   // shared #drawer for everything else (search included at every width).
+
+  let evidenceOpener = null;
 
   async function openEvidence(id, opts) {
     if (!id) return;
@@ -409,18 +521,29 @@
       : document.querySelector('.evidence-panel');
     const wide = matchMedia('(min-width:1280px)').matches;
     const narrow = matchMedia('(max-width:759px)').matches;
+    evidenceOpener = document.activeElement instanceof Element ? document.activeElement : null;
     const html = await fetchHTML('/dashboard/partials/evidence/' + encodeURIComponent(id));
     if (panel && (wide || narrow)) {
       panel.innerHTML = html;
+      panel.setAttribute('tabindex', '-1');
+      const first = visibleFocusables(panel)[0];
+      (first || panel).focus();
     } else {
       showOverlay(html, false);
     }
   }
 
   function closeEvidence() {
-    document.querySelectorAll('.evidence-panel').forEach((p) => { p.innerHTML = ''; });
+    let held = false;
+    document.querySelectorAll('.evidence-panel').forEach((p) => {
+      if (p.contains(document.activeElement)) held = true;
+      p.innerHTML = '';
+    });
     closeDrawer();
+    restoreFocus(evidenceOpener, held);
+    evidenceOpener = null;
   }
+
 
   // ── Delegated data-action dispatch (shared actions; page modules namespace ──
   // their own listeners — evidence:* stays shared here for phase-10 producers).
@@ -449,13 +572,25 @@
     if (!(e.target instanceof Element)) return;
     if (e.target.id === 'backdrop') { closeDrawer(); return; }
     if (e.target.closest('.mobile-chats')) {
-      const list = document.querySelector('.mobile-chats-list');
-      if (list) list.classList.toggle('open');
+      // The history-sheet toggle and its in-sheet Close button share the
+      // class; a click on either releases the sheet the same way.
+      if (mobileChatsOpen()) closeMobileChats();
+      else openMobileChats(e.target.closest('.mobile-chats'));
+      return;
     }
     const pop = el('pop');
     if (pop && !pop.hidden && !pop.contains(e.target) &&
         !e.target.closest('[data-action="user-menu"],[data-action="conf-pop"]')) {
       closePopover();
+    }
+    if (mobileChatsOpen() &&
+        !e.target.closest('.mobile-chats-list')) {
+      closeMobileChats(false);
+    }
+    if (mobileNavOpen() &&
+        !e.target.closest('.sidebar') &&
+        !e.target.closest('[data-action="toggle-nav"]')) {
+      closeMobileNav(false);
     }
     const trigger = e.target.closest('[data-action]');
     if (!trigger) return;
@@ -466,13 +601,10 @@
       case 'close-drawer':
         closeDrawer();
         break;
-      case 'toggle-nav': {
-        document.body.classList.toggle('mobile-open');
-        const menu = document.querySelector('.mobile-menu');
-        if (menu) menu.setAttribute('aria-expanded',
-          document.body.classList.contains('mobile-open') ? 'true' : 'false');
+      case 'toggle-nav':
+        if (mobileNavOpen()) closeMobileNav();
+        else openMobileNav(trigger);
         break;
-      }
       case 'desktop-collapse': {
         const collapsed = document.body.classList.toggle('collapsed');
         try { localStorage.setItem('enclava-nav-collapsed', collapsed ? '1' : '0'); } catch (_) {}
@@ -508,19 +640,22 @@
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       if (popoverOpen()) { closePopover(); return; }
+      if (mobileChatsOpen()) { closeMobileChats(); return; }
+      if (mobileNavOpen()) { closeMobileNav(); return; }
       if (drawerOpen()) closeDrawer();
       return;
     }
-    if (e.key !== 'Tab' || !drawerOpen()) return;
-    const drawer = el('drawer');
-    const focusables = visibleFocusables(drawer);
-    if (!focusables.length) { e.preventDefault(); drawer.focus(); return; }
-    const first = focusables[0];
-    const last = focusables[focusables.length - 1];
-    const active = document.activeElement;
-    if (!drawer.contains(active)) { e.preventDefault(); first.focus(); }
-    else if (e.shiftKey && active === first) { e.preventDefault(); last.focus(); }
-    else if (!e.shiftKey && active === last) { e.preventDefault(); first.focus(); }
+    if (e.key !== 'Tab') return;
+    if (popoverOpen()) { trapTab(e, el('pop'), null); return; }
+    if (mobileChatsOpen()) {
+      trapTab(e, document.querySelector('.mobile-chats-list'), mobileChatsOpener);
+      return;
+    }
+    if (mobileNavOpen()) {
+      trapTab(e, document.querySelector('.sidebar'), document.querySelector('.mobile-menu'));
+      return;
+    }
+    if (drawerOpen()) trapTab(e, el('drawer'), null);
   });
 
   // ── htmx wiring: document listeners only (D-20 — no hx-on, no inline) ──

@@ -61,7 +61,11 @@
   function setProvider(id) {
     qa('[data-provider-fields]').forEach(function (n) { n.hidden = n.dataset.providerFields !== id; });
     qa('[data-provider-access]').forEach(function (n) { n.hidden = n.dataset.providerAccess !== id; });
-    qa('.tile').forEach(function (t) { t.classList.toggle('selected', t.dataset.provider === id); });
+    qa('.tile').forEach(function (t) {
+      var on = t.dataset.provider === id;
+      t.classList.toggle('selected', on);
+      t.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
     // Switching provider can never leak another provider's keys into the
     // payload: collection happens at submit from the active group only.
     validateStep(currentStep());
@@ -202,7 +206,10 @@
       pane.hidden = Number(pane.dataset.stepPane) !== step;
     });
     qa('[data-step-dot]').forEach(function (dot) {
-      dot.classList.toggle('active', Number(dot.dataset.stepDot) <= step);
+      var reached = Number(dot.dataset.stepDot) <= step;
+      dot.classList.toggle('active', reached);
+      if (Number(dot.dataset.stepDot) === step) dot.setAttribute('aria-current', 'step');
+      else dot.removeAttribute('aria-current');
     });
     var back = q('[data-action="sources:back"]');
     var next = q('[data-action="sources:next"]');
@@ -214,6 +221,20 @@
     }
     if (step === STEPS) renderReview();
     validateStep(step, currentProvider());
+    // Move focus onto the new pane's first VISIBLE control (provider groups
+    // stay in the DOM hidden); a read-only pane falls back to the primary
+    // action so keyboard users land inside the step.
+    var pane = activePane();
+    if (pane) {
+      var candidates = pane.querySelectorAll('input:not([type="hidden"]), select, textarea, button');
+      var target = null;
+      for (var i = 0; i < candidates.length; i++) {
+        if (candidates[i].offsetParent !== null) { target = candidates[i]; break; }
+      }
+      if (!target && submit && !submit.hidden) target = submit;
+      if (!target && next && !next.hidden) target = next;
+      if (target) target.focus();
+    }
   }
 
   // ── Review ───────────────────────────────────────────────────────────────

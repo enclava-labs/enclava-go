@@ -253,13 +253,14 @@
     return schema;
   }
 
+  // label wraps the control — the label text is the accessible name.
   function labeled(labelText, control) {
     const wrap = document.createElement('div');
     const lab = document.createElement('label');
     lab.className = 'label';
     lab.textContent = labelText;
+    lab.appendChild(control);
     wrap.appendChild(lab);
-    wrap.appendChild(control);
     return wrap;
   }
 

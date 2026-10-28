@@ -5,7 +5,7 @@
 <div class="section" id="usage-audit">
   <form class="filters" method="get" action="/dashboard/usage/audit" aria-label="Audit filters">
     <input type="hidden" name="kind" value="{{.Data.Audit.Filters.Kind}}">
-{{range .Data.Audit.Kinds}}    <a class="chip{{if .Active}} active{{end}}" href="{{.Href}}">{{.Label}}</a>
+{{range .Data.Audit.Kinds}}    <a class="chip{{if .Active}} active{{end}}" aria-pressed="{{if .Active}}true{{else}}false{{end}}" href="{{.Href}}">{{.Label}}</a>
 {{end}}    <select class="field" name="subject_type" aria-label="Subject type">
 {{range .Data.Audit.SubjectTypes}}      <option value="{{.Value}}"{{if .Active}} selected{{end}}>{{.Label}}</option>
 {{end}}    </select>

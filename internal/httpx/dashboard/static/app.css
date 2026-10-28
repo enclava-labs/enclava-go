@@ -576,6 +576,7 @@ mark{background:var(--accentbg);color:var(--accent-fg)}
   padding:11px 16px;
   border-radius:9px;
   transition:.2s;
+  max-width:min(560px,calc(100vw - 24px));
 }
 .toast.show{transform:translate(-50%,0);opacity:1}
 .toast a{color:var(--accent-fg);font-weight:600}

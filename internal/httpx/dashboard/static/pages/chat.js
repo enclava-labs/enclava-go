@@ -204,6 +204,7 @@
             btn.className = 'citation';
             btn.dataset.action = 'evidence:open';
             btn.textContent = '[' + m[1] + ']';
+            btn.setAttribute('aria-label', 'Evidence ' + m[1]);
             const id = ids[parseInt(m[1], 10) - 1];
             if (id) btn.dataset.evidenceId = id;
             frag.appendChild(btn);

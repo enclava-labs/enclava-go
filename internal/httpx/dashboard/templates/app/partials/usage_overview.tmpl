@@ -4,9 +4,9 @@
      reads for the selected range; gaps in the daily series stay gaps. */}}
 <div class="section" id="usage-overview">
   <div class="filters" role="group" aria-label="Date range">
-    <a class="chip{{if eq .Data.Days 7}} active{{end}}" href="/dashboard/usage?range=7"{{if eq .Data.Days 7}} aria-pressed="true"{{end}}>7 days</a>
-    <a class="chip{{if eq .Data.Days 30}} active{{end}}" href="/dashboard/usage?range=30"{{if eq .Data.Days 30}} aria-pressed="true"{{end}}>30 days</a>
-    <a class="chip{{if eq .Data.Days 90}} active{{end}}" href="/dashboard/usage?range=90"{{if eq .Data.Days 90}} aria-pressed="true"{{end}}>90 days</a>
+    <a class="chip{{if eq .Data.Days 7}} active{{end}}" href="/dashboard/usage?range=7" aria-pressed="{{if eq .Data.Days 7}}true{{else}}false{{end}}">7 days</a>
+    <a class="chip{{if eq .Data.Days 30}} active{{end}}" href="/dashboard/usage?range=30" aria-pressed="{{if eq .Data.Days 30}}true{{else}}false{{end}}">30 days</a>
+    <a class="chip{{if eq .Data.Days 90}} active{{end}}" href="/dashboard/usage?range=90" aria-pressed="{{if eq .Data.Days 90}}true{{else}}false{{end}}">90 days</a>
   </div>
   <div class="grid three">
     <div class="kpi">

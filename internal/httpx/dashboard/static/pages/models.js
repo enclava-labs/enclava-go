@@ -148,8 +148,8 @@
       '<b>Set ' + d.unitLabel + ' price</b>' +
       '<p class="help">' + d.model + ' @ ' + d.endpoint + ' · ' + d.capability + '</p>' +
       '<label class="label" for="models-price-rate">Rate — millionths of the currency unit, per 1M tokens</label>' +
-      '<input class="field" id="models-price-rate" name="rate_micros" type="number" min="0" step="1" required>' +
-      '<span class="help" data-models-price-preview>Enter a rate to preview it.</span>' +
+      '<input class="field" id="models-price-rate" name="rate_micros" type="number" min="0" step="1" required aria-describedby="models-price-help">' +
+      '<span class="help" id="models-price-help" data-models-price-preview>Enter a rate to preview it.</span>' +
       '<label class="label" for="models-price-currency">Currency</label>' +
       '<input class="field" id="models-price-currency" name="currency" value="USD" maxlength="3">' +
       '<p class="field-error" data-models-price-error hidden></p>' +

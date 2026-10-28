@@ -100,15 +100,15 @@
       <p class="help">One labeled row per extracted field — name, type, whether it is required, and an optional description.</p>
       <div class="stack" data-editor-schema="output">
         <div class="grid two" data-schema-row="output">
-          <div><label class="label">Field name</label><input class="field" data-row-name placeholder="field_name"></div>
-          <div><label class="label">Type</label>
+          <div><label class="label">Field name<input class="field" data-row-name placeholder="field_name"></label></div>
+          <div><label class="label">Type
             <select class="field" data-row-type>
               <option>string</option><option>number</option><option>boolean</option><option>object</option><option>array</option>
-            </select>
+            </select></label>
           </div>
-          <div><label class="label">Required</label><label class="row"><input type="checkbox" data-row-required> Required</label></div>
-          <div><label class="label">Description</label><input class="field" data-row-description placeholder="Shown to reviewers"></div>
-          <button type="button" class="btn danger" data-row-remove>Remove</button>
+          <div><span class="label">Required</span><label class="row"><input type="checkbox" data-row-required> Required</label></div>
+          <div><label class="label">Description<input class="field" data-row-description placeholder="Shown to reviewers"></label></div>
+          <button type="button" class="btn danger" data-row-remove>Remove field</button>
         </div>
       </div>
       <div class="row"><button type="button" class="btn" data-editor-add-row="output">{{icon "plus"}}Add field</button></div>
@@ -116,13 +116,13 @@
       <p class="help">Optional named values the user prompt can reference as {name}.</p>
       <div class="stack" data-editor-schema="context">
         <div class="grid two" data-schema-row="context">
-          <div><label class="label">Field name</label><input class="field" data-row-name placeholder="hint_name"></div>
-          <div><label class="label">Type</label>
+          <div><label class="label">Field name<input class="field" data-row-name placeholder="hint_name"></label></div>
+          <div><label class="label">Type
             <select class="field" data-row-type>
               <option>string</option><option>number</option><option>boolean</option>
-            </select>
+            </select></label>
           </div>
-          <button type="button" class="btn danger" data-row-remove>Remove</button>
+          <button type="button" class="btn danger" data-row-remove>Remove hint</button>
         </div>
       </div>
       <div class="row"><button type="button" class="btn" data-editor-add-row="context">{{icon "plus"}}Add hint</button></div>

@@ -169,7 +169,7 @@ func TestDashboardViewMeta(t *testing.T) {
 	req := httptest.NewRequest("GET", "/dashboard/meta", nil).WithContext(context.Background())
 	rec := httptest.NewRecorder()
 	app.renderDashboardInto(rec, req, set, "page", "meta", nil)
-	if body := rec.Body.String(); !strings.Contains(body, `id="content">Meta</div>`) {
+	if body := rec.Body.String(); !strings.Contains(body, `id="content" tabindex="-1">Meta</div>`) {
 		t.Fatalf("fallback PageTitle %q missing humanized page name", rec.Body.String())
 	}
 }

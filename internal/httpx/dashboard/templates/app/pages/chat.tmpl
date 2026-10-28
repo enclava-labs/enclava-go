@@ -11,7 +11,7 @@
     <p class="desc">Secure conversations grounded in your organisation's knowledge.</p>
   </div>
   <div class="right-mobile">
-    <button type="button" class="btn mobile-chats" aria-label="Show chat history">{{icon "chat"}} Chats</button>
+    <button type="button" class="btn mobile-chats" aria-label="Show chat history" aria-expanded="false" aria-controls="mobileChats">{{icon "chat"}} Chats</button>
     <button type="button" class="btn primary" data-action="chat:new">{{icon "plus"}} New chat</button>
   </div>
 </header>
@@ -56,7 +56,7 @@
 </div>
 
 <div class="mobile-chats-list" id="mobileChats">
-  <button type="button" class="btn mobile-chats">Close chats</button>
+  <button type="button" class="btn mobile-chats" aria-expanded="false" aria-controls="mobileChats">Close chats</button>
   {{$conv := .Data.ConversationID}}{{range .Data.History.Groups}}<h3>{{.Label}}</h3>{{range .Items}}<a class="history-item{{if eq .ID $conv}} selected{{end}}" href="/dashboard/chat/{{.ID}}">{{.Title}}<span class="subline">{{relTime .UpdatedAt}}</span></a>{{end}}{{end}}
 </div>
 {{end}}
