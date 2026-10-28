@@ -1,0 +1,66 @@
+{{define "frag-assistant-drawer"}}{{/* Configure drawer (09-03): name,
+     description, model (priced+routable only), instructions picker + preview,
+     knowledge checklist, tools checklist (pending = disabled "Awaiting
+     approval"), audience, enabled. Markup only (D-20) — assistants.js owns
+     the save. Arg: dashboardView; page model under .Data. */}}
+<div class="drawer-head">
+  <h2>{{if .Data.Assistant}}Edit assistant{{else}}New assistant{{end}}</h2>
+  <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button>
+</div>
+<form id="assistant-form" data-assistant-id="{{if .Data.Assistant}}{{.Data.Assistant.ID}}{{end}}">
+  <label class="label" for="assistant-name">Name
+    <input class="field" id="assistant-name" name="name" value="{{if .Data.Assistant}}{{.Data.Assistant.Name}}{{end}}" required>
+  </label>
+  <label class="label" for="assistant-description">Description
+    <textarea class="field" id="assistant-description" name="description" rows="2">{{if .Data.Assistant}}{{.Data.Assistant.Description}}{{end}}</textarea>
+  </label>
+  <label class="label" for="assistant-model">Model
+    <select class="field" id="assistant-model" name="model" required>
+{{if .Data.CurrentModel}}      <option value="{{.Data.CurrentModel}}" selected>{{.Data.CurrentModel}} (current — no priced route)</option>
+{{end}}{{range .Data.Models}}      <option value="{{.ID}}"{{if .Current}} selected{{end}}>{{.ID}}</option>
+{{end}}    </select>
+{{if not .Data.Models}}    <span class="help">No priced, routable models are available for your grants — an admin must configure pricing on an endpoint first.</span>
+{{else}}    <span class="help">Only models with complete pricing on a routable endpoint are offered.</span>
+{{end}}  </label>
+  <label class="label" for="assistant-template">Instructions
+    <select class="field" id="assistant-template" name="prompt_template_id" data-instructions-select>
+      <option value="">None (assistant default)</option>
+{{range .Data.Templates}}      <option value="{{.ID}}"{{if .Selected}} selected{{end}}>{{.Name}}</option>
+{{end}}    </select>
+  </label>
+  <div class="stack" data-instructions-preview hidden>
+    <span class="help">Preview — the prompts render read-only.</span>
+{{range .Data.Templates}}    <template data-preview-for="{{.ID}}">
+      <div><b>System prompt</b><p class="muted">{{.SystemPrompt}}</p></div>
+      <div><b>User prompt</b><p class="muted">{{.UserPrompt}}</p></div>
+    </template>
+{{end}}    <div data-preview-body></div>
+  </div>
+  <h3>Knowledge</h3>
+{{if .Data.Knowledge}}  <div class="stack">
+{{range .Data.Knowledge}}    <label><input type="checkbox" name="knowledge" value="{{.ID}}"{{if .Selected}} checked{{end}}> {{.Name}}</label>
+{{end}}  </div>
+{{else}}  <p class="muted">No readable collections. The assistant answers without retrieval.</p>
+{{end}}  <h3>Tools</h3>
+  <div class="stack">
+{{range .Data.Tools}}    <label><input type="checkbox" name="tools" value="{{.ID}}"{{if .Selected}} checked{{end}}{{if not .Approved}} disabled{{end}}> {{.Label}}{{if not .Approved}}<span class="subline">{{statusLabel "tool" "pending"}}</span>{{end}}</label>
+{{end}}  </div>
+  <h3>Audience</h3>
+  <div class="stack">
+    <label><input type="radio" name="audience-mode" value="all"{{if .Data.AudienceAll}} checked{{end}}> Everyone in {{.Org}}</label>
+    <label><input type="radio" name="audience-mode" value="members"{{if not .Data.AudienceAll}} checked{{end}}> Specific members</label>
+    <div class="stack">
+{{range .Data.Members}}      <label><input type="checkbox" name="audience-member" value="{{.ID}}"{{if .Selected}} checked{{end}}> {{.Label}}<span class="subline">{{.ID}}</span></label>
+{{else}}      <p class="muted">No members found.</p>
+{{end}}    </div>
+    <span class="help">Audience members can run this assistant; role grants still apply.</span>
+  </div>
+  <label><input type="checkbox" name="is_enabled"{{if or (not .Data.Assistant) .Data.Assistant.IsEnabled}} checked{{end}}> Enabled</label>
+{{range .Data.Preserved}}  <input type="hidden" data-setting-key="{{.Key}}" value="{{.JSON}}">
+{{end}}  <div class="drawer-actions">
+{{if .Data.Assistant}}    <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete this assistant?" data-assistant-delete="{{.Data.Assistant.ID}}">{{icon "x"}}Delete</button>
+{{end}}    <button type="button" class="btn ghost" data-action="close-drawer">Cancel</button>
+    <button type="button" class="btn primary" data-action="assistants:save">{{icon "check"}}Save assistant</button>
+  </div>
+</form>
+{{end}}

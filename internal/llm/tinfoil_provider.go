@@ -19,8 +19,17 @@ import (
 )
 
 var (
-	newTinfoilClient           = tinfoil.NewClient
-	newTinfoilClientWithParams = tinfoil.NewClientWithParams
+	newTinfoilClient = tinfoil.NewClient
+	// NewClientWithParams was replaced by NewClientWithOptions in
+	// tinfoil-go v0.16; keep the (enclave, repo, opts...) seam for tests.
+	newTinfoilClientWithParams = func(enclave, repo string, opts ...option.RequestOption) (*tinfoil.Client, error) {
+		clientOpts := []tinfoil.ClientOption{tinfoil.WithEnclave(enclave)}
+		if repo != "" {
+			clientOpts = append(clientOpts, tinfoil.WithRepo(repo))
+		}
+		clientOpts = append(clientOpts, tinfoil.WithOpenAIOptions(opts...))
+		return tinfoil.NewClientWithOptions(clientOpts...)
+	}
 )
 
 type TinfoilProvider struct {
@@ -182,9 +191,13 @@ func (p *TinfoilProvider) verifyAttestationOnce(ctx context.Context) (Attestatio
 	status.Enclave = client.Enclave()
 	status.Repo = client.Repo()
 	if groundTruth != nil {
-		status.Digest = groundTruth.Digest
-		status.CodeFingerprint = groundTruth.CodeFingerprint
-		status.EnclaveFingerprint = groundTruth.EnclaveFingerprint
+		status.Digest = groundTruth.CodeDigest
+		if m := groundTruth.CodeMeasurement; m != nil {
+			status.CodeFingerprint = m.String()
+		}
+		if m := groundTruth.EnclaveMeasurement; m != nil {
+			status.EnclaveFingerprint = m.String()
+		}
 	}
 	p.setStatus(status)
 	return status, nil
@@ -193,9 +206,9 @@ func (p *TinfoilProvider) verifyAttestationOnce(ctx context.Context) (Attestatio
 // verifyWithContext runs the SDK's blocking Verify in a goroutine bounded by
 // ctx. If Verify itself hangs past the deadline it still leaks one goroutine,
 // but callers and the singleflight group are released truthfully.
-func verifyWithContext(ctx context.Context, client *tinfoil.Client) (*verifierclient.GroundTruth, error) {
+func verifyWithContext(ctx context.Context, client *tinfoil.Client) (*verifierclient.VerifiedDocumentV3, error) {
 	type result struct {
-		gt  *verifierclient.GroundTruth
+		gt  *verifierclient.VerifiedDocumentV3
 		err error
 	}
 	ch := make(chan result, 1)

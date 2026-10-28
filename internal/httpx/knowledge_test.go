@@ -51,7 +51,7 @@ func TestKnowledgeImportHTTPAuthorizationAndDuplicate(t *testing.T) {
 	tenant := testdb.SeedTenant(t, db, "knowledge-import")
 	owner := testdb.SeedUser(t, db, tenant, "knowledge-owner@example.test", nil)
 	outsider := testdb.SeedUser(t, db, tenant, "knowledge-outsider@example.test", nil)
-	ownerKey, _ := testdb.SeedAPIKey(t, db, tenant, testdb.SeedKeySpec{Name: "knowledge-owner", OwnerUserID: owner.ID, Scopes: []string{"rag"}})
+	ownerKey, _ := testdb.SeedAPIKey(t, db, tenant, testdb.SeedKeySpec{Name: "knowledge-owner", OwnerUserID: owner.ID, Scopes: []string{"rag", "rag.manage"}})
 	outsiderKey, _ := testdb.SeedAPIKey(t, db, tenant, testdb.SeedKeySpec{Name: "knowledge-outsider", OwnerUserID: outsider.ID, Scopes: []string{"rag"}})
 	jobsRepo := postgres.NewJobsRepo(db)
 	jobsSvc := jobs.NewService(jobsRepo, 0)
@@ -104,11 +104,9 @@ func TestKnowledgeImportHTTPAuthorizationAndDuplicate(t *testing.T) {
 	}
 	var uploadBody bytes.Buffer
 	form := multipart.NewWriter(&uploadBody)
-	_ = form.WriteField("action", "upload_document")
-	_ = form.WriteField("collection_id", collection.ID)
-	_ = form.WriteField("source_type", "forged")
-	_ = form.WriteField("source_id", "forged-id")
-	_ = form.WriteField("source_uri", "https://attacker.invalid")
+	// Forged provenance fields — the upload surface is server-owned, so
+	// neither the legacy dashboard form nor the /api/v1 route may carry them
+	// into the stored document.
 	file, err := form.CreateFormFile("file", "upload.txt")
 	if err != nil {
 		t.Fatal(err)
@@ -119,10 +117,13 @@ func TestKnowledgeImportHTTPAuthorizationAndDuplicate(t *testing.T) {
 	if err := form.Close(); err != nil {
 		t.Fatal(err)
 	}
-	uploadRequest := httptest.NewRequest(http.MethodPost, "/dashboard/partials/rag", &uploadBody)
+	uploadRequest := httptest.NewRequest(http.MethodPost, "/api/v1/rag/collections/"+collection.ID+"/documents", &uploadBody)
 	uploadRequest.Header.Set("Content-Type", form.FormDataContentType())
-	if success, failure := app.handleDashboardRAGAction(uploadRequest, ownerPrincipal); success == "" || failure != "" {
-		t.Fatalf("upload action success=%q failure=%q", success, failure)
+	uploadRequest.Header.Set("Authorization", "Bearer "+ownerKey)
+	uploadResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(uploadResponse, uploadRequest)
+	if uploadResponse.Code != http.StatusOK && uploadResponse.Code != http.StatusAccepted {
+		t.Fatalf("upload status=%d body=%s", uploadResponse.Code, uploadResponse.Body.String())
 	}
 	uploaded, err := ragSvc.ListDocuments(ctx, ownerPrincipal, collection.ID, rag.DocumentStatusAll, 10, 0)
 	if err != nil {

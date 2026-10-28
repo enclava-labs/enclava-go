@@ -41,6 +41,10 @@ type Repository interface {
 	// CountConversations counts one owner's conversations; the owner binds
 	// to the caller at the service boundary — never a request parameter.
 	CountConversations(ctx context.Context, tenantID, ownerActorID string) (int64, error)
+	// ListConversationCountsByAssistant batches the per-assistant
+	// conversation counts shown in the Assistants table. The ID list comes
+	// from the caller's own authorized listing; absent rows count as zero.
+	ListConversationCountsByAssistant(ctx context.Context, tenantID string, chatbotIDs []string) (map[string]int64, error)
 }
 
 type RunRepository interface {
@@ -774,6 +778,17 @@ func (s *Service) CountConversations(ctx context.Context, p auth.Principal) (int
 		return 0, err
 	}
 	return s.repo.CountConversations(ctx, p.TenantID, actorKey(p))
+}
+
+// ListConversationCountsByAssistant is the Assistants-table read (OA-24):
+// counts for exactly the assistant IDs the caller's authorized listing
+// returned, pinned to the caller's tenant. Authorization happened upstream
+// in List — this read never widens the ID set.
+func (s *Service) ListConversationCountsByAssistant(ctx context.Context, p auth.Principal, chatbotIDs []string) (map[string]int64, error) {
+	if err := requireTenant(p); err != nil {
+		return nil, err
+	}
+	return s.repo.ListConversationCountsByAssistant(ctx, p.TenantID, chatbotIDs)
 }
 
 // conversationTitle derives the preview from the first VISIBLE user message

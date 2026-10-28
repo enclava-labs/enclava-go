@@ -1,0 +1,27 @@
+{{define "content"}}{{/* Access (09-07, OA-28): five-tab identity
+     administration. The page renders the active tab's fragment inline; every
+     fragment is also served as a refresh partial under
+     /dashboard/partials/access/<tab>. Writes go through /api/v1 from
+     pages/access.js (D-17/D-20). */}}
+<header class="head">
+  <div class="headcopy">
+    <div class="crumb">{{.Org}} / Admin</div>
+    <h1>Access</h1>
+    <p class="desc">People, roles, service accounts and API keys for {{.Org}}.</p>
+  </div>
+  <div class="right-mobile">
+{{if eq .Data.Tab "people"}}    <button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/access/user-drawer">{{icon "plus"}}Invite person</button>
+{{else if eq .Data.Tab "roles"}}    <button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/access/role-editor">{{icon "plus"}}New role</button>
+{{else if eq .Data.Tab "api-keys"}}    <button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/access/key-drawer">{{icon "plus"}}New key</button>
+{{end}}  </div>
+</header>
+{{template "tabs" .Data.Tabs}}
+{{if .Data.Unconfigured}}
+<div class="empty">{{icon "info"}}<p>Identity management is not configured on this deployment.</p></div>
+{{else if eq .Data.Tab "people"}}{{template "frag-access-people" .}}
+{{else if eq .Data.Tab "roles"}}{{template "frag-access-roles" .}}
+{{else if eq .Data.Tab "service-accounts"}}{{template "frag-access-service-accounts" .}}
+{{else if eq .Data.Tab "api-keys"}}{{template "frag-access-api-keys" .}}
+{{else if eq .Data.Tab "sign-in"}}{{template "frag-access-sign-in" .}}
+{{end}}
+{{end}}

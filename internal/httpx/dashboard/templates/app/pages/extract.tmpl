@@ -1,0 +1,73 @@
+{{define "content"}}{{/* Extract Work page (OA-25, §6.5): Process / Jobs /
+     Templates tabs. Handlers render only (D-17) — writes go through
+     static/pages/extract.js via Enclava.api; no scripts, no hx-on (D-20). */}}
+<header class="head">
+  <div class="headcopy">
+    <div class="crumb">{{.Org}} / Work</div>
+    <h1>Extract</h1>
+    <p class="desc">Turn documents into structured, reviewable data.</p>
+  </div>
+</header>
+{{template "tabs" .Data.Tabs}}
+
+{{if eq .Data.Tab "process"}}
+<div class="section grid two">
+  <div class="card">
+    {{if .Data.Templates}}
+    <div class="card-title">Process a document</div>
+    <div class="card-sub">The result lands in your Jobs list; completed results can be added to knowledge.</div>
+    <div class="stack" style="margin-top:12px">
+      <div>
+        <label class="label" for="extract-template">Extraction template</label>
+        <select class="field" id="extract-template" data-extract-template-select>
+          {{range .Data.Templates}}<option value="{{.ID}}">{{.Name}}{{if .IsDefault}} · default{{end}}</option>{{end}}
+        </select>
+      </div>
+      {{/* Real visually-hidden file input behind the styled zone (§6.5). */}}
+      <input type="file" id="extract-file" class="visually-hidden" data-extract-file aria-describedby="extract-file-help">
+      <label class="empty" for="extract-file" id="extract-dropzone" data-extract-dropzone>
+        {{icon "upload"}}
+        <p>Drop a document to extract</p>
+        <span class="btn primary">Choose file</span>
+      </label>
+      <p class="help" id="extract-file-help" data-extract-filename hidden></p>
+      <p class="help" id="extract-file-limit">PDF, Word, image or text files · up to {{count .Data.MaxUploadMB}} MB per file.</p>
+      <div class="row">
+        <button type="button" class="btn primary" data-action="extract:submit">{{icon "sparkles"}}Run extraction</button>
+      </div>
+    </div>
+    {{else}}
+    <div class="empty">
+      {{icon "extract"}}
+      <p>No extraction templates yet — an admin needs to grant access.</p>
+    </div>
+    {{end}}
+  </div>
+  <div class="card">
+    <div class="card-title">How it works</div>
+    <div class="stack" style="margin-top:10px">
+      <div class="activity-row">
+        <span class="activity-icon">{{icon "file"}}</span>
+        <span class="activity-copy"><b>Choose a template</b><small>Only templates granted to you appear here.</small></span>
+      </div>
+      <div class="activity-row">
+        <span class="activity-icon">{{icon "upload"}}</span>
+        <span class="activity-copy"><b>Drop the document</b><small>One file per extraction; it is stored durably before processing starts.</small></span>
+      </div>
+      <div class="activity-row">
+        <span class="activity-icon">{{icon "sparkles"}}</span>
+        <span class="activity-copy"><b>Review the result</b><small>Fields, validation state, and one click into knowledge.</small></span>
+      </div>
+    </div>
+  </div>
+</div>
+{{else if eq .Data.Tab "jobs"}}
+<div class="section">
+  {{template "frag-extract-jobs" .}}
+</div>
+{{else if eq .Data.Tab "templates"}}
+<div class="section">
+  {{template "frag-extract-templates" .}}
+</div>
+{{end}}
+{{end}}

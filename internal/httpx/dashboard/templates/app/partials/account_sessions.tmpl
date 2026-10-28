@@ -1,0 +1,31 @@
+{{define "frag-account-sessions"}}{{/* Own sessions (OA-30): the page embeds
+     this fragment for first paint and htmx re-fetches it on the shared
+     refresh event after a revoke — the root div therefore carries the
+     hx-get/hx-trigger/hx-swap triple and is its own swap target. */}}
+<div class="card" id="account-sessions-card" hx-get="/dashboard/partials/account/sessions" hx-trigger="refresh from:body" hx-swap="outerHTML">
+{{if .Data.SessionsErr}}  <p class="muted">Could not load sessions.</p>
+{{else if .Data.Sessions}}  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Session</th>
+          <th scope="col">Signed in</th>
+          <th scope="col">Idle expiry</th>
+          <th scope="col">Status</th>
+          <th scope="col"><span class="visually-hidden">Actions</span></th>
+        </tr>
+      </thead>
+      <tbody>
+{{range .Data.Sessions}}        <tr>
+          <td data-label="Session">{{.ShortID}}{{if .Current}} {{statusPill "session" "current"}}{{end}}</td>
+          <td data-label="Signed in">{{relTime .CreatedAt}}</td>
+          <td data-label="Idle expiry">{{relTime .IdleExpiresAt}}</td>
+          <td data-label="Status">{{if .Revoked}}{{statusPill "session" "stopped"}}{{if .Reason}}<span class="subline">{{.Reason}}</span>{{end}}{{else}}—{{end}}</td>
+          <td data-label="Actions">{{if not .Revoked}}<button type="button" class="btn danger" data-action="confirm" data-confirm="Revoke this session? That device signs out immediately." data-account-revoke="{{.ID}}"{{if .Current}} data-account-current="1"{{end}}>{{if .Current}}Sign out{{else}}Revoke{{end}}</button>{{end}}</td>
+        </tr>
+{{end}}      </tbody>
+    </table>
+  </div>
+{{else}}  <div class="empty">{{icon "clock"}}<p>No sessions.</p></div>
+{{end}}</div>
+{{end}}

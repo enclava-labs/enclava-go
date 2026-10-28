@@ -8,15 +8,10 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"enclava-go/internal/auth"
-	"enclava-go/internal/billing"
-	"enclava-go/internal/extract"
-	"enclava-go/internal/store/postgres"
 )
 
 //go:embed dashboard/templates/*.tmpl
@@ -58,31 +53,6 @@ var dashboardDefaultScopes = []string{
 	"chatbot",
 }
 
-type dashboardUsageRow struct {
-	APIKeyID     string
-	APIKeyName   string
-	TotalTokens  int64
-	CostDisplay  string
-	RequestCount int64
-}
-
-type dashboardCurrencyTotal struct {
-	Currency     string
-	AmountMicros int64
-}
-
-type dashboardAnalyticsData struct {
-	TotalRequests    int64
-	TotalTokens      int64
-	TotalCostDisplay string
-	CurrencyTotals   []dashboardCurrencyTotal
-	Days             int
-	BySubject        []postgres.UsageGroupSum
-	ByEndpoint       []postgres.UsageGroupSum
-	ByModel          []postgres.UsageGroupSum
-	Rows             []dashboardUsageRow
-}
-
 type dashboardKeysData struct {
 	Keys       []auth.APIKeyRecord
 	Message    string
@@ -97,13 +67,6 @@ type dashboardLoginData struct {
 	LinkToken        string
 	LinkProviderName string
 	LinkEmail        string
-}
-
-type dashboardStatsData struct {
-	ActiveAPIKeys     int
-	RecentExtractJobs int64
-	TotalExtractJobs  int64
-	PlatformAdmin     bool
 }
 
 type dashboardPageCommon struct {
@@ -136,72 +99,29 @@ type dashboardIdentityData struct {
 	Providers []auth.OIDCProvider
 }
 
-type dashboardBudgetRow struct {
-	Subject   string
-	Window    string
-	Limit     string
-	Held      string
-	Unknown   string
-	Settled   string
-	Remaining string
-}
-
-type dashboardBudgetsData struct {
-	Rows []dashboardBudgetRow
-}
-
-type dashboardExtractData struct {
-	RecentJobs int64
-	TotalJobs  int64
-	Templates  []extract.Template
-}
-
 // registerLegacyDashboardRoutes registers the pre-phase-7 dashboard partials
-// and pages only — static/auth routes live in dashboard_shell.go now; the
-// /dashboard/ subtree stays the phase-6 404 catch-all until each page phase
-// replaces its own registration (deletions ride WITH the replacement).
+// and pages only — static/auth routes live in dashboard_shell.go now. The
+// /dashboard and /dashboard/ Home registrations plus the old stats,
+// chatbots, prompt-templates and rag surfaces died with the phase-10 Home
+// cutover (dashboard_home.go owns /dashboard and the subtree 404 catch-all
+// now); the remaining legacy pages stay until their page phases replace
+// them (deletions ride WITH the replacement).
 func (a *App) registerLegacyDashboardRoutes() {
 	// Dashboard data endpoints carry the same scope as the equivalent
 	// /api/v1 route — session sign-in alone never widens what a member may
 	// read or change. Mutating POST branches keep an additional *.manage
 	// check inside the handlers where the API splits read and write scopes.
-	a.mux.HandleFunc("/dashboard/partials/stats", a.sessionAuth.RequireSession(a.handleDashboardStats))
 	a.mux.HandleFunc("/dashboard/partials/keys", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardAPIKeys))
-	a.mux.HandleFunc("/dashboard/partials/usage", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardUsage))
-	a.mux.HandleFunc("/dashboard/partials/budgets", a.sessionAuth.RequireSession(a.handleDashboardBudgets))
-	a.mux.HandleFunc("/dashboard/partials/extract", a.sessionAuth.RequireSessionScope("extract", a.handleDashboardExtract))
-	a.mux.HandleFunc("/dashboard/partials/extract/templates", a.sessionAuth.RequireSessionScope("extract", a.handleDashboardExtractTemplates))
-	a.mux.HandleFunc("/dashboard/partials/extract/templates/", a.sessionAuth.RequireSessionScope("extract.manage", a.handleDashboardExtractTemplateByID))
-	a.mux.HandleFunc("/dashboard/partials/extract/reset-defaults", a.sessionAuth.RequireSessionScope("extract.manage", a.handleDashboardExtractResetDefaults))
-	a.mux.HandleFunc("/dashboard/partials/extract/settings", a.sessionAuth.RequireSessionScope("extract", a.handleDashboardExtractSettings))
-	a.mux.HandleFunc("/dashboard/partials/extract/jobs", a.sessionAuth.RequireSessionScope("extract", a.handleDashboardExtractJobs))
-	a.mux.HandleFunc("/dashboard/partials/extract/process", a.sessionAuth.RequireSessionScope("extract", a.handleDashboardExtractProcess))
-	a.mux.HandleFunc("/dashboard/partials/extract/models", a.sessionAuth.RequireSessionScope("extract", a.handleDashboardExtractModels))
 	a.mux.HandleFunc("/dashboard/partials/providers", a.sessionAuth.RequireSessionScope("pricing.manage", a.handleDashboardProviders))
 	a.mux.HandleFunc("/dashboard/partials/pricing", a.sessionAuth.RequireSessionScope("pricing.manage", a.handleDashboardPricing))
-	a.mux.HandleFunc("/dashboard/partials/billing-audit", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardBillingAudit))
-	a.mux.HandleFunc("/dashboard/partials/rag", a.sessionAuth.RequireSessionScope("rag", a.handleDashboardRAG))
-	a.mux.HandleFunc("/dashboard/partials/chatbots", a.sessionAuth.RequireSessionScope("chatbot", a.handleDashboardChatbots))
-	a.mux.HandleFunc("/dashboard/partials/prompt-templates", a.sessionAuth.RequireSessionScope("chatbot", a.handleDashboardPromptTemplates))
 	a.mux.HandleFunc("/dashboard/partials/mcp", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardMCP))
 	a.mux.HandleFunc("/dashboard/partials/connectors", a.sessionAuth.RequireSessionScope("connectors.manage", a.handleDashboardConnectors))
-	a.mux.HandleFunc("/dashboard/rag/documents/", a.sessionAuth.RequireSessionScope("rag", a.handleDashboardRAGDocumentDownload))
-	a.mux.HandleFunc("/dashboard/documents", a.sessionAuth.RequireSession(a.handleDashboardPageDocuments))
-	a.mux.HandleFunc("/dashboard/extract", a.sessionAuth.RequireSessionScope("extract", a.handleDashboardPageExtract))
 	a.mux.HandleFunc("/dashboard/keys", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardPageKeys))
-	a.mux.HandleFunc("/dashboard/budgets", a.sessionAuth.RequireSession(a.handleDashboardPageBudgets))
-	a.mux.HandleFunc("/dashboard/analytics", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardPageAnalytics))
 	a.mux.HandleFunc("/dashboard/providers", a.sessionAuth.RequireSessionScope("pricing.manage", a.handleDashboardPageProviders))
 	a.mux.HandleFunc("/dashboard/pricing", a.sessionAuth.RequireSessionScope("pricing.manage", a.handleDashboardPagePricing))
-	a.mux.HandleFunc("/dashboard/billing-audit", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardPageBillingAudit))
-	a.mux.HandleFunc("/dashboard/rag", a.sessionAuth.RequireSessionScope("rag", a.handleDashboardPageRAG))
-	a.mux.HandleFunc("/dashboard/chatbots", a.sessionAuth.RequireSessionScope("chatbot", a.handleDashboardPageChatbots))
-	a.mux.HandleFunc("/dashboard/prompt-templates", a.sessionAuth.RequireSessionScope("chatbot", a.handleDashboardPagePromptTemplates))
 	a.mux.HandleFunc("/dashboard/connectors", a.sessionAuth.RequireSessionScope("connectors.manage", a.handleDashboardPageConnectors))
 	a.mux.HandleFunc("/dashboard/mcp", a.sessionAuth.RequireSessionScope(auth.ScopePlatformAdmin, a.handleDashboardPageMCP))
 	a.mux.HandleFunc("/dashboard/identity", a.sessionAuth.RequireSession(a.handleDashboardPageIdentity))
-	a.mux.HandleFunc("/dashboard", a.sessionAuth.RequireSession(a.handleDashboardPage))
-	a.mux.HandleFunc("/dashboard/", a.sessionAuth.RequireSession(a.handleDashboardPage))
 }
 
 func (a *App) dashboardPageData(r *http.Request, activePage, pageTitle string) dashboardPageCommon {
@@ -254,24 +174,6 @@ func (a *App) handleDashboardPageIdentity(w http.ResponseWriter, r *http.Request
 	}
 }
 
-func (a *App) handleDashboardPage(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	// The /dashboard/ subtree registration funnels unknown paths here; only
-	// the exact Home paths render Home — everything else is a truthful 404.
-	if r.URL.Path != "/dashboard" && r.URL.Path != "/dashboard/" {
-		a.sessionAuth.renderDashboardNotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "page-dashboard", a.dashboardPageData(r, "dashboard", "Dashboard")); err != nil {
-		log.Printf("failed to render dashboard page: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_render_failed")
-	}
-}
-
 func (a *App) handleDashboardPageKeys(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		WriteMethodNotAllowed(w)
@@ -281,233 +183,6 @@ func (a *App) handleDashboardPageKeys(w http.ResponseWriter, r *http.Request) {
 	if err := dashboardTemplates.ExecuteTemplate(w, "page-keys", a.dashboardPageData(r, "keys", "API Keys")); err != nil {
 		log.Printf("failed to render dashboard keys page: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_keys_page_render_failed")
-	}
-}
-
-func (a *App) handleDashboardPageAnalytics(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "page-analytics", a.dashboardPageData(r, "analytics", "Analytics")); err != nil {
-		log.Printf("failed to render dashboard analytics page: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_analytics_page_render_failed")
-	}
-}
-
-func (a *App) handleDashboardPageBudgets(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "page-budgets", a.dashboardPageData(r, "budgets", "Budgets")); err != nil {
-		log.Printf("failed to render dashboard budgets page: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_budgets_page_render_failed")
-	}
-}
-
-func (a *App) handleDashboardPageExtract(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "page-extract", a.dashboardPageData(r, "extract", "Extract")); err != nil {
-		log.Printf("failed to render dashboard extract page: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_extract_page_render_failed")
-	}
-}
-
-func (a *App) handleDashboardPageDocuments(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	setNoStoreHeaders(w)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "page-documents", a.dashboardPageData(r, "documents", "Documents")); err != nil {
-		log.Printf("failed to render dashboard documents page: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_documents_page_render_failed")
-	}
-}
-
-func (a *App) handleDashboardStats(w http.ResponseWriter, r *http.Request) {
-	setNoStoreHeaders(w)
-	if r.Method != http.MethodGet {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	tenantID, ok := a.dashboardTenantID(w, r)
-	if !ok {
-		return
-	}
-	if a.identity == nil {
-		WriteOpenAIError(w, http.StatusNotImplemented, "API key store not configured", "server_error", "not_configured")
-		return
-	}
-
-	p, ok := auth.PrincipalFromContext(r.Context())
-	if !ok || p.TenantID == "" {
-		WriteUnauthorized(w, "authenticated principal required")
-		return
-	}
-
-	keys, err := a.identity.ListAPIKeys(r.Context(), tenantID)
-	if err != nil {
-		log.Printf("failed to load dashboard stats keys: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_stats_keys_failed")
-		return
-	}
-
-	// Only an administrator sees the tenant-wide key count; other members get
-	// their own keys' count — the same data their own credentials could see.
-	tenantWideKeys := auth.HasScope(p, auth.ScopePlatformAdmin)
-	activeKeys := 0
-	for _, key := range keys {
-		if !key.IsActive {
-			continue
-		}
-		if !tenantWideKeys && key.OwnerUserID != p.UserID {
-			continue
-		}
-		activeKeys++
-	}
-
-	var recentExtractJobs int64
-	if a.extractSvc != nil {
-		since := time.Now().UTC().Add(-24 * time.Hour)
-		recentExtractJobs, _, err = a.extractSvc.JobStats(r.Context(), p, since)
-		if err != nil {
-			log.Printf("failed to load dashboard extract job stats: %v", err)
-			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_stats_extract_failed")
-			return
-		}
-	}
-
-	// No tenant-wide default allowance exists; the dashboard reports only
-	// configured budgets on the dedicated budget page.
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "partial-stats", dashboardStatsData{
-		ActiveAPIKeys:     activeKeys,
-		RecentExtractJobs: recentExtractJobs,
-		PlatformAdmin:     tenantWideKeys,
-	}); err != nil {
-		log.Printf("failed to render dashboard stats: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_stats_render_failed")
-	}
-}
-
-func (a *App) handleDashboardUsage(w http.ResponseWriter, r *http.Request) {
-	setNoStoreHeaders(w)
-	if r.Method != http.MethodGet {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	if a.identity == nil || a.billingRepo == nil {
-		WriteOpenAIError(w, http.StatusNotImplemented, "usage tracking not configured", "server_error", "not_configured")
-		return
-	}
-	tenantID, ok := a.dashboardTenantID(w, r)
-	if !ok {
-		return
-	}
-
-	days := 30
-	if d := r.URL.Query().Get("days"); d != "" {
-		if parsed, err := strconv.Atoi(d); err == nil {
-			switch parsed {
-			case 7, 30, 90:
-				days = parsed
-			}
-		}
-	}
-	since := time.Now().UTC().AddDate(0, 0, -days)
-
-	totals, err := a.billingRepo.UsageTotals(r.Context(), tenantID, since)
-	if err != nil {
-		log.Printf("failed to load dashboard usage totals: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_usage_totals_failed")
-		return
-	}
-	var totalRequests, totalTokens int64
-	currencyTotals := make([]dashboardCurrencyTotal, 0, len(totals))
-	for _, t := range totals {
-		totalRequests += t.RequestCount
-		totalTokens += t.TotalUnits
-		currencyTotals = append(currencyTotals, dashboardCurrencyTotal{
-			Currency: t.Currency, AmountMicros: t.AmountMicros,
-		})
-	}
-
-	byEndpoint, err := a.billingRepo.UsageByEndpoint(r.Context(), tenantID, since)
-	if err != nil {
-		log.Printf("failed to load dashboard usage by endpoint: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_usage_endpoint_failed")
-		return
-	}
-
-	byModel, err := a.billingRepo.UsageByModel(r.Context(), tenantID, since)
-	if err != nil {
-		log.Printf("failed to load dashboard usage by model: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_usage_model_failed")
-		return
-	}
-
-	bySubject, err := a.billingRepo.UsageBySubject(r.Context(), tenantID, since)
-	if err != nil {
-		log.Printf("failed to load dashboard usage by subject: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_usage_subject_failed")
-		return
-	}
-	keys, err := a.identity.ListAPIKeys(r.Context(), tenantID)
-	if err != nil {
-		log.Printf("failed to load dashboard keys for usage: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_usage_keys_failed")
-		return
-	}
-
-	nameByID := make(map[string]string, len(keys))
-	for _, key := range keys {
-		name := strings.TrimSpace(key.Name)
-		if name == "" {
-			name = "API key " + key.ID
-		}
-		nameByID[key.ID] = name
-	}
-
-	rows := make([]dashboardUsageRow, 0, len(bySubject))
-	for _, item := range bySubject {
-		if item.SubjectType != billing.BudgetSubjectAPIKey {
-			continue
-		}
-		name := nameByID[item.SubjectID]
-		if name == "" {
-			continue
-		}
-		rows = append(rows, dashboardUsageRow{
-			APIKeyID: item.SubjectID, APIKeyName: name,
-			TotalTokens: item.TotalUnits, CostDisplay: formatCurrencyMicros(item.Currency, item.AmountMicros),
-			RequestCount: item.RequestCount,
-		})
-	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].TotalTokens > rows[j].TotalTokens })
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "partial-usage", dashboardAnalyticsData{
-		TotalRequests:  totalRequests,
-		TotalTokens:    totalTokens,
-		CurrencyTotals: currencyTotals,
-		Days:           days,
-		BySubject:      bySubject,
-		ByEndpoint:     byEndpoint,
-		ByModel:        byModel,
-		Rows:           rows,
-	}); err != nil {
-		log.Printf("failed to render dashboard usage: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_usage_render_failed")
 	}
 }
 
@@ -731,153 +406,6 @@ func (a *App) renderDashboardKeys(w http.ResponseWriter, ctx context.Context, te
 	}); err != nil {
 		log.Printf("failed to render dashboard keys: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_keys_render_failed")
-	}
-}
-
-func (a *App) handleDashboardBudgets(w http.ResponseWriter, r *http.Request) {
-	setNoStoreHeaders(w)
-	if r.Method != http.MethodGet {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	if a.billingRepo == nil {
-		WriteOpenAIError(w, http.StatusNotImplemented, "budget tracking not configured", "server_error", "not_configured")
-		return
-	}
-	tenantID, ok := a.dashboardTenantID(w, r)
-	if !ok {
-		return
-	}
-	p, ok := auth.PrincipalFromContext(r.Context())
-	if !ok || p.TenantID != tenantID {
-		WriteUnauthorized(w, "authenticated principal required")
-		return
-	}
-	subject := billingSubjectOf(p)
-	subjects := []billing.Subject{subject}
-	// The tenant-wide budget subject is administrator data; members see only
-	// the budgets their own billing subject is bound to.
-	if auth.HasScope(p, auth.ScopePlatformAdmin) {
-		subjects = append(subjects, billing.Subject{Type: billing.BudgetSubjectTenant, ID: tenantID})
-	}
-	if p.CredentialKind == auth.CredentialKindAPIKey && p.CredentialID != "" {
-		subjects = append(subjects, billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: p.CredentialID})
-	}
-	now := time.Now().UTC()
-	budgets, err := a.billingRepo.ListActiveBudgets(r.Context(), tenantID, subjects, now)
-	if err != nil {
-		log.Printf("failed to load dashboard active budgets: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_budgets_list_failed")
-		return
-	}
-	rows := make([]dashboardBudgetRow, 0, len(budgets))
-	for _, budget := range budgets {
-		usedUnits, usedMicros, err := a.liabilityForBudget(r.Context(), tenantID, budget, now)
-		if err != nil {
-			log.Printf("failed to load dashboard budget liability: %v", err)
-			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_budgets_usage_failed")
-			return
-		}
-		from := periodStart(budget.Period, now)
-		if budget.StartsAt.After(from) {
-			from = budget.StartsAt
-		}
-		liabilities, err := a.billingRepo.Liabilities(r.Context(), tenantID, budget.Subject, from)
-		if err != nil {
-			log.Printf("failed to load dashboard budget breakdown: %v", err)
-			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_budgets_usage_failed")
-			return
-		}
-		var held, unknown, settled, heldUnits, unknownUnits, settledUnits int64
-		for _, liability := range liabilities {
-			amount, units := &settled, &settledUnits
-			switch liability.State {
-			case billing.ReservationHeld:
-				amount, units = &held, &heldUnits
-			case billing.ReservationUnknown:
-				amount, units = &unknown, &unknownUnits
-			case billing.ReservationSettled:
-			default:
-				continue
-			}
-			if sum, ok := checkedBudgetAdd(*amount, liability.AmountMicros); ok {
-				*amount = sum
-			} else {
-				*amount = int64(^uint64(0) >> 1)
-			}
-			for _, value := range liability.Units {
-				if sum, ok := checkedBudgetAdd(*units, value); ok {
-					*units = sum
-				} else {
-					*units = int64(^uint64(0) >> 1)
-				}
-			}
-		}
-		if budget.Kind == billing.BudgetKindTokens {
-			remaining := budget.LimitAmountMicros - usedUnits
-			rows = append(rows, dashboardBudgetRow{
-				Subject: budget.Subject.Type + " " + budget.Subject.ID, Window: budget.Period,
-				Limit: strconv.FormatInt(budget.LimitAmountMicros, 10) + " raw units",
-				Held:  strconv.FormatInt(heldUnits, 10) + " raw units", Unknown: strconv.FormatInt(unknownUnits, 10) + " raw units",
-				Settled: strconv.FormatInt(settledUnits, 10) + " raw units", Remaining: strconv.FormatInt(remaining, 10) + " raw units",
-			})
-		} else {
-			remaining := budget.LimitAmountMicros - usedMicros
-			rows = append(rows, dashboardBudgetRow{
-				Subject: budget.Subject.Type + " " + budget.Subject.ID, Window: budget.Period,
-				Limit: formatCurrencyMicros(budget.Currency, budget.LimitAmountMicros),
-				Held:  formatCurrencyMicros(budget.Currency, held), Unknown: formatCurrencyMicros(budget.Currency, unknown),
-				Settled: formatCurrencyMicros(budget.Currency, settled), Remaining: formatCurrencyMicros(budget.Currency, remaining),
-			})
-		}
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "partial-budgets", dashboardBudgetsData{Rows: rows}); err != nil {
-		log.Printf("failed to render dashboard budgets: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_budgets_render_failed")
-	}
-}
-
-func (a *App) handleDashboardExtract(w http.ResponseWriter, r *http.Request) {
-	setNoStoreHeaders(w)
-	if r.Method != http.MethodGet {
-		WriteMethodNotAllowed(w)
-		return
-	}
-
-	p, ok := a.extractPrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	var recentJobs int64
-	var totalJobs int64
-	var templates []extract.Template
-	if a.extractSvc != nil {
-		var err error
-		since := time.Now().UTC().Add(-24 * time.Hour)
-		recentJobs, totalJobs, err = a.extractSvc.JobStats(r.Context(), p, since)
-		if err != nil {
-			log.Printf("failed to load extract job stats: %v", err)
-			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_extract_stats_failed")
-			return
-		}
-		templates, err = a.extractSvc.ListTemplates(r.Context(), p)
-		if err != nil {
-			log.Printf("failed to load extract templates: %v", err)
-			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_extract_templates_failed")
-			return
-		}
-	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboardTemplates.ExecuteTemplate(w, "partial-extract", dashboardExtractData{
-		RecentJobs: recentJobs,
-		TotalJobs:  totalJobs,
-		Templates:  templates,
-	}); err != nil {
-		log.Printf("failed to render dashboard extract: %v", err)
-		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "dashboard_extract_render_failed")
 	}
 }
 

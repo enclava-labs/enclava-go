@@ -1,0 +1,65 @@
+{{define "frag-extract-result"}}{{/* Extraction result drawer (OA-25):
+     fields with locations only where produced Data carries them, validation
+     state, Copy JSON, Download CSV, Add to knowledge (search cap + a
+     writable collection). Served by GET /dashboard/partials/extract/result?job=. */}}
+<div class="drawer-head">
+  <h2>Extraction result</h2>
+  <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close">{{icon "x"}}<span class="visually-hidden">Close</span></button>
+</div>
+{{if .Data.Job}}
+<p class="muted">{{.Data.Job.FileName}}{{if .Data.Job.TemplateID}} · {{.Data.Job.TemplateID}}{{end}}</p>
+<p>{{statusPill "job" .Data.Job.Status}}</p>
+{{if .Data.Result}}
+  {{if or .Data.Result.ValidationErrors .Data.Result.ValidationWarnings}}
+  <div class="stack">
+    {{range .Data.Result.ValidationErrors}}<p class="bad">{{icon "alert"}} {{.}}</p>{{end}}
+    {{range .Data.Result.ValidationWarnings}}<p class="warn">{{icon "alert"}} {{.}}</p>{{end}}
+  </div>
+  {{end}}
+  {{if .Data.Fields}}
+  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Field</th>
+          <th scope="col">Value</th>
+          <th scope="col">Location</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Data.Fields}}
+        <tr>
+          <td data-label="Field"><b>{{.Name}}</b></td>
+          <td data-label="Value">{{.Value}}</td>
+          <td data-label="Location">{{.Location}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <p class="muted">The stored result carries no fields.</p>
+  {{end}}
+  <div class="row" style="margin-top:14px">
+    <button type="button" class="btn" data-action="extract:copy" data-job-id="{{.Data.Job.ID}}">{{icon "copy"}}Copy JSON</button>
+    <button type="button" class="btn" data-action="extract:csv" data-job-id="{{.Data.Job.ID}}" data-file-name="{{.Data.Job.FileName}}">{{icon "file"}}Download CSV</button>
+  </div>
+  {{if and .Can.Search .Data.Writable}}
+  <div class="stack" style="margin-top:16px">
+    <label class="label" for="extract-import-collection">Add to knowledge</label>
+    <select class="field" id="extract-import-collection">
+      {{range .Data.Writable}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
+    </select>
+    <div class="row">
+      <button type="button" class="btn primary" data-action="extract:import" data-job-id="{{.Data.Job.ID}}">{{icon "knowledge"}}Add to knowledge</button>
+    </div>
+    <p class="help">Imports this extraction result as a document in the selected collection.</p>
+  </div>
+  {{end}}
+{{else}}
+<p class="muted">No result is available for this job yet.</p>
+{{end}}
+{{else}}
+<p class="muted">Extraction job not found.</p>
+{{end}}
+{{end}}

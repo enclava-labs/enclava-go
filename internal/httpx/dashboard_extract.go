@@ -1,407 +1,296 @@
+// dashboard_extract.go — the Extract Work page (OA-25, plan 09-04): Process,
+// Jobs and Templates tabs rendered from the phase-8 extract producers.
+//
+// Cutover record (this plan owns the extract removal atomically): the old
+// JSON-proxy file content is gone — handleDashboardExtractTemplates/ByID/
+// ResetDefaults/Settings/Process/Jobs/Models, dashboardMergeTemplate and
+// extractPrincipal died with the rewrite; dashboard.go lost the nine old
+// `/dashboard/extract` + `/dashboard/partials/extract*` registrations plus
+// handleDashboardPageExtract/handleDashboardExtract/dashboardExtractData;
+// templates/page_extract.tmpl, templates/partial_extract.tmpl and
+// static/extraction.js are deleted; the five dashboard_resources.go callers
+// of extractPrincipal now use the file-local legacyPrincipal. Nothing
+// extract-related remains for 09-10 to sweep.
+//
+// Handlers render only (D-17): every write is a page-module fetch to the
+// /api/v1/extract API through Enclava.api, and fragments re-render through
+// htmx `refresh from:body` after each write.
 package httpx
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
-	"io"
+	"fmt"
 	"log"
 	"net/http"
-	"path/filepath"
-	"strconv"
+	"sort"
 	"strings"
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/extract"
+	"enclava-go/internal/jobs"
 )
 
-// extractPrincipal resolves the real request principal for dashboard extract
-// calls — an API-key-authenticated request carries it in context. The signed
-// dashboard password cookie carries no tenant identity, so password-mode
-// dashboard extract calls get a truthful 401 rather than a fabricated
-// authority; the session-cookie principal lands with 01-16/01-20.
-func (a *App) extractPrincipal(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {
-	if p, ok := auth.PrincipalFromContext(r.Context()); ok && p.TenantID != "" {
-		return p, true
-	}
-	WriteUnauthorized(w, "authenticated principal required")
-	return auth.Principal{}, false
+// extractCollectionOption is one writable knowledge collection in the result
+// drawer's "Add to knowledge" select.
+type extractCollectionOption struct {
+	ID, Name string
 }
 
-// handleDashboardExtractTemplates handles GET (list) and POST (create) for templates.
-func (a *App) handleDashboardExtractTemplates(w http.ResponseWriter, r *http.Request) {
-	setNoStoreHeaders(w)
-	switch r.Method {
-	case http.MethodGet:
-		if a.extractSvc == nil {
-			WriteJSON(w, http.StatusOK, map[string]any{"templates": []any{}})
-			return
-		}
-		p, ok := a.extractPrincipal(w, r)
-		if !ok {
-			return
-		}
-		templates, err := a.extractSvc.ListTemplates(r.Context(), p)
-		if err != nil {
-			log.Printf("dashboard: list extract templates: %v", err)
-			WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
-		}
-		WriteJSON(w, http.StatusOK, map[string]any{"templates": templates})
-	case http.MethodPost:
-		p, ok := a.extractPrincipal(w, r)
-		if !ok {
-			return
-		}
-		// Template writes map to the API's extract.manage scope.
-		if !auth.HasScope(p, "extract.manage") {
-			WriteForbidden(w, "missing required scope: extract.manage")
-			return
-		}
-		if a.extractSvc == nil {
-			WriteJSON(w, http.StatusNotImplemented, map[string]any{"error": "extract not configured"})
-			return
-		}
-		var payload extract.Template
-		if err := DecodeJSON(r, &payload); err != nil {
-			WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON payload"})
-			return
-		}
-		if err := a.extractSvc.UpsertTemplate(r.Context(), p, payload); err != nil {
-			WriteJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		tpl, err := a.extractSvc.GetTemplate(r.Context(), p, payload.ID)
-		if err != nil {
-			WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
-		}
-		WriteJSON(w, http.StatusCreated, tpl)
-	default:
-		WriteMethodNotAllowed(w)
-	}
+// extractFieldRow is one result field. Location is filled only where the
+// stored Data actually carries provider-emitted per-field location data —
+// absent data renders "—", never an invented value.
+type extractFieldRow struct {
+	Name, Value, Location string
 }
 
-// handleDashboardExtractTemplateByID handles PUT (update) and DELETE for a specific template.
-func (a *App) handleDashboardExtractTemplateByID(w http.ResponseWriter, r *http.Request) {
-	setNoStoreHeaders(w)
-	if a.extractSvc == nil {
-		WriteJSON(w, http.StatusNotImplemented, map[string]any{"error": "extract not configured"})
-		return
-	}
-	p, ok := a.extractPrincipal(w, r)
-	if !ok {
-		return
-	}
-	templateID := strings.TrimPrefix(r.URL.Path, "/dashboard/partials/extract/templates/")
-	if strings.TrimSpace(templateID) == "" {
-		WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "template id is required"})
-		return
-	}
-
-	switch r.Method {
-	case http.MethodPut:
-		existing, err := a.extractSvc.GetTemplate(r.Context(), p, templateID)
-		if err != nil {
-			WriteJSON(w, http.StatusNotFound, map[string]any{"error": "template not found"})
-			return
-		}
-		var patch map[string]any
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1*1024*1024))
-		if err != nil {
-			WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
-			return
-		}
-		defer func() { _ = r.Body.Close() }()
-		if err := json.Unmarshal(body, &patch); err != nil {
-			WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON payload"})
-			return
-		}
-		merged := dashboardMergeTemplate(existing, patch)
-		if err := a.extractSvc.UpsertTemplate(r.Context(), p, merged); err != nil {
-			WriteJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		tpl, err := a.extractSvc.GetTemplate(r.Context(), p, templateID)
-		if err != nil {
-			WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
-		}
-		WriteJSON(w, http.StatusOK, tpl)
-	case http.MethodDelete:
-		if err := a.extractSvc.DeleteTemplate(r.Context(), p, templateID); err != nil {
-			WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
-		}
-		WriteJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": templateID})
-	default:
-		WriteMethodNotAllowed(w)
-	}
+// extractView is the model for the Extract page and its three fragments; one
+// struct keeps a tab identical whether the page renders it inline or a
+// partial route re-renders it after a write.
+type extractView struct {
+	Tabs        []dashboardTab
+	Tab         string
+	Templates   []extract.Template // Process picker: execution-grant intersection (D-25)
+	Jobs        []extract.JobView  // caller's own extraction jobs only
+	Total       int
+	Live        bool // any queued/running job → the fragment polls every 3s
+	Manage      []extract.Template
+	Settings    extract.Settings
+	Models      []string
+	Job         *extract.JobView
+	Result      *extract.ResultView
+	Fields      []extractFieldRow
+	Writable    []extractCollectionOption
+	MaxUploadMB int64
 }
 
-// handleDashboardExtractResetDefaults resets default templates.
-func (a *App) handleDashboardExtractResetDefaults(w http.ResponseWriter, r *http.Request) {
-	setNoStoreHeaders(w)
-	if r.Method != http.MethodPost {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	if a.extractSvc == nil {
-		WriteJSON(w, http.StatusNotImplemented, map[string]any{"error": "extract not configured"})
-		return
-	}
-	p, ok := a.extractPrincipal(w, r)
-	if !ok {
-		return
-	}
-	if err := a.extractSvc.ResetDefaultTemplates(r.Context(), p); err != nil {
-		WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+func (extractView) DashboardTitle() string  { return "Extract" }
+func (extractView) DashboardModule() string { return "extract" }
+
+// registerDashboardExtractRoutes self-registers via init() below (frozen
+// phase-7 registrar); page plans never touch dashboard_shell.go.
+func (a *App) registerDashboardExtractRoutes() {
+	a.mux.HandleFunc("/dashboard/extract", a.sessionAuth.requireCap(capExtract, a.handleDashboardExtractPage))
+	a.mux.HandleFunc("/dashboard/partials/extract/jobs", a.sessionAuth.requireCap(capExtract, a.handleDashboardExtractJobsFragment))
+	a.mux.HandleFunc("/dashboard/partials/extract/result", a.sessionAuth.requireCap(capExtract, a.handleDashboardExtractResultFragment))
+	a.mux.HandleFunc("/dashboard/partials/extract/templates", a.sessionAuth.requireCap(capExtractManage, a.handleDashboardExtractTemplatesFragment))
 }
 
-// handleDashboardExtractSettings handles GET (fetch) and PUT (update) for extract settings.
-func (a *App) handleDashboardExtractSettings(w http.ResponseWriter, r *http.Request) {
-	setNoStoreHeaders(w)
-	p, ok := a.extractPrincipal(w, r)
-	if !ok {
-		return
-	}
-	// Settings writes map to the API's extract.manage scope.
-	if r.Method == http.MethodPut && !auth.HasScope(p, "extract.manage") {
-		WriteForbidden(w, "missing required scope: extract.manage")
-		return
-	}
-	if a.extractSvc == nil {
-		WriteJSON(w, http.StatusNotImplemented, map[string]any{"error": "extract settings not configured"})
-		return
-	}
-	switch r.Method {
-	case http.MethodGet:
-		settings, err := a.extractSvc.GetSettings(r.Context(), p)
-		if err != nil {
-			log.Printf("dashboard: get extract settings: %v", err)
-			WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
-		}
-		WriteJSON(w, http.StatusOK, settings)
-	case http.MethodPut:
-		var payload struct {
-			DefaultModel  string `json:"default_model"`
-			MaxFileSizeMB int64  `json:"max_file_size_mb"`
-		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1*1024*1024))
-		if err != nil {
-			WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
-			return
-		}
-		defer func() { _ = r.Body.Close() }()
-		if err := json.Unmarshal(body, &payload); err != nil {
-			WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON payload"})
-			return
-		}
-		if payload.MaxFileSizeMB <= 0 {
-			payload.MaxFileSizeMB = a.maxUploadMB
-		}
-		updated, err := a.extractSvc.UpdateSettings(r.Context(), p, extract.Settings{
-			DefaultModel:  payload.DefaultModel,
-			MaxFileSizeMB: payload.MaxFileSizeMB,
-		})
-		if err != nil {
-			WriteJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		WriteJSON(w, http.StatusOK, updated)
-	default:
-		WriteMethodNotAllowed(w)
-	}
-}
+func init() { registerDashboardPage((*App).registerDashboardExtractRoutes) }
 
-// handleDashboardExtractProcess handles multipart file upload and extraction.
-func (a *App) handleDashboardExtractProcess(w http.ResponseWriter, r *http.Request) {
-	setNoStoreHeaders(w)
-	if r.Method != http.MethodPost {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	if a.extractSvc == nil {
-		WriteJSON(w, http.StatusNotImplemented, map[string]any{"error": "extract not configured"})
-		return
-	}
-	p, ok := a.extractPrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	r.Body = http.MaxBytesReader(w, r.Body, a.maxUploadMB*1024*1024+64*1024)
-	if err := r.ParseMultipartForm(32 * 1024); err != nil {
-		WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid multipart form or file too large"})
-		return
-	}
-	defer func() {
-		if r.MultipartForm != nil {
-			_ = r.MultipartForm.RemoveAll()
-		}
-	}()
-
-	templateID := strings.TrimSpace(r.FormValue("template_id"))
-	if templateID == "" {
-		WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "template_id is required"})
-		return
-	}
-
-	if r.MultipartForm == nil || len(r.MultipartForm.File) != 1 || len(r.MultipartForm.File["file"]) != 1 {
-		WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "exactly one file is required"})
-		return
-	}
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "file is required"})
-		return
-	}
-	defer file.Close()
-	if header.Size <= 0 || header.Size > a.maxUploadMB*1024*1024 {
-		WriteJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "file size is outside the allowed limit"})
-		return
-	}
-
-	mimeType := header.Header.Get("Content-Type")
-	if strings.TrimSpace(mimeType) == "" {
-		mimeType = "application/octet-stream"
-	}
-
-	contextValues := map[string]any{}
-	contextRaw := strings.TrimSpace(r.FormValue("context"))
-	if contextRaw != "" {
-		if err := json.Unmarshal([]byte(contextRaw), &contextValues); err != nil {
-			WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "context must be valid JSON object"})
-			return
-		}
-	}
-
-	operation := strings.TrimSpace(r.FormValue("operation"))
-	if operation == "image-recognition" {
-		operation = extract.OperationVision
-	}
-	if operation == "" {
-		operation = extract.OperationProcess
-	}
-	result, err := a.extractSvc.ProcessReader(r.Context(), p, extract.ProcessInput{
-		Operation: operation, TemplateID: templateID, Context: contextValues,
-		FileName: filepath.Base(header.Filename), MimeType: mimeType, Reader: file,
-		IdempotencyKey: strings.TrimSpace(r.FormValue("idempotency_key")),
-	})
-	if err != nil {
-		if errors.Is(err, extract.ErrExtractionAdmissionLimited) {
-			WriteJSON(w, http.StatusTooManyRequests, map[string]any{"error": err.Error()})
-			return
-		}
-		WriteJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
-		return
-	}
-	WriteJSON(w, http.StatusAccepted, map[string]any{
-		"job_id": result.JobID, "status": result.Status,
-		"status_url": "/api/v1/extract/jobs/" + result.JobID,
-	})
-}
-
-// handleDashboardExtractJobs returns recent extract jobs as JSON.
-func (a *App) handleDashboardExtractJobs(w http.ResponseWriter, r *http.Request) {
-	setNoStoreHeaders(w)
+func (a *App) handleDashboardExtractPage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		WriteMethodNotAllowed(w)
 		return
 	}
-	if a.extractSvc == nil {
-		WriteJSON(w, http.StatusOK, map[string]any{"jobs": []any{}, "total": 0})
+	caps, _ := capsFromContext(r.Context())
+	tab := r.URL.Query().Get("tab")
+	if tab != "jobs" && tab != "templates" {
+		tab = "process"
+	}
+	// The Templates tab stays manager-only even by URL (§6.5).
+	if tab == "templates" && !caps.grants(capExtractManage) {
+		a.sessionAuth.renderDashboardForbidden(w, r)
 		return
 	}
-	p, ok := a.extractPrincipal(w, r)
-	if !ok {
-		return
-	}
-	limit := 20
-	offset := 0
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
-			limit = n
-		}
-	}
-	if raw := r.URL.Query().Get("offset"); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
-			offset = n
-		}
-	}
-	jobsList, total, err := a.extractSvc.ListJobs(r.Context(), p, "", limit, offset)
-	if err != nil {
-		log.Printf("dashboard: list extract jobs: %v", err)
-		WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	WriteJSON(w, http.StatusOK, map[string]any{"jobs": jobsList, "total": total, "limit": limit, "offset": offset})
+	p, _ := auth.PrincipalFromContext(r.Context())
+	a.renderDashboard(w, r, "extract", a.buildExtractView(r.Context(), tab, p, caps))
 }
 
-// handleDashboardExtractModels returns available vision models as JSON.
-func (a *App) handleDashboardExtractModels(w http.ResponseWriter, r *http.Request) {
-	setNoStoreHeaders(w)
+func (a *App) handleDashboardExtractJobsFragment(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		WriteMethodNotAllowed(w)
 		return
 	}
+	p, _ := auth.PrincipalFromContext(r.Context())
+	caps, _ := capsFromContext(r.Context())
+	a.renderDashboardFragment(w, r, "extract", "extract-jobs", a.buildExtractView(r.Context(), "jobs", p, caps))
+}
+
+func (a *App) handleDashboardExtractResultFragment(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	jobID := strings.TrimSpace(r.URL.Query().Get("job"))
+	if jobID == "" {
+		WriteOpenAIError(w, http.StatusBadRequest, "job is required", "invalid_request_error", "missing_job")
+		return
+	}
+	p, _ := auth.PrincipalFromContext(r.Context())
+	v := extractView{Tab: "jobs"}
+	if a.extractSvc != nil {
+		detail, err := a.extractSvc.GetJob(r.Context(), p, jobID)
+		if err != nil {
+			log.Printf("dashboard extract: load job: %v", err)
+			WriteOpenAIError(w, http.StatusNotFound, "extraction job not found", "invalid_request_error", "job_not_found")
+			return
+		}
+		v.Job = &detail.Job
+		v.Result = detail.Result
+		v.Fields = extractFieldRows(detail.Result)
+		if detail.Result != nil {
+			v.Writable = a.extractWritableCollections(r.Context(), p)
+		}
+	}
+	a.renderDashboardFragment(w, r, "extract", "extract-result", v)
+}
+
+func (a *App) handleDashboardExtractTemplatesFragment(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	p, _ := auth.PrincipalFromContext(r.Context())
+	caps, _ := capsFromContext(r.Context())
+	a.renderDashboardFragment(w, r, "extract", "extract-templates", a.buildExtractView(r.Context(), "templates", p, caps))
+}
+
+// buildExtractView assembles the per-tab model; a nil extract service yields
+// the truthful empty states instead of fabricated rows.
+func (a *App) buildExtractView(ctx context.Context, tab string, p auth.Principal, caps dashboardCaps) extractView {
+	v := extractView{Tab: tab, Tabs: extractTabs(caps, tab), MaxUploadMB: a.maxUploadMB}
 	if a.extractSvc == nil {
-		WriteJSON(w, http.StatusOK, map[string]any{"models": []any{}})
-		return
+		return v
 	}
-	p, ok := a.extractPrincipal(w, r)
-	if !ok {
-		return
+	var err error
+	switch tab {
+	case "jobs":
+		v.Jobs, v.Total, err = a.extractSvc.ListJobs(ctx, p, "", 50, 0)
+		if err != nil {
+			log.Printf("dashboard extract: list jobs: %v", err)
+		}
+		v.Live = extractHasLive(v.Jobs)
+	case "templates":
+		v.Manage, err = a.extractSvc.ListTemplates(ctx, p)
+		if err != nil {
+			log.Printf("dashboard extract: list templates: %v", err)
+		}
+		v.Settings, err = a.extractSvc.GetSettings(ctx, p)
+		if err != nil {
+			log.Printf("dashboard extract: load settings: %v", err)
+		}
+		v.Models = a.extractModels(ctx, p)
+	default:
+		v.Templates, err = a.extractSvc.ListExecutableTemplates(ctx, p)
+		if err != nil {
+			log.Printf("dashboard extract: list executable templates: %v", err)
+		}
 	}
-	models, err := a.extractSvc.ModelsForExtract(r.Context(), p.TenantID)
+	return v
+}
+
+// extractTabs: Process · Jobs · Templates, the Templates link only under
+// extract.manage (member never sees it).
+func extractTabs(caps dashboardCaps, active string) []dashboardTab {
+	tabs := []dashboardTab{
+		{Label: "Process", Href: "/dashboard/extract?tab=process", Active: active == "process"},
+		{Label: "Jobs", Href: "/dashboard/extract?tab=jobs", Active: active == "jobs"},
+	}
+	if caps.grants(capExtractManage) {
+		tabs = append(tabs, dashboardTab{Label: "Templates", Href: "/dashboard/extract?tab=templates", Active: active == "templates"})
+	}
+	return tabs
+}
+
+func extractHasLive(jobViews []extract.JobView) bool {
+	for _, j := range jobViews {
+		if j.Status == jobs.StatusQueued || j.Status == jobs.StatusRunning {
+			return true
+		}
+	}
+	return false
+}
+
+// extractModels lists the model aliases the tenant's vision-capable endpoints
+// expose, narrowed to what the caller may actually select — the same rule the
+// settings PUT enforces (auth.ModelAllowed).
+func (a *App) extractModels(ctx context.Context, p auth.Principal) []string {
+	models, err := a.extractSvc.ModelsForExtract(ctx, p.TenantID)
 	if err != nil {
-		log.Printf("dashboard: list extract models: %v", err)
-		WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
+		log.Printf("dashboard extract: list models: %v", err)
+		return nil
 	}
-	type modelInfo struct {
-		ID   string `json:"id"`
-		Name string `json:"name,omitempty"`
-	}
-	out := make([]modelInfo, 0, len(models))
+	out := make([]string, 0, len(models))
 	for _, m := range models {
-		name := m.ID
-		if strings.TrimSpace(m.Object) != "" && m.Object != "model" {
-			name = m.Object
+		if auth.ModelAllowed(p, m.ID) {
+			out = append(out, m.ID)
 		}
-		out = append(out, modelInfo{ID: m.ID, Name: name})
 	}
-	WriteJSON(w, http.StatusOK, map[string]any{"models": out})
+	sort.Strings(out)
+	return out
 }
 
-// dashboardMergeTemplate merges a JSON patch into an existing template.
-func dashboardMergeTemplate(existing extract.Template, patch map[string]any) extract.Template {
-	if v, ok := patch["name"].(string); ok {
-		existing.Name = v
+// extractWritableCollections mirrors the writability rule the knowledge
+// import endpoint enforces (rag.collectionManageable: owner or
+// platform.admin) so the drawer only offers collections the import would
+// accept.
+func (a *App) extractWritableCollections(ctx context.Context, p auth.Principal) []extractCollectionOption {
+	if a.ragSvc == nil {
+		return nil
 	}
-	if v, ok := patch["description"].(string); ok {
-		existing.Description = v
+	collections, err := a.ragSvc.ListCollections(ctx, p)
+	if err != nil {
+		log.Printf("dashboard extract: list collections: %v", err)
+		return nil
 	}
-	if v, ok := patch["system_prompt"].(string); ok {
-		existing.SystemPrompt = v
+	out := make([]extractCollectionOption, 0, len(collections))
+	for _, c := range collections {
+		if auth.HasScope(p, auth.ScopePlatformAdmin) || (c.OwnerActorID != "" && c.OwnerActorID == p.ActorID) {
+			out = append(out, extractCollectionOption{ID: c.ID, Name: c.Name})
+		}
 	}
-	if v, ok := patch["user_prompt"].(string); ok {
-		existing.UserPrompt = v
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// extractFieldRows projects result Data into one row per field. A Location is
+// filled only where the stored Data carries provider-emitted per-field
+// location data ({"value":…,"location":…}) — no producer exists today
+// (service.go persists Data + validation only), so cells stay "—" rather
+// than an invented location.
+func extractFieldRows(result *extract.ResultView) []extractFieldRow {
+	if result == nil || len(result.Data) == 0 {
+		return nil
 	}
-	if v, ok := patch["model"].(string); ok {
-		existing.DefaultModel = v
+	keys := make([]string, 0, len(result.Data))
+	for k := range result.Data {
+		keys = append(keys, k)
 	}
-	if v, ok := patch["is_default"].(bool); ok {
-		existing.IsDefault = v
+	sort.Strings(keys)
+	rows := make([]extractFieldRow, 0, len(keys))
+	for _, k := range keys {
+		row := extractFieldRow{Name: k, Value: extractFieldValue(result.Data[k]), Location: "—"}
+		if m, ok := result.Data[k].(map[string]any); ok {
+			if loc, ok := m["location"].(string); ok && strings.TrimSpace(loc) != "" {
+				row.Location = loc
+				if val, has := m["value"]; has {
+					row.Value = extractFieldValue(val)
+				}
+			}
+		}
+		rows = append(rows, row)
 	}
-	if v, ok := patch["is_active"].(bool); ok {
-		existing.Enabled = v
+	return rows
+}
+
+// extractFieldValue renders a decoded Data value plainly; GetJob decodes with
+// json.Number, so numbers keep their exact stored digits.
+func extractFieldValue(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case json.Number:
+		return t.String()
+	case string:
+		return t
+	case map[string]any, []any:
+		b, err := json.Marshal(t)
+		if err != nil {
+			return fmt.Sprint(t)
+		}
+		return string(b)
+	default:
+		return fmt.Sprint(t)
 	}
-	if v, ok := patch["context_schema"].(map[string]any); ok {
-		existing.ContextSchema = v
-	}
-	return existing
 }

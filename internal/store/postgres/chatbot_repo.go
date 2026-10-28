@@ -281,6 +281,36 @@ func (r *ChatbotRepo) CountConversations(ctx context.Context, tenantID, ownerAct
 	return count, nil
 }
 
+// ListConversationCountsByAssistant batches the per-assistant conversation
+// counts behind the Assistants table: one grouped read over the tenant's
+// conversations for exactly the listed assistants. Assistants without
+// conversations are absent from the map — callers treat missing rows as zero.
+func (r *ChatbotRepo) ListConversationCountsByAssistant(ctx context.Context, tenantID string, chatbotIDs []string) (map[string]int64, error) {
+	counts := make(map[string]int64, len(chatbotIDs))
+	if len(chatbotIDs) == 0 {
+		return counts, nil
+	}
+	rows, err := r.db.SQL.QueryContext(ctx,
+		`SELECT chatbot_id, COUNT(*) FROM conversations WHERE tenant_id = $1 AND chatbot_id = ANY($2) GROUP BY chatbot_id`,
+		tenantID, chatbotIDs)
+	if err != nil {
+		return nil, fmt.Errorf("count conversations by assistant: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id string
+		var n int64
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, fmt.Errorf("scan conversation count: %w", err)
+		}
+		counts[id] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate conversation counts: %w", err)
+	}
+	return counts, nil
+}
+
 // encodeConversationCursor makes the opaque keyset cursor: the exact
 // (created_at, id) pair of the last returned row, base64-wrapped.
 func encodeConversationCursor(createdAt time.Time, id string) string {

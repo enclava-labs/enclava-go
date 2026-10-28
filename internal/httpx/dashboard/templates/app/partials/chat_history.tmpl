@@ -1,0 +1,20 @@
+{{define "frag-chat-history"}}{{/* One keyset page of the caller's own
+     conversations, newest first, grouped Today/Earlier. The root re-fetches
+     itself on `refresh from:body`; "Show earlier" follows the cursor. */}}
+{{$conv := .Data.ConversationID}}
+<div class="history-list" id="chatHistory"
+  hx-get="/dashboard/partials/chat/history{{if $conv}}?c={{$conv}}{{end}}"
+  hx-trigger="refresh from:body" hx-target="this" hx-swap="outerHTML">
+  {{if .Data.History.Groups}}
+    {{range .Data.History.Groups}}<h3>{{.Label}}</h3>
+      {{range .Items}}<a class="history-item{{if .Selected}} selected{{end}}" href="/dashboard/chat/{{.ID}}">{{.Title}}<span class="subline">{{relTime .UpdatedAt}}</span></a>
+      {{end}}
+    {{end}}
+    {{if .Data.History.NextCursor}}<button type="button" class="btn"
+      hx-get="/dashboard/partials/chat/history?cursor={{urlquery .Data.History.NextCursor}}{{if $conv}}&c={{$conv}}{{end}}"
+      hx-target="#chatHistory" hx-swap="outerHTML">Show earlier</button>{{end}}
+  {{else}}
+    <p class="muted">No conversations yet — start one with New chat.</p>
+  {{end}}
+</div>
+{{end}}

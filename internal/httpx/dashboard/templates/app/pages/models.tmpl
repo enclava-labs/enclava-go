@@ -1,0 +1,19 @@
+{{define "content"}}{{/* Models + Pricing page (OA-27): tabs render the
+     matching fragment define so page and fragment stay one source of truth.
+     No scripts, no hx-on (D-20) — behaviors live in pages/models.js. */}}
+<header class="head">
+  <div class="headcopy">
+    <div class="crumb">{{.Org}} / Admin</div>
+    <h1>Models</h1>
+    <p class="desc">Inference endpoints with their observed assurance and health, and the pricing that routes depend on.</p>
+  </div>
+  <div class="right-mobile">
+    <button type="button" class="btn primary" data-action="models:endpoint" data-endpoint-id="">{{icon "plus"}}Add endpoint</button>
+  </div>
+</header>
+<nav class="tabs" aria-label="Models sections">
+  <a class="tab{{if ne .Data.Tab "pricing"}} active{{end}}" href="/dashboard/models"{{if ne .Data.Tab "pricing"}} aria-current="page"{{end}}>Endpoints</a>
+  <a class="tab{{if eq .Data.Tab "pricing"}} active{{end}}" href="/dashboard/models/pricing"{{if eq .Data.Tab "pricing"}} aria-current="page"{{end}}>Pricing</a>
+</nav>
+{{if eq .Data.Tab "pricing"}}{{template "frag-models-pricing" .}}{{else}}{{template "frag-models-endpoints" .}}{{end}}
+{{end}}

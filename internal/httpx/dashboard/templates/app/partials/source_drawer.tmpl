@@ -1,0 +1,214 @@
+{{define "frag-sources-drawer"}}{{/* Add-source wizard (OA-23, plan 09-02):
+     five steps, provider-conditional fields, credential refs filtered
+     server-side per provider, Notion published-audiences editor. Markup only
+     (D-20) — static/pages/sources.js drives every interaction via
+     data-action delegation and writes through Enclava.api (D-17). */}}
+<div class="drawer-head">
+  <h2>Add source</h2>
+  <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button>
+</div>
+<div class="stepper" aria-label="Add source steps">
+  <span class="step active" data-step-dot="1">1 Provider</span>
+  <span class="step" data-step-dot="2">2 Connect</span>
+  <span class="step" data-step-dot="3">3 Access</span>
+  <span class="step" data-step-dot="4">4 Destination</span>
+  <span class="step" data-step-dot="5">5 Review</span>
+</div>
+
+<div class="section" data-step-pane="1">
+  <div class="tilegrid">
+    <button type="button" class="tile" data-action="sources:provider" data-provider="slack">{{icon "chat"}}<b>Slack</b><span class="subline">Channel messages</span></button>
+    <button type="button" class="tile" data-action="sources:provider" data-provider="teams">{{icon "users"}}<b>Microsoft Teams</b><span class="subline">Channels and chats</span></button>
+    <button type="button" class="tile" data-action="sources:provider" data-provider="github">{{icon "command"}}<b>GitHub</b><span class="subline">Repository files</span></button>
+    <button type="button" class="tile" data-action="sources:provider" data-provider="notion">{{icon "file"}}<b>Notion</b><span class="subline">Pages and subpages</span></button>
+    <button type="button" class="tile" data-action="sources:provider" data-provider="google_drive">{{icon "upload"}}<b>Google Drive</b><span class="subline">Shared folders</span></button>
+  </div>
+  <span class="field-error" data-wizard-error hidden></span>
+</div>
+
+<div class="section" data-step-pane="2" hidden>
+  <div class="section-head"><h2>Connect and scope</h2></div>
+
+  <div data-provider-fields="slack" hidden>
+    <label class="label" for="slack-channel">Channel ID</label>
+    <input class="field" id="slack-channel" data-config="channel_id" required>
+    <span class="help">One channel per source — the ID Slack shows in channel details.</span>
+    <label class="label" for="slack-limit">Item limit</label>
+    <input class="field" id="slack-limit" data-config="limit" data-type="number" type="number" min="1" inputmode="numeric">
+    <label class="label"><input type="checkbox" data-config="reconcile" data-type="bool" value="true"> Reconcile access on every sync</label>
+    <label class="label" for="slack-credential">Credential reference</label>
+    <input class="field" id="slack-credential" data-credential list="cred-slack" autocomplete="off" required>
+    <datalist id="cred-slack">{{range index .Data.CredentialRefs "slack"}}<option value="{{.RefID}}"></option>{{end}}</datalist>
+    {{if not (index .Data.CredentialRefs "slack")}}<span class="help">No Slack credentials configured — an administrator must bind a CONNECTOR_SLACK_* secret first.</span>{{end}}
+  </div>
+
+  <div data-provider-fields="teams" hidden>
+    <label class="label" for="teams-tenant">Tenant ID</label>
+    <input class="field" id="teams-tenant" data-config="tenant_id" autocomplete="off">
+    <label class="label" for="teams-client">Client ID</label>
+    <input class="field" id="teams-client" data-config="client_id" autocomplete="off">
+    <span class="help">Tenant and client IDs are required together for app-only access.</span>
+    <label class="label" for="teams-team">Team ID(s)</label>
+    <input class="field" id="teams-team" data-team-scope required>
+    <span class="help">One team ID, or several separated by commas.</span>
+    <label class="label" for="teams-channels">Channel restrictions</label>
+    <textarea class="field" id="teams-channels" data-channels rows="2" placeholder="team-id:channel-id"></textarea>
+    <span class="help">One team-id:channel-id pair per line to sync only those channels; empty syncs every channel of the selected teams.</span>
+    <label class="label" for="teams-chats">Chat IDs</label>
+    <textarea class="field" id="teams-chats" data-config="chat_ids" data-type="list" rows="2" placeholder="chat-id per line"></textarea>
+    <span class="help">Optional — chat-backed content outside any team.</span>
+    <label class="label" for="teams-graph">Graph base URL</label>
+    <input class="field" id="teams-graph" data-config="graph_base_url" autocomplete="off" placeholder="https://graph.microsoft.com/v1.0">
+    <label class="label" for="teams-credential">Credential reference</label>
+    <input class="field" id="teams-credential" data-credential list="cred-teams" autocomplete="off" required>
+    <datalist id="cred-teams">{{range index .Data.CredentialRefs "teams"}}<option value="{{.RefID}}"></option>{{end}}</datalist>
+    {{if not (index .Data.CredentialRefs "teams")}}<span class="help">No Teams credentials configured — an administrator must bind a CONNECTOR_TEAMS_* secret first.</span>{{end}}
+  </div>
+
+  <div data-provider-fields="github" hidden>
+    <label class="label" for="github-owner">Owner</label>
+    <input class="field" id="github-owner" data-config="owner" required>
+    <label class="label" for="github-repo">Repository</label>
+    <input class="field" id="github-repo" data-config="repo" required>
+    <label class="label" for="github-ref">Ref</label>
+    <input class="field" id="github-ref" data-config="ref" placeholder="HEAD">
+    <label class="label" for="github-paths">Paths</label>
+    <textarea class="field" id="github-paths" data-config="paths" data-type="list" rows="2" placeholder="docs/ per line"></textarea>
+    <span class="help">Optional — restrict the sync to these repository paths.</span>
+    <label class="label" for="github-api">API URL</label>
+    <input class="field" id="github-api" data-config="api_url" autocomplete="off" placeholder="https://api.github.com">
+    <label class="label" for="github-credential">Credential reference</label>
+    <input class="field" id="github-credential" data-credential list="cred-github" autocomplete="off">
+    <datalist id="cred-github">{{range index .Data.CredentialRefs "github"}}<option value="{{.RefID}}"></option>{{end}}</datalist>
+    <span class="help">Optional for public repositories.</span>
+  </div>
+
+  <div data-provider-fields="notion" hidden>
+    <label class="label" for="notion-pages">Page IDs</label>
+    <textarea class="field" id="notion-pages" data-notion-pages rows="2" placeholder="page id per line" required></textarea>
+    <span class="help">Each selected page syncs with its published audiences (next step).</span>
+    <label class="label" for="notion-depth">Max depth</label>
+    <input class="field" id="notion-depth" data-config="max_depth" data-type="number" type="number" min="1" max="8" inputmode="numeric" placeholder="3">
+    <label class="label" for="notion-max-pages">Max pages</label>
+    <input class="field" id="notion-max-pages" data-config="max_pages" data-type="number" type="number" min="1" max="500" inputmode="numeric" placeholder="50">
+    <label class="label" for="notion-version">Notion version</label>
+    <input class="field" id="notion-version" data-config="notion_version" placeholder="2022-06-28">
+    <label class="label" for="notion-base">Base URL</label>
+    <input class="field" id="notion-base" data-config="base_url" autocomplete="off" placeholder="https://api.notion.com/v1">
+    <label class="label" for="notion-credential">Credential reference</label>
+    <input class="field" id="notion-credential" data-credential list="cred-notion" autocomplete="off" required>
+    <datalist id="cred-notion">{{range index .Data.CredentialRefs "notion"}}<option value="{{.RefID}}"></option>{{end}}</datalist>
+    {{if not (index .Data.CredentialRefs "notion")}}<span class="help">No Notion credentials configured — an administrator must bind a CONNECTOR_NOTION_* secret first.</span>{{end}}
+  </div>
+
+  <div data-provider-fields="google_drive" hidden>
+    <label class="label" for="drive-folder">Folder ID</label>
+    <input class="field" id="drive-folder" data-config="folder_id" required>
+    <label class="label" for="drive-shared">Shared drive ID</label>
+    <input class="field" id="drive-shared" data-config="shared_drive_id" autocomplete="off">
+    <label class="label" for="drive-mimes">MIME types</label>
+    <textarea class="field" id="drive-mimes" data-config="mime_types" data-type="list" rows="2" placeholder="application/pdf per line"></textarea>
+    <span class="help">Optional — restrict the sync to these file types.</span>
+    <label class="label" for="drive-base">Base URL</label>
+    <input class="field" id="drive-base" data-config="base_url" autocomplete="off" placeholder="https://www.googleapis.com/drive/v3">
+    <label class="label" for="drive-sheets">Sheets base URL</label>
+    <input class="field" id="drive-sheets" data-config="sheets_base_url" autocomplete="off" placeholder="https://sheets.googleapis.com/v4">
+    <label class="label" for="drive-credential">Credential reference</label>
+    <input class="field" id="drive-credential" data-credential list="cred-google_drive" autocomplete="off" required>
+    <datalist id="cred-google_drive">{{range index .Data.CredentialRefs "google_drive"}}<option value="{{.RefID}}"></option>{{end}}</datalist>
+    {{if not (index .Data.CredentialRefs "google_drive")}}<span class="help">No Google Drive credentials configured — an administrator must bind a CONNECTOR_GOOGLE_DRIVE_* secret first.</span>{{end}}
+  </div>
+  <span class="field-error" data-wizard-error hidden></span>
+</div>
+
+<div class="section" data-step-pane="3" hidden>
+  <div class="section-head"><h2>Access</h2></div>
+  <div data-provider-access="slack" hidden>
+    <p class="muted">Slack sources mirror the workspace membership the connected app can see — readers keep their own Slack access to open native URLs.</p>
+  </div>
+  <div data-provider-access="teams" hidden>
+    <p class="muted">Teams sources mirror standard, private and shared channel membership plus the configured chats — readers keep their own Teams access.</p>
+  </div>
+  <div data-provider-access="github" hidden>
+    <p class="muted">GitHub sources mirror repository collaborator grants — only collaborators can find the repository's content here.</p>
+  </div>
+  <div data-provider-access="notion" hidden>
+    <p class="muted">Notion sources grant only the <b>published audiences</b> configured below, applied to every selected page. Selecting a page never grants access by itself.</p>
+    <div class="stack" id="notion-audiences">
+      <div class="row" data-audience-row>
+        <input class="field" data-audience-id placeholder="Audience name" aria-label="Audience name">
+        <input class="field" data-audience-members placeholder="Enclava user IDs, comma separated" aria-label="Audience members">
+        <button type="button" class="iconbtn" data-action="sources:audience-remove" aria-label="Remove audience">{{icon "x"}}<span class="visually-hidden">Remove audience</span></button>
+      </div>
+    </div>
+    <button type="button" class="btn" data-action="sources:audience-add">{{icon "plus"}}Add audience</button>
+    <span class="field-error" data-wizard-error hidden></span>
+  </div>
+  <div data-provider-access="google_drive" hidden>
+    <p class="muted">Drive sources mirror Drive sharing and folder inheritance — content stays readable only to people Drive already shares it with.</p>
+  </div>
+</div>
+
+<div class="section" data-step-pane="4" hidden>
+  <div class="section-head"><h2>Destination and schedule</h2></div>
+  <label class="label" for="source-name">Source name</label>
+  <input class="field" id="source-name" data-source-name required>
+  <label class="label" for="source-collection">Target collection</label>
+  <select class="field" id="source-collection" data-source-collection required>
+    <option value="" disabled{{if not .Data.Collections}} selected{{end}}>Choose a collection</option>
+    {{range .Data.Collections}}<option value="{{.ID}}"{{if eq .ID $.Data.PresetCollection}} selected{{end}}>{{.Name}}</option>{{end}}
+  </select>
+  {{if not .Data.Collections}}<span class="help">No writable collections — create one in Knowledge first.</span>{{end}}
+  <label class="label" for="source-interval">Sync interval</label>
+  <input class="field" id="source-interval" data-source-interval placeholder="30m" autocomplete="off">
+  <span class="help">e.g. 30m, 6h, 24h — empty uses the 1h default; 0 disables scheduled syncs. Minimum 5m.</span>
+  <label class="label"><input type="checkbox" id="source-enabled" data-source-enabled checked> Enabled</label>
+  <span class="field-error" data-wizard-error hidden></span>
+</div>
+
+<div class="section" data-step-pane="5" hidden>
+  <div class="section-head"><h2>Review</h2></div>
+  <div class="stack" id="source-review" data-source-review></div>
+  <p class="muted">Creating the source starts its first sync immediately.</p>
+  <span class="field-error" data-wizard-error hidden></span>
+</div>
+
+<div class="drawer-actions">
+  <button type="button" class="btn ghost" data-action="sources:back" disabled>Back</button>
+  <button type="button" class="btn primary" data-action="sources:next" disabled>Continue</button>
+  <button type="button" class="btn primary" data-action="sources:submit" hidden>Create source and sync</button>
+</div>
+{{end}}
+
+{{define "frag-sources-bindings"}}{{/* Verified source-user bindings drawer —
+     served under access.manage only (platform.admin inner gate on the API). */}}
+<div class="drawer-head">
+  <h2>User bindings</h2>
+  <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button>
+</div>
+<p class="muted">Verified mappings from {{if .Data.SourceName}}“{{.Data.SourceName}}”{{else}}this source{{end}}'s native users to Enclava users. Bindings decide whose access a source-native grant can widen.</p>
+<div class="stack">
+  {{range .Data.Bindings}}  <div class="row">
+    <code>{{.NativeID}}</code>
+    {{if .MappedUserID}}<span>→ <code>{{.MappedUserID}}</code></span>
+    <button type="button" class="btn danger" data-action="sources:unbind" data-source-id="{{$.Data.SourceID}}" data-binding-id="{{.ID}}">Revoke</button>
+    {{else}}<span class="muted">unbound</span>{{end}}
+  </div>
+  {{else}}  <p class="muted">No observed source users yet — bindings appear after the source's first access sync.</p>
+  {{end}}
+</div>
+<div class="section">
+  <div class="section-head"><h2>Bind a user</h2></div>
+  <label class="label" for="bind-native">Observed native user ID</label>
+  <input class="field" id="bind-native" data-bind-native required>
+  <label class="label" for="bind-mapped">Enclava user ID</label>
+  <input class="field" id="bind-mapped" data-bind-mapped required>
+  <label class="label" for="bind-evidence">Administrator verification evidence</label>
+  <input class="field" id="bind-evidence" data-bind-evidence required>
+  <span class="help">Where the verification is recorded (ticket, request, review).</span>
+  <div class="row">
+    <button type="button" class="btn primary" data-action="sources:bind" data-source-id="{{.Data.SourceID}}">Bind user</button>
+  </div>
+  <span class="field-error" data-wizard-error hidden></span>
+</div>
+{{end}}

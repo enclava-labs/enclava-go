@@ -1,0 +1,18 @@
+{{define "content"}}{{/* Instructions (OA-24, plan 09-03): prompt-template
+     list; Edit/New open the guarded editor drawer route; ?new=1 deep link is
+     handled by the assistants page module. Sidebar stays on Assistants. */}}
+<header class="head">
+  <div class="headcopy">
+    <div class="crumb">{{.Org}} / Build</div>
+    <h1>Instructions</h1>
+    <p class="desc">Prompt templates that shape how assistants answer.</p>
+  </div>
+  <div class="right-mobile">
+    <button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/assistants/instructions/editor?new=1">{{icon "plus"}}New instructions</button>
+  </div>
+</header>
+{{template "tabs" .Data.Tabs}}
+<section data-assistants-page="instructions">
+{{template "frag-instructions-list" .}}
+</section>
+{{end}}

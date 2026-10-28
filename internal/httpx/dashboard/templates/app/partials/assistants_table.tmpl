@@ -1,0 +1,35 @@
+{{define "frag-assistants-table"}}{{/* Assistants table (09-03): truthful
+     columns — model+endpoint with the confidential chip from observed
+     assurance, knowledge names resolved server-side, stored tools, verbatim
+     audience, status, REAL per-assistant conversation counts. The wrapper
+     re-fetches on Enclava.refresh() (D-17). Arg: assistantsPageData. */}}
+<div class="card" id="assistants-table" hx-get="/dashboard/partials/assistants/table" hx-trigger="refresh from:body" hx-swap="outerHTML">
+{{if .Data.Table.Rows}}  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Assistant</th>
+          <th scope="col">Model &amp; endpoint</th>
+          <th scope="col">Knowledge</th>
+          <th scope="col">Tools</th>
+          <th scope="col">Audience</th>
+          <th scope="col">Status</th>
+          <th scope="col">Conversations</th>
+        </tr>
+      </thead>
+      <tbody>
+{{range .Data.Table.Rows}}        <tr>
+          <td data-label="Assistant"><span class="avatar" style="background:{{.AvatarColor}}">{{.Initials}}</span> <b>{{.Name}}</b>{{if .Description}}<span class="subline">{{.Description}}</span>{{end}}</td>
+          <td data-label="Model &amp; endpoint">{{.Model}}<span class="subline">{{if .Endpoint}}{{.Endpoint}}{{else}}Auto-route{{end}}</span>{{if eq .ConfState "verified"}} <span class="pill {{statusTone "verified"}}"><i class="dot"></i>Confidential · {{.Endpoint}} verified</span>{{else if eq .ConfState "unverified"}} <span class="pill {{statusTone "warning"}}"><i class="dot"></i>Confidential · unverified</span>{{end}}</td>
+          <td data-label="Knowledge">{{if .Knowledge}}{{range $i, $k := .Knowledge}}{{if $i}}, {{end}}{{$k}}{{end}}{{else}}<span class="muted">No knowledge attached</span>{{end}}</td>
+          <td data-label="Tools">{{if .Tools}}{{range $i, $t := .Tools}}{{if $i}}, {{end}}{{$t}}{{end}}{{else}}<span class="muted">No tools</span>{{end}}</td>
+          <td data-label="Audience">{{.Audience}}</td>
+          <td data-label="Status">{{statusPill "assistant" .StatusState}} <button type="button" class="btn" data-action="open-drawer" data-drawer-url="/dashboard/partials/assistants/drawer?id={{.ID}}">Edit</button></td>
+          <td data-label="Conversations">{{count .Conversations}}</td>
+        </tr>
+{{end}}      </tbody>
+    </table>
+  </div>
+{{else}}  {{template "empty" .Empty}}
+{{end}}</div>
+{{end}}

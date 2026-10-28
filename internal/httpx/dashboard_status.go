@@ -31,6 +31,7 @@ var dashboardStatusLabels = map[string]dashboardStatusRow{
 	"review":       {"Needs attention", "warn"},
 	"pending":      {"Awaiting approval", "warn"},
 	"degraded":     {"Degraded", "warn"},
+	"unverified":   {"Unverified", "warn"},
 	"changed":      {"Changed", "warn"},
 	"invited":      {"Invited", "warn"},
 	"queued":       {"Queued", "neutral"},

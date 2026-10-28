@@ -1,0 +1,110 @@
+{{define "frag-access-people"}}{{/* People tab (09-07): real rows only —
+     role names, stored team, derived status (disabled > invited > active) and
+     the user's stored last login. Row manage drawer maps every write to an
+     identities subroute via pages/access.js. */}}
+<div id="access-people" hx-get="/dashboard/partials/access/people" hx-trigger="refresh from:body" hx-target="this" hx-swap="outerHTML">
+{{if .Data.People}}  <div class="card">
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Person</th>
+            <th scope="col">Roles</th>
+            <th scope="col">Team</th>
+            <th scope="col">Status</th>
+            <th scope="col">Last active</th>
+            <th scope="col"><span class="visually-hidden">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody>
+{{range .Data.People}}          <tr>
+            <td data-label="Person"><b>{{.Name}}</b><span class="subline">{{.Email}}</span></td>
+            <td data-label="Roles">{{if .Roles}}{{range $i, $r := .Roles}}{{if $i}} · {{end}}{{$r}}{{end}}{{else}}<span class="muted">No roles</span>{{end}}</td>
+            <td data-label="Team">{{if .Team}}{{.Team}}{{else}}—{{end}}</td>
+            <td data-label="Status">{{statusPill "member" .Status}}</td>
+            <td data-label="Last active">{{if .LastLogin}}{{relTime .LastLogin}}{{else}}—{{end}}</td>
+            <td data-label="Actions"><button type="button" class="btn" data-action="open-drawer" data-drawer-url="/dashboard/partials/access/user-drawer?id={{.ID}}">{{icon "settings"}}Manage</button></td>
+          </tr>
+{{end}}        </tbody>
+      </table>
+    </div>
+  </div>
+{{else}}  <div class="empty">{{icon "users"}}<p>No people yet — invite your first teammate.</p><button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/access/user-drawer">{{icon "plus"}}Invite person</button></div>
+{{end}}</div>
+{{end}}
+
+{{define "frag-access-user-drawer"}}{{/* Person drawer (09-07): create mode
+     (no id) enrolls via POST /api/v1/identities/users; manage mode writes
+     roles (PUT/DELETE …/users/{id}/roles/{roleID}), password (POST …/password),
+     status (PATCH …/users/{id}) and sessions (DELETE …/sessions/{sid}) — the
+     disable path revokes sessions API-side. */}}
+<div class="drawer-head">
+  <h2>{{if .Data.UserDrawer.Create}}Invite a person{{else}}Manage person{{end}}</h2>
+  <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close">{{icon "x"}}<span class="visually-hidden">Close</span></button>
+</div>
+{{$d := .Data.UserDrawer}}
+{{if $d.Create}}
+<form data-form="access-user-create">
+  <div class="stack">
+    <div>
+      <label class="label" for="access-user-email">Email</label>
+      <input class="field" id="access-user-email" name="email" type="email" required autocomplete="off">
+    </div>
+    <div>
+      <label class="label" for="access-user-name">Display name</label>
+      <input class="field" id="access-user-name" name="display_name" autocomplete="off">
+    </div>
+    <div>
+      <label class="label" for="access-user-password">Initial password</label>
+      <input class="field" id="access-user-password" name="password" type="password" required minlength="8" autocomplete="new-password">
+      <span class="help">Share it through a safe channel — they can change it in Account.</span>
+    </div>
+    <fieldset class="stack">
+      <legend class="label">Roles</legend>
+{{range $d.Roles}}      <label class="row"><input type="checkbox" name="role" value="{{.ID}}"> {{.Name}}</label>
+{{end}}{{if not $d.Roles}}      <p class="help">No roles exist yet — a person without a role holds no capabilities.</p>
+{{end}}    </fieldset>
+  </div>
+  <div class="drawer-actions">
+    <button type="button" class="btn ghost" data-action="close-drawer">Cancel</button>
+    <button type="submit" class="btn primary">{{icon "plus"}}Send invite</button>
+  </div>
+</form>
+{{else}}
+  <div class="stack">
+    <div class="row">
+      <div><b>{{$d.Name}}</b><span class="subline">{{$d.Email}}</span></div>
+      {{statusPill "member" $d.Status}}
+    </div>
+    <form data-form="access-user-roles" data-user-id="{{$d.ID}}">
+      <fieldset class="stack">
+        <legend class="label">Roles</legend>
+{{range $d.Roles}}        <label class="row"><input type="checkbox" name="role" value="{{.ID}}"{{if .Assigned}} checked data-assigned="1"{{end}}> {{.Name}}</label>
+{{end}}{{if not $d.Roles}}        <p class="help">No roles exist yet.</p>
+{{end}}      </fieldset>
+      <div class="drawer-actions">
+        <button type="submit" class="btn primary">Save roles</button>
+      </div>
+    </form>
+    <form data-form="access-user-password" data-user-id="{{$d.ID}}">
+      <label class="label" for="access-user-new-password">Set a new password</label>
+      <input class="field" id="access-user-new-password" name="password" type="password" required minlength="8" autocomplete="new-password">
+      <div class="drawer-actions">
+        <button type="submit" class="btn">{{icon "key"}}Reset password</button>
+      </div>
+    </form>
+    <div class="row">
+{{if $d.Disabled}}      <button type="button" class="btn" data-action="confirm" data-confirm="Re-enable this person?" data-access-confirm="user-status" data-user-id="{{$d.ID}}" data-status="active">Enable</button>
+{{else}}      <button type="button" class="btn danger" data-action="confirm" data-confirm="Disable this person and revoke their sessions?" data-access-confirm="user-status" data-user-id="{{$d.ID}}" data-status="disabled">Disable</button>
+{{end}}    </div>
+    <div class="stack">
+      <h3>Sessions</h3>
+{{range $d.Sessions}}      <div class="row">
+        <span class="muted">Started {{relTime .Created}}{{if .Current}} · this session{{end}}</span>
+        <button type="button" class="btn danger" data-action="confirm" data-confirm="Revoke this session?" data-access-confirm="session" data-user-id="{{$d.ID}}" data-session-id="{{.ID}}">Revoke</button>
+      </div>
+{{end}}{{if not $d.Sessions}}      <p class="help">No active sessions.</p>
+{{end}}    </div>
+  </div>
+{{end}}
+{{end}}

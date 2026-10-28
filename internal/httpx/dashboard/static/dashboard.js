@@ -143,85 +143,6 @@
     mount.className = 'min-h-[1.5rem] text-sm ' + cls;
   }
 
-  // ── Service health ────────────────────────────────────────────────
-
-  function setDot(id, tone) {
-    var el = document.getElementById(id);
-    if (!el) return;
-    el.className = 'status-dot' + (tone ? ' ' + tone : '');
-  }
-
-  function setSeal(state, title, meta) {
-    var band = document.getElementById('seal-band');
-    var titleEl = document.getElementById('seal-title');
-    var metaEl = document.getElementById('seal-meta');
-    if (band) band.setAttribute('data-state', state);
-    if (titleEl) titleEl.textContent = title;
-    if (metaEl) metaEl.innerHTML = meta;
-  }
-
-  function fmtVerifiedAt(iso) {
-    if (!iso || iso.indexOf('0001-01-01') === 0) return null;
-    var d = new Date(iso);
-    if (isNaN(d.getTime())) return null;
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) +
-      ' ' + d.toLocaleDateString([], { month: 'short', day: 'numeric' });
-  }
-
-  function sep() { return '<span class="sep">·</span>'; }
-
-  function refreshServiceStatus() {
-    var systemStatus = document.getElementById('system-status');
-    var providerStatus = document.getElementById('provider-status');
-    if (!systemStatus || !providerStatus) return;
-
-    fetch('/health')
-      .then(function (res) {
-        return res.ok ? res.json() : Promise.reject(new Error('health endpoint unavailable'));
-      })
-      .then(function (payload) {
-        var providerState = payload && typeof payload.provider === 'object' ? payload.provider : null;
-        var att = payload && typeof payload.attestation === 'object' ? payload.attestation : null;
-        var providerName = (att && att.provider) || (providerState && providerState.name) || 'provider';
-        var ready = !!(providerState && providerState.ready);
-
-        // System snapshot rows
-        systemStatus.textContent = ready ? 'Ready · ' + providerName : 'Not ready · ' + providerName;
-        setDot('provider-dot', ready ? 'ok' : 'warn');
-
-        if (att) {
-          providerStatus.textContent = att.enabled
-            ? (att.verified ? 'Verified' : 'Enabled, not yet verified')
-            : 'Not supported by this provider';
-          setDot('attest-dot', att.enabled ? (att.verified ? 'ok' : 'warn') : '');
-        } else {
-          providerStatus.textContent = 'Unavailable';
-          setDot('attest-dot', '');
-        }
-
-        // Signature seal band
-        var verifiedAt = att ? fmtVerifiedAt(att.verified_at) : null;
-        var readyTxt = ready ? 'provider live' : 'provider offline';
-        if (att && att.enabled && att.verified) {
-          setSeal('sealed', 'Enclave sealed',
-            'Confidential compute attested' + sep() + providerName +
-            (verifiedAt ? sep() + 'verified ' + verifiedAt : '') + sep() + readyTxt);
-        } else if (att && att.enabled) {
-          setSeal('unsealed', 'Enclave unsealed',
-            'Attestation enabled but not yet verified' + sep() + providerName + sep() + readyTxt);
-        } else {
-          setSeal('off', 'Attestation not active',
-            providerName + ' does not expose a confidential attestation' + sep() + readyTxt);
-        }
-      })
-      .catch(function () {
-        systemStatus.textContent = 'Could not reach /health';
-        setDot('provider-dot', 'warn');
-        providerStatus.textContent = '';
-        setSeal('off', 'Status unavailable', 'Could not reach the health endpoint.');
-      });
-  }
-
   // ── HTMX event handlers ──────────────────────────────────────────
 
   function getEventPath(event) {
@@ -272,30 +193,6 @@
     if (path === '/dashboard/partials/keys' && event.detail.successful) {
       return;
     }
-    if (path === '/dashboard/partials/stats' && event.detail.successful) {
-      initializeEndpointCopy();
-      refreshServiceStatus();
-      return;
-    }
-  }
-
-  // ── Endpoint copy ─────────────────────────────────────────────────
-
-  function initializeEndpointCopy() {
-    var endpoint = document.getElementById('api-endpoint');
-    var copyButton = document.getElementById('copy-api-endpoint');
-    if (!endpoint) return;
-
-    endpoint.textContent = window.location.origin + '/api/v1';
-    if (!copyButton) return;
-
-    copyButton.addEventListener('click', function () {
-      navigator.clipboard.writeText(endpoint.textContent || '').then(function () {
-        showToast('API endpoint copied to clipboard.', 'success', 3000);
-      }).catch(function () {
-        showToast('Failed to copy API endpoint.', 'error');
-      });
-    });
   }
 
   // ── Initialize ────────────────────────────────────────────────────
@@ -303,15 +200,9 @@
   document.body.addEventListener('htmx:configRequest', onBeforeDashboardRequest);
   document.body.addEventListener('htmx:responseError', onDashboardError);
   document.body.addEventListener('htmx:afterRequest', onDashboardAfterRequest);
-  document.body.addEventListener('htmx:afterSwap', function () {
-    initializeEndpointCopy();
-    refreshServiceStatus();
-  });
 
   document.addEventListener('DOMContentLoaded', function () {
     initTheme();
-    refreshServiceStatus();
-    initializeEndpointCopy();
     initExtractPage();
     initIdentityPage();
   });

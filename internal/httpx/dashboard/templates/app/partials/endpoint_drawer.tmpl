@@ -1,0 +1,87 @@
+{{define "frag-models-endpoint-drawer"}}{{/* Add/edit endpoint drawer
+     (OA-27). Editable fields mirror the endpointRequest DTO exactly; the
+     form NEVER contains an assurance_verified control — verification is
+     observed at dispatch (T-09-06-03 keeps authorized_private server
+     enforced; this drawer only exposes the field). The page module submits
+     POST/PUT /api/v1/providers and the confirm action DELETEs. */}}
+<div class="drawer-head">
+  <h2>{{if .Data.Editing}}Edit endpoint{{else}}Add endpoint{{end}}</h2>
+  <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button>
+</div>
+<form data-models-endpoint-form data-endpoint-id="{{.Data.Endpoint.ID}}">
+  {{if .Data.Editing}}
+  <div class="row">
+    <span class="admin-tag">Assurance</span>
+    {{if eq .Data.AssuranceState "verified"}}{{statusPill "assurance" "verified"}}<span class="muted">checked {{relTime .Data.AssuranceChecked}}</span>
+    {{else if eq .Data.AssuranceState "none"}}{{statusPill "assurance" "none"}}
+    {{else}}{{statusPill "assurance" "unverified"}}{{if .Data.AssuranceNote}}<span class="muted">{{.Data.AssuranceNote}}</span>{{end}}{{end}}
+  </div>
+  <p class="help">Assurance is observed verification state — it is never set from this form. Editing routing fields clears the recorded verification until the endpoint re-verifies at dispatch.</p>
+  {{end}}
+  <div class="grid two">
+    <div>
+      <label class="label" for="mep-id">Endpoint id</label>
+      <input class="field" id="mep-id" name="id" value="{{.Data.Endpoint.ID}}"{{if .Data.Editing}} disabled{{end}}>
+      {{if not .Data.Editing}}<span class="help">Leave empty to generate an id.</span>{{end}}
+    </div>
+    <div>
+      <label class="label" for="mep-protocol">Protocol</label>
+      <select class="field" id="mep-protocol" name="protocol">
+        <option value="tinfoil"{{if eq .Data.Endpoint.Protocol "tinfoil"}} selected{{end}}>tinfoil</option>
+        <option value="privatemode"{{if eq .Data.Endpoint.Protocol "privatemode"}} selected{{end}}>privatemode</option>
+        <option value="openai_compatible"{{if eq .Data.Endpoint.Protocol "openai_compatible"}} selected{{end}}>openai_compatible</option>
+        <option value="redpill"{{if eq .Data.Endpoint.Protocol "redpill"}} selected{{end}}>redpill</option>
+        <option value="confidential_sdk"{{if eq .Data.Endpoint.Protocol "confidential_sdk"}} selected{{end}}>confidential_sdk</option>
+      </select>
+    </div>
+    <div>
+      <label class="label" for="mep-sdk">SDK provider</label>
+      <input class="field" id="mep-sdk" name="sdk_provider" value="{{.Data.Endpoint.SDKProvider}}">
+      <span class="help">Required for confidential_sdk.</span>
+    </div>
+    <div>
+      <label class="label" for="mep-origin">Base origin</label>
+      <input class="field" id="mep-origin" name="base_origin" value="{{.Data.Endpoint.BaseOrigin}}" placeholder="https://" required>
+      <span class="help">Bare https origin.</span>
+    </div>
+    <div>
+      <label class="label" for="mep-credential">Credential ref</label>
+      <input class="field" id="mep-credential" name="credential_ref" value="{{.Data.Endpoint.CredentialRef}}">
+      <span class="help">Server-approved secret reference — never a raw key.</span>
+    </div>
+    <div>
+      <label class="label" for="mep-assurance">Assurance mode</label>
+      <select class="field" id="mep-assurance" name="assurance_mode">
+        <option value=""{{if eq .Data.Endpoint.AssuranceMode ""}} selected{{end}}>None</option>
+        <option value="standard"{{if eq .Data.Endpoint.AssuranceMode "standard"}} selected{{end}}>Standard</option>
+        <option value="high"{{if eq .Data.Endpoint.AssuranceMode "high"}} selected{{end}}>High</option>
+      </select>
+    </div>
+  </div>
+  <fieldset class="filters" role="group" aria-label="Capabilities">
+    <legend class="label">Capabilities</legend>
+    {{range .Data.Checks}}
+    <label class="chip{{if .Checked}} active{{end}}"><input type="checkbox" name="capability" value="{{.Value}}"{{if .Checked}} checked{{end}}> {{.Label}}</label>
+    {{end}}
+  </fieldset>
+  <label class="label" for="mep-models">Model aliases</label>
+  <input class="field" id="mep-models" name="model_aliases" value="{{.Data.Aliases}}" placeholder="gpt-4o, acme=upstream-id">
+  <span class="help">Comma-separated alias or alias=upstream-id bindings — the aliases chat requests may use on this endpoint.</span>
+  <div class="grid two">
+    <div>
+      <label class="chip{{if .Data.Endpoint.AuthorizedPrivate}} active{{end}}"><input type="checkbox" name="authorized_private"{{if .Data.Endpoint.AuthorizedPrivate}} checked{{end}}> Authorized private</label>
+      <span class="help">Private endpoints (including http origins) dispatch only with this explicit authorization.</span>
+    </div>
+    <div>
+      <label class="chip{{if .Data.Endpoint.Enabled}} active{{end}}"><input type="checkbox" name="is_enabled"{{if .Data.Endpoint.Enabled}} checked{{end}}> Enabled</label>
+      <span class="help">Disabled endpoints never route.</span>
+    </div>
+  </div>
+  <p class="field-error" data-models-form-error hidden></p>
+  <div class="drawer-actions">
+    {{if .Data.Editing}}<button type="button" class="btn danger" data-action="confirm" data-confirm="Disable endpoint {{.Data.Endpoint.ID}}?" data-models-disable data-endpoint-id="{{.Data.Endpoint.ID}}">Disable</button>{{end}}
+    <button type="button" class="btn ghost" data-action="close-drawer">Cancel</button>
+    <button type="submit" class="btn primary">{{if .Data.Editing}}Save changes{{else}}Add endpoint{{end}}</button>
+  </div>
+</form>
+{{end}}

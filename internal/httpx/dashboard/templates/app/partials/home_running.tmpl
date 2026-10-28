@@ -1,0 +1,22 @@
+{{define "frag-running"}}{{/* Running now (OA-18): self-replacing fragment per
+     the phase-7 partial convention. The 3s trigger renders only while
+     non-terminal items exist; progress bars only when the stored worker
+     progress carries real counts — otherwise the indeterminate .pulse. */}}
+<div id="homeRunning" hx-get="/dashboard/partials/home/running" hx-trigger="refresh from:body{{if .Data.Running.Live}}, every 3s{{end}}" hx-target="this" hx-swap="outerHTML">
+  {{if .Data.Running.Rows}}
+  <div class="stack">
+  {{range .Data.Running.Rows}}
+    <div class="activity-row">
+      <span class="activity-icon">{{icon "activity"}}</span>
+      <div class="activity-copy">
+        <div>{{.Label}}</div>
+        <span class="muted">{{relTime .UpdatedAt}}</span>
+      </div>
+      {{if .HasPercent}}<span class="progress"><i style="width: {{.Percent}}%"></i></span>{{else if .Live}}<span class="pulse" aria-hidden="true"></span>{{end}}
+      {{statusPill "job" .Status}}
+      {{if .Href}}<a class="btn ghost" href="{{.Href}}">Open</a>{{end}}
+    </div>
+  {{end}}
+  </div>
+  {{else}}<div class="empty">{{icon "check"}}<p>Nothing is running right now.</p></div>{{end}}
+</div>{{end}}

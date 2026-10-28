@@ -1,0 +1,7 @@
+{{define "content"}}{{/* Sources page (OA-23, plan 09-02) — sources.manage.
+     Table markup lives in the frag-sources-table partial so htmx can refresh
+     it; the drawer and bindings drawers are separate fragments served by
+     their own routes. */}}
+{{template "page-head" .Data.Header}}
+{{template "frag-sources-table" .}}
+{{end}}

@@ -1,0 +1,40 @@
+{{define "frag-usage-audit"}}{{/* Audit tab (§6.12): combined billing +
+     pricing events. Chips and paging links are real URLs (server-side query
+     params, addressable); the filter form GETs the same page so every view
+     is bookmarkable without JS. */}}
+<div class="section" id="usage-audit">
+  <form class="filters" method="get" action="/dashboard/usage/audit" aria-label="Audit filters">
+    <input type="hidden" name="kind" value="{{.Data.Audit.Filters.Kind}}">
+{{range .Data.Audit.Kinds}}    <a class="chip{{if .Active}} active{{end}}" href="{{.Href}}">{{.Label}}</a>
+{{end}}    <select class="field" name="subject_type" aria-label="Subject type">
+{{range .Data.Audit.SubjectTypes}}      <option value="{{.Value}}"{{if .Active}} selected{{end}}>{{.Label}}</option>
+{{end}}    </select>
+    <input class="field" type="text" name="subject_id" value="{{.Data.Audit.Filters.SubjectID}}" placeholder="Subject id" aria-label="Subject id" size="16">
+    <input class="field" type="text" name="actor" value="{{.Data.Audit.Filters.Actor}}" placeholder="Actor id" aria-label="Actor id" size="16">
+    <input class="field" type="date" name="from" value="{{.Data.Audit.Filters.From}}" aria-label="From date">
+    <input class="field" type="date" name="to" value="{{.Data.Audit.Filters.To}}" aria-label="To date">
+    <button type="submit" class="btn">{{icon "filter"}}Apply</button>
+    <a class="chip" href="{{.Data.Audit.ResetHref}}">Clear</a>
+  </form>
+{{if .Data.Audit.Rows}}  <div class="card">
+    <div class="tablewrap"><table>
+      <thead><tr><th scope="col">When</th><th scope="col">Event</th><th scope="col">Actor</th><th scope="col">Subject</th><th scope="col">Amount</th></tr></thead>
+      <tbody>
+{{range .Data.Audit.Rows}}        <tr>
+          <td data-label="When">{{relTime .Time}}</td>
+          <td data-label="Event"><b>{{.Kind}}</b></td>
+          <td data-label="Actor">{{.Actor}}{{if .ActorType}}<span class="subline">{{.ActorType}}</span>{{end}}</td>
+          <td data-label="Subject">{{.SubjectLabel}}<span class="subline">{{.SubjectType}} · {{.SubjectID}}</span></td>
+          <td data-label="Amount">{{if .Amount}}{{.Amount}}{{else}}<span class="muted">—</span>{{end}}</td>
+        </tr>
+{{end}}      </tbody>
+    </table></div>
+  </div>
+  <div class="filters">
+    <span class="muted">{{count .Data.Audit.Total}} events · showing {{len .Data.Audit.Rows}} from offset {{.Data.Audit.Offset}}</span>
+{{if ge .Data.Audit.PrevOffset 0}}    <a class="chip" href="{{.Data.Audit.PrevHref}}">Newer</a>
+{{end}}{{if ge .Data.Audit.NextOffset 0}}    <a class="chip" href="{{.Data.Audit.NextHref}}">Older</a>
+{{end}}  </div>
+{{else}}  {{template "empty" .Data.Audit.Empty}}
+{{end}}</div>
+{{end}}

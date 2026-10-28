@@ -1,0 +1,27 @@
+{{define "frag-evidence"}}{{/* The shared evidence card (OA-15/§6.3):
+     fetched by Enclava.evidence.open for Chat AND Search — one template
+     serves the column, the drawer and the bottom sheet. Two not-found
+     branches are distinct: an empty EvidenceID is the uniform metadata
+     miss; Unavailable means the metadata is real but the passage is gone. */}}
+<div class="evidence-card">
+  <div class="section-head">
+    <b>Evidence</b>
+    <button type="button" class="iconbtn" data-action="evidence:close" aria-label="Close evidence">{{icon "x"}}<span class="visually-hidden">Close evidence</span></button>
+  </div>
+  {{if not .Data.EvidenceID}}
+    <p class="muted">This evidence is no longer available.</p>
+  {{else}}
+    {{if .Data.Collection}}<div class="card-sub">{{.Data.Collection}}</div>{{end}}
+    <h3 class="evidence-doc">{{.Data.Document}}</h3>
+    {{if .Data.Location}}<div class="muted evidence-location">{{.Data.Location}}</div>{{end}}
+    {{statusPill "evidence" .Data.Status}}
+    {{if .Data.Unavailable}}
+      <p class="muted">The source changed since this answer was given — its current passage is unavailable. The document details and links below are still real.</p>
+    {{else}}
+      <div class="quote">{{.Data.Quote}}</div>
+    {{end}}
+    {{if .Data.OpenHref}}<a class="btn" href="{{.Data.OpenHref}}" target="_blank" rel="noopener noreferrer">{{icon "external"}} Open in source</a>{{end}}
+    {{if .Data.CopyURL}}<a class="btn ghost" href="{{.Data.CopyURL}}">{{icon "file"}} View retained copy</a>{{end}}
+  {{end}}
+</div>
+{{end}}

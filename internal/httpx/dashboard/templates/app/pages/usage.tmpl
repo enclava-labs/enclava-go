@@ -1,0 +1,17 @@
+{{define "content"}}{{/* Usage & billing (OA-29, plan 09-08) — one page
+     file serves all three tabs; the handler sets Data.ActiveTab and the
+     matching fragment renders below the shared tabs. No scripts here (D-20):
+     writes ride static/pages/usage.js through window.Enclava.api. */}}
+<header class="head">
+  <div class="headcopy">
+    <div class="crumb">{{.Org}} / Admin</div>
+    <h1>Usage &amp; billing</h1>
+    <p class="desc">Requests, tokens and spend across {{.Org}}, with budgets and the combined billing and pricing audit trail.</p>
+  </div>
+  <div class="right-mobile">
+{{if eq .Data.ActiveTab "budgets"}}    <button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/usage/budget-drawer">{{icon "plus"}}New budget</button>
+{{end}}  </div>
+</header>
+{{template "tabs" .Data.Tabs}}
+{{if eq .Data.ActiveTab "budgets"}}{{template "frag-usage-budgets" .}}{{else if eq .Data.ActiveTab "audit"}}{{template "frag-usage-audit" .}}{{else}}{{template "frag-usage-overview" .}}{{end}}
+{{end}}

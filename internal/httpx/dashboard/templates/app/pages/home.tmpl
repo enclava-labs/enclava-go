@@ -1,0 +1,158 @@
+{{define "content"}}{{/* Home /dashboard (OA-31) — §6.2 section order:
+     Needs attention → KPIs → Running now → Confidential inference → Recent
+     conversations → Start a chat → Recent extractions → Your knowledge.
+     Sections render only when the caller's Caps allow; a held section with
+     an empty list renders the shared .empty state. Component classes only
+     (D-16); no scripts, no hx-on (D-20). */}}
+<header class="head">
+  <div class="headcopy">
+    <div class="crumb">{{.Org}} / Home</div>
+    <h1>{{.Data.Greeting}}, {{.User.Name}}</h1>
+    <p class="desc">Your workspace at {{.Org}} — work, health and what needs attention.</p>
+  </div>
+</header>
+
+<section class="card home-greeting">
+  <div class="row"><b>{{.Data.Greeting}}, {{.User.Name}}</b><span class="muted">{{.User.RoleLabel}}</span></div>
+  <span class="muted">API base · {{.Data.APIBase}}</span>
+</section>
+
+<section class="section" id="homeAttention">
+  <div class="section-head"><h2>Needs attention</h2></div>
+  {{if .Data.Attention}}
+  <div class="stack">
+  {{range .Data.Attention}}
+    <div class="attention">
+      <span class="activity-icon">{{icon "bell"}}</span>
+      <div class="activity-copy"><div>{{.Text}}</div></div>
+      {{if .ActionHref}}<a class="btn ghost" href="{{.ActionHref}}">{{.ActionLabel}}</a>{{end}}
+    </div>
+  {{end}}
+  </div>
+  {{else}}<div class="empty">{{icon "check"}}<p>Nothing needs attention.</p></div>{{end}}
+</section>
+
+{{if .Can.BillingView}}
+<section class="section" id="homeKPIs">
+  <div class="section-head"><h2>At a glance</h2><span class="muted">Last 30 days</span></div>
+  <div class="grid four">
+    <div class="card kpi">
+      <div class="kpi-label">Requests · 30d</div>
+      <div class="kpi-value">{{count .Data.KPIs.Requests30d}}</div>
+      {{spark .Data.KPIs.Spark}}
+    </div>
+    <div class="card kpi">
+      <div class="kpi-label">Spend · 30d</div>
+      {{range .Data.KPIs.Spend}}
+      <div class="row"><span class="kpi-value">{{money .AmountMicros .Currency}}</span><span class="muted">{{.Currency}}</span></div>
+      {{if and $.Data.KPIs.Budget (eq $.Data.KPIs.Budget.Progress.Currency .Currency)}}<span class="progress"><i style="width: {{$.Data.KPIs.Budget.Percent}}%"></i></span><span class="muted">of budget</span>{{end}}
+      {{else}}<div class="kpi-value">—</div><span class="muted">No spend recorded</span>{{end}}
+    </div>
+    <div class="card kpi">
+      <div class="kpi-label">Knowledge documents</div>
+      <div class="kpi-value">{{count .Data.KPIs.Documents}}</div>
+    </div>
+    <div class="card kpi">
+      <div class="kpi-label">Assistant conversations</div>
+      <div class="kpi-value">{{count .Data.KPIs.Conversations}}</div>
+    </div>
+  </div>
+</section>
+{{end}}
+
+<section class="section" id="homeRunningSection">
+  <div class="section-head"><h2>Running now</h2></div>
+  {{template "frag-running" .}}
+</section>
+
+<section class="section" id="homeConfidential">
+  <div class="section-head"><h2>Confidential inference</h2></div>
+  <div class="card">
+    <div class="row">
+      {{if .Conf.Total}}<b>Confidential · {{.Conf.Verified}}/{{.Conf.Total}} verified</b>
+      <span class="muted">Checked {{relTime .Conf.CheckedAt}}</span>
+      {{else}}<b>No confidential endpoints</b>{{end}}
+    </div>
+    {{range .Conf.Endpoints}}
+    <div class="row">
+      <span>{{.Label}}</span>
+      {{statusPill "confidential" .State.String}}
+      {{if .VerifiedAt}}<span class="muted">Checked {{relTime .VerifiedAt}}</span>{{end}}
+      {{if .LastError}}<span class="muted">{{.LastError}}</span>{{end}}
+    </div>
+    {{end}}
+  </div>
+</section>
+
+{{if .Can.Chat}}
+<section class="section" id="homeConversations">
+  <div class="section-head"><h2>Recent conversations</h2></div>
+  {{if .Data.Conversations}}
+  <div class="stack">
+  {{range .Data.Conversations}}
+    <a class="activity-row" href="/dashboard/chat/{{.ID}}">
+      <span class="activity-icon">{{icon "chat"}}</span>
+      <div class="activity-copy">
+        <div>{{if .Title}}{{.Title}}{{else}}Untitled conversation{{end}}</div>
+        <span class="muted">{{.AssistantName}} · {{relTime .UpdatedAt}}</span>
+      </div>
+    </a>
+  {{end}}
+  </div>
+  {{else}}<div class="empty">{{icon "chat"}}<p>No conversations yet.</p></div>{{end}}
+</section>
+
+<section class="section" id="homeStartChat">
+  <div class="section-head"><h2>Start a chat</h2></div>
+  {{if .Data.Assistants}}
+  <div class="grid three">
+  {{range .Data.Assistants}}
+    <a class="card" href="/dashboard/chat?assistant={{.ID}}">
+      <div class="card-title">{{.Name}}</div>
+      {{if .Description}}<span class="muted">{{.Description}}</span>{{end}}
+    </a>
+  {{end}}
+  </div>
+  {{else}}<div class="empty">{{icon "assistant"}}<p>No assistants you can use yet — ask an admin to grant access.</p></div>{{end}}
+</section>
+{{end}}
+
+{{if .Can.Extract}}
+<section class="section" id="homeExtractions">
+  <div class="section-head"><h2>Recent extractions</h2><span class="muted">{{count .Data.ExtractionTotal}} total</span></div>
+  {{if .Data.Extractions}}
+  <div class="stack">
+  {{range .Data.Extractions}}
+    <div class="activity-row">
+      <span class="activity-icon">{{icon "extract"}}</span>
+      <div class="activity-copy">
+        <div>{{if .FileName}}{{.FileName}}{{else}}{{.ID}}{{end}}</div>
+        <span class="muted">{{relTime .CreatedAt}}</span>
+      </div>
+      {{statusPill "job" .Status}}
+    </div>
+  {{end}}
+  </div>
+  {{else}}<div class="empty">{{icon "extract"}}<p>No extractions yet.</p></div>{{end}}
+</section>
+{{end}}
+
+{{if .Can.Search}}
+<section class="section" id="homeKnowledge">
+  <div class="section-head"><h2>Your knowledge</h2></div>
+  {{if .Data.Collections}}
+  <div class="stack">
+  {{range .Data.Collections}}
+    <a class="activity-row" href="/dashboard/knowledge/{{.ID}}">
+      <span class="activity-icon">{{icon "knowledge"}}</span>
+      <div class="activity-copy">
+        <div>{{.Name}}</div>
+        <span class="muted">Updated {{relTime .UpdatedAt}}</span>
+      </div>
+    </a>
+  {{end}}
+  </div>
+  {{else}}<div class="empty">{{icon "knowledge"}}<p>No collections you can read yet.</p></div>{{end}}
+</section>
+{{end}}
+{{end}}

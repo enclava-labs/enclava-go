@@ -1,0 +1,140 @@
+{{define "frag-extract-templates"}}{{/* Extraction template management
+     (extract.manage, OA-25): list + create/edit via the labeled editor in
+     the page module, Reset defaults, and the default-model setting. */}}
+<div id="extract-templates" hx-get="/dashboard/partials/extract/templates" hx-trigger="refresh from:body" hx-swap="outerHTML">
+  <div class="row" style="margin-bottom:14px">
+    <button type="button" class="btn primary" data-action="extract:edit-template">{{icon "plus"}}New template</button>
+    <button type="button" class="btn danger" data-action="confirm" data-confirm="Restore the default extraction templates?" data-extract-reset-defaults>{{icon "refresh"}}Reset defaults</button>
+  </div>
+
+  <div class="grid two">
+    <div class="card">
+      <div class="card-title">Templates</div>
+      <div class="card-sub">Prompts and output contracts every member's process tab can be granted on.</div>
+      {{if .Data.Manage}}
+      <div class="tablewrap" style="margin-top:10px">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Template</th>
+              <th scope="col">Model</th>
+              <th scope="col">Status</th>
+              <th scope="col">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {{range .Data.Manage}}
+            <tr>
+              <td data-label="Template"><b>{{.Name}}</b><span class="subline">{{.ID}}{{if .IsDefault}} · default{{end}}</span></td>
+              <td data-label="Model">{{if .DefaultModel}}{{.DefaultModel}}{{else}}Default model{{end}}</td>
+              <td data-label="Status">{{if .Enabled}}{{statusPill "document" "active"}}{{else}}{{statusPill "document" "disabled"}}{{end}}</td>
+              <td data-label="Actions">
+                <div class="row">
+                  <button type="button" class="btn" data-action="extract:edit-template" data-template-id="{{.ID}}">Edit</button>
+                  <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete template {{.Name}}?" data-extract-template-delete="{{.ID}}">{{icon "x"}}Delete</button>
+                </div>
+              </td>
+            </tr>
+            {{end}}
+          </tbody>
+        </table>
+      </div>
+      {{else}}
+      <div class="empty" style="margin-top:10px">
+        {{icon "extract"}}
+        <p>No extraction templates — create one or restore the defaults.</p>
+      </div>
+      {{end}}
+    </div>
+
+    <div class="card">
+      <div class="card-title">Default model</div>
+      <div class="card-sub">Used when a template does not pin its own model.</div>
+      <div class="stack" style="margin-top:10px">
+        <div>
+          <label class="label" for="extract-default-model">Model</label>
+          <select class="field" id="extract-default-model">
+            <option value="">Template default</option>
+            {{range .Data.Models}}<option value="{{.}}"{{if eq . $.Data.Settings.DefaultModel}} selected{{end}}>{{.}}</option>{{end}}
+          </select>
+        </div>
+        <p class="help">Current: {{if .Data.Settings.DefaultModel}}{{.Data.Settings.DefaultModel}}{{else}}not set{{end}} · max upload {{count .Data.Settings.MaxFileSizeMB}} MB</p>
+        <div class="row">
+          <button type="button" class="btn" data-action="extract:save-settings" data-max-mb="{{.Data.Settings.MaxFileSizeMB}}">{{icon "check"}}Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {{/* Editor skeleton: the page module clones it into the shared drawer and
+       fills the labeled schema rows. No scripts here (D-20). */}}
+  <template id="extract-template-editor">
+    <div class="drawer-head">
+      <h2 data-editor-title>New template</h2>
+      <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close">{{icon "x"}}<span class="visually-hidden">Close</span></button>
+    </div>
+    <div class="stack">
+      <div>
+        <label class="label" for="extract-tpl-name">Name</label>
+        <input class="field" id="extract-tpl-name" data-editor-field="name" required>
+      </div>
+      <div>
+        <label class="label" for="extract-tpl-description">Description</label>
+        <input class="field" id="extract-tpl-description" data-editor-field="description">
+      </div>
+      <div>
+        <label class="label" for="extract-tpl-system">System prompt</label>
+        <textarea class="field" id="extract-tpl-system" rows="3" data-editor-field="system_prompt" required></textarea>
+      </div>
+      <div>
+        <label class="label" for="extract-tpl-user">User prompt</label>
+        <textarea class="field" id="extract-tpl-user" rows="5" data-editor-field="user_prompt" required></textarea>
+      </div>
+      <div>
+        <label class="label" for="extract-tpl-model">Model</label>
+        <select class="field" id="extract-tpl-model" data-editor-field="model">
+          <option value="">Default model</option>
+          {{range .Data.Models}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      <label><input type="checkbox" data-editor-field="is_active" checked> Active</label>
+      <label><input type="checkbox" data-editor-field="is_default"> Default template</label>
+      <h3>Output fields</h3>
+      <p class="help">One labeled row per extracted field — name, type, whether it is required, and an optional description.</p>
+      <div class="stack" data-editor-schema="output">
+        <div class="grid two" data-schema-row="output">
+          <div><label class="label">Field name</label><input class="field" data-row-name placeholder="field_name"></div>
+          <div><label class="label">Type</label>
+            <select class="field" data-row-type>
+              <option>string</option><option>number</option><option>boolean</option><option>object</option><option>array</option>
+            </select>
+          </div>
+          <div><label class="label">Required</label><label class="row"><input type="checkbox" data-row-required> Required</label></div>
+          <div><label class="label">Description</label><input class="field" data-row-description placeholder="Shown to reviewers"></div>
+          <button type="button" class="btn danger" data-row-remove>Remove</button>
+        </div>
+      </div>
+      <div class="row"><button type="button" class="btn" data-editor-add-row="output">{{icon "plus"}}Add field</button></div>
+      <h3>Context hints</h3>
+      <p class="help">Optional named values the user prompt can reference as {name}.</p>
+      <div class="stack" data-editor-schema="context">
+        <div class="grid two" data-schema-row="context">
+          <div><label class="label">Field name</label><input class="field" data-row-name placeholder="hint_name"></div>
+          <div><label class="label">Type</label>
+            <select class="field" data-row-type>
+              <option>string</option><option>number</option><option>boolean</option>
+            </select>
+          </div>
+          <button type="button" class="btn danger" data-row-remove>Remove</button>
+        </div>
+      </div>
+      <div class="row"><button type="button" class="btn" data-editor-add-row="context">{{icon "plus"}}Add hint</button></div>
+      <p class="help" data-editor-note hidden></p>
+    </div>
+    <div class="drawer-actions">
+      <button type="button" class="btn ghost" data-action="close-drawer">Cancel</button>
+      <button type="button" class="btn primary" data-editor-save>Save template</button>
+    </div>
+  </template>
+</div>
+{{end}}

@@ -1,0 +1,39 @@
+{{define "frag-chat-thread"}}{{/* The conversation body: server-rendered
+     messages, per-turn collapsible tool steps, pending-run markers and
+     terminal run lines. The root re-fetches on `refresh from:body` so the
+     2s poll in chat.js only has to call Enclava.refresh() at terminal.
+     Citation [n] text stays literal here — chat.js binds the buttons from
+     data-evidence-ids (text-node splitting, never innerHTML). */}}
+<div class="thread-body" id="chatThread" data-scroll-latest
+  {{if .Data.ConversationID}}hx-get="/dashboard/partials/chat/thread?c={{urlquery .Data.ConversationID}}"
+     hx-trigger="refresh from:body" hx-target="this" hx-swap="outerHTML"{{end}}>
+  {{if .Data.Thread}}
+    {{range .Data.Thread.Messages}}
+    <article class="message"{{if .EvidAttr}} data-evidence-ids="{{.EvidAttr}}"{{end}}{{if .RunID}} data-run-id="{{.RunID}}"{{if .RunStatus}} data-run-status="{{.RunStatus}}"{{end}}{{end}}>
+      <div class="author">{{.Author}} · {{relTime .CreatedAt}}</div>
+      {{if .Steps}}<details class="toolstep">
+        <summary>{{icon "check"}} {{len .Steps}} tool {{if eq (len .Steps) 1}}step{{else}}steps{{end}}</summary>
+        {{range .Steps}}<div class="steprow"><b>{{.Name}}</b> <span class="muted">{{term .Kind}}</span> {{statusPill "job" .Status}}{{if .Error}}<span class="muted stepnote">{{.Error}}</span>{{end}}{{if .Output}}<span class="muted stepnote">{{.Output}}</span>{{end}}</div>{{end}}
+      </details>{{end}}
+      {{if .Content}}<div class="bubble">{{.Content}}</div>{{end}}
+      {{if and .RunID (not .Pending) (ne .Role "user")}}
+        {{if eq .RunStatus "cancelled"}}<div class="runline muted">{{statusPill "job" .RunStatus}} Stopped by you</div>
+        {{else if eq .RunStatus "unknown"}}<div class="runline muted">{{statusPill "job" .RunStatus}}{{if .RunError}} {{.RunError}}{{else}} Worker outcome unknown; this attempt will not be repeated.{{end}}</div>
+        {{else if eq .RunStatus "failed"}}<div class="runline muted">{{statusPill "job" .RunStatus}}{{if .RunError}} {{.RunError}}{{else}} This run failed.{{end}}</div>
+        {{end}}
+      {{end}}
+      {{if and .Pending (eq .Role "user")}}
+        <div class="runline"><span class="pulse">●</span>{{statusPill "job" .RunStatus}}
+          <button type="button" class="btn danger" data-action="confirm" data-confirm="Stop run?" data-run-id="{{.RunID}}">{{icon "stop"}} Stop</button>
+        </div>
+      {{end}}
+    </article>
+    {{end}}
+  {{else}}
+    <div class="empty">
+      {{icon "chat"}}
+      <p>No conversation open yet — pick an assistant and ask your first question.</p>
+    </div>
+  {{end}}
+</div>
+{{end}}

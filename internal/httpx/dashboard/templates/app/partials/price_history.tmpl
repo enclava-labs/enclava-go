@@ -1,0 +1,38 @@
+{{define "frag-models-price-history"}}{{/* Price-history drawer (OA-27):
+     real ListPrices rows for the row's (endpoint, model) pair, newest
+     effective first. Read-only presentation of BillingRepo data. */}}
+<div class="drawer-head">
+  <h2>Price history</h2>
+  <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button>
+</div>
+<p class="help">{{.Data.Model}} @ {{.Data.EndpointID}} · {{.Data.Capability}} · newest effective first</p>
+{{if .Data.Rows}}
+<div class="tablewrap">
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">Applies to</th>
+        <th scope="col">Unit</th>
+        <th scope="col">Rate</th>
+        <th scope="col">Effective from</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Data.Rows}}
+      <tr>
+        <td data-label="Applies to">{{.Subject}}<span class="subline">{{.SubjectID}}</span></td>
+        <td data-label="Unit">{{.UnitLabel}}</td>
+        <td data-label="Rate"><b>{{money .RateMicros .Currency}}</b><span class="subline">per {{count .UnitQuantity}} tokens</span></td>
+        <td data-label="Effective from">{{relTime .EffectiveFrom}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+</div>
+{{else}}
+<div class="empty">
+  {{icon "billing"}}
+  <p>No price rows recorded for this pair yet.</p>
+</div>
+{{end}}
+{{end}}

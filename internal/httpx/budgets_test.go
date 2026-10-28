@@ -102,21 +102,23 @@ func TestCheckedBudgetAdd(t *testing.T) {
 		})
 	}
 }
-func TestDashboardBudgetShowsHeldSettledAndRemaining(t *testing.T) {
+func TestDashboardBudgetShowsHeldSettledAndProgress(t *testing.T) {
 	f := newBudgetFixture(t)
 	ctx := context.Background()
 	keyID := "dashboard-key"
 	subject := billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: keyID}
 	now := time.Now().UTC()
+	// $1 per input unit so the frozen money() formatter shows the exact
+	// held/settled amounts at its two-decimal precision.
 	if err := f.repo.PutPrice(ctx, f.tenant, "dashboard-price", billing.Price{
 		SubjectType: billing.PriceSubjectModel, SubjectID: "dashboard-model", Capability: "chat",
-		Unit: billing.UnitInput, RateMicros: 1, UnitQuantity: 1, Currency: "USD",
+		Unit: billing.UnitInput, RateMicros: 1_000_000, UnitQuantity: 1, Currency: "USD",
 	}, "tester", now); err != nil {
 		t.Fatalf("put price: %v", err)
 	}
 	if err := f.repo.CreateBudget(ctx, f.tenant, "dashboard-budget", billing.Budget{
 		Name: "dashboard", Subject: subject, Kind: billing.BudgetKindAmount, Period: billing.PeriodMonthly,
-		LimitAmountMicros: 100, Currency: "USD", StartsAt: now.Add(-time.Hour),
+		LimitAmountMicros: 100_000_000, Currency: "USD", StartsAt: now.Add(-time.Hour),
 	}); err != nil {
 		t.Fatalf("create budget: %v", err)
 	}
@@ -136,25 +138,34 @@ func TestDashboardBudgetShowsHeldSettledAndRemaining(t *testing.T) {
 		t.Fatalf("reserve: %v", err)
 	}
 	render := func() string {
-		req := httptest.NewRequest(http.MethodGet, "/dashboard/partials/budgets", nil)
-		req = req.WithContext(auth.WithPrincipal(req.Context(), principal))
+		req := httptest.NewRequest(http.MethodGet, "/dashboard/partials/usage/budgets", nil)
+		req = req.WithContext(auth.WithPrincipal(req.Context(),
+			auth.Principal{TenantID: f.tenant, ActorID: "admin-1", ActorKind: auth.ActorKindUser}))
 		rec := httptest.NewRecorder()
-		f.app.handleDashboardBudgets(rec, req)
+		f.app.handleDashboardUsageBudgetsFragment(rec, req)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("budget dashboard returned %d: %s", rec.Code, rec.Body.String())
+			t.Fatalf("budgets tab returned %d: %s", rec.Code, rec.Body.String())
 		}
 		return rec.Body.String()
 	}
 	held := render()
-	if !strings.Contains(held, "USD 0.000040") || !strings.Contains(held, "USD 0.000100") || !strings.Contains(held, "USD 0.000060") {
-		t.Fatalf("held liability or remaining allowance not rendered: %s", held)
+	// Progress counts the held liability (40%); the informational liability
+	// row shows the same held amount per currency.
+	if !strings.Contains(held, "$40.00") || !strings.Contains(held, "Held $40.00") {
+		t.Fatalf("held liability or counted usage not rendered: %s", held)
+	}
+	if !strings.Contains(held, `aria-valuenow="40"`) {
+		t.Fatalf("progress bar must show the admission-matching ratio: %s", held)
 	}
 	if _, err := service.Settle(ctx, principal, reservation.ID, billing.Usage{InputUnits: 30}); err != nil {
 		t.Fatalf("settle: %v", err)
 	}
 	settled := render()
-	if !strings.Contains(settled, "USD 0.000030") || !strings.Contains(settled, "USD 0.000070") {
-		t.Fatalf("settled liability or remaining allowance not rendered: %s", settled)
+	if !strings.Contains(settled, "$30.00") || !strings.Contains(settled, "Settled $30.00") {
+		t.Fatalf("settled liability or counted usage not rendered: %s", settled)
+	}
+	if !strings.Contains(settled, `aria-valuenow="30"`) {
+		t.Fatalf("progress must follow the settled counted scalar: %s", settled)
 	}
 }
 

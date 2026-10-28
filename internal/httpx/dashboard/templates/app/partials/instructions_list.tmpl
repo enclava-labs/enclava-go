@@ -1,0 +1,21 @@
+{{define "frag-instructions-list"}}{{/* Instructions tab list (09-03): prompt
+     templates with default badge, variable count, updated time; Edit opens
+     the editor drawer route, Delete rides the shared two-step confirm. The
+     wrapper re-fetches on Enclava.refresh() (D-17). Arg: instructionsPageData. */}}
+<div id="instructions-list" hx-get="/dashboard/partials/assistants/instructions" hx-trigger="refresh from:body" hx-swap="outerHTML">
+{{if .Data.List.Templates}}  <div class="stack">
+{{range .Data.List.Templates}}    <div class="card">
+      <div class="row">
+        <div>
+          <b>{{.Name}}</b>{{if .IsDefault}} <span class="pill accent"><i class="dot"></i>Default</span>{{end}}
+{{if .Description}}          <span class="subline">{{.Description}}</span>
+{{end}}          <div class="muted">{{count .Variables}} variables · Updated {{relTime .UpdatedAt}}</div>
+        </div>
+        <button type="button" class="btn" data-action="open-drawer" data-drawer-url="/dashboard/partials/assistants/instructions/editor?id={{.ID}}">{{icon "settings"}}Edit</button>
+        <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete instructions “{{.Name}}”?" data-template-delete="{{.ID}}">{{icon "x"}}Delete</button>
+      </div>
+    </div>
+{{end}}  </div>
+{{else}}  {{template "empty" .Empty}}
+{{end}}</div>
+{{end}}

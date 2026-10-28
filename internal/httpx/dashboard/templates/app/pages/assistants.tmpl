@@ -1,0 +1,18 @@
+{{define "content"}}{{/* Assistants (OA-24, plan 09-03): the table fragment
+     renders server-side and re-fetches on refresh; the head action and deep
+     links (?new=1 / ?id=) open the configure drawer. */}}
+<header class="head">
+  <div class="headcopy">
+    <div class="crumb">{{.Org}} / Build</div>
+    <h1>Assistants</h1>
+    <p class="desc">Purpose-built helpers, with approved tools and instructions.</p>
+  </div>
+  <div class="right-mobile">
+    <button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/assistants/drawer">{{icon "plus"}}New assistant</button>
+  </div>
+</header>
+{{template "tabs" .Data.Tabs}}
+<section data-assistants-page="assistants">
+{{template "frag-assistants-table" .}}
+</section>
+{{end}}

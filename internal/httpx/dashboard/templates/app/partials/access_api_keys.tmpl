@@ -1,0 +1,93 @@
+{{define "frag-access-api-keys"}}{{/* API keys tab (09-07): live keys with
+     scopes as plain words; rotate → POST …/{id}/regenerate, revoke →
+     DELETE …/{id} — both confirmed, both via pages/access.js. No budget or
+     AllowedIPs controls exist anywhere on this surface. */}}
+<div id="access-api-keys" hx-get="/dashboard/partials/access/api-keys" hx-trigger="refresh from:body" hx-target="this" hx-swap="outerHTML">
+{{if .Data.Keys}}  <div class="card">
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Key</th>
+            <th scope="col">Capabilities</th>
+            <th scope="col">Expires</th>
+            <th scope="col">Last used</th>
+            <th scope="col">Status</th>
+            <th scope="col"><span class="visually-hidden">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody>
+{{range .Data.Keys}}          <tr>
+            <td data-label="Key"><b>{{if .Name}}{{.Name}}{{else}}API key{{end}}</b><span class="subline">{{.Prefix}}…</span></td>
+            <td data-label="Capabilities">{{if .ScopeLabels}}{{range $i, $l := .ScopeLabels}}{{if $i}} · {{end}}{{$l}}{{end}}{{else}}<span class="muted">No capabilities</span>{{end}}</td>
+            <td data-label="Expires">{{if .Expires}}{{relTime .Expires}}{{else}}—{{end}}</td>
+            <td data-label="Last used">{{if .LastUsed}}{{relTime .LastUsed}}{{else}}—{{end}}</td>
+            <td data-label="Status">{{if .Active}}{{statusPill "member" "active"}}{{else}}{{statusPill "member" "disabled"}}{{end}}</td>
+            <td data-label="Actions">
+              <div class="row">
+                <button type="button" class="btn" data-action="confirm" data-confirm="Rotate this key? The old secret stops working." data-access-confirm="key-rotate" data-key-id="{{.ID}}">Rotate</button>
+                <button type="button" class="btn danger" data-action="confirm" data-confirm="Revoke this key?" data-access-confirm="key-revoke" data-key-id="{{.ID}}">Revoke</button>
+              </div>
+            </td>
+          </tr>
+{{end}}        </tbody>
+      </table>
+    </div>
+  </div>
+{{else}}  <div class="empty">{{icon "key"}}<p>No API keys yet.</p><button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/access/key-drawer">{{icon "plus"}}New key</button></div>
+{{end}}</div>
+{{end}}
+
+{{define "frag-access-key-drawer"}}{{/* Key drawer (09-07): scope checklist
+     restricted to the creator's own scopes and ALWAYS submitted (omitted
+     fields widen); owner pick across users and service accounts; the created
+     secret renders once in the result panel below the form. */}}
+<div class="drawer-head">
+  <h2>New API key</h2>
+  <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close">{{icon "x"}}<span class="visually-hidden">Close</span></button>
+</div>
+<form data-form="access-key">
+  <div class="stack">
+    <div>
+      <label class="label" for="access-key-name">Name</label>
+      <input class="field" id="access-key-name" name="name" required autocomplete="off">
+    </div>
+    <div>
+      <label class="label" for="access-key-owner">Owner</label>
+      <select class="field" id="access-key-owner" name="owner">
+        <option value="">Me ({{.User.Name}})</option>
+{{range .Data.KeyDrawer.Owners}}        <option value="{{.Kind}}:{{.ID}}">{{.Label}}{{if eq .Kind "service_account"}} (service account){{end}}</option>
+{{end}}      </select>
+    </div>
+    <div>
+      <label class="label" for="access-key-expires">Expires</label>
+      <input class="field" id="access-key-expires" name="expires" type="datetime-local">
+      <span class="help">Leave empty for no expiry.</span>
+    </div>
+    <div class="grid three">
+      <div>
+        <label class="label" for="access-key-rlm">Requests / minute</label>
+        <input class="field" id="access-key-rlm" name="rate_limit_per_minute" type="number" min="1" inputmode="numeric">
+      </div>
+      <div>
+        <label class="label" for="access-key-rlh">Requests / hour</label>
+        <input class="field" id="access-key-rlh" name="rate_limit_per_hour" type="number" min="1" inputmode="numeric">
+      </div>
+      <div>
+        <label class="label" for="access-key-rld">Requests / day</label>
+        <input class="field" id="access-key-rld" name="rate_limit_per_day" type="number" min="1" inputmode="numeric">
+      </div>
+    </div>
+    <fieldset class="stack">
+      <legend class="label">Capabilities</legend>
+{{range .Data.KeyDrawer.Scopes}}      <label class="row"><input type="checkbox" name="scope" value="{{.Scope}}"> {{.Label}}</label>
+{{end}}      <span class="help">A key can hold only scopes you hold; the API refuses anything wider.</span>
+    </fieldset>
+  </div>
+  <div class="drawer-actions">
+    <button type="button" class="btn ghost" data-action="close-drawer">Cancel</button>
+    <button type="submit" class="btn primary">{{icon "plus"}}Create key</button>
+  </div>
+  <div class="stack" data-key-result hidden></div>
+</form>
+{{end}}

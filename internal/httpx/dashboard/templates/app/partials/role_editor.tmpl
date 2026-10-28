@@ -1,0 +1,36 @@
+{{define "frag-access-role-editor"}}{{/* Role editor (09-07): capability
+     checklist bounded to the editing caller's scopes plus the four AI-resource
+     grant sections (D-25) — item options are only what the caller may grant,
+     a new non-admin role renders every section deny-all, and saving emits the
+     canonical {"mode":"all"}/{"mode":"list","items":[…]} documents. */}}
+<div class="drawer-head">
+  <h2>{{if .Data.RoleEditor.RoleID}}Edit role{{else}}New role{{end}}</h2>
+  <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close">{{icon "x"}}<span class="visually-hidden">Close</span></button>
+</div>
+{{$e := .Data.RoleEditor}}
+{{if $e.Overreach}}<p class="field-error">This role carries capabilities or grants beyond your own authority — the API refuses saves that would preserve them.</p>{{end}}
+<form data-form="access-role"{{if $e.RoleID}} data-role-id="{{$e.RoleID}}"{{end}}>
+  <div class="stack">
+    <div>
+      <label class="label" for="access-role-name">Name</label>
+      <input class="field" id="access-role-name" name="name" value="{{$e.Name}}" required autocomplete="off">
+    </div>
+    <fieldset class="stack">
+      <legend class="label">Capabilities</legend>
+{{range $e.Scopes}}      <label class="row"><input type="checkbox" name="scope" value="{{.Scope}}"{{if .Checked}} checked{{end}}> {{.Label}}</label>
+{{end}}{{if not $e.Scopes}}      <p class="help">You hold no grantable capabilities.</p>
+{{end}}    </fieldset>
+    <p class="help">Access is the intersection of this role's grants, source permissions and assistant audiences.</p>
+{{range $e.Grants}}    <fieldset class="stack" data-grant="{{.Kind}}">
+      <legend class="label">{{.Label}}</legend>
+{{if .CallerAll}}      <label class="row"><input type="checkbox" data-grant-all{{if .All}} checked{{end}}> All {{.Label}}</label>
+{{end}}{{range .Items}}      <label class="row"><input type="checkbox" data-grant-item value="{{.ID}}"{{if .Checked}} checked{{end}}> {{.Label}}</label>
+{{end}}{{if not .Items}}      <p class="help">No {{.Label}} you can grant{{if not .CallerAll}} — you hold no all-access grant for them{{end}}.</p>
+{{end}}    </fieldset>
+{{end}}  </div>
+  <div class="drawer-actions">
+    <button type="button" class="btn ghost" data-action="close-drawer">Cancel</button>
+    <button type="submit" class="btn primary">{{if $e.RoleID}}Save role{{else}}Create role{{end}}</button>
+  </div>
+</form>
+{{end}}

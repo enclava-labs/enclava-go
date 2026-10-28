@@ -1,0 +1,79 @@
+{{define "frag-usage-budget-drawer"}}{{/* Budget drawer (plan 09-08):
+     create form with subject pickers bounded to existing tenant entities, or
+     the limit-only edit form — a PATCH may carry limit_value and nothing
+     else, so held/settled liability can never be reset from here. The form
+     is markup only (D-20); static/pages/usage.js owns the submit. */}}
+<div class="drawer-head">
+  <h2>{{if .Data.Drawer.Edit}}Edit budget limit{{else}}New budget{{end}}</h2>
+  <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button>
+</div>
+{{if .Data.Drawer.Edit}}
+<p class="muted">{{.Data.Drawer.Name}} · {{.Data.Drawer.KindLabel}} · {{.Data.Drawer.PeriodLabel}}</p>
+<p class="help">Only the limit changes — held and settled liability is kept.</p>
+<form data-usage-form data-budget-id="{{.Data.Drawer.BudgetID}}">
+  <label class="label" for="budget-limit">Limit{{if eq .Data.Drawer.Kind "tokens"}} (tokens){{end}}</label>
+  <input class="field" id="budget-limit" name="limit_value" type="number" min="1" step="1" value="{{.Data.Drawer.LimitValue}}" required>
+  <span class="field-error" hidden></span>
+  <div class="drawer-actions">
+    <button type="button" class="btn ghost" data-action="close-drawer">Cancel</button>
+    <button type="submit" class="btn primary">Save limit</button>
+  </div>
+</form>
+{{else}}
+<form data-usage-form>
+  <label class="label" for="budget-name">Name</label>
+  <input class="field" id="budget-name" name="name" type="text" required>
+  <label class="label" for="budget-subject-type">Subject</label>
+  <select class="field" id="budget-subject-type" name="subject_type">
+    <option value="tenant">This workspace ({{.Data.Drawer.OrgName}})</option>
+    <option value="api_key">API key</option>
+    <option value="user">User</option>
+    <option value="service_account">Service account</option>
+  </select>
+  <div data-subject-for="api_key" hidden>
+    <label class="label" for="budget-subject-key">API key</label>
+    <select class="field" id="budget-subject-key" name="subject_id_api_key">
+{{range .Data.Drawer.Keys}}      <option value="{{.ID}}">{{.Label}}</option>
+{{end}}    </select>
+  </div>
+  <div data-subject-for="user" hidden>
+    <label class="label" for="budget-subject-user">User</label>
+    <select class="field" id="budget-subject-user" name="subject_id_user">
+{{range .Data.Drawer.Users}}      <option value="{{.ID}}">{{.Label}}</option>
+{{end}}    </select>
+  </div>
+  <div data-subject-for="service_account" hidden>
+    <label class="label" for="budget-subject-service">Service account</label>
+    <select class="field" id="budget-subject-service" name="subject_id_service_account">
+{{range .Data.Drawer.Services}}      <option value="{{.ID}}">{{.Label}}</option>
+{{end}}    </select>
+  </div>
+  <label class="label" for="budget-kind">Kind</label>
+  <select class="field" id="budget-kind" name="kind">
+    <option value="amount">Amount (money)</option>
+    <option value="tokens">Tokens</option>
+  </select>
+  <label class="label" for="budget-limit-value">Limit value</label>
+  <input class="field" id="budget-limit-value" name="limit_value" type="number" min="1" step="1" required>
+  <label class="label" for="budget-currency">Currency</label>
+  <input class="field" id="budget-currency" name="currency" type="text" maxlength="3" placeholder="USD">
+  <span class="help">Amount budgets only — leave empty for token budgets.</span>
+  <label class="label" for="budget-period">Period</label>
+  <select class="field" id="budget-period" name="period">
+    <option value="daily">Daily</option>
+    <option value="weekly">Weekly</option>
+    <option value="monthly" selected>Monthly</option>
+  </select>
+  <label class="label" for="budget-starts">Starts at</label>
+  <input class="field" id="budget-starts" name="starts_at" type="date" value="{{.Data.Drawer.Today}}">
+  <label class="label" for="budget-ends">Ends at</label>
+  <input class="field" id="budget-ends" name="ends_at" type="date">
+  <span class="help">Optional — must be after the start.</span>
+  <span class="field-error" hidden></span>
+  <div class="drawer-actions">
+    <button type="button" class="btn ghost" data-action="close-drawer">Cancel</button>
+    <button type="submit" class="btn primary">Create budget</button>
+  </div>
+</form>
+{{end}}
+{{end}}

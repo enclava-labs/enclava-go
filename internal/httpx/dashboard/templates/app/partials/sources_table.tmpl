@@ -1,0 +1,62 @@
+{{define "frag-sources-table"}}{{/* Sources table fragment (OA-23). Served by
+     GET /dashboard/partials/sources/table and rendered inline by the page.
+     htmx refreshes it on the shared body `refresh` event; the 3s poll runs
+     only while any row is Syncing (server omits it when all-terminal). */}}
+<div id="sources-table" hx-get="/dashboard/partials/sources/table?status={{.Data.Status}}" hx-swap="outerHTML" hx-trigger="{{if .Data.AnySyncing}}refresh from:body, every 3s{{else}}refresh from:body{{end}}">
+  <div class="filters" role="group" aria-label="Filter sources by status">
+    <a class="chip{{if eq .Data.Status ""}} active{{end}}" aria-pressed="{{if eq .Data.Status ""}}true{{else}}false{{end}}" href="/dashboard/sources">All</a>
+    <a class="chip{{if eq .Data.Status "syncing"}} active{{end}}" aria-pressed="{{if eq .Data.Status "syncing"}}true{{else}}false{{end}}" href="/dashboard/sources?status=syncing">{{statusLabel "source" "syncing"}}</a>
+    <a class="chip{{if eq .Data.Status "healthy"}} active{{end}}" aria-pressed="{{if eq .Data.Status "healthy"}}true{{else}}false{{end}}" href="/dashboard/sources?status=healthy">{{statusLabel "source" "healthy"}}</a>
+    <a class="chip{{if eq .Data.Status "attention"}} active{{end}}" aria-pressed="{{if eq .Data.Status "attention"}}true{{else}}false{{end}}" href="/dashboard/sources?status=attention">{{statusLabel "source" "warning"}}</a>
+    <a class="chip{{if eq .Data.Status "paused"}} active{{end}}" aria-pressed="{{if eq .Data.Status "paused"}}true{{else}}false{{end}}" href="/dashboard/sources?status=paused">{{statusLabel "source" "paused"}}</a>
+  </div>
+{{if .Data.Rows}}  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Source</th>
+          <th scope="col">Scope</th>
+          <th scope="col">Collection</th>
+          <th scope="col">Status</th>
+          <th scope="col">Last sync</th>
+          <th scope="col">Next sync</th>
+          <th scope="col">Items</th>
+          <th scope="col">Permissions</th>
+          <th scope="col">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+{{range .Data.Rows}}        <tr>
+          <td data-label="Source"><span class="row"><span class="avatar" aria-hidden="true">{{.Monogram}}</span><b>{{.Source.Name}}</b></span><span class="subline">{{.Provider}}</span></td>
+          <td data-label="Scope">{{.Scope}}</td>
+          <td data-label="Collection">{{.Collection}}</td>
+          <td data-label="Status">
+{{if and (eq .State "syncing") .HasProgress}}            {{statusPill "source" .State}}
+            <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{.ProgressPct}}" title="{{.ProgressPct}}% reported by the running sync"><i style="width:{{.ProgressPct}}%"></i></div>
+{{else if eq .State "syncing"}}            <span class="pill {{statusTone "syncing"}}"><i class="dot pulse"></i>{{statusLabel "source" "syncing"}}</span>
+{{else}}            {{statusPill "source" .State}}
+{{end}}{{if .LastError}}            <span class="subline">{{.LastError}}</span>
+{{end}}          </td>
+          <td data-label="Last sync">{{relTime .Source.LastSyncAt}}</td>
+          <td data-label="Next sync">{{if .NextEnabled}}{{relTime .NextAt}}{{else}}—{{end}}</td>
+          <td data-label="Items">{{if .HasItems}}{{count .Items}}{{else}}—{{end}}</td>
+          <td data-label="Permissions">{{.Permissions}}</td>
+          <td data-label="Actions">
+            <span class="row">
+              <button type="button" class="btn" data-action="sources:sync" data-source-id="{{.Source.ID}}">{{icon "refresh"}}Sync now</button>
+              <button type="button" class="btn" data-action="sources:toggle" data-source-id="{{.Source.ID}}" data-enabled="{{.Source.IsEnabled}}">{{if .Source.IsEnabled}}Pause{{else}}Resume{{end}}</button>
+              <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete source {{.Source.Name}}?" data-source-id="{{.Source.ID}}" data-source-del="1">Delete</button>
+{{if $.Can.AccessManage}}              <button type="button" class="btn" data-action="sources:bindings" data-source-id="{{.Source.ID}}">{{icon "users"}}User bindings</button>
+{{end}}            </span>
+          </td>
+        </tr>
+{{end}}      </tbody>
+    </table>
+  </div>
+{{else}}  <div class="empty">
+    {{icon "sources"}}
+    <p>No sources yet — connect Slack, Teams, GitHub, Notion or Google Drive to start syncing knowledge.</p>
+    <a class="btn primary" href="/dashboard/sources?new=1">Add source</a>
+  </div>
+{{end}}</div>
+{{end}}

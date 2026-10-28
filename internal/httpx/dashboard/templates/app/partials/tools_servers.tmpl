@@ -1,0 +1,45 @@
+{{define "frag-tools-servers"}}{{/* Registered MCP servers: ref names only —
+     a credential reference is a name, never a secret value. Counts come from
+     the same durable rows as the queue. */}}
+<section class="section" id="tools-servers" hx-get="/dashboard/partials/tools/servers" hx-trigger="refresh from:body" hx-swap="outerHTML">
+  <div class="section-head"><h2>Servers</h2></div>
+  {{if .Data.Servers}}
+  <div class="card">
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Server</th>
+            <th scope="col">Origin</th>
+            <th scope="col">Credential</th>
+            <th scope="col">Status</th>
+            <th scope="col">Approved tools</th>
+            <th scope="col">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Data.Servers}}
+          <tr>
+            <td data-label="Server"><b>{{.ID}}</b><span class="subline">{{.EndpointPath}}</span></td>
+            <td data-label="Origin">{{.Origin}}</td>
+            <td data-label="Credential">{{if .CredentialRef}}{{.CredentialRef}}{{else}}—{{end}}</td>
+            <td data-label="Status">{{if .Enabled}}{{statusPill "server" "connected"}}{{else}}{{statusPill "server" "disabled"}}{{end}}{{if .DiscoveredAt}}<span class="subline">Discovered {{relTime .DiscoveredAt}}</span>{{end}}</td>
+            <td data-label="Approved tools">{{if .Total}}{{count .Approved}} of {{count .Total}}{{else}}—{{end}}</td>
+            <td data-label="Actions">
+              <div class="row">
+                <button type="button" class="btn" data-action="tools:discover" data-server="{{.ID}}">Discover</button>
+                <button type="button" class="btn ghost" data-action="open-drawer" data-drawer-url="/dashboard/partials/tools/register?server={{.ID}}">Edit</button>
+                <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete server {{.ID}}?" data-server="{{.ID}}">Delete</button>
+              </div>
+            </td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {{else}}
+  <div class="card"><div class="empty">{{icon "tools"}}<p>No servers registered yet — connect one to discover its tools.</p></div></div>
+  {{end}}
+</section>
+{{end}}

@@ -1,0 +1,50 @@
+{{define "frag-models-pricing"}}{{/* Pricing matrix (OA-27): one row per
+     model @ endpoint binding, columns Input / Cached input / Output per 1M
+     tokens. Unpriced required cells carry the exact refusal copy plus an
+     inline Set price popover trigger bound to that cell's unit (T-09-06-02:
+     capability + unit travel with the button; the API validates the write).
+     data-price-row/data-price-cell hook the browser spec and refresh swaps. */}}
+<section class="section" id="models-pricing" hx-get="/dashboard/partials/models/pricing" hx-trigger="refresh from:body" hx-swap="outerHTML">
+  <div class="card">
+    {{if .Data.Error}}<div class="attention">{{icon "alert"}}<p>{{.Data.Error}}</p></div>{{end}}
+    {{if .Data.Rows}}
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Model @ endpoint</th>
+            <th scope="col">Input</th>
+            <th scope="col">Cached input</th>
+            <th scope="col">Output</th>
+            <th scope="col"><span class="visually-hidden">History</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Data.Rows}}
+          <tr data-price-row="{{.EndpointID}}|{{.Model}}">
+            <td data-label="Model @ endpoint"><b>{{.Model}}</b><span class="subline">@{{.EndpointID}}{{if .Upstream}} → {{.Upstream}}{{end}}</span></td>
+            {{$row := .}}
+            {{range .Cells}}
+            <td data-label="{{.UnitLabel}}" data-price-cell="{{$row.EndpointID}}|{{.Unit}}">
+              {{if .Priced}}<b>{{money .RateMicros .Currency}}</b><span class="subline">per {{count .UnitQuantity}} tokens · via {{.Basis}}</span>
+              {{else if .Required}}<span class="price-warning">Not priced — requests refused</span>
+              <button type="button" class="btn" data-action="models:price" aria-haspopup="dialog" aria-expanded="false" data-endpoint="{{$row.EndpointID}}" data-model="{{$row.Model}}" data-capability="{{$row.Capability}}" data-unit="{{.Unit}}" data-unit-label="{{.UnitLabel}}">Set price</button>
+              {{else}}<span class="muted">—</span>{{end}}
+            </td>
+            {{end}}
+            <td data-label="History"><button type="button" class="btn ghost" data-action="models:history"
+              data-endpoint="{{$row.EndpointID}}" data-model="{{$row.Model}}" data-capability="{{$row.Capability}}">History</button></td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+    {{else if not .Data.Error}}
+    <div class="empty">
+      {{icon "billing"}}
+      <p>No model routes to price — bind a model alias on an endpoint first.</p>
+    </div>
+    {{end}}
+  </div>
+</section>
+{{end}}

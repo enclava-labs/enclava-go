@@ -1,0 +1,42 @@
+{{define "frag-tools-register"}}{{/* Register/edit server drawer mirroring
+     mcpServerInput fields. Audience scopes are a labeled checklist, never a
+     comma field. Markup only — the page module owns the POST/PUT (D-20). */}}
+<div class="drawer-head">
+  <h2>{{if .Data.Server}}Edit server{{else}}Register a server{{end}}</h2>
+  <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close">{{icon "x"}}<span class="visually-hidden">Close</span></button>
+</div>
+<form data-tools-form="server" data-mode="{{if .Data.Server}}edit{{else}}create{{end}}"{{if .Data.Server}} data-server="{{.Data.Server.ID}}"{{end}}>
+  <div class="stack">
+    <div>
+      <label class="label" for="tools-server-id">Server ID</label>
+      <input class="field" id="tools-server-id" name="id" value="{{if .Data.Server}}{{.Data.Server.ID}}{{end}}"{{if .Data.Server}} disabled{{end}} required>
+      <span class="help">Stable identifier assistants reference — immutable after registration.</span>
+    </div>
+    <div>
+      <label class="label" for="tools-server-origin">Origin</label>
+      <input class="field" id="tools-server-origin" name="origin" value="{{if .Data.Server}}{{.Data.Server.Origin}}{{end}}" placeholder="https://mcp.example" required>
+      <span class="help">HTTPS only, except loopback HTTP fixtures.</span>
+    </div>
+    <div>
+      <label class="label" for="tools-server-path">Endpoint path</label>
+      <input class="field" id="tools-server-path" name="endpoint_path" value="{{if .Data.Server}}{{.Data.Server.EndpointPath}}{{else}}/mcp{{end}}">
+    </div>
+    <div>
+      <label class="label" for="tools-server-cred">Credential reference</label>
+      <input class="field" id="tools-server-cred" name="credential_ref" value="{{if .Data.Server}}{{.Data.Server.CredentialRef}}{{end}}" autocomplete="off">
+      <span class="help">The stored credential's name — never a secret value.</span>
+    </div>
+    <div>
+      <span class="label">Audience scopes</span>
+      {{range .Data.Scopes}}<label class="row"><input type="checkbox" name="audience_scope" value="{{.Name}}"{{if .Checked}} checked{{end}}> {{.Name}}</label>{{end}}
+      <span class="help">Callers must hold every checked scope to call this server's tools.</span>
+    </div>
+    <label class="row"><input type="checkbox" name="authorized_private"{{if .Data.Server}}{{if .Data.Server.AuthorizedPrivate}} checked{{end}}{{end}}> Allow private destination addresses</label>
+    <label class="row"><input type="checkbox" name="enabled"{{if .Data.Server}}{{if .Data.Server.Enabled}} checked{{end}}{{else}} checked{{end}}> Enabled</label>
+  </div>
+  <div class="drawer-actions">
+    <button type="button" class="btn ghost" data-action="close-drawer">Cancel</button>
+    <button type="submit" class="btn primary">{{if .Data.Server}}Save changes{{else}}Register server{{end}}</button>
+  </div>
+</form>
+{{end}}

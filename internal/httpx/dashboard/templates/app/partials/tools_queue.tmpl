@@ -1,0 +1,66 @@
+{{define "frag-tools-queue"}}{{/* Approval queue: ONLY persisted
+     pending|changed discovery rows (never re-discovery). The Approve button
+     binds the durable schema_version the PUT must echo; model name and
+     caller scopes are editable labeled controls beside the field-level
+     diff. */}}
+<section class="section" id="tools-queue" hx-get="/dashboard/partials/tools/queue" hx-trigger="refresh from:body" hx-swap="outerHTML">
+  <div class="section-head">
+    <h2>Needs approval</h2>
+    {{if .Data.Queue}}<span class="pill warn"><i class="dot"></i>{{count (len .Data.Queue)}} waiting</span>{{end}}
+  </div>
+  {{if .Data.Queue}}
+    {{range $i, $row := .Data.Queue}}
+    <div class="card" data-tool-card>
+      <div class="attention">
+        {{icon "tools"}}
+        <p><b>{{$row.Name}}</b>
+          {{if eq $row.State "changed"}}{{statusPill "tool" "changed"}}{{else}}{{statusPill "tool" "pending"}}{{end}}
+          {{if $row.ReadOnly}}<span class="pill neutral"><i class="dot"></i>{{term "readonly"}}</span>{{else if $row.WritesData}}<span class="pill warn"><i class="dot"></i>{{term "writes-data"}}</span>{{end}}
+          <span class="subline">{{$row.Origin}} · schema v{{$row.SchemaVersion}} · discovered {{relTime $row.DiscoveredAt}}</span></p>
+        <button type="button" class="btn" data-action="tools:approve" data-server="{{$row.ServerID}}" data-tool="{{$row.ToolID}}" data-schema-version="{{$row.SchemaVersion}}" data-remote-name="{{$row.RemoteName}}">Approve</button>
+        <button type="button" class="btn danger" data-action="tools:reject" data-server="{{$row.ServerID}}" data-tool="{{$row.ToolID}}">Reject</button>
+      </div>
+      <div class="stack">
+        <div class="grid two">
+          <div>
+            <label class="label" for="tools-model-{{$i}}">Tool name for assistants</label>
+            <input class="field" id="tools-model-{{$i}}" name="model_name" value="{{$row.ModelName}}" placeholder="{{$row.RemoteName}}">
+            <span class="help">Assistants call the tool by this name — defaults to the remote name when left empty.</span>
+          </div>
+          <div>
+            <span class="label">Caller scopes</span>
+            {{range $.Data.Scopes}}<label class="row"><input type="checkbox" name="caller_scope" value="{{.Name}}" checked> {{.Name}}</label>{{end}}
+            <span class="help">Callers must hold every checked scope to invoke the approved tool.</span>
+          </div>
+        </div>
+        {{if $row.Diff}}
+        <div>
+          <span class="label">Schema changes since approval</span>
+          <div class="stack">
+            {{range $row.Diff}}<div class="row"><b>{{.Field}}</b>{{if .Change}}{{statusPill "diff" .Change}}{{end}}<span class="muted">{{.Old}} → {{.New}}</span></div>{{end}}
+          </div>
+        </div>
+        {{end}}
+        {{if $row.Props}}
+        <div>
+          {{if $row.InputUnchanged}}
+          <span class="label">Schema changed without input-field differences</span>
+          <p class="muted">The schema digest moved on — review the current fields before approving.</p>
+          {{else if not $row.Diff}}
+          <span class="label">Discovered schema</span>
+          {{else}}
+          <span class="label">Current schema</span>
+          {{end}}
+          <div class="stack">
+            {{range $row.Props}}<div class="row"><b>{{.Field}}</b><span class="muted">{{.Type}}</span></div>{{end}}
+          </div>
+        </div>
+        {{end}}
+      </div>
+    </div>
+    {{end}}
+  {{else}}
+    <div class="card"><div class="empty">{{icon "check"}}<p>Nothing needs approval.</p></div></div>
+  {{end}}
+</section>
+{{end}}

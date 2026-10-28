@@ -1,0 +1,45 @@
+{{define "frag-instruction-editor"}}{{/* Instructions editor (09-03): name,
+     system prompt, user prompt, variables as labeled add/remove rows
+     (name + description + required), default flag. No JSON field anywhere —
+     assistants.js serializes the rows into variables_schema. Markup only
+     (D-20). Arg: dashboardView; page model under .Data. */}}
+<div class="drawer-head">
+  <h2>{{if .Data.Template}}Edit instructions{{else}}New instructions{{end}}</h2>
+  <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button>
+</div>
+<form id="instruction-form" data-template-id="{{if .Data.Template}}{{.Data.Template.ID}}{{end}}">
+  <label class="label" for="instruction-name">Name
+    <input class="field" id="instruction-name" name="name" value="{{if .Data.Template}}{{.Data.Template.Name}}{{end}}" required>
+  </label>
+  <label class="label" for="instruction-system">System prompt
+    <textarea class="field" id="instruction-system" name="system_prompt" rows="5">{{if .Data.Template}}{{.Data.Template.SystemPrompt}}{{end}}</textarea>
+    <span class="help">Variables render as {{`{{.name}}`}}; {{`{{.rag_context}}`}} and {{`{{.user_input}}`}} are always available.</span>
+  </label>
+  <label class="label" for="instruction-user">User prompt
+    <textarea class="field" id="instruction-user" name="user_prompt" rows="3">{{if .Data.Template}}{{.Data.Template.UserPrompt}}{{else}}{{`{{.user_input}}`}}{{end}}</textarea>
+  </label>
+  <h3>Variables</h3>
+  <div class="stack" data-var-list>
+{{range .Data.Vars}}    <div class="row" data-var-row>
+      <label class="label">Name<input class="field" data-var-name value="{{.Name}}"></label>
+      <label class="label">Description<input class="field" data-var-description value="{{.Description}}"></label>
+      <label><input type="checkbox" data-var-required{{if .Required}} checked{{end}}> Required</label>
+      <button type="button" class="iconbtn" data-action="assistants:remove-var" aria-label="Remove variable {{.Name}}">{{icon "x"}}<span class="visually-hidden">Remove</span></button>
+    </div>
+{{end}}  </div>
+  <button type="button" class="btn" data-action="assistants:add-var">{{icon "plus"}}Add variable</button>
+  <template data-var-template>
+    <div class="row" data-var-row>
+      <label class="label">Name<input class="field" data-var-name></label>
+      <label class="label">Description<input class="field" data-var-description></label>
+      <label><input type="checkbox" data-var-required> Required</label>
+      <button type="button" class="iconbtn" data-action="assistants:remove-var" aria-label="Remove variable">{{icon "x"}}<span class="visually-hidden">Remove</span></button>
+    </div>
+  </template>
+  <label><input type="checkbox" name="is_default"{{if and .Data.Template .Data.Template.IsDefault}} checked{{end}}> Default for new assistants</label>
+  <div class="drawer-actions">
+    <button type="button" class="btn ghost" data-action="close-drawer">Cancel</button>
+    <button type="button" class="btn primary" data-action="assistants:save-template">{{icon "check"}}Save instructions</button>
+  </div>
+</form>
+{{end}}

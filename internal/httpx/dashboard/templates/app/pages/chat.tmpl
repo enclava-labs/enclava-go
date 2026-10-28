@@ -1,0 +1,62 @@
+{{define "content"}}{{/* Chat page (OA-32): three columns ≥1280 — history,
+     thread, evidence. Fragments live in partials/chat_history.tmpl,
+     chat_thread.tmpl and partials/evidence.tmpl; behaviors ride
+     static/pages/chat.js via data-action delegation (D-20: no scripts, no
+     hx-on, no inline handlers here). The attach icon from the mockup is
+     deliberately omitted — no upload API exists (10-CONTEXT). */}}
+<header class="head">
+  <div class="headcopy">
+    <div class="crumb">{{.Org}} / Chat</div>
+    <h1>Chat</h1>
+    <p class="desc">Secure conversations grounded in your organisation's knowledge.</p>
+  </div>
+  <div class="right-mobile">
+    <button type="button" class="btn mobile-chats" aria-label="Show chat history">{{icon "chat"}} Chats</button>
+    <button type="button" class="btn primary" data-action="chat:new">{{icon "plus"}} New chat</button>
+  </div>
+</header>
+
+<div class="thread-layout">
+  <aside class="history" aria-label="Chat history">
+    <input class="field" type="search" placeholder="Search chats" aria-label="Search chats" data-chat-search>
+    <button type="button" class="btn primary" data-action="chat:new">{{icon "plus"}} New chat</button>
+    {{template "frag-chat-history" .}}
+  </aside>
+
+  <section class="thread" aria-label="Conversation">
+    <div class="thread-head">
+      <div class="stack">
+        <label class="label" for="assistantSelect">Assistant</label>
+        <select class="field" id="assistantSelect" aria-label="Assistant"{{if not .Data.Assistants}} disabled{{end}}>
+          {{$sel := .Data.SelectedAssistant}}{{range .Data.Assistants}}<option value="{{.ID}}"{{if eq .ID $sel}} selected{{end}}>{{.Name}}</option>{{end}}
+        </select>
+        {{if not .Data.Assistants}}<span class="help">No assistants you can use yet — ask an admin to grant access.</span>{{end}}
+      </div>
+      {{with .Data.Thread}}{{if .AssistantName}}<div class="threadmeta">
+        <strong id="chatAssistantName">{{.AssistantName}}</strong>
+        {{if .Subline}}<span class="muted" id="chatAssistantSubline">{{.Subline}}</span>{{end}}
+        {{if .ConfText}}<button type="button" class="conf-card{{if .ConfWarn}} warn{{end}}" data-action="conf-pop" aria-haspopup="dialog" aria-expanded="false" aria-controls="pop">
+          <span class="conf-title">{{icon "shield"}}<strong>{{.ConfText}}</strong></span>
+        </button>{{end}}
+      </div>{{end}}{{end}}
+    </div>
+
+    {{template "frag-chat-thread" .}}
+
+    <div class="composer" id="chatComposer"{{if .Data.EvidenceIDsAttr}} data-evidence="{{.Data.EvidenceIDsAttr}}"{{end}}>
+      <textarea class="field" id="composer" rows="2" placeholder="Ask a follow-up…" aria-label="Message"></textarea>
+      <div class="compose-foot">
+        <span class="muted" id="evidenceChip"{{if not .Data.EvidenceIDsAttr}} hidden{{end}}>Answering from the saved passages you attached.</span>
+        <button type="button" class="btn primary" data-action="chat:send"{{if not .Data.Assistants}} disabled data-locked="1"{{end}}>{{icon "send"}} Send</button>
+      </div>
+    </div>
+  </section>
+
+  <aside id="evidence" class="evidence-panel" aria-label="Evidence"></aside>
+</div>
+
+<div class="mobile-chats-list" id="mobileChats">
+  <button type="button" class="btn mobile-chats">Close chats</button>
+  {{$conv := .Data.ConversationID}}{{range .Data.History.Groups}}<h3>{{.Label}}</h3>{{range .Items}}<a class="history-item{{if eq .ID $conv}} selected{{end}}" href="/dashboard/chat/{{.ID}}">{{.Title}}<span class="subline">{{relTime .UpdatedAt}}</span></a>{{end}}{{end}}
+</div>
+{{end}}

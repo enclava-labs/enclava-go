@@ -1,0 +1,53 @@
+{{define "content"}}{{/* Tools (OA-26, source §6.9): approval queue first,
+     then servers, then the approved tool list. Every section is a fragment
+     the page module refreshes through htmx after an API write (D-17/D-20). */}}
+<header class="head">
+  <div class="headcopy">
+    <div class="crumb">{{.Org}} / Admin</div>
+    <h1>Tools</h1>
+    <p class="desc">Approve outbound {{term "mcp"}} tools, connect servers, and see which assistants use each tool.</p>
+  </div>
+  <div class="right-mobile">
+    <button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/tools/register">{{icon "plus"}}Add server</button>
+  </div>
+</header>
+{{template "frag-tools-queue" .}}
+{{template "frag-tools-servers" .}}
+{{template "frag-tools-list" .}}
+{{end}}
+
+{{define "frag-tools-list"}}{{/* Approved tools: effect badges are untrusted
+     display hints from the persisted annotations — never authority. Lives in
+     the page file so every define parses with the page's own template set. */}}
+<section class="section" id="tools-list" hx-get="/dashboard/partials/tools/list" hx-trigger="refresh from:body" hx-swap="outerHTML">
+  <div class="section-head"><h2>Tools</h2></div>
+  {{if .Data.Tools}}
+  <div class="card">
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Tool</th>
+            <th scope="col">Server</th>
+            <th scope="col">Effect</th>
+            <th scope="col">Used by</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Data.Tools}}
+          <tr>
+            <td data-label="Tool"><b>{{.ModelName}}</b>{{if .Builtin}} <span class="admin-tag">Built-in</span>{{end}}<span class="subline">remote: {{.RemoteName}}</span></td>
+            <td data-label="Server">{{.ServerOrigin}}</td>
+            <td data-label="Effect">{{if .ReadOnly}}<span class="pill neutral"><i class="dot"></i>{{term "readonly"}}</span>{{else if .WritesData}}<span class="pill warn"><i class="dot"></i>{{term "writes-data"}}</span>{{else}}—{{end}}</td>
+            <td data-label="Used by">{{if .UsedByList}}{{.UsedByList}}{{else}}—{{end}}</td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {{else}}
+  <div class="card"><div class="empty">{{icon "tools"}}<p>No approved tools yet — approve one from the queue above.</p></div></div>
+  {{end}}
+</section>
+{{end}}

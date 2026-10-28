@@ -13,10 +13,9 @@ import (
 	"net/url"
 	"strings"
 	"testing"
-	"time"
 
 	"enclava-go/internal/auth"
-	"enclava-go/internal/billing"
+	"enclava-go/internal/extract"
 	"enclava-go/internal/testdb"
 )
 
@@ -171,42 +170,28 @@ func TestDashboardEndpointsMirrorAPIScopes(t *testing.T) {
 	f := newIdentityFixture(t)
 
 	memberSess, memberCSRF := loginUser(t, f, "member@example.com", []string{"chatbot"}, "member-pass")
-	readerSess, readerCSRF := loginUser(t, f, "reader@example.com", []string{"rag"}, "reader-pass")
-	extractSess, extractCSRF := loginUser(t, f, "extract@example.com", []string{"extract"}, "extract-pass")
+	readerSess, _ := loginUser(t, f, "reader@example.com", []string{"rag"}, "reader-pass")
 	adminSess, adminCSRF := loginUser(t, f, "admin2@example.com", []string{auth.ScopePlatformAdmin}, "admin-pass")
 	pricerSess, pricerCSRF := loginUser(t, f, "pricer@example.com", []string{"pricing.manage"}, "pricer-pass")
-	connSess, connCSRF := loginUser(t, f, "connector@example.com", []string{"connectors.manage"}, "conn-pass")
+	connSess, _ := loginUser(t, f, "connector@example.com", []string{"connectors.manage"}, "conn-pass")
 
 	// Member (chatbot only): every admin, provider, knowledge and extract
 	// surface is refused — session alone never reaches the handler.
+	// (Budgets/usage/analytics/billing-audit moved to the admin-only
+	// /dashboard/usage surface in 09-08's cutover; the rag family died with
+	// the phase-10 teardown and moved to the 404 block.)
 	memberDenied := []struct{ method, path string }{
 		{http.MethodGet, "/dashboard/partials/keys"},
-		{http.MethodGet, "/dashboard/partials/usage"},
+		{http.MethodGet, "/dashboard/partials/usage/overview"},
 		{http.MethodGet, "/dashboard/partials/providers"},
 		{http.MethodGet, "/dashboard/partials/pricing"},
-		{http.MethodGet, "/dashboard/partials/billing-audit"},
 		{http.MethodGet, "/dashboard/partials/connectors"},
 		{http.MethodGet, "/dashboard/partials/mcp"},
-		{http.MethodGet, "/dashboard/partials/rag"},
-		{http.MethodGet, "/dashboard/partials/extract"},
-		{http.MethodGet, "/dashboard/partials/extract/templates"},
-		{http.MethodGet, "/dashboard/partials/extract/jobs"},
-		{http.MethodGet, "/dashboard/partials/extract/models"},
-		{http.MethodGet, "/dashboard/partials/extract/settings"},
-		{http.MethodGet, "/dashboard/rag/documents/doc-1/download"},
 		{http.MethodGet, "/dashboard/keys"},
-		{http.MethodGet, "/dashboard/analytics"},
 		{http.MethodGet, "/dashboard/providers"},
 		{http.MethodGet, "/dashboard/pricing"},
-		{http.MethodGet, "/dashboard/billing-audit"},
-		{http.MethodGet, "/dashboard/rag"},
-		{http.MethodGet, "/dashboard/extract"},
 		{http.MethodGet, "/dashboard/connectors"},
 		{http.MethodGet, "/dashboard/mcp"},
-		{http.MethodPost, "/dashboard/partials/extract/templates"},
-		{http.MethodPut, "/dashboard/partials/extract/settings"},
-		{http.MethodPut, "/dashboard/partials/extract/templates/t1"},
-		{http.MethodPost, "/dashboard/partials/extract/reset-defaults"},
 	}
 	for _, tc := range memberDenied {
 		rec := sessionForm(t, f.app, tc.method, tc.path, nil, memberSess, memberCSRF)
@@ -215,19 +200,12 @@ func TestDashboardEndpointsMirrorAPIScopes(t *testing.T) {
 		}
 	}
 
-	// Member keeps its own surfaces: anything but a scope refusal is fine
-	// (unconfigured dependencies answer 501, configured ones render).
+	// Member keeps its own surfaces: anything but a scope refusal is fine.
+	// (Budgets/usage moved to the admin-only /dashboard/usage surface in
+	// 09-08's cutover; the rag/chatbots/prompt-templates/stats family died
+	// with the phase-10 Home cutover — see the 404 block below.)
 	memberOK := []struct{ method, path string }{
-		{http.MethodGet, "/dashboard"},
-		{http.MethodGet, "/dashboard/partials/stats"},
-		{http.MethodGet, "/dashboard/budgets"},
-		{http.MethodGet, "/dashboard/partials/budgets"},
 		{http.MethodGet, "/dashboard/identity"},
-		{http.MethodGet, "/dashboard/documents"},
-		{http.MethodGet, "/dashboard/chatbots"},
-		{http.MethodGet, "/dashboard/partials/chatbots"},
-		{http.MethodGet, "/dashboard/prompt-templates"},
-		{http.MethodGet, "/dashboard/partials/prompt-templates"},
 	}
 	for _, tc := range memberOK {
 		rec := sessionForm(t, f.app, tc.method, tc.path, nil, memberSess, memberCSRF)
@@ -236,50 +214,39 @@ func TestDashboardEndpointsMirrorAPIScopes(t *testing.T) {
 		}
 	}
 
-	// Read-scope holders reach the read surfaces but mutations demand the
-	// matching *.manage scope — enforced before the service lookup.
-	post := url.Values{"action": {"create_collection"}}
-	if rec := sessionForm(t, f.app, http.MethodPost, "/dashboard/partials/rag", post, readerSess, readerCSRF); rec.Code != http.StatusForbidden {
-		t.Fatalf("rag post without rag.manage: expected 403, got %d", rec.Code)
+	// The old rag family died with the phase-10 Home cutover: every deleted
+	// URL answers with the designed 404 — for members and scope holders
+	// alike, with no redirect or alias (D-19).
+	deletedRoutes := []struct{ method, path string }{
+		{http.MethodGet, "/dashboard/partials/stats"},
+		{http.MethodGet, "/dashboard/chatbots"},
+		{http.MethodGet, "/dashboard/partials/chatbots"},
+		{http.MethodPost, "/dashboard/partials/chatbots"},
+		{http.MethodGet, "/dashboard/prompt-templates"},
+		{http.MethodGet, "/dashboard/partials/prompt-templates"},
+		{http.MethodGet, "/dashboard/rag"},
+		{http.MethodGet, "/dashboard/partials/rag"},
+		{http.MethodGet, "/dashboard/rag/documents/doc-1/download"},
 	}
-	if rec := sessionForm(t, f.app, http.MethodGet, "/dashboard/partials/rag", nil, readerSess, readerCSRF); rec.Code == http.StatusForbidden {
-		t.Fatal("rag get with rag scope refused")
-	}
-	if rec := sessionForm(t, f.app, http.MethodGet, "/dashboard/rag", nil, readerSess, readerCSRF); rec.Code != http.StatusOK {
-		t.Fatalf("rag page with rag scope: expected 200, got %d", rec.Code)
-	}
-	if rec := sessionForm(t, f.app, http.MethodGet, "/dashboard/rag/documents/doc-1/download", nil, readerSess, readerCSRF); rec.Code == http.StatusForbidden {
-		t.Fatal("rag document download with rag scope refused")
-	}
-
-	if rec := sessionForm(t, f.app, http.MethodGet, "/dashboard/partials/extract", nil, extractSess, extractCSRF); rec.Code != http.StatusOK {
-		t.Fatalf("extract partial with extract scope: expected 200, got %d", rec.Code)
-	}
-	if rec := sessionForm(t, f.app, http.MethodGet, "/dashboard/extract", nil, extractSess, extractCSRF); rec.Code != http.StatusOK {
-		t.Fatalf("extract page with extract scope: expected 200, got %d", rec.Code)
-	}
-	if rec := sessionForm(t, f.app, http.MethodPost, "/dashboard/partials/extract/process", nil, extractSess, extractCSRF); rec.Code == http.StatusForbidden {
-		t.Fatal("extract process with extract scope refused")
-	}
-	// chatbot-scope POSTs without chatbot.manage are refused inside the
-	// handler, before the (unconfigured) service is consulted.
-	if rec := sessionForm(t, f.app, http.MethodPost, "/dashboard/partials/chatbots", url.Values{"action": {"create_chatbot"}}, memberSess, memberCSRF); rec.Code != http.StatusForbidden {
-		t.Fatalf("chatbot post without chatbot.manage: expected 403, got %d", rec.Code)
-	}
-	if rec := sessionForm(t, f.app, http.MethodPost, "/dashboard/partials/prompt-templates", url.Values{}, memberSess, memberCSRF); rec.Code != http.StatusForbidden {
-		t.Fatalf("prompt-template post without chatbot.manage: expected 403, got %d", rec.Code)
+	for _, tc := range deletedRoutes {
+		pairs := []struct{ session, csrf *http.Cookie }{{memberSess, memberCSRF}}
+		if tc.method == http.MethodGet { // a reader's bare GET still 404s; POSTs need their matching CSRF pair
+			pairs = append(pairs, struct{ session, csrf *http.Cookie }{readerSess, nil})
+		}
+		for _, pair := range pairs {
+			rec := sessionForm(t, f.app, tc.method, tc.path, nil, pair.session, pair.csrf)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("deleted %s %s: expected the designed 404, got %d body=%s",
+					tc.method, tc.path, rec.Code, rec.Body.String())
+			}
+		}
 	}
 
 	// platform.admin reaches the admin surfaces (downstream nil services
-	// answer 501 — never 403); provider/pricing and connector surfaces need
-	// their own scopes, matching the API.
+	// answer 501 — never 403).
 	adminOK := []struct{ method, path string }{
 		{http.MethodGet, "/dashboard/partials/keys"},
 		{http.MethodGet, "/dashboard/keys"},
-		{http.MethodGet, "/dashboard/partials/usage"},
-		{http.MethodGet, "/dashboard/analytics"},
-		{http.MethodGet, "/dashboard/partials/billing-audit"},
-		{http.MethodGet, "/dashboard/billing-audit"},
 		{http.MethodGet, "/dashboard/partials/mcp"},
 		{http.MethodGet, "/dashboard/mcp"},
 	}
@@ -310,104 +277,41 @@ func TestDashboardEndpointsMirrorAPIScopes(t *testing.T) {
 		}
 	}
 	for _, path := range []string{"/dashboard/partials/connectors", "/dashboard/connectors"} {
-		rec := sessionForm(t, f.app, http.MethodGet, path, nil, connSess, connCSRF)
+		rec := sessionForm(t, f.app, http.MethodGet, path, nil, connSess, nil)
 		if rec.Code == http.StatusForbidden {
 			t.Fatalf("connectors.manage GET %s: unexpected 403", path)
 		}
 	}
 }
 
-func TestDashboardStatsScopesKeyCountToCaller(t *testing.T) {
-	f := newIdentityFixture(t)
-	ctx := context.Background()
+// TestDashboardHomeScopesOwnStatsToCaller replaces the deleted stats-trio
+// coverage (TestDashboardStatsScopesKeyCountToCaller — the surface died with
+// the phase-10 Home cutover): the new Home is actor-scoped the same way — a
+// member's extraction total and running feed count only their OWN jobs, and
+// another member's jobs never appear, whatever their counts.
+func TestDashboardHomeScopesOwnStatsToCaller(t *testing.T) {
+	f := newHomeFixture(t)
 
-	// The fixture already seeds one active admin-owned key; add a second
-	// admin key and one owned by the member.
-	var fixtureAdminID string
-	users, err := f.repo.ListUsers(ctx, f.tenant)
-	if err != nil {
-		t.Fatalf("list users: %v", err)
-	}
-	for _, u := range users {
-		if u.Email == "admin@example.com" {
-			fixtureAdminID = u.ID
-		}
-	}
-	if fixtureAdminID == "" {
-		t.Fatal("fixture admin user missing")
-	}
-	member := testdb.SeedUser(t, f.db, f.tenant, "stat-member@example.com", nil)
-	setPassword(t, f.repo, f.tenant, member.ID, "member-pass")
-	testdb.SeedAPIKey(t, f.db, f.tenant, testdb.SeedKeySpec{Name: "admin-2", OwnerUserID: fixtureAdminID})
-	testdb.SeedAPIKey(t, f.db, f.tenant, testdb.SeedKeySpec{Name: "member-1", OwnerUserID: member.ID})
+	other, _ := homeUser(t, f, "stat-other@example.com", []string{"extract"}, auth.ResourceGrants{}, "other-pass")
+	f.enqueue(t, other, extract.OperationProcess, "stat-other-1")
+	f.enqueue(t, other, extract.OperationProcess, "stat-other-2")
 
-	memberSess, _ := login(t, f.app, "stat-member@example.com", "member-pass")
-	rec := sessionForm(t, f.app, http.MethodGet, "/dashboard/partials/stats", nil, memberSess, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("member stats expected 200, got %d", rec.Code)
-	}
-	if !strings.Contains(rec.Body.String(), `<div class="stat-value">1</div>`) {
-		t.Fatalf("member should see only their own active key, got %s", rec.Body.String())
-	}
+	member, memberSess := homeUser(t, f, "stat-member@example.com", []string{"extract"}, auth.ResourceGrants{}, "member-pass")
+	f.enqueue(t, member, extract.OperationProcess, "stat-member-1")
 
-	admin := testdb.SeedUser(t, f.db, f.tenant, "stat-admin@example.com", []string{auth.ScopePlatformAdmin})
-	setPassword(t, f.repo, f.tenant, admin.ID, "admin-pass")
-	adminSess, _ := login(t, f.app, "stat-admin@example.com", "admin-pass")
-	rec = sessionForm(t, f.app, http.MethodGet, "/dashboard/partials/stats", nil, adminSess, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("admin stats expected 200, got %d", rec.Code)
+	body := homeGet(t, f, "/dashboard", memberSess)
+	if !strings.Contains(body, "1 total") {
+		t.Fatalf("member extraction total must scope to own jobs, not the tenant's\n%s", body)
 	}
-	if !strings.Contains(rec.Body.String(), `<div class="stat-value">3</div>`) {
-		t.Fatalf("admin should see all three tenant keys, got %s", rec.Body.String())
+	frag := homeGet(t, f, "/dashboard/partials/home/running", memberSess)
+	if got := strings.Count(frag, `class="activity-row"`); got != 1 {
+		t.Fatalf("member running feed must show exactly their own job, got %d rows\n%s", got, frag)
+	}
+	if !strings.Contains(frag, "every 3s") {
+		t.Fatal("own queued job must keep the fragment polling")
 	}
 }
 
-func TestDashboardBudgetsHideTenantSubjectFromMembers(t *testing.T) {
-	f := newBudgetFixture(t)
-	ctx := context.Background()
-	now := time.Now().UTC()
-
-	memberSubject := billing.Subject{Type: auth.BillingSubjectUser, ID: "member-user"}
-	tenantSubject := billing.Subject{Type: billing.BudgetSubjectTenant, ID: f.tenant}
-	for i, subject := range []billing.Subject{memberSubject, tenantSubject} {
-		if err := f.repo.CreateBudget(ctx, f.tenant, "b-"+subject.ID, billing.Budget{
-			Name: "budget-" + subject.ID, Subject: subject, Kind: billing.BudgetKindAmount,
-			Period: billing.PeriodMonthly, LimitAmountMicros: int64(100 + i), Currency: "USD",
-			StartsAt: now.Add(-time.Hour),
-		}); err != nil {
-			t.Fatalf("create budget %s: %v", subject.ID, err)
-		}
-	}
-
-	render := func(p auth.Principal) string {
-		req := httptest.NewRequest(http.MethodGet, "/dashboard/partials/budgets", nil)
-		req = req.WithContext(auth.WithPrincipal(req.Context(), p))
-		rec := httptest.NewRecorder()
-		f.app.handleDashboardBudgets(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("budgets render expected 200, got %d body=%s", rec.Code, rec.Body.String())
-		}
-		return rec.Body.String()
-	}
-
-	member := render(auth.Principal{
-		TenantID: f.tenant, UserID: "member-user",
-		BillingSubjectKind: auth.BillingSubjectUser, BillingSubjectID: "member-user",
-		Scopes: map[string]struct{}{"chatbot": {}},
-	})
-	if !strings.Contains(member, "user member-user") {
-		t.Fatalf("member should see their own budget row, got %s", member)
-	}
-	if strings.Contains(member, "tenant "+f.tenant) {
-		t.Fatalf("member must not see the tenant-wide budget, got %s", member)
-	}
-
-	admin := render(auth.Principal{
-		TenantID: f.tenant, UserID: "admin-user",
-		BillingSubjectKind: auth.BillingSubjectUser, BillingSubjectID: "admin-user",
-		Scopes: map[string]struct{}{auth.ScopePlatformAdmin: {}},
-	})
-	if !strings.Contains(admin, "tenant "+f.tenant) {
-		t.Fatalf("admin should see the tenant-wide budget, got %s", admin)
-	}
-}
+// The member-readable /dashboard/partials/budgets surface and its scoped
+// visibility rules died with plan 09-08's atomic billing cutover — budgets
+// are admin-only now (TestDashboardUsageMemberDenied covers the 403s).
