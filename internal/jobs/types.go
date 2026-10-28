@@ -76,6 +76,10 @@ type Job struct {
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 	CompletedAt       *time.Time
+	// Progress is the stored worker progress document, verbatim — nil when
+	// the job reports no real counts (empty doc or percent 0), so a progress
+	// field on a projection always means real observed numbers.
+	Progress json.RawMessage
 }
 
 // Attempt is one recorded execution attempt of a Job.

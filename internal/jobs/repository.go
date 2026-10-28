@@ -56,6 +56,15 @@ type JobsRepository interface {
 	GetOwnedJob(ctx context.Context, tenantID, id, submitterKey string) (JobRow, error)
 	// ListOwnedJobs returns the newest non-deleted rows for one submitter.
 	ListOwnedJobs(ctx context.Context, tenantID, submitterKey string, limit int) ([]JobRow, error)
+	// ListActorJobs lists the newest non-deleted jobs whose frozen principal
+	// carries the actor ID — the list-only activity read behind OA-18 that
+	// survives a new session (submitter keys change, the actor does not).
+	// Never loosens the submitter-key Get/Cancel owner binding.
+	ListActorJobs(ctx context.Context, tenantID, actorID string, statuses, ops []string, limit int) ([]JobRow, error)
+	// ListManagedJobs lists the tenant's newest non-deleted jobs restricted
+	// to the given operations and statuses — the manager capability view;
+	// callers pick the operation set from dashboard capabilities.
+	ListManagedJobs(ctx context.Context, tenantID string, ops, statuses []string, limit int) ([]JobRow, error)
 
 	// Claim atomically: (1) sweeps every running job whose lease expired
 	// with an unfinished DISPATCHED attempt to status=unknown (the outcome

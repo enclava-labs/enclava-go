@@ -136,6 +136,175 @@ func TestABAObservedRevisionsAreDistinctJobs(t *testing.T) {
 	}
 }
 
+// TestListActorActivityScopesByActorAndOperation proves the actor key (not
+// the submitter binding): a member's NEW session (different credential →
+// different submitter key) still sees the job an earlier session submitted,
+// and never another actor's job. Operation/status filters narrow the feed.
+func TestListActorActivityScopesByActorAndOperation(t *testing.T) {
+	svc, db, tenant := setup(t)
+	ctx := context.Background()
+
+	aliceOld := principal(tenant, "alice", "cred-1")
+	aliceNew := principal(tenant, "alice", "cred-2")
+	bob := principal(tenant, "bob", "cred-1")
+
+	oldJob := enqueue(t, svc, aliceOld, req(tenant, "alice-old", "extract.process", "h1", 1))
+	bobJob := enqueue(t, svc, bob, req(tenant, "bob-1", "extract.process", "h2", 1))
+	newJob := enqueue(t, svc, aliceNew, req(tenant, "alice-new", "chatbot.run", "h3", 1))
+
+	// New session, all statuses/ops: sees BOTH own jobs across the session
+	// boundary, never bob's.
+	aliceJobs, err := svc.ListActorActivity(ctx, aliceNew, nil, nil, 50)
+	if err != nil {
+		t.Fatalf("list actor activity: %v", err)
+	}
+	got := map[string]bool{}
+	for _, j := range aliceJobs {
+		got[j.ID] = true
+	}
+	if !got[oldJob.ID] || !got[newJob.ID] {
+		t.Fatalf("alice's new session lost an earlier job: %#v", aliceJobs)
+	}
+	if got[bobJob.ID] {
+		t.Fatalf("another actor's job leaked into the actor feed: %#v", aliceJobs)
+	}
+
+	// Operation filter narrows to matching ops only.
+	runJobs, err := svc.ListActorActivity(ctx, aliceNew, nil, []string{"chatbot.run"}, 50)
+	if err != nil || len(runJobs) != 1 || runJobs[0].ID != newJob.ID {
+		t.Fatalf("operation filter = %#v err=%v, want only %s", runJobs, err, newJob.ID)
+	}
+
+	// Status filter narrows likewise.
+	queuedJobs, err := svc.ListActorActivity(ctx, aliceNew, []string{jobs.StatusQueued}, nil, 50)
+	if err != nil || len(queuedJobs) != 2 {
+		t.Fatalf("status filter = %d jobs err=%v, want both queued", len(queuedJobs), err)
+	}
+
+	// Tenant isolation: another tenant's actor sees nothing of alice's.
+	otherTenant := testdb.SeedTenant(t, db, "actor-other")
+	foreign, err := svc.ListActorActivity(ctx, principal(otherTenant, "alice", "cred-1"), nil, nil, 50)
+	if err != nil || len(foreign) != 0 {
+		t.Fatalf("cross-tenant actor leak: %#v err=%v", foreign, err)
+	}
+}
+
+// TestListActorActivityPredicatesBeforeLimit proves the non-starvation rule:
+// an old queued job and an old FAILED job stay visible behind a full page of
+// newer successes, because status/operation predicates apply in SQL BEFORE
+// the LIMIT.
+func TestListActorActivityPredicatesBeforeLimit(t *testing.T) {
+	svc, db, tenant := setup(t)
+	ctx := context.Background()
+	p := principal(tenant, "alice", "cred-1")
+
+	// The older failure: real worker path — lease then fenced terminal fail.
+	failedJob := enqueue(t, svc, p, req(tenant, "k-failed", "extract.process", "hf", 1))
+	claim := leaseJob(t, svc, failedJob.ID)
+	if err := claim.Fail(ctx, errors.New("boom"), jobs.FailureFatal); err != nil {
+		t.Fatalf("fail job: %v", err)
+	}
+
+	// The older queued job, backdated so it is the oldest row, and delayed so
+	// the test's lease loop never claims it.
+	queuedJob := enqueue(t, svc, p, req(tenant, "k-queued", "extract.process", "hq", 1))
+	if _, err := db.SQL.ExecContext(ctx,
+		`UPDATE jobs SET submitted_at = submitted_at - interval '2 hours',
+		        lease_expires_at = now() + interval '1 hour'
+		 WHERE tenant_id = $1::uuid AND id = $2`, tenant, queuedJob.ID); err != nil {
+		t.Fatalf("backdate queued job: %v", err)
+	}
+
+	// A full page of newer successes on top.
+	for i := range 50 {
+		done := enqueue(t, svc, p, req(tenant, fmt.Sprintf("k-done-%d", i), "extract.process", fmt.Sprintf("hd%d", i), int64(i+2)))
+		claim := leaseJob(t, svc, done.ID)
+		if _, err := claim.Complete(ctx, "{}"); err != nil {
+			t.Fatalf("complete job: %v", err)
+		}
+	}
+
+	queued, err := svc.ListActorActivity(ctx, p, []string{jobs.StatusQueued}, nil, 50)
+	if err != nil || len(queued) != 1 || queued[0].ID != queuedJob.ID {
+		t.Fatalf("old queued job starved behind newer successes: %#v err=%v", queued, err)
+	}
+	failed, err := svc.ListActorActivity(ctx, p, []string{jobs.StatusFailed}, nil, 50)
+	if err != nil || len(failed) != 1 || failed[0].ID != failedJob.ID {
+		t.Fatalf("old failed job starved behind newer successes: %#v err=%v", failed, err)
+	}
+	all, err := svc.ListActorActivity(ctx, p, nil, nil, 50)
+	if err != nil || len(all) != 50 {
+		t.Fatalf("unfiltered page = %d jobs err=%v, want the newest 50", len(all), err)
+	}
+	for _, j := range all {
+		if j.ID == queuedJob.ID || j.ID == failedJob.ID {
+			t.Fatalf("older non-matching job consumed the newest-50 page: %#v", all)
+		}
+	}
+}
+
+// TestListActorActivityCarriesRealProgressOnly proves the progress read
+// projection: a job whose worker published real counts carries the stored
+// document verbatim; a job without counts carries none.
+func TestListActorActivityCarriesRealProgressOnly(t *testing.T) {
+	svc, _, tenant := setup(t)
+	ctx := context.Background()
+	p := principal(tenant, "alice", "cred-1")
+
+	counted := enqueue(t, svc, p, req(tenant, "k-counted", "extract.process", "hc1", 1))
+	blank := enqueue(t, svc, p, req(tenant, "k-blank", "extract.process", "hc2", 1))
+
+	claim := leaseJob(t, svc, counted.ID)
+	if err := claim.Progress(ctx, 42, "halfway"); err != nil {
+		t.Fatalf("publish progress: %v", err)
+	}
+
+	rows, err := svc.ListActorActivity(ctx, p, nil, nil, 50)
+	if err != nil {
+		t.Fatalf("list actor activity: %v", err)
+	}
+	progressByID := map[string]json.RawMessage{}
+	for _, j := range rows {
+		progressByID[j.ID] = j.Progress
+	}
+	if got := progressByID[counted.ID]; got == nil {
+		t.Fatal("counted job carries no progress, want the stored document verbatim")
+	} else {
+		var doc struct {
+			Percent int    `json:"percent"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(got, &doc); err != nil || doc.Percent != 42 || doc.Message != "halfway" {
+			t.Fatalf("counted job progress = %q (decoded %+v err=%v), want percent 42 halfway", got, doc, err)
+		}
+	}
+	if got := progressByID[blank.ID]; got != nil {
+		t.Fatalf("non-counted job carries progress %q, want none", got)
+	}
+}
+
+// leaseJob leases one specific queued job, completing anything older that
+// gets in the way.
+func leaseJob(t *testing.T, svc *jobs.Service, wantID string) *jobs.Claim {
+	t.Helper()
+	ctx := context.Background()
+	for {
+		claim, err := svc.Lease(ctx, "test-worker", time.Minute)
+		if err != nil {
+			t.Fatalf("lease: %v", err)
+		}
+		if claim == nil {
+			t.Fatalf("job %s never became claimable", wantID)
+		}
+		if claim.Job().ID == wantID {
+			return claim
+		}
+		if _, err := claim.Complete(ctx, "{}"); err != nil {
+			t.Fatalf("complete bystander job: %v", err)
+		}
+	}
+}
+
 func TestEnqueueFreezesPrincipalBeforeAck(t *testing.T) {
 	svc, db, tenant := setup(t)
 	p := principal(tenant, "actor-9", "cred-9")

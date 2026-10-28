@@ -33,7 +33,7 @@ var _ jobs.JobsRepository = (*JobsRepo)(nil)
 const jobColumns = `tenant_id::text, id, operation, status, connection_id,
 	object_id, observed_revision, idempotency_key, input_hash, input_ref,
 	principal, submitter_key, policy, attempts, max_attempts, fence_token,
-	lease_owner, lease_expires_at, dispatched_attempt_id, result_ref, error,
+	lease_owner, lease_expires_at, dispatched_attempt_id, result_ref, progress, error,
 	submitted_at, started_at, finished_at, deleted_at`
 
 // scanJobRow decodes jobColumns order plus any caller-supplied trailing
@@ -43,13 +43,13 @@ func scanJobRow(s rowScanner, extra ...any) (jobs.JobRow, error) {
 	var observed sql.NullInt64
 	var leaseOwner sql.NullString
 	var leaseExpires, startedAt, finishedAt, deletedAt sql.NullTime
-	var principal, policy, errDoc []byte
+	var principal, policy, progress, errDoc []byte
 	dests := []any{
 		&row.TenantID, &row.ID, &row.Operation, &row.Status, &connID,
 		&objectID,
 		&observed, &row.IdempotencyKey, &row.InputHash, &inputRef, &principal,
 		&submitterKey, &policy, &row.Attempt, &row.MaxAttempts, &row.FenceToken,
-		&leaseOwner, &leaseExpires, &dispatched, &resultRef, &errDoc,
+		&leaseOwner, &leaseExpires, &dispatched, &resultRef, &progress, &errDoc,
 		&row.CreatedAt, &startedAt, &finishedAt, &deletedAt}
 	dests = append(dests, extra...)
 	if err := s.Scan(dests...); err != nil {
@@ -64,6 +64,16 @@ func scanJobRow(s rowScanner, extra ...any) (jobs.JobRow, error) {
 	row.DispatchedAttempt = dispatched.String
 	row.PrincipalSnapshot = principal
 	row.ResultRef = resultRef.String
+	// Real counts only: an empty progress doc (or percent 0) never carries,
+	// so consumers can render Progress verbatim without inventing a percent.
+	if len(progress) > 0 {
+		var counts struct {
+			Percent int `json:"percent"`
+		}
+		if json.Unmarshal(progress, &counts) == nil && counts.Percent > 0 {
+			row.Progress = progress
+		}
+	}
 	if len(policy) > 0 {
 		_ = json.Unmarshal(policy, &row.Policy)
 	}
@@ -280,6 +290,56 @@ func (r *JobsRepo) ListOwnedJobsFiltered(ctx context.Context, tenantID, submitte
 // page across every operation (jobs.Service.List, connectors).
 func (r *JobsRepo) ListOwnedJobs(ctx context.Context, tenantID, submitterKey string, limit int) ([]jobs.JobRow, error) {
 	return r.ListOwnedJobsFiltered(ctx, tenantID, submitterKey, nil, nil, limit)
+}
+
+// listActivityRows is the shared activity query: every predicate (tenant,
+// optional actor, operations, statuses) applies in SQL BEFORE the LIMIT —
+// the non-starvation rule, so an old queued job behind a page of completed
+// rows and an old failure behind newer successes still surface. Newest first.
+func (r *JobsRepo) listActivityRows(ctx context.Context, tenantID, actorPredicate, actorID string, ops, statuses []string, limit int) ([]jobs.JobRow, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := `
+		SELECT ` + jobColumns + ` FROM jobs
+		WHERE tenant_id = $1 AND deleted_at IS NULL`
+	args := []any{tenantID}
+	if actorPredicate != "" {
+		query += ` AND ` + actorPredicate
+		args = append(args, actorID)
+	}
+	query, args = appendJobPredicate(query, args, "operation", ops)
+	query, args = appendJobPredicate(query, args, "status", statuses)
+	query += `
+		ORDER BY submitted_at DESC, id DESC
+		LIMIT ` + strconv.Itoa(limit)
+	rows, err := r.db.SQL.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list activity jobs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := []jobs.JobRow{}
+	for rows.Next() {
+		row, err := scanJobRow(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan job: %w", err)
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// ListActorJobs lists one actor's jobs across every submitter binding — the
+// member activity/attention read keyed on the frozen principal's ActorID.
+// Read-only: Get/Cancel/replay stay submitter-key bound.
+func (r *JobsRepo) ListActorJobs(ctx context.Context, tenantID, actorID string, statuses, ops []string, limit int) ([]jobs.JobRow, error) {
+	return r.listActivityRows(ctx, tenantID, `principal->>'ActorID' = $2`, actorID, ops, statuses, limit)
+}
+
+// ListManagedJobs lists the tenant's jobs restricted to the given
+// operations/statuses — the capability-gated manager view; no actor filter.
+func (r *JobsRepo) ListManagedJobs(ctx context.Context, tenantID string, ops, statuses []string, limit int) ([]jobs.JobRow, error) {
+	return r.listActivityRows(ctx, tenantID, "", "", ops, statuses, limit)
 }
 
 // ListConnectionJobs lists a connection's non-deleted jobs regardless of

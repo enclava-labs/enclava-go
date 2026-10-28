@@ -332,11 +332,38 @@ func (s *Service) List(ctx context.Context, p auth.Principal, limit int) ([]Job,
 	if err != nil {
 		return nil, err
 	}
+	return jobRows(rows), nil
+}
+
+// ListActorActivity returns the caller's newest jobs keyed on the frozen
+// principal's ACTOR ID, not the submitter binding: a member's new session
+// (new credential or session ID) still sees the jobs an earlier session
+// submitted. List-only read — Get/Cancel/replay stay submitter-key bound.
+func (s *Service) ListActorActivity(ctx context.Context, p auth.Principal, statuses, ops []string, limit int) ([]Job, error) {
+	rows, err := s.repo.ListActorJobs(ctx, p.TenantID, p.ActorID, statuses, ops, limit)
+	if err != nil {
+		return nil, err
+	}
+	return jobRows(rows), nil
+}
+
+// ListTenantActivity returns the tenant's newest jobs restricted to the
+// given operations and statuses; the CALLER picks the operation set from
+// dashboard capabilities — this method only keeps the tenant scope.
+func (s *Service) ListTenantActivity(ctx context.Context, p auth.Principal, ops, statuses []string, limit int) ([]Job, error) {
+	rows, err := s.repo.ListManagedJobs(ctx, p.TenantID, ops, statuses, limit)
+	if err != nil {
+		return nil, err
+	}
+	return jobRows(rows), nil
+}
+
+func jobRows(rows []JobRow) []Job {
 	out := make([]Job, len(rows))
 	for i := range rows {
 		out[i] = rows[i].Job
 	}
-	return out, nil
+	return out
 }
 
 // Cancel requests cancellation: a queued job transitions to cancelled

@@ -291,6 +291,7 @@ func main() {
 		artifactRepo,
 	)
 	app.ConfigureMCP(mcpRepo, mcpTransport)
+	app.ConfigureActivity(jobsSvc)
 
 	// The extract module mounts its API routes on the app's mux — every
 	// processing call it makes funnels through the shared executor.

@@ -16,6 +16,7 @@ import (
 	"enclava-go/internal/connectors"
 	"enclava-go/internal/extract"
 	"enclava-go/internal/inference"
+	"enclava-go/internal/jobs"
 	"enclava-go/internal/llm"
 	"enclava-go/internal/mcp"
 	"enclava-go/internal/prompts"
@@ -50,10 +51,17 @@ type App struct {
 	artifactRepo *postgres.ArtifactRepo
 	mcpRepo      *postgres.MCPToolsRepo
 	mcpTransport *mcp.StreamableHTTP
+	jobsSvc      *jobs.Service
 	rl           *RateLimiter
 	gate         *inferenceGate
 	mux          *http.ServeMux
 }
+
+// ConfigureActivity wires the shared durable-job service after construction
+// (the ConfigureMCP pattern — NewApp's signature stays untouched). main.go
+// calls it next to app.ConfigureMCP. Producers degrade to the non-job items
+// while it is unset.
+func (a *App) ConfigureActivity(jobSvc *jobs.Service) { a.jobsSvc = jobSvc }
 
 const (
 	preAuthRateLimitPerMinute = 120

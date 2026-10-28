@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -251,5 +252,160 @@ func TestJobsRepoRetryableRequeueBackoff(t *testing.T) {
 	}
 	if c2.Attempt != 2 {
 		t.Fatalf("attempt counter must advance to 2, got %d", c2.Attempt)
+	}
+}
+
+// insertActorJob inserts one job row carrying the actor key in the frozen
+// principal with an explicit status — the row shape the activity queries key
+// on (jobs.principal->>'ActorID').
+func insertActorJob(t *testing.T, ctx context.Context, r *JobsRepo, tenant, id, op, status, actor string) jobs.Job {
+	t.Helper()
+	rec := jobs.InsertRecord{
+		Job: jobs.Job{
+			TenantID: tenant, ID: id, Operation: op, Status: status,
+			IdempotencyKey: id,
+			Subject:        jobs.Subject{ConnectionID: "c", ObjectID: "o", ObservedRevision: 1},
+			InputHash:      "h", Policy: map[string]any{}, MaxAttempts: 3,
+		},
+		SubmitterKey: "submitter-" + id,
+		Principal:    json.RawMessage(`{"ActorID":"` + actor + `"}`),
+		PolicyJSON:   []byte(`{}`),
+	}
+	if _, _, err := r.InsertJob(ctx, rec); err != nil {
+		t.Fatalf("insert actor job %s: %v", id, err)
+	}
+	// InsertJob freezes status='queued' (real transitions go through the
+	// fenced claim path); a terminal fixture row flips it explicitly, the
+	// same way the run-repo tests seed bound-job states.
+	if status != jobs.StatusQueued {
+		if _, err := r.db.SQL.ExecContext(ctx,
+			`UPDATE jobs SET status = $3 WHERE tenant_id = $1 AND id = $2`,
+			tenant, id, status); err != nil {
+			t.Fatalf("status %s for %s: %v", status, id, err)
+		}
+	}
+	return rec.Job
+}
+
+// TestJobsRepoListActorJobsActorScoped proves the actor key scopes the feed:
+// one actor's rows only, within the tenant, filtered by operation/status.
+func TestJobsRepoListActorJobsActorScoped(t *testing.T) {
+	db := RequireTestDB(t)
+	ctx := context.Background()
+	tenant := idTenantA
+	seedTenant(t, ctx, db, tenant)
+	other := idTenantB
+	seedTenant(t, ctx, db, other)
+	r := NewJobsRepo(db)
+
+	mine := insertActorJob(t, ctx, r, tenant, "job_actor1", "extract.process", jobs.StatusQueued, "actor-1")
+	insertActorJob(t, ctx, r, tenant, "job_actor2", "extract.process", jobs.StatusQueued, "actor-2")
+	insertActorJob(t, ctx, r, other, "job_other_tenant", "extract.process", jobs.StatusQueued, "actor-1")
+
+	rows, err := r.ListActorJobs(ctx, tenant, "actor-1", nil, nil, 50)
+	if err != nil || len(rows) != 1 || rows[0].ID != mine.ID {
+		t.Fatalf("actor feed = %#v err=%v, want exactly %s", rows, err, mine.ID)
+	}
+	// Deleted rows never surface.
+	if err := r.DeleteJob(ctx, tenant, mine.ID); err != nil {
+		t.Fatalf("delete job: %v", err)
+	}
+	rows, err = r.ListActorJobs(ctx, tenant, "actor-1", nil, nil, 50)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("tombstoned job leaked into the actor feed: %#v err=%v", rows, err)
+	}
+
+	// Operation + status predicates narrow the query server-side.
+	insertActorJob(t, ctx, r, tenant, "job_run", "chatbot.run", jobs.StatusRunning, "actor-1")
+	rows, err = r.ListActorJobs(ctx, tenant, "actor-1", []string{jobs.StatusRunning}, []string{"chatbot.run"}, 50)
+	if err != nil || len(rows) != 1 || rows[0].Operation != "chatbot.run" {
+		t.Fatalf("filtered actor feed = %#v err=%v, want the chatbot.run row", rows, err)
+	}
+}
+
+// TestJobsRepoListManagedJobsPredicatesBeforeLimit proves the tenant-wide
+// managed query filters in SQL before LIMIT: the older FAILED row stays
+// reachable behind a full page of newer successes.
+func TestJobsRepoListManagedJobsPredicatesBeforeLimit(t *testing.T) {
+	db := RequireTestDB(t)
+	ctx := context.Background()
+	tenant := idTenantA
+	seedTenant(t, ctx, db, tenant)
+	r := NewJobsRepo(db)
+
+	failed := insertActorJob(t, ctx, r, tenant, "job_old_failed", "extract.process", jobs.StatusFailed, "actor-1")
+	if _, err := db.SQL.ExecContext(ctx,
+		`UPDATE jobs SET submitted_at = submitted_at - interval '2 hours' WHERE tenant_id = $1 AND id = $2`,
+		tenant, failed.ID); err != nil {
+		t.Fatalf("backdate failed job: %v", err)
+	}
+	for i := range 50 {
+		insertActorJob(t, ctx, r, tenant, fmt.Sprintf("job_done_%d", i), "extract.process", jobs.StatusSucceeded, "actor-1")
+	}
+
+	// The failed row is not in the newest-50 page, but its own status query
+	// still surfaces it.
+	page, err := r.ListManagedJobs(ctx, tenant, nil, nil, 50)
+	if err != nil || len(page) != 50 {
+		t.Fatalf("unfiltered page = %d rows err=%v, want 50", len(page), err)
+	}
+	for _, row := range page {
+		if row.ID == failed.ID {
+			t.Fatalf("failed row must not consume the newest-50 page: %#v", page)
+		}
+	}
+	failedRows, err := r.ListManagedJobs(ctx, tenant, nil, []string{jobs.StatusFailed}, 50)
+	if err != nil || len(failedRows) != 1 || failedRows[0].ID != failed.ID {
+		t.Fatalf("status-filtered managed feed = %#v err=%v, want the old failed row", failedRows, err)
+	}
+	// Operation filters narrow the tenant-wide read too.
+	syncRows, err := r.ListManagedJobs(ctx, tenant, []string{"connector.sync"}, nil, 50)
+	if err != nil || len(syncRows) != 0 {
+		t.Fatalf("operation-filtered managed feed = %#v err=%v, want none", syncRows, err)
+	}
+}
+
+// TestJobsRepoActivityProgressRoundTrip proves the activity projection reads
+// jobs.progress: a job whose worker published real counts carries the stored
+// document; a non-counted row carries none.
+func TestJobsRepoActivityProgressRoundTrip(t *testing.T) {
+	db := RequireTestDB(t)
+	ctx := context.Background()
+	tenant := idTenantA
+	seedTenant(t, ctx, db, tenant)
+	r := NewJobsRepo(db)
+
+	counted := insertActorJob(t, ctx, r, tenant, "job_progress", "extract.process", jobs.StatusQueued, "actor-1")
+	blank := insertActorJob(t, ctx, r, tenant, "job_blank", "extract.process", jobs.StatusQueued, "actor-1")
+
+	cj, err := r.Claim(ctx, "w1", time.Second)
+	if err != nil || cj == nil || cj.JobRow.ID != counted.ID {
+		t.Fatalf("claim counted job: cj=%v err=%v", cj, err)
+	}
+	if err := r.WriteProgress(ctx, tenant, counted.ID, "w1", cj.Lease.FenceToken,
+		json.RawMessage(`{"percent":42,"message":"halfway"}`)); err != nil {
+		t.Fatalf("write progress: %v", err)
+	}
+
+	rows, err := r.ListActorJobs(ctx, tenant, "actor-1", nil, nil, 50)
+	if err != nil {
+		t.Fatalf("list actor jobs: %v", err)
+	}
+	progressByID := map[string]json.RawMessage{}
+	for _, row := range rows {
+		progressByID[row.ID] = row.Progress
+	}
+	if got := progressByID[counted.ID]; got == nil {
+		t.Fatal("counted row carries no progress")
+	} else {
+		var doc struct {
+			Percent int `json:"percent"`
+		}
+		if err := json.Unmarshal(got, &doc); err != nil || doc.Percent != 42 {
+			t.Fatalf("counted row progress = %q (decoded %+v err=%v), want percent 42", got, doc, err)
+		}
+	}
+	if got := progressByID[blank.ID]; got != nil {
+		t.Fatalf("non-counted row carries progress %q, want none", got)
 	}
 }
