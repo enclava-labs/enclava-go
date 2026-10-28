@@ -581,7 +581,7 @@ func TestDashboardAttentionCapabilityMatrix(t *testing.T) {
 				t.Fatalf("unverified endpoint text = %q, want the tri-state count", it.Text)
 			}
 		case "unpriced_units":
-			if !strings.Contains(it.Text, "chat/completions") || it.ActionHref != "/dashboard/pricing" {
+			if !strings.Contains(it.Text, "chat/completions") || it.ActionHref != "/dashboard/models/pricing" {
 				t.Fatalf("unpriced item = %+v", it)
 			}
 		case "budget":

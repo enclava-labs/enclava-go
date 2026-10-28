@@ -93,7 +93,7 @@ func TestSessionHXExpiryRedirects(t *testing.T) {
 	}
 
 	hxRequest := func(currentURL string, cookie *http.Cookie) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodGet, "/dashboard/partials/stats", nil)
+		req := httptest.NewRequest(http.MethodGet, "/dashboard/partials/home/running", nil)
 		req.Header.Set("HX-Request", "true")
 		if currentURL != "" {
 			req.Header.Set("HX-Current-URL", currentURL)

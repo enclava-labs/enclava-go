@@ -1,0 +1,80 @@
+{{define "content"}}{{/* Collection page (OA-22, plan 09-01): Documents
+     (default), Sources, Search, Settings tabs. Sources/Settings never render
+     for members — the tab bar is server-built per capability. The Search tab
+     binds the shared results fragment via collection= (D-24: 10-03's
+     frag-search-results is the only renderer — zero result markup here). */}}
+{{template "page-head" .Data.Header}}
+{{template "tabs" .Data.Tabs}}
+
+{{if eq .Data.Tab "documents"}}
+{{template "frag-knowledge-documents" .}}
+{{else if eq .Data.Tab "sources"}}
+{{template "frag-knowledge-sources" .}}
+{{else if eq .Data.Tab "search"}}
+<form id="knowledgeSearchForm" action="/dashboard/partials/search/results" method="get"
+      hx-get="/dashboard/partials/search/results?collection={{.Data.Collection.ID}}" hx-target="#knowledgeSearchResults" hx-swap="innerHTML" hx-push-url="false">
+  <input type="hidden" name="mode" id="knowledgeSearchMode" value="hybrid">
+  <div class="filters" role="group" aria-label="Match mode">
+    <button type="button" class="chip active" data-mode="hybrid" aria-pressed="true">Best match</button>
+    <button type="button" class="chip" data-mode="lexical" aria-pressed="false">Keywords</button>
+    <button type="button" class="chip" data-mode="semantic" aria-pressed="false">Meaning</button>
+  </div>
+  <div class="row">
+    <input class="field" type="search" name="q" id="knowledgeSearchQuery" placeholder="Search {{.Data.Collection.Name}}" aria-label="Search {{.Data.Collection.Name}}" autocomplete="off">
+    <button class="btn primary" type="submit">{{icon "search"}} Search</button>
+  </div>
+</form>
+<div id="knowledgeSearchResults">
+  <div class="empty">{{icon "search"}}<p>Search inside {{.Data.Collection.Name}} — only content you can access appears.</p></div>
+</div>
+{{else if eq .Data.Tab "settings"}}
+<div class="section grid two">
+  <div class="card">
+    <div class="card-title">Collection settings</div>
+    <form class="stack" style="margin-top:12px" data-knowledge-settings-form data-collection-id="{{.Data.Collection.ID}}">
+      <div>
+        <label class="label" for="kcs-name">Name</label>
+        <input class="field" id="kcs-name" name="name" value="{{.Data.Collection.Name}}" required maxlength="200">
+      </div>
+      <div>
+        <label class="label" for="kcs-desc">Description</label>
+        <input class="field" id="kcs-desc" name="description" value="{{.Data.Collection.Description}}" maxlength="500">
+      </div>
+      <div>
+        <label class="label" for="kcs-model">Embedding model</label>
+        <select class="field" id="kcs-model" name="embedding_model">
+          {{if .Data.Collection.EmbeddingModel}}<option value="{{.Data.Collection.EmbeddingModel}}" selected>{{.Data.Collection.EmbeddingModel}} · current</option>{{end}}
+          {{range .Data.EmbeddingModels}}{{if ne . $.Data.Collection.EmbeddingModel}}<option value="{{.}}">{{.}}</option>{{end}}{{end}}
+        </select>
+      </div>
+      <div>
+        <label class="label" for="kcs-profile">Processing profile</label>
+        <select class="field" id="kcs-profile" name="chunk_profile_version_id" data-knowledge-profile-select data-current="{{.Data.Collection.ChunkProfileVersionID}}">
+          <option value="">Keep current profile</option>
+        </select>
+        <span class="help">Changing the profile re-chunks documents on their next reprocess — published evidence is never silently re-chunked.</span>
+      </div>
+      <div>
+        <label class="label" for="kcs-access">Who can read it</label>
+        <select class="field" id="kcs-access" name="access">
+          <option value="org"{{if .Data.Everyone}} selected{{end}}>Everyone in the organization</option>
+          <option value="me"{{if not .Data.Everyone}} selected{{end}}>Restricted</option>
+        </select>
+        <span class="help">Restricted collections are read by their owner and granted members; per-member grants live under Access.</span>
+      </div>
+      <p class="field-error" data-knowledge-form-error hidden></p>
+      <div class="row">
+        <button type="submit" class="btn primary">Save changes</button>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <div class="card-title">Danger zone</div>
+    <p class="help">Deleting a collection removes its index; retained documents stay in the document store.</p>
+    <div class="row" style="margin-top:12px">
+      <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete collection {{.Data.Collection.Name}}?" data-knowledge-collection-del="1" data-collection-id="{{.Data.Collection.ID}}">Delete collection</button>
+    </div>
+  </div>
+</div>
+{{end}}
+{{end}}

@@ -21,25 +21,26 @@ import (
 )
 
 func TestKnowledgeNavigationRequiresReadableScope(t *testing.T) {
-	render := func(readable, manage bool) string {
+	// The 09-10 sweep deleted the old layout-nav template; the same gating
+	// intent is asserted on the dashboardNav model — a missing capability
+	// never renders its item.
+	hrefs := func(caps dashboardCaps) map[string]bool {
 		t.Helper()
-		var out bytes.Buffer
-		err := dashboardTemplates.ExecuteTemplate(&out, "layout-nav", dashboardPageCommon{
-			KnowledgeReadable: readable,
-			ConnectorsManage:  manage,
-		})
-		if err != nil {
-			t.Fatal(err)
+		out := map[string]bool{}
+		for _, g := range dashboardNav(caps, "") {
+			for _, it := range g.Items {
+				out[it.Href] = true
+			}
 		}
-		return out.String()
+		return out
 	}
-	if strings.Contains(render(false, false), `href="/dashboard/rag"`) {
+	if hrefs(dashboardCaps{})["/dashboard/knowledge"] {
 		t.Fatal("knowledge navigation visible without a readable scope")
 	}
-	if !strings.Contains(render(true, false), `>Knowledge</a>`) {
+	if !hrefs(dashboardCaps{Search: true})["/dashboard/knowledge"] {
 		t.Fatal("knowledge navigation missing for readable principal")
 	}
-	if !strings.Contains(render(false, true), `href="/dashboard/connectors"`) {
+	if !hrefs(dashboardCaps{SourcesManage: true})["/dashboard/sources"] {
 		t.Fatal("source navigation missing for connector manager")
 	}
 }

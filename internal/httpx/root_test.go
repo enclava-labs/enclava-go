@@ -91,12 +91,17 @@ func newSessionApp(t *testing.T) (*App, *postgres.IdentityRepo, string) {
 func TestDashboardSessionLoginFlow(t *testing.T) {
 	app, repo, tenant := newSessionApp(t)
 	seedLoginUser(t, repo, tenant, "login@example.com", "correct-horse")
-	// The keys partial requires platform.admin, and creation enforces
-	// scopes ⊆ caller — grant the form's default set so the CSRF-success
-	// assertion below exercises a permitted mint.
+	// The admin API key routes require platform.admin; grant the scope so
+	// the CSRF-success assertion below exercises a permitted mint.
 	role := auth.Role{
 		ID: "role_login_admin", Name: "admin",
-		Scopes: append([]string{auth.ScopePlatformAdmin}, dashboardDefaultScopes...),
+		Scopes: []string{auth.ScopePlatformAdmin, "chatbot"},
+		Grants: auth.ResourceGrants{
+			Models:           auth.Allowlist{All: true},
+			Endpoints:        auth.Allowlist{All: true},
+			Assistants:       auth.Allowlist{All: true},
+			ExtractTemplates: auth.Allowlist{All: true},
+		},
 	}
 	if err := repo.CreateRole(context.Background(), tenant, role); err != nil {
 		t.Fatalf("seed admin role: %v", err)
@@ -167,9 +172,9 @@ func TestDashboardSessionLoginFlow(t *testing.T) {
 	}
 
 	// Mutation without the CSRF header is rejected even with a valid session.
-	mut := url.Values{"action": {"create"}, "name": {"k1"}}
-	req = httptest.NewRequest(http.MethodPost, "/dashboard/partials/keys", strings.NewReader(mut.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	mut := `{"name":"k1","scopes":["chatbot"]}`
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/api-keys", strings.NewReader(mut))
+	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(session)
 	rec = httptest.NewRecorder()
 	app.Handler().ServeHTTP(rec, req)
@@ -178,15 +183,15 @@ func TestDashboardSessionLoginFlow(t *testing.T) {
 	}
 
 	// Mutation with the session's CSRF token succeeds.
-	req = httptest.NewRequest(http.MethodPost, "/dashboard/partials/keys", strings.NewReader(mut.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/api-keys", strings.NewReader(mut))
+	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(session)
 	req.AddCookie(csrf)
 	req.Header.Set("X-CSRF-Token", csrf.Value)
 	rec = httptest.NewRecorder()
 	app.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("mutation with CSRF expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("mutation with CSRF expected 201, got %d body=%s", rec.Code, rec.Body.String())
 	}
 
 	// Logout revokes the session server-side; the next GET is denied.

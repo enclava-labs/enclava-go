@@ -9,7 +9,6 @@ package httpx
 import (
 	"context"
 	"net/http"
-	"net/url"
 	"strings"
 	"testing"
 
@@ -117,23 +116,25 @@ func TestAdminAPIKeyGrantsBounded(t *testing.T) {
 		t.Fatalf("refused regenerate/restore must not touch the stored secret")
 	}
 
-	// --- Legacy dashboard form paths -------------------------------------
+	// --- Session-cookie admin API paths -----------------------------------
+	// (The legacy /dashboard/partials/keys action-table died in the 09-10
+	// sweep; these are its session-authenticated successors — the same
+	// browser authority bound, through the JSON admin routes.)
 
-	// Dashboard create omits the grant fields entirely, so the built record
-	// requests mode:all on every resource: the limited caller is refused and
-	// no key persists.
-	rec = sessionForm(t, f.app, http.MethodPost, "/dashboard/partials/keys",
-		url.Values{"action": {"create"}, "name": {"dash-omitted"}, "scopes": {auth.ScopePlatformAdmin}}, limitedSess, limitedCSRF)
-	if !strings.Contains(rec.Body.String(), "exceed your authority") {
-		t.Fatalf("dashboard create expected grants refusal, got %d body=%s", rec.Code, rec.Body.String())
+	// A create that omits the grant fields requests mode:all on every
+	// resource: the limited caller is refused and no key persists.
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/admin/api-keys",
+		`{"name":"dash-omitted","scopes":["platform.admin"]}`, limitedSess, limitedCSRF)
+	if !strings.Contains(rec.Body.String(), "authority") {
+		t.Fatalf("session create expected grants refusal, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	countKeys("dashboard denied create", 4)
+	countKeys("session denied create", 4)
 
-	// Toggle DEACTIVATE on the same wider key stays allowed — disabling
-	// never grants anything.
-	rec = sessionForm(t, f.app, http.MethodPost, "/dashboard/partials/keys",
-		url.Values{"action": {"toggle"}, "key_id": {wideKey.ID}}, limitedSess, limitedCSRF)
-	if strings.Contains(rec.Body.String(), "exceed your authority") {
+	// PATCH is_active:false DEACTIVATES the same wider key — disabling
+	// never grants anything, so it stays allowed.
+	rec = sessionDo(t, f.app, http.MethodPut, "/api/v1/admin/api-keys/"+wideKey.ID,
+		`{"is_active":false}`, limitedSess, limitedCSRF)
+	if strings.Contains(rec.Body.String(), "authority") {
 		t.Fatalf("deactivation must never be grants-bound: %s", rec.Body.String())
 	}
 	fetched, err = f.repo.GetAPIKey(ctx, f.tenant, wideKey.ID)
@@ -141,19 +142,20 @@ func TestAdminAPIKeyGrantsBounded(t *testing.T) {
 		t.Fatalf("deactivate expected inactive key, got %v %v", fetched, err)
 	}
 
-	// Toggle ACTIVATE refuses and leaves the stored row byte-identical.
+	// PATCH is_active:true on a wider key refuses and leaves the stored row
+	// byte-identical.
 	before, err := f.repo.GetAPIKey(ctx, f.tenant, wideKey.ID)
 	if err != nil {
-		t.Fatalf("fetch before toggle: %v", err)
+		t.Fatalf("fetch before activate: %v", err)
 	}
-	rec = sessionForm(t, f.app, http.MethodPost, "/dashboard/partials/keys",
-		url.Values{"action": {"toggle"}, "key_id": {wideKey.ID}}, limitedSess, limitedCSRF)
-	if !strings.Contains(rec.Body.String(), "exceed your authority") {
+	rec = sessionDo(t, f.app, http.MethodPut, "/api/v1/admin/api-keys/"+wideKey.ID,
+		`{"is_active":true}`, limitedSess, limitedCSRF)
+	if !strings.Contains(rec.Body.String(), "authority") {
 		t.Fatalf("activate wider key expected refusal, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	after, err := f.repo.GetAPIKey(ctx, f.tenant, wideKey.ID)
 	if err != nil {
-		t.Fatalf("fetch after toggle: %v", err)
+		t.Fatalf("fetch after activate: %v", err)
 	}
 	if after.IsActive || after.KeyPrefix != before.KeyPrefix || after.KeyHash != before.KeyHash {
 		t.Fatalf("refused activate must leave the stored row untouched")
@@ -165,11 +167,8 @@ func TestAdminAPIKeyGrantsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetch before regenerate: %v", err)
 	}
-	rec = sessionForm(t, f.app, http.MethodPost, "/dashboard/partials/keys",
-		url.Values{"action": {"regenerate"}, "key_id": {wideKey.ID}}, limitedSess, limitedCSRF)
-	// The keys table legitimately lists public key prefixes, so the refusal
-	// proof is the refusal message plus the byte-identical row below — never
-	// the absence of prefix-shaped strings.
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/admin/api-keys/"+wideKey.ID+"/regenerate",
+		"", limitedSess, limitedCSRF)
 	if !strings.Contains(rec.Body.String(), "exceed") {
 		t.Fatalf("refused regenerate must render the authority refusal, got %s", rec.Body.String())
 	}
@@ -181,9 +180,9 @@ func TestAdminAPIKeyGrantsBounded(t *testing.T) {
 		t.Fatalf("refused regenerate must be byte-identical: before=%+v after=%+v", before, after)
 	}
 
-	// POSITIVE legacy controls: an explicitly all-granted admin keeps the
-	// full legacy behavior — regenerate persists a new hash and renders the
-	// plaintext once, and toggle activation flips the key.
+	// POSITIVE session controls: an explicitly all-granted admin keeps the
+	// full behavior — regenerate persists a new hash and returns the
+	// plaintext once, and restore reactivates the key.
 	all := auth.ResourceGrants{
 		Models:           auth.Allowlist{All: true},
 		Endpoints:        auth.Allowlist{All: true},
@@ -193,8 +192,8 @@ func TestAdminAPIKeyGrantsBounded(t *testing.T) {
 	bossSess, bossCSRF := loginUserWithGrants(t, f, "boss-admin@example.com",
 		[]string{auth.ScopePlatformAdmin}, all, "boss-pass")
 
-	rec = sessionForm(t, f.app, http.MethodPost, "/dashboard/partials/keys",
-		url.Values{"action": {"regenerate"}, "key_id": {inKey.ID}}, bossSess, bossCSRF)
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/admin/api-keys/"+inKey.ID+"/regenerate",
+		"", bossSess, bossCSRF)
 	if !strings.Contains(rec.Body.String(), "enc_") {
 		t.Fatalf("all-granted regenerate expected plaintext render, got %s", rec.Body.String())
 	}
@@ -206,16 +205,16 @@ func TestAdminAPIKeyGrantsBounded(t *testing.T) {
 		t.Fatalf("regenerated key must persist a NEW hash")
 	}
 
-	rec = sessionForm(t, f.app, http.MethodPost, "/dashboard/partials/keys",
-		url.Values{"action": {"toggle"}, "key_id": {inKey.ID}}, bossSess, bossCSRF)
-	if strings.Contains(rec.Body.String(), "exceed your authority") {
-		t.Fatalf("all-granted toggle must not be refused: %s", rec.Body.String())
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/admin/api-keys/"+wideKey.ID+"/restore",
+		"", bossSess, bossCSRF)
+	if strings.Contains(rec.Body.String(), "authority") {
+		t.Fatalf("all-granted restore must not be refused: %s", rec.Body.String())
 	}
-	fetched, err = f.repo.GetAPIKey(ctx, f.tenant, inKey.ID)
+	fetched, err = f.repo.GetAPIKey(ctx, f.tenant, wideKey.ID)
 	if err != nil {
-		t.Fatalf("fetch toggled key: %v", err)
+		t.Fatalf("fetch restored key: %v", err)
 	}
-	if fetched.IsActive != !inKey.IsActive {
-		t.Fatalf("toggle must flip IsActive: got %v", fetched.IsActive)
+	if !fetched.IsActive {
+		t.Fatalf("restore must set IsActive: got %v", fetched.IsActive)
 	}
 }

@@ -234,7 +234,7 @@ func (a *App) attentionUnpricedUnits(ctx context.Context, p auth.Principal, caps
 					Text: fmt.Sprintf("Endpoint %s cannot price %s for model %q (missing: %s)",
 						endpointCardLabel(e), capability, alias, strings.Join(kinds, ", ")),
 					ActionLabel: "Set prices",
-					ActionHref:  "/dashboard/pricing",
+					ActionHref:  "/dashboard/models/pricing",
 				})
 				break // one item per endpoint+capability
 			}

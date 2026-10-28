@@ -331,24 +331,6 @@ func TestMCPAdministrationRejectsNonAdminBeforeRepositoryAccess(t *testing.T) {
 	}
 }
 
-func TestMCPDashboardIsAdminOnlyAndUsesPublicAPIs(t *testing.T) {
-	app := &App{}
-	nonAdmin := httptest.NewRequest(http.MethodGet, "/dashboard/partials/mcp", nil)
-	nonAdminRec := httptest.NewRecorder()
-	app.handleDashboardMCP(nonAdminRec, nonAdmin)
-	if nonAdminRec.Code != http.StatusForbidden {
-		t.Fatalf("non-admin partial status=%d", nonAdminRec.Code)
-	}
-	admin := auth.Principal{TenantID: "tenant", Scopes: map[string]struct{}{"platform.admin": {}}}
-	request := httptest.NewRequest(http.MethodGet, "/dashboard/partials/mcp", nil)
-	request = request.WithContext(auth.WithPrincipal(request.Context(), admin))
-	rec := httptest.NewRecorder()
-	app.handleDashboardMCP(rec, request)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "mcp-server-form") || !strings.Contains(rec.Body.String(), "/dashboard/static/mcp.js") {
-		t.Fatalf("admin partial status=%d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
 func TestMCPScopesAreTrimmedAtHTTPBoundary(t *testing.T) {
 	got := normalizeMCPScopeList([]string{" mcp.use ", "assistant.use "})
 	if len(got) != 2 || got[0] != "mcp.use" || got[1] != "assistant.use" {

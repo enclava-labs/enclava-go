@@ -210,7 +210,7 @@ test.describe('Home /dashboard — members (grant-shaped, D-25)', () => {
       await expect(member.locator('#homeAttention')).not.toContainText('not verified');
       await expect(member.locator('#homeAttention')).not.toContainText('Budget');
       // Members still cannot reach admin-only surfaces.
-      const probe = await member.request.get(`${BASE}/dashboard/partials/usage`, { maxRedirects: 0 });
+      const probe = await member.request.get(`${BASE}/dashboard/partials/usage/overview`, { maxRedirects: 0 });
       expect(probe.status()).toBe(403);
     } finally {
       await member.context().close();

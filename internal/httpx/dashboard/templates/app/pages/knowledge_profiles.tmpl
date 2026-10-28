@@ -1,0 +1,6 @@
+{{define "content"}}{{/* Processing profiles (OA-22): read-only profile list
+     plus the document-preview tool ported from the old Documents page. No
+     profile editing UI exists — there is no write API (source non-goal). */}}
+{{template "page-head" .Data.Header}}
+{{template "frag-knowledge-profiles" .}}
+{{end}}

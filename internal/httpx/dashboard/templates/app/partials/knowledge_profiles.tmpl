@@ -1,0 +1,50 @@
+{{define "frag-knowledge-profiles"}}{{/* Read-only processing profiles +
+     document-preview tool (OA-22). The profile table and the preview form's
+     select hydrate from GET /api/v1/document-profiles — there is no write
+     API, so nothing here is editable (source non-goal). The preview flow is
+     the old documents.js tool verbatim: bounded upload →
+     POST /api/v1/document-previews → poll GET /document-previews/{id} →
+     render real blocks/chunks/spans and warnings. */}}
+<div class="section grid two">
+  <div class="card">
+    <div class="card-title">Profiles</div>
+    <div class="card-sub">Every version is immutable — collections pin a version, never a live profile.</div>
+    <div class="tablewrap" style="margin-top:12px">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Profile</th>
+            <th scope="col">Version</th>
+            <th scope="col">Settings</th>
+          </tr>
+        </thead>
+        <tbody id="knowledge-profiles-body">
+          <tr><td data-label="Profile" colspan="3" class="muted">Loading profiles…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Preview a document</div>
+    <div class="card-sub">Upload a document to see exactly how the selected profile chunks it — blocks, chunks and spans.</div>
+    <form id="document-preview-form" class="stack" style="margin-top:12px">
+      <div>
+        <label class="label" for="document-profile">Processing profile</label>
+        <select class="field" id="document-profile" name="chunk_profile_version_id" disabled></select>
+      </div>
+      <div id="document-profile-details" class="stack"><p class="help">Select a profile version to review its immutable controls.</p></div>
+      <div>
+        <label class="label" for="document-preview-file">Document</label>
+        <input class="field" type="file" id="document-preview-file" name="file" required>
+      </div>
+      <div class="row">
+        <button type="submit" class="btn primary" id="document-preview-submit" disabled>{{icon "sparkles"}}Preview</button>
+        <button type="button" class="btn ghost" id="document-preview-cancel" hidden>Cancel</button>
+      </div>
+      <p class="help" id="document-preview-status"></p>
+    </form>
+    <div id="document-preview-warnings" class="stack"></div>
+    <div id="document-preview-chunks" class="stack"></div>
+  </div>
+</div>
+{{end}}

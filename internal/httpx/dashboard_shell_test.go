@@ -28,9 +28,8 @@ func TestDashboardRouteRegistration(t *testing.T) {
 		"/dashboard/logout",         // session auth (moved)
 		"/auth/oidc/link",           // link identity (moved)
 		"/auth/oidc/x/start",        // suffix router (moved)
-		"/dashboard",                // legacy exact Home
-		"/dashboard/keys",           // legacy page
-		"/dashboard/partials/stats", // legacy partial
+		"/dashboard",                // exact Home
+		"/dashboard/access",         // self-registered admin page (09-10 swept the legacy /dashboard/keys + /dashboard/partials/stats)
 		"/dashboard/boats",          // self-registered page
 		"/dashboard/anything-else",  // /dashboard/ subtree catch-all (phase-6 404 body) still wins
 	} {

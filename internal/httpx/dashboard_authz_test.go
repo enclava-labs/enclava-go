@@ -30,7 +30,9 @@ func sessionForm(t *testing.T, app *App, method, path string, form url.Values, s
 	} else {
 		r = httptest.NewRequest(method, path, nil)
 	}
-	r.AddCookie(session)
+	if session != nil {
+		r.AddCookie(session)
+	}
 	if csrf != nil && method != http.MethodGet && method != http.MethodHead {
 		r.AddCookie(csrf)
 		r.Header.Set("X-CSRF-Token", csrf.Value)
@@ -65,20 +67,21 @@ func TestDashboardKeyManagementRequiresPlatformAdmin(t *testing.T) {
 	f := newIdentityFixture(t)
 	sess, csrf := loginUser(t, f, "member@example.com", []string{"chatbot", "models.list"}, "member-pass")
 
+	// The legacy dashboard action-table died in the 09-10 sweep; the same
+	// denial is asserted on the surviving admin API + Access surfaces.
 	denied := []struct {
 		method string
 		path   string
-		form   url.Values
+		body   string
 	}{
-		{http.MethodGet, "/dashboard/partials/keys", nil},
-		{http.MethodPost, "/dashboard/partials/keys", url.Values{"action": {"create"}, "name": {"escalated"}, "scopes": {"platform.admin"}}},
-		{http.MethodPost, "/dashboard/partials/keys", url.Values{"action": {"toggle"}, "key_id": {"any"}}},
-		{http.MethodPost, "/dashboard/partials/keys", url.Values{"action": {"delete"}, "key_id": {"any"}}},
-		{http.MethodPost, "/dashboard/partials/keys", url.Values{"action": {"regenerate"}, "key_id": {"any"}}},
-		{http.MethodGet, "/dashboard/keys", nil},
+		{http.MethodGet, "/api/v1/admin/api-keys", ""},
+		{http.MethodPost, "/api/v1/admin/api-keys", `{"name":"escalated","scopes":["platform.admin"]}`},
+		{http.MethodGet, "/dashboard/access/api-keys", ""},
+		{http.MethodGet, "/dashboard/partials/access/api-keys", ""},
+		{http.MethodGet, "/dashboard/partials/access/key-drawer", ""},
 	}
 	for _, tc := range denied {
-		rec := sessionForm(t, f.app, tc.method, tc.path, tc.form, sess, csrf)
+		rec := sessionDo(t, f.app, tc.method, tc.path, tc.body, sess, csrf)
 		if rec.Code != http.StatusForbidden {
 			t.Fatalf("%s %s: expected 403 for member, got %d body=%s", tc.method, tc.path, rec.Code, rec.Body.String())
 		}
@@ -98,14 +101,6 @@ func TestDashboardKeyCreateScopeSubsetAndDefaults(t *testing.T) {
 	f := newIdentityFixture(t)
 	ctx := context.Background()
 
-	// The hidden form field no longer ships platform.admin or *.manage
-	// scopes as the silent default.
-	for _, s := range dashboardDefaultScopes {
-		if s == auth.ScopePlatformAdmin || strings.HasSuffix(s, ".manage") {
-			t.Fatalf("dashboard default scopes still grant %q", s)
-		}
-	}
-
 	// The permitted "boss" issuer carries explicit mode:all grants — an
 	// unrestricted issuer keeps the legacy omitted→all mint behavior, while
 	// zero-grant admin denial is covered by the new grants-bound deny cases.
@@ -118,10 +113,10 @@ func TestDashboardKeyCreateScopeSubsetAndDefaults(t *testing.T) {
 	sess, csrf := loginUserWithGrants(t, f, "boss@example.com", []string{auth.ScopePlatformAdmin}, bossGrants, "admin-pass")
 
 	// A scope the caller holds mints fine.
-	rec := sessionForm(t, f.app, http.MethodPost, "/dashboard/partials/keys",
-		url.Values{"action": {"create"}, "name": {"admin-key"}, "scopes": {"platform.admin"}}, sess, csrf)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("admin create expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	rec := sessionDo(t, f.app, http.MethodPost, "/api/v1/admin/api-keys",
+		`{"name":"admin-key","scopes":["platform.admin"],"allowed_models":["m1"],"allowed_endpoints":["e1"],"allowed_chatbots":["b1"],"allowed_agents":["b1"],"allowed_extract_templates":["t1"]}`, sess, csrf)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("admin create expected 201, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	keys, err := f.repo.ListAPIKeys(ctx, f.tenant)
 	if err != nil {
@@ -143,18 +138,10 @@ func TestDashboardKeyCreateScopeSubsetAndDefaults(t *testing.T) {
 	}
 
 	// A scope the caller does not hold is refused — and nothing persists.
-	rec = sessionForm(t, f.app, http.MethodPost, "/dashboard/partials/keys",
-		url.Values{"action": {"create"}, "name": {"too-wide"}, "scopes": {"platform.admin,made.up.scope"}}, sess, csrf)
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/admin/api-keys",
+		`{"name":"too-wide","scopes":["platform.admin","made.up.scope"]}`, sess, csrf)
 	if !strings.Contains(rec.Body.String(), "subset") {
 		t.Fatalf("over-wide create expected subset refusal, got %d body=%s", rec.Code, rec.Body.String())
-	}
-
-	// The form's default scope set is also refused for a caller that lacks
-	// it — same rule as the admin API route.
-	rec = sessionForm(t, f.app, http.MethodPost, "/dashboard/partials/keys",
-		url.Values{"action": {"create"}, "name": {"defaults"}}, sess, csrf)
-	if !strings.Contains(rec.Body.String(), "subset") {
-		t.Fatalf("default-scope create expected subset refusal, got %d body=%s", rec.Code, rec.Body.String())
 	}
 
 	keys, err = f.repo.ListAPIKeys(ctx, f.tenant)
@@ -175,23 +162,20 @@ func TestDashboardEndpointsMirrorAPIScopes(t *testing.T) {
 	pricerSess, pricerCSRF := loginUser(t, f, "pricer@example.com", []string{"pricing.manage"}, "pricer-pass")
 	connSess, _ := loginUser(t, f, "connector@example.com", []string{"connectors.manage"}, "conn-pass")
 
-	// Member (chatbot only): every admin, provider, knowledge and extract
-	// surface is refused — session alone never reaches the handler.
-	// (Budgets/usage/analytics/billing-audit moved to the admin-only
-	// /dashboard/usage surface in 09-08's cutover; the rag family died with
-	// the phase-10 teardown and moved to the 404 block.)
+	// Member (chatbot only): every admin, models, sources, tools and
+	// billing surface on the NEW route table is refused — session alone
+	// never reaches the handler.
 	memberDenied := []struct{ method, path string }{
-		{http.MethodGet, "/dashboard/partials/keys"},
 		{http.MethodGet, "/dashboard/partials/usage/overview"},
-		{http.MethodGet, "/dashboard/partials/providers"},
-		{http.MethodGet, "/dashboard/partials/pricing"},
-		{http.MethodGet, "/dashboard/partials/connectors"},
-		{http.MethodGet, "/dashboard/partials/mcp"},
-		{http.MethodGet, "/dashboard/keys"},
-		{http.MethodGet, "/dashboard/providers"},
-		{http.MethodGet, "/dashboard/pricing"},
-		{http.MethodGet, "/dashboard/connectors"},
-		{http.MethodGet, "/dashboard/mcp"},
+		{http.MethodGet, "/dashboard/usage"},
+		{http.MethodGet, "/dashboard/models"},
+		{http.MethodGet, "/dashboard/partials/models/endpoints"},
+		{http.MethodGet, "/dashboard/sources"},
+		{http.MethodGet, "/dashboard/partials/sources/table"},
+		{http.MethodGet, "/dashboard/tools"},
+		{http.MethodGet, "/dashboard/partials/tools/queue"},
+		{http.MethodGet, "/dashboard/access/api-keys"},
+		{http.MethodGet, "/dashboard/partials/access/api-keys"},
 	}
 	for _, tc := range memberDenied {
 		rec := sessionForm(t, f.app, tc.method, tc.path, nil, memberSess, memberCSRF)
@@ -201,11 +185,10 @@ func TestDashboardEndpointsMirrorAPIScopes(t *testing.T) {
 	}
 
 	// Member keeps its own surfaces: anything but a scope refusal is fine.
-	// (Budgets/usage moved to the admin-only /dashboard/usage surface in
-	// 09-08's cutover; the rag/chatbots/prompt-templates/stats family died
-	// with the phase-10 Home cutover — see the 404 block below.)
+	// (The old /dashboard/identity page died in the 09-10 sweep — Account
+	// owns the member self-service surface now.)
 	memberOK := []struct{ method, path string }{
-		{http.MethodGet, "/dashboard/identity"},
+		{http.MethodGet, "/dashboard/account"},
 	}
 	for _, tc := range memberOK {
 		rec := sessionForm(t, f.app, tc.method, tc.path, nil, memberSess, memberCSRF)
@@ -214,9 +197,10 @@ func TestDashboardEndpointsMirrorAPIScopes(t *testing.T) {
 		}
 	}
 
-	// The old rag family died with the phase-10 Home cutover: every deleted
-	// URL answers with the designed 404 — for members and scope holders
-	// alike, with no redirect or alias (D-19).
+	// Every deleted URL answers with the designed 404 — for members and
+	// scope holders alike, with no redirect or alias (D-19). The rag
+	// family died with the phase-10 Home cutover; the phase-9 page family
+	// died in the 09-10 sweep.
 	deletedRoutes := []struct{ method, path string }{
 		{http.MethodGet, "/dashboard/partials/stats"},
 		{http.MethodGet, "/dashboard/chatbots"},
@@ -227,6 +211,19 @@ func TestDashboardEndpointsMirrorAPIScopes(t *testing.T) {
 		{http.MethodGet, "/dashboard/rag"},
 		{http.MethodGet, "/dashboard/partials/rag"},
 		{http.MethodGet, "/dashboard/rag/documents/doc-1/download"},
+		{http.MethodGet, "/dashboard/partials/keys"},
+		{http.MethodPost, "/dashboard/partials/keys"},
+		{http.MethodGet, "/dashboard/keys"},
+		{http.MethodGet, "/dashboard/partials/providers"},
+		{http.MethodGet, "/dashboard/providers"},
+		{http.MethodGet, "/dashboard/partials/pricing"},
+		{http.MethodGet, "/dashboard/pricing"},
+		{http.MethodGet, "/dashboard/partials/connectors"},
+		{http.MethodGet, "/dashboard/connectors"},
+		{http.MethodGet, "/dashboard/partials/mcp"},
+		{http.MethodGet, "/dashboard/mcp"},
+		{http.MethodGet, "/dashboard/identity"},
+		{http.MethodGet, "/dashboard/documents"},
 	}
 	for _, tc := range deletedRoutes {
 		pairs := []struct{ session, csrf *http.Cookie }{{memberSess, memberCSRF}}
@@ -245,10 +242,12 @@ func TestDashboardEndpointsMirrorAPIScopes(t *testing.T) {
 	// platform.admin reaches the admin surfaces (downstream nil services
 	// answer 501 — never 403).
 	adminOK := []struct{ method, path string }{
-		{http.MethodGet, "/dashboard/partials/keys"},
-		{http.MethodGet, "/dashboard/keys"},
-		{http.MethodGet, "/dashboard/partials/mcp"},
-		{http.MethodGet, "/dashboard/mcp"},
+		{http.MethodGet, "/dashboard/tools"},
+		{http.MethodGet, "/dashboard/partials/tools/queue"},
+		{http.MethodGet, "/dashboard/access"},
+		{http.MethodGet, "/dashboard/partials/access/api-keys"},
+		{http.MethodGet, "/dashboard/usage"},
+		{http.MethodGet, "/dashboard/partials/usage/overview"},
 	}
 	for _, tc := range adminOK {
 		rec := sessionForm(t, f.app, tc.method, tc.path, nil, adminSess, adminCSRF)
@@ -258,17 +257,17 @@ func TestDashboardEndpointsMirrorAPIScopes(t *testing.T) {
 	}
 	// Scope checks are exact: platform.admin alone does not open
 	// pricing.manage or connectors.manage surfaces.
-	for _, path := range []string{"/dashboard/partials/providers", "/dashboard/partials/pricing", "/dashboard/partials/connectors"} {
+	for _, path := range []string{"/dashboard/models", "/dashboard/partials/models/endpoints", "/dashboard/sources", "/dashboard/partials/sources/table"} {
 		rec := sessionForm(t, f.app, http.MethodGet, path, nil, adminSess, adminCSRF)
 		if rec.Code != http.StatusForbidden {
-			t.Fatalf("admin without %s scope %s: expected 403, got %d", "manage", path, rec.Code)
+			t.Fatalf("admin without manage scope %s: expected 403, got %d", path, rec.Code)
 		}
 	}
 	pricerOK := []struct{ method, path string }{
-		{http.MethodGet, "/dashboard/partials/providers"},
-		{http.MethodGet, "/dashboard/providers"},
-		{http.MethodGet, "/dashboard/partials/pricing"},
-		{http.MethodGet, "/dashboard/pricing"},
+		{http.MethodGet, "/dashboard/models"},
+		{http.MethodGet, "/dashboard/partials/models/endpoints"},
+		{http.MethodGet, "/dashboard/models/pricing"},
+		{http.MethodGet, "/dashboard/partials/models/pricing"},
 	}
 	for _, tc := range pricerOK {
 		rec := sessionForm(t, f.app, tc.method, tc.path, nil, pricerSess, pricerCSRF)
@@ -276,7 +275,7 @@ func TestDashboardEndpointsMirrorAPIScopes(t *testing.T) {
 			t.Fatalf("pricing.manage %s %s: unexpected 403", tc.method, tc.path)
 		}
 	}
-	for _, path := range []string{"/dashboard/partials/connectors", "/dashboard/connectors"} {
+	for _, path := range []string{"/dashboard/sources", "/dashboard/partials/sources/table"} {
 		rec := sessionForm(t, f.app, http.MethodGet, path, nil, connSess, nil)
 		if rec.Code == http.StatusForbidden {
 			t.Fatalf("connectors.manage GET %s: unexpected 403", path)

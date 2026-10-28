@@ -283,7 +283,7 @@ func TestDashboardHomeAttentionKindsAndFixLinks(t *testing.T) {
 		"failed processing", "/dashboard/knowledge/",
 		"sync failed", "/dashboard/sources",
 		"not verified", "/dashboard/models",
-		"cannot price", "/dashboard/pricing",
+		"cannot price", "/dashboard/models/pricing",
 		"Budget", "/dashboard/usage/budgets",
 		"changed on their server", "/dashboard/tools",
 	} {

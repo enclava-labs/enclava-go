@@ -339,14 +339,24 @@ func (a *App) handleAdminAPIKeyByID(w http.ResponseWriter, r *http.Request, prin
 			return
 		}
 		applyAdminPatch(&key, req)
-		if !a.writeScopeSubsetError(w, principal, key.Scopes) {
-			return
-		}
-		// The whole resulting record is checked: an unlisted or all-widening
-		// patch can never slip past by only patching one field.
-		if !principalCoversKeyGrants(principal, key) {
-			WriteForbidden(w, "key resource grants exceed the caller's authority")
-			return
+		// The scope and grant bounds apply only to patches that RE-ARM the key —
+		// reactivation or any scope/grant field edit. A pure deactivation (or
+		// rename) of a key wider than the caller reduces capability and stays
+		// allowed, matching the legacy toggle rule: deactivate is free, activate
+		// is bound.
+		rearms := (req.IsActive != nil && *req.IsActive) || req.Scopes != nil ||
+			req.AllowedModels != nil || req.AllowedEndpoints != nil ||
+			req.AllowedExtractTemplates != nil || req.AllowedChatbots != nil || req.AllowedAgents != nil
+		if rearms {
+			if !a.writeScopeSubsetError(w, principal, key.Scopes) {
+				return
+			}
+			// The whole resulting record is checked: an unlisted or all-widening
+			// patch can never slip past by only patching one field.
+			if !principalCoversKeyGrants(principal, key) {
+				WriteForbidden(w, "key resource grants exceed the caller's authority")
+				return
+			}
 		}
 		if req.IsActive != nil && !*req.IsActive && !a.lastAdminKeyExcluded(w, r, principal, key) {
 			return

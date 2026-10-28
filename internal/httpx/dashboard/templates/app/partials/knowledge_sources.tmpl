@@ -1,0 +1,35 @@
+{{define "frag-knowledge-sources"}}{{/* Sources targeting this collection
+     (OA-22; sources.manage only). Served by
+     GET /dashboard/partials/knowledge/sources?collection= and rendered
+     inline. Add source links into the shared Sources wizard preset to this
+     collection — this tab ships no drawer of its own. */}}
+<div id="knowledge-sources" hx-get="/dashboard/partials/knowledge/sources?collection={{.Data.Collection.ID}}" hx-swap="outerHTML" hx-trigger="refresh from:body">
+{{if .Data.Sources}}  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Source</th>
+          <th scope="col">Type</th>
+          <th scope="col">Status</th>
+          <th scope="col">Last sync</th>
+        </tr>
+      </thead>
+      <tbody>
+{{range .Data.Sources}}        <tr>
+          <td data-label="Source"><b>{{.Name}}</b></td>
+          <td data-label="Type">{{term .Type}}</td>
+          <td data-label="Status">{{if .IsEnabled}}{{statusPill "source" "healthy"}}{{else}}{{statusPill "source" "paused"}}{{end}}</td>
+          <td data-label="Last sync">{{relTime .LastSyncAt}}</td>
+        </tr>
+{{end}}      </tbody>
+    </table>
+  </div>
+{{else}}  <div class="empty">
+    {{icon "sources"}}
+    <p>No sources sync into this collection yet.</p>
+  </div>
+{{end}}  <div class="row" style="margin-top:12px">
+    <a class="btn primary" href="/dashboard/sources?new=1&collection={{urlquery .Data.Collection.ID}}">{{icon "plus"}}Add source</a>
+  </div>
+</div>
+{{end}}

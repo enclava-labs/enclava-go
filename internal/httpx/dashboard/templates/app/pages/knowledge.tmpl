@@ -1,0 +1,55 @@
+{{define "content"}}{{/* Knowledge list (OA-22, plan 09-01): readable
+     collections rendered by frag-knowledge-collections. §3.4 hard split —
+     the New collection control and the manager columns live only inside
+     .Can.KnowledgeManage branches; a member render contains none of them.
+     The drawer markup is a <template> cloned into the shared #drawer by
+     knowledge.js (data-action="knowledge:new" or ?new=1). */}}
+{{template "page-head" .Data.Header}}
+{{template "frag-knowledge-collections" .}}
+
+{{if .Can.KnowledgeManage}}
+<template id="knowledge-new-tpl">
+  <div class="drawer-head">
+    <h2>New collection</h2>
+    <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button>
+  </div>
+  <form data-knowledge-new-form>
+    <div>
+      <label class="label" for="knc-name">Name</label>
+      <input class="field" id="knc-name" name="name" required maxlength="200">
+    </div>
+    <div>
+      <label class="label" for="knc-desc">Description</label>
+      <input class="field" id="knc-desc" name="description" maxlength="500">
+    </div>
+    <div>
+      <label class="label" for="knc-model">Embedding model</label>
+      <select class="field" id="knc-model" name="embedding_model">
+        <option value="">Deployment default</option>
+        {{range .Data.EmbeddingModels}}<option value="{{.}}">{{.}}</option>{{end}}
+      </select>
+      <span class="help">Only models on enabled embeddings-capable endpoints are listed.</span>
+    </div>
+    <div>
+      <label class="label" for="knc-profile">Processing profile</label>
+      <select class="field" id="knc-profile" name="chunk_profile_version_id" data-knowledge-profile-select>
+        <option value="">Default chunking</option>
+      </select>
+      <span class="help" data-knowledge-profile-note>Loaded from your processing profiles.</span>
+    </div>
+    <div>
+      <label class="label" for="knc-access">Who can read it</label>
+      <select class="field" id="knc-access" name="access">
+        <option value="org">Everyone in the organization</option>
+        <option value="me">Only me</option>
+      </select>
+    </div>
+    <p class="field-error" data-knowledge-form-error hidden></p>
+    <div class="drawer-actions">
+      <button type="button" class="btn ghost" data-action="close-drawer">Cancel</button>
+      <button type="submit" class="btn primary">Create collection</button>
+    </div>
+  </form>
+</template>
+{{end}}
+{{end}}
