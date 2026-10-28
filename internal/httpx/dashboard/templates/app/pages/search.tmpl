@@ -1,0 +1,38 @@
+{{define "content"}}{{/* Search page (OA-33): URL-state form + mode segmented
+     control + collection filter; results live in partials/search_results.tmpl —
+     the single renderer (embedded here AND served to htmx and to 09-01's
+     Knowledge Search tab). Behaviors ride static/pages/search.js; evidence
+     goes to the shared #drawer at every width — this page emits no evidence
+     container (corrected phase-7 contract: no .split/.evidence). */}}
+<header class="head">
+  <div class="headcopy">
+    <div class="crumb">{{.Org}} / Search</div>
+    <h1>Search</h1>
+    <p class="desc">Search across {{.Org}}'s knowledge — only content you can access appears.</p>
+  </div>
+</header>
+
+<form id="searchForm" action="/dashboard/partials/search/results" method="get"
+      hx-get="/dashboard/partials/search/results" hx-target="#searchResults" hx-swap="innerHTML" hx-push-url="false">
+  <input type="hidden" name="mode" id="searchMode" value="{{.Data.Mode}}">
+  <div class="filters" role="group" aria-label="Match mode">
+    <button type="button" class="chip{{if eq .Data.Mode "hybrid"}} active{{end}}" data-mode="hybrid" aria-pressed="{{if eq .Data.Mode "hybrid"}}true{{else}}false{{end}}">Best match</button>
+    <button type="button" class="chip{{if eq .Data.Mode "lexical"}} active{{end}}" data-mode="lexical" aria-pressed="{{if eq .Data.Mode "lexical"}}true{{else}}false{{end}}">Keywords</button>
+    <button type="button" class="chip{{if eq .Data.Mode "semantic"}} active{{end}}" data-mode="semantic" aria-pressed="{{if eq .Data.Mode "semantic"}}true{{else}}false{{end}}">Meaning</button>
+  </div>
+  <div class="row">
+    <input class="field" type="search" name="q" id="searchQuery" value="{{.Data.Query}}" placeholder="Search your knowledge" aria-label="Search your knowledge" autocomplete="off">
+    <button class="btn primary" type="submit">{{icon "search"}} Search</button>
+  </div>
+  <div class="filters">
+    <select class="field" name="collection" id="searchCollection" aria-label="Collection">
+      <option value="">All collections</option>
+      {{range .Data.Collections}}<option value="{{.ID}}"{{if eq .ID $.Data.Collection}} selected{{end}}>{{.Name}}</option>{{end}}
+    </select>
+  </div>
+</form>
+
+<div id="searchResults" data-recents-key="{{.Data.RecentsKey}}">
+  {{template "frag-search-results" .}}
+</div>
+{{end}}

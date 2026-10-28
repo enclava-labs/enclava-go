@@ -420,3 +420,290 @@ test.describe('Chat surfaces and grants (OA-32)', () => {
     await expect(page.locator('[data-action="chat:send"]')).toBeDisabled();
   });
 });
+// ── Search scenarios (OA-33, plan 10-03) ─────────────────────────────────
+//
+// The results fragment GET /dashboard/partials/search/results is the single
+// renderer — these drive the page surface only (D-24). Members read through
+// real ACL audiences (collection acl.audience entries); an absent contract
+// fails naming it, never a skip.
+
+interface SearchSeed {
+  colA: string;
+  colB: string;
+  colSecret: string;
+  docA: string;
+  evidenceID: string;
+  memberEmail: string;
+  memberPass: string;
+  memberID: string;
+  assistantID: string;
+}
+
+// Create a member user (explicit empty grants — deny-default per D-25) plus a
+// role carrying the scopes the scenario needs; returns its actor id.
+async function seedMember(request: APIRequestContext, page: Page, scopes: string[], grants: Record<string, unknown>) {
+  const roleRes = await api(request, page, 'POST', '/api/v1/identities/roles', {
+    name: `search-member-${Date.now()}-${Math.floor(Math.random() * 1e6)}`, scopes, grants,
+  });
+  if (!roleRes.ok()) throw new Error(`member role create failed (${roleRes.status()}): ${await roleRes.text()}`);
+  const roleID = await fieldString(roleRes, 'id');
+  const email = `search-member-${Date.now()}@example.test`;
+  const pass = 'search-member-pass';
+  const userRes = await api(request, page, 'POST', '/api/v1/identities/users', {
+    email, display_name: 'Search Member', password: pass, role_ids: [roleID],
+  });
+  if (!userRes.ok()) throw new Error(`member create failed (${userRes.status()}): ${await userRes.text()}`);
+  const memberID = await fieldString(userRes, 'id');
+  return { email, pass, memberID };
+}
+
+// Upload one document through the multipart API and poll until ready.
+async function uploadDoc(request: APIRequestContext, page: Page, collectionID: string, name: string, content: string) {
+  const form = new FormData();
+  form.append('file', new Blob([Buffer.from(content)], { type: 'text/plain' }), name);
+  const res = await api(request, page, 'POST', `/api/v1/rag/collections/${collectionID}/documents`, form);
+  if (!res.ok() && res.status() !== 202) {
+    throw new Error(`upload ${name} failed (${res.status()}): ${await res.text()}`);
+  }
+  await expect
+    .poll(
+      async () => {
+        const list = await api(request, page, 'GET', `/api/v1/rag/collections/${collectionID}/documents?status=ready`);
+        return list.ok() ? documentsReadyCount(list) : 0;
+      },
+      { timeout: 60_000, message: 'document never reached ready — check the deployment embedding provider (08-08)' },
+    )
+    .toBeGreaterThan(0);
+}
+
+// Two member-readable collections (each with a matching document), one
+// collection restricted to an outsider, plus an assistant the member's stored
+// grants name — the Ask-about-this run must be real and server-authorized.
+async function seedSearchFixtures(request: APIRequestContext, page: Page): Promise<SearchSeed> {
+  const member = await seedMember(request, page, ['rag', 'chatbot'], {
+    assistants: { mode: 'list', items: [] },
+    models: { mode: 'list', items: [] },
+  });
+
+  const mkCol = async (name: string, audience: string[]) => {
+    const res = await api(request, page, 'POST', '/api/v1/rag/collections', {
+      name, chunk_size: 200, chunk_overlap: 20, acl: { audience },
+    });
+    if (!res.ok()) throw new Error(`collection ${name} failed (${res.status()}): ${await res.text()}`);
+    return fieldString(res, 'id');
+  };
+  const colA = await mkCol(`search-a-${Date.now()}`, [member.memberID]);
+  const colB = await mkCol(`search-b-${Date.now()}`, [member.memberID]);
+  const colSecret = await mkCol(`search-secret-${Date.now()}`, ['actor_outsider']);
+
+  await uploadDoc(request, page, colA, 'alpha-contract.txt',
+    'The contract renewal clause requires notice ninety days before expiry.');
+  await uploadDoc(request, page, colB, 'beta-contract.txt',
+    'Contract pricing terms are reviewed each quarter by the committee.');
+  await uploadDoc(request, page, colSecret, 'secret-contract.txt',
+    'Secret contract annex the member must never see.');
+
+  const modelRes = await api(request, page, 'GET', '/v1/models');
+  if (!modelRes.ok()) throw new Error(`GET /v1/models failed (${modelRes.status()}) — no model catalog to seed an assistant`);
+  const model = await firstModelID(modelRes);
+  const botRes = await api(request, page, 'POST', '/api/v1/chatbots', {
+    name: `Search E2E ${Date.now()}`, model,
+    rag_collection_ids: [colA, colB], audience: ['*'],
+  });
+  if (!botRes.ok()) throw new Error(`assistant create failed (${botRes.status()}): ${await botRes.text()}`);
+  const assistantID = await fieldString(botRes, 'id');
+
+  // Grant the member this assistant (stored mode:list grants — D-25).
+  const roleRes = await api(request, page, 'POST', '/api/v1/identities/roles', {
+    name: `search-ask-${Date.now()}-${Math.floor(Math.random() * 1e6)}`, scopes: ['rag', 'chatbot'],
+    grants: { assistants: { mode: 'list', items: [assistantID] } },
+  });
+  if (!roleRes.ok()) throw new Error(`granted role create failed (${roleRes.status()}): ${await roleRes.text()}`);
+  const grantRoleID = await fieldString(roleRes, 'id');
+  const assign = await api(request, page, 'PUT', `/api/v1/identities/users/${member.memberID}/roles/${grantRoleID}`);
+  if (!assign.ok()) throw new Error(`role assign failed (${assign.status()}): ${await assign.text()}`);
+
+  // A first evidence id from the JSON search API (admin view).
+  const searchRes = await api(request, page, 'POST', '/api/v1/rag/search', {
+    query: 'contract', mode: 'lexical', collection_ids: [colA],
+  });
+  if (!searchRes.ok()) throw new Error(`seed search failed (${searchRes.status()}): ${await searchRes.text()}`);
+  const evidenceID = await firstEvidenceID(searchRes);
+  return { colA, colB, colSecret, docA: 'alpha-contract.txt', evidenceID, memberEmail: member.email, memberPass: member.pass, memberID: member.memberID, assistantID };
+}
+
+test.describe('Search (OA-33)', () => {
+  test('member sees fused results from both readable collections, facet chips filter with real counts, and restricted content never leaks', async ({ page, request }) => {
+    test.setTimeout(180_000);
+    await login(page);
+    const seed = await seedSearchFixtures(request, page);
+    await page.context().clearCookies();
+    await login(page, seed.memberEmail, seed.memberPass);
+
+    await page.goto(`${BASE}/dashboard/search`);
+    await page.fill('#searchQuery', 'contract');
+    await page.click('#searchForm button[type="submit"]');
+    const results = page.locator('#searchResults .result');
+    await expect(results.first()).toBeVisible({ timeout: 15_000 });
+
+    // URL state round-trips: the module pushStates ?q=&mode= (D-19).
+    await expect(page).toHaveURL(/\/dashboard\/search\?.*q=contract.*mode=hybrid/);
+
+    // Multi-collection fusion: rows from both readable collections.
+    await expect(page.locator('#searchResults .result .result-title', { hasText: 'alpha-contract.txt' })).toBeVisible();
+    await expect(page.locator('#searchResults .result .result-title', { hasText: 'beta-contract.txt' })).toBeVisible();
+
+    // Restricted collection: no row, no title, no facet for it anywhere.
+    await expect(page.locator('#searchResults')).not.toContainText('secret-contract');
+    await expect(page.locator('#searchResults')).not.toContainText('Secret');
+
+    // Facet chip: real count matches the visible filtered set.
+    const rows = await results.count();
+    const chip = page.locator('#searchResults .chip[data-facet="upload"]');
+    await expect(chip).toBeVisible();
+    await expect(chip).toContainText(String(rows));
+    await chip.click();
+    const visible = page.locator('#searchResults .result:visible');
+    await expect(visible).toHaveCount(rows);
+    await page.locator('#searchResults .chip[data-facet=""]').click(); // All resets
+
+    // Collection-scoped fragment — the 09-01 contract shape.
+    await page.selectOption('#searchCollection', seed.colA);
+    await expect(page.locator('#searchResults .result', { hasText: 'alpha-contract.txt' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator('#searchResults .result', { hasText: 'beta-contract.txt' })).toHaveCount(0);
+
+    // Semantic mode executes — a 5xx/empty fragment here fails naming the
+    // embedding prerequisite, never a skip.
+    await page.selectOption('#searchCollection', '');
+    await page.locator('.chip[data-mode="semantic"]').click();
+    await expect(page.locator('#searchResults .result').first()).toBeVisible({ timeout: 30_000 });
+    await expect(page).toHaveURL(/mode=semantic/);
+  });
+
+  test('evidence opens the shared #drawer at desktop width and Ask about this runs authorized — plus the revocation denial', async ({ page, request }) => {
+    test.setTimeout(300_000);
+    await login(page);
+    const seed = await seedSearchFixtures(request, page);
+    await page.context().clearCookies();
+    await login(page, seed.memberEmail, seed.memberPass);
+
+    await page.goto(`${BASE}/dashboard/search`);
+    await page.fill('#searchQuery', 'contract');
+    await page.click('#searchForm button[type="submit"]');
+    await expect(page.locator('#searchResults .result').first()).toBeVisible({ timeout: 15_000 });
+
+    // Evidence drawer: shared #drawer at every width — no Search container.
+    const evBtn = page.locator('#searchResults [data-action="evidence:open"]').first();
+    await expect(evBtn).toBeVisible();
+    const evidenceID = await evBtn.getAttribute('data-evidence-id');
+    if (!evidenceID) throw new Error('result row carried no data-evidence-id — the evidence persistence contract (08-08) is missing');
+    await evBtn.click();
+    const drawer = page.locator('#drawer .evidence-card');
+    await expect(drawer).toBeVisible({ timeout: 15_000 });
+    await expect(drawer).toContainText('alpha-contract');
+    await expect(drawer.locator('.quote')).toBeVisible();
+    await drawer.locator('[data-action="evidence:close"]').click();
+
+    // Ask about this: a real link carrying ONLY the evidence id.
+    const ask = page.locator('#searchResults a[data-action="search:ask-about"]').first();
+    const href = await ask.getAttribute('href');
+    if (!href || !href.startsWith('/dashboard/chat?evidence=') || href.includes('contract')) {
+      throw new Error(`ask-about link must carry only the evidence id, got ${href}`);
+    }
+    await ask.click();
+    await page.waitForURL(/\/dashboard\/chat/);
+    await expect(page.locator('#chatComposer')).toHaveAttribute('data-evidence', evidenceID);
+
+    // The real authorized run: complete and assert the persisted turn carries
+    // the evidence ids (server re-authorized at StartRun — never an
+    // intercepted payload).
+    await page.selectOption('#assistantSelect', seed.assistantID);
+    await page.fill('#composer', 'Summarise the attached contract passage.');
+    await page.click('[data-action="chat:send"]');
+    await expect(page.locator('article.message[data-run-id]').first()).toBeVisible({ timeout: 15_000 });
+    await awaitTerminal(page);
+    const turn = page.locator(`article.message[data-evidence-ids*="${evidenceID}"]`);
+    await expect(turn.first()).toBeVisible();
+
+    // Revocation: remove the document, then the same handoff must be denied
+    // server-side — surfaced via the shared error toast, never a fake success.
+    await page.context().clearCookies();
+    await login(page);
+    const docsRes = await api(request, page, 'GET', `/api/v1/rag/collections/${seed.colA}/documents`);
+    const docsPayload: unknown = await docsRes.json();
+    let docID = '';
+    if (typeof docsPayload === 'object' && docsPayload !== null && 'documents' in docsPayload) {
+      const docs: unknown = (docsPayload as { documents: unknown }).documents;
+      if (Array.isArray(docs)) {
+        for (const d of docs) {
+          if (typeof d === 'object' && d !== null && 'id' in d && typeof (d as { id: unknown }).id === 'string') {
+            docID = (d as { id: string }).id;
+          }
+        }
+      }
+    }
+    if (!docID) throw new Error('could not resolve the seeded document id for the revocation case');
+    const del = await api(request, page, 'DELETE', `/api/v1/rag/documents/${docID}`);
+    if (!del.ok()) throw new Error(`document delete failed (${del.status()}): ${await del.text()}`);
+
+    await page.context().clearCookies();
+    await login(page, seed.memberEmail, seed.memberPass);
+    await page.goto(`${BASE}/dashboard/chat?evidence=${evidenceID}`);
+    await page.selectOption('#assistantSelect', seed.assistantID);
+    await page.fill('#composer', 'Try the revoked passage.');
+    await page.click('[data-action="chat:send"]');
+    await expect(page.locator('#toast')).toBeVisible({ timeout: 15_000 });
+    // The denied send never adopts a conversation or starts a runline.
+    await expect(page.locator('#chatThread .runline')).toHaveCount(0);
+  });
+
+  test('recents are namespaced per identity across logout and Back/Forward restores without new history entries at 390px', async ({ page, request }) => {
+    test.setTimeout(240_000);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await login(page);
+    const seed = await seedSearchFixtures(request, page);
+    await page.context().clearCookies();
+    await login(page, seed.memberEmail, seed.memberPass);
+
+    // Two searches seed the member's recents bucket.
+    await page.goto(`${BASE}/dashboard/search`);
+    await page.fill('#searchQuery', 'contract');
+    await page.click('#searchForm button[type="submit"]');
+    await expect(page.locator('#searchResults .result').first()).toBeVisible({ timeout: 15_000 });
+    await page.fill('#searchQuery', 'pricing');
+    await page.click('#searchForm button[type="submit"]');
+    await expect(page.locator('#searchResults')).toBeVisible();
+
+    // Reload with no ?q shows this user's recents; clicking refills + submits.
+    await page.goto(`${BASE}/dashboard/search`);
+    const recents = page.locator('#searchRecents [data-action="search:recent"]');
+    await expect(recents.first()).toBeVisible();
+    await expect(page.locator('#searchRecents')).toContainText('pricing');
+    await expect(page.locator('#searchRecents')).toContainText('contract');
+
+    // Back/Forward across distinct states restores results without pushing.
+    await page.goto(`${BASE}/dashboard/search`);
+    await page.fill('#searchQuery', 'contract');
+    await page.click('#searchForm button[type="submit"]');
+    await expect(page).toHaveURL(/q=contract/, { timeout: 15_000 });
+    await page.fill('#searchQuery', 'pricing');
+    await page.click('#searchForm button[type="submit"]');
+    await expect(page).toHaveURL(/q=pricing/, { timeout: 15_000 });
+    await page.goBack();
+    await expect(page).toHaveURL(/q=contract/, { timeout: 15_000 });
+    await expect(page.locator('#searchResults .result').first()).toBeVisible();
+    await page.goForward();
+    await expect(page).toHaveURL(/q=pricing/, { timeout: 15_000 });
+    // A restoration never pushes: going Back again must not loop forward.
+    await page.goBack();
+    await expect(page).toHaveURL(/q=contract/, { timeout: 15_000 });
+
+    // Shared browser: a different user's recents bucket is their own/empty —
+    // never the first user's queries.
+    await page.context().clearCookies();
+    await login(page);
+    await page.goto(`${BASE}/dashboard/search`);
+    await expect(page.locator('#searchRecents')).not.toContainText('contract');
+    await expect(page.locator('#searchRecents')).not.toContainText('pricing');
+  });
+});
