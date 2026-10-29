@@ -13,6 +13,9 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net/url"
+	"path"
+
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -75,7 +78,7 @@ func (p *Parser) Parse(ctx context.Context, ref artifacts.Ref, opts ParseOptions
 		ref.SHA256 = hex.EncodeToString(digest[:])
 	}
 	format := formatFor(opts.Filename, opts.MIMEType)
-	if !utf8.Valid(data) && format != "pdf" && format != "image" && format != "docx" {
+	if !utf8.Valid(data) && format != "pdf" && format != "image" && format != "docx" && format != "epub" {
 		return source.Document{}, fmt.Errorf("%w: invalid UTF-8", ErrMalformedDocument)
 	}
 	var blocks []parseBlock
@@ -95,6 +98,8 @@ func (p *Parser) Parse(ctx context.Context, ref artifacts.Ref, opts ParseOptions
 		blocks, err = jsonBlocks(data, strings.EqualFold(filepath.Ext(opts.Filename), ".jsonl") || strings.EqualFold(filepath.Ext(opts.Filename), ".ndjson") || strings.Contains(strings.ToLower(opts.MIMEType), "ndjson"))
 	case "docx":
 		blocks, err = docxBlocks(data)
+	case "epub":
+		blocks, err = epubBlocks(data)
 	case "pdf", "image":
 		return p.parseNative(ctx, ref, opts, data, format)
 	default:
@@ -129,6 +134,8 @@ func formatFor(name, contentType string) string {
 		return "json"
 	case ext == ".docx" || strings.Contains(media, "wordprocessingml"):
 		return "docx"
+	case ext == ".epub" || media == "application/epub+zip":
+		return "epub"
 	case ext == ".pdf" || media == "application/pdf":
 		return "pdf"
 	case strings.HasPrefix(media, "image/") || ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tif" || ext == ".tiff":
@@ -597,6 +604,185 @@ func xmlAttr(attrs []xml.Attr, name string) string {
 		}
 	}
 	return ""
+}
+
+// epubBlocks extracts reading-ordered blocks from an EPUB: container.xml
+// locates the OPF, the OPF spine orders the XHTML members, and each member
+// is parsed as HTML. Books with an unusable package fall back to name-sorted
+// XHTML members — order is lost, content is not.
+func epubBlocks(data []byte) ([]parseBlock, error) {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, fmt.Errorf("%w: EPUB zip: %v", ErrMalformedDocument, err)
+	}
+	if len(zr.File) > 4096 {
+		return nil, ErrDocumentTooLarge
+	}
+	names := epubSpine(zr)
+	var blocks []parseBlock
+	expanded := int64(0)
+	for _, name := range names {
+		file := epubMember(zr, name)
+		if file == nil {
+			continue
+		}
+		if file.UncompressedSize64 > uint64(maxExpandedBytes-expanded) {
+			return nil, ErrDocumentTooLarge
+		}
+		rc, err := file.Open()
+		if err != nil {
+			return nil, err
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(rc, maxExpandedBytes-expanded+1))
+		_ = rc.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		expanded += int64(len(raw))
+		if expanded > maxExpandedBytes {
+			return nil, ErrDocumentTooLarge
+		}
+		part := htmlBlocks(string(raw))
+		if part == nil {
+			part = plainBlocks(string(raw))
+		}
+		for i := range part {
+			if part[i].locator.Section == "" {
+				part[i].locator.Section = name
+			}
+		}
+		blocks = append(blocks, part...)
+	}
+	offset := 0
+	for i := range blocks {
+		blocks[i].start = offset
+		blocks[i].end = offset + len(blocks[i].text)
+		offset = blocks[i].end + 1
+	}
+	return blocks, nil
+}
+
+// epubSpine resolves container.xml → OPF → spine itemrefs to XHTML member
+// names in reading order.
+func epubSpine(zr *zip.Reader) []string {
+	opfPath := ""
+	if raw, ok := epubReadMember(zr, "META-INF/container.xml", 1<<20); ok {
+		decoder := xml.NewDecoder(bytes.NewReader(raw))
+		for {
+			token, err := decoder.Token()
+			if err != nil {
+				break
+			}
+			if t, ok := token.(xml.StartElement); ok && t.Name.Local == "rootfile" {
+				if p := xmlAttr(t.Attr, "full-path"); p != "" {
+					opfPath = p
+				}
+				break
+			}
+		}
+	}
+	if opfPath == "" {
+		return epubFallbackNames(zr)
+	}
+	opf, ok := epubReadMember(zr, opfPath, 4<<20)
+	if !ok {
+		return epubFallbackNames(zr)
+	}
+	base := path.Dir(opfPath)
+	manifest := map[string]string{}
+	var spine []string
+	decoder := xml.NewDecoder(bytes.NewReader(opf))
+	inManifest, inSpine := false, false
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		switch t := token.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "manifest":
+				inManifest = true
+			case "spine":
+				inSpine = true
+			case "item":
+				if !inManifest {
+					break
+				}
+				href := xmlAttr(t.Attr, "href")
+				media := xmlAttr(t.Attr, "media-type")
+				if id := xmlAttr(t.Attr, "id"); id != "" && href != "" &&
+					(media == "application/xhtml+xml" || media == "text/html") {
+					if unescaped, err := url.PathUnescape(href); err == nil {
+						href = unescaped
+					}
+					manifest[id] = path.Join(base, href)
+				}
+			case "itemref":
+				if inSpine {
+					if name, ok := manifest[xmlAttr(t.Attr, "idref")]; ok {
+						spine = append(spine, name)
+					}
+				}
+			}
+		case xml.EndElement:
+			switch t.Name.Local {
+			case "manifest":
+				inManifest = false
+			case "spine":
+				inSpine = false
+			}
+		}
+	}
+	if len(spine) == 0 {
+		return epubFallbackNames(zr)
+	}
+	return spine
+}
+
+// epubFallbackNames returns XHTML members in name order when the package
+// metadata is missing or unreadable.
+func epubFallbackNames(zr *zip.Reader) []string {
+	var names []string
+	for _, file := range zr.File {
+		n := strings.ToLower(file.Name)
+		if strings.HasSuffix(n, ".xhtml") || strings.HasSuffix(n, ".html") || strings.HasSuffix(n, ".htm") {
+			names = append(names, file.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func epubMember(zr *zip.Reader, name string) *zip.File {
+	for _, file := range zr.File {
+		if file.Name == name {
+			return file
+		}
+	}
+	for _, file := range zr.File { // lenient: some producers vary case
+		if strings.EqualFold(file.Name, name) {
+			return file
+		}
+	}
+	return nil
+}
+
+func epubReadMember(zr *zip.Reader, name string, limit int64) ([]byte, bool) {
+	file := epubMember(zr, name)
+	if file == nil || file.UncompressedSize64 > uint64(limit) {
+		return nil, false
+	}
+	rc, err := file.Open()
+	if err != nil {
+		return nil, false
+	}
+	defer func() { _ = rc.Close() }()
+	raw, err := io.ReadAll(io.LimitReader(rc, limit+1))
+	if err != nil || int64(len(raw)) > limit {
+		return nil, false
+	}
+	return raw, true
 }
 
 func (p *Parser) parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data []byte, format string) (source.Document, error) {

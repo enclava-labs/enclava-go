@@ -120,6 +120,68 @@ func TestDOCXParagraphsNumberingTablesAndNotesKeepOrder(t *testing.T) {
 	}
 }
 
+func writeZip(t *testing.T, parts map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, text := range parts {
+		f, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(f, text); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestEPUBSpineOrderSectionsAndFormat(t *testing.T) {
+	data := writeZip(t, map[string]string{
+		"META-INF/container.xml": `<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>`,
+		"OEBPS/content.opf":      `<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><manifest><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/><item id="c2" href="ch2.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c2"/><itemref idref="c1"/></spine></package>`,
+		"OEBPS/ch1.xhtml":        `<html><body><h1>First chapter</h1><p>Hello epub</p></body></html>`,
+		"OEBPS/ch2.xhtml":        `<html><body><h1>Second chapter</h1><p>Later text</p></body></html>`,
+	})
+	blocks, err := epubBlocks(data)
+	if err != nil || len(blocks) != 4 {
+		t.Fatalf("EPUB parse blocks=%#v err=%v", blocks, err)
+	}
+	if blocks[0].text != "Second chapter" || blocks[1].text != "Later text" ||
+		blocks[2].text != "First chapter" || blocks[3].text != "Hello epub" {
+		t.Fatalf("spine order lost: %#v", blocks)
+	}
+	if blocks[0].locator.Section != "OEBPS/ch2.xhtml" || blocks[2].locator.Section != "OEBPS/ch1.xhtml" {
+		t.Fatalf("chapter sections lost: %#v", blocks)
+	}
+	if blocks[0].kind != "heading" || blocks[1].kind != "paragraph" {
+		t.Fatalf("block kinds lost: %#v", blocks)
+	}
+	if formatFor("book.epub", "") != "epub" || formatFor("x", "application/epub+zip") != "epub" {
+		t.Fatal("formatFor does not detect EPUB")
+	}
+}
+
+func TestEPUBMalformedAndFallbackOrder(t *testing.T) {
+	if _, err := epubBlocks([]byte("not a zip")); !errors.Is(err, ErrMalformedDocument) {
+		t.Fatalf("malformed EPUB error = %v", err)
+	}
+	data := writeZip(t, map[string]string{ // no container.xml: fall back to name order
+		"b.xhtml": `<html><body><p>B</p></body></html>`,
+		"a.xhtml": `<html><body><p>A</p></body></html>`,
+	})
+	blocks, err := epubBlocks(data)
+	if err != nil || len(blocks) != 2 {
+		t.Fatalf("fallback EPUB blocks=%#v err=%v", blocks, err)
+	}
+	if blocks[0].text != "A" || blocks[1].text != "B" {
+		t.Fatalf("fallback order lost: %#v", blocks)
+	}
+}
+
 func TestDOCXExpandedSizeLimit(t *testing.T) {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
