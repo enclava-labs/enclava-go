@@ -25,8 +25,11 @@ invoice_number, invoice_date, due_date, service_provider, buyer, subtotal, tax_a
 					"invoice_number":   map[string]any{"type": "string"},
 					"invoice_date":     map[string]any{"type": "string"},
 					"due_date":         map[string]any{"type": "string"},
-					"service_provider": map[string]any{"type": "object"},
-					"buyer":            map[string]any{"type": "object"},
+					// Party names are strings in the prompt's field list —
+					// a bare {"type":"object"} here flags every model's
+					// natural output as invalid.
+					"service_provider": map[string]any{"type": "string"},
+					"buyer":            map[string]any{"type": "string"},
 					"subtotal":         map[string]any{"type": "number"},
 					"tax_amount":       map[string]any{"type": "number"},
 					"total_amount":     map[string]any{"type": "number"},

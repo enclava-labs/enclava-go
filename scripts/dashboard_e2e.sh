@@ -226,6 +226,22 @@ if [ -n "${E2E_WALKTHROUGH:-}" ]; then
       done
       curl -s -m 10 -H "$AUTH" -H "$JSON" -X POST "http://$CLIENT_HOST:$APP_PORT/api/v1/chatbots" \
         -d "{\"name\":\"Local · $LOCAL_MODEL_MODEL\",\"model\":\"$LOCAL_MODEL_MODEL\",\"rag_collection_ids\":[],\"audience\":[\"*\"]}" >/dev/null || true
+      # Default extraction templates pin to the real local model — the
+      # stub-backed aliases return canned text and fail schema validation.
+      LOCAL_MODEL_MODEL="$LOCAL_MODEL_MODEL" node -e '
+        const B = "http://127.0.0.1:" + process.env.APP_PORT;
+        const H = { authorization: "Bearer " + process.env.E2E_ADMIN_API_KEY, "content-type": "application/json" };
+        (async () => {
+          const j = await (await fetch(B + "/api/v1/extract/templates", { headers: H })).json();
+          for (const t of (j.templates || j || [])) {
+            if (t.model) continue;
+            await fetch(B + "/api/v1/extract/templates/" + encodeURIComponent(t.id), {
+              method: "PUT", headers: H,
+              body: JSON.stringify({ name: t.name, description: t.description || "", system_prompt: t.system_prompt, user_prompt: t.user_prompt, model: process.env.LOCAL_MODEL_MODEL, is_active: t.is_active, is_default: !!t.is_default, context_schema: t.context_schema || {}, output_schema: t.output_schema || {} }),
+            });
+          }
+        })().catch(() => {});
+      ' || true
       log "local model registered: $LOCAL_MODEL_MODEL on $LOCAL_MODEL_ORIGIN (assistant \"Local · $LOCAL_MODEL_MODEL\")"
     else
       log "LOCAL_MODEL_ORIGIN unreachable — skipping local model registration"
