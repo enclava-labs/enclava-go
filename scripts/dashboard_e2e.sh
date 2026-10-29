@@ -59,6 +59,12 @@ log() { printf '[dashboard-e2e] %s\n' "$*" >&2; }
 cleanup() {
   local code=$?
   set +e
+  if [ "${E2E_KEEP_STACK:-}" = "1" ] && [ "${PW_CODE:-0}" != "0" ]; then
+    log "E2E_KEEP_STACK=1 and playwright failed — stack left up for diagnosis"
+    log "  data dir: $DATA_DIR   app pid: $APP_PID   base: http://127.0.0.1:$APP_PORT"
+    log "  stop with: kill $APP_PID $INFERENCE_PID $MCP_PID $CONNECTOR_PID; pgctl drop \"$BASE_DSN\" \"$SCHEMA\""
+    exit "$code"
+  fi
   for pid in "$APP_PID" "$INFERENCE_PID" "$MCP_PID" "$CONNECTOR_PID"; do
     if [ -n "$pid" ]; then kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; fi
   done
@@ -201,6 +207,31 @@ export ENCLAVA_DATA_DIR
 if [ -n "${E2E_WALKTHROUGH:-}" ]; then
   log "seeding walkthrough data (setup project)"
   npx playwright test --workers=1 --project=setup
+
+  # Optional bring-your-own local model (walkthrough only): e.g.
+  #   LOCAL_MODEL_ORIGIN=http://spark02:8000 LOCAL_MODEL_MODEL=dsv41
+  # Registers the endpoint (plain HTTP needs authorized_private — tailnet
+  # internal), near-zero prices so billing admits it, and a tenant-wide
+  # assistant. Skipped silently when the origin is unset or unreachable.
+  if [ -n "${LOCAL_MODEL_ORIGIN:-}" ] && [ -n "${LOCAL_MODEL_MODEL:-}" ]; then
+    if curl -fsS -m 5 "$LOCAL_MODEL_ORIGIN/v1/models" >/dev/null 2>&1; then
+      AUTH="authorization: Bearer $E2E_ADMIN_API_KEY"
+      JSON="content-type: application/json"
+      LM_ID="local-$LOCAL_MODEL_MODEL"
+      curl -s -m 10 -H "$AUTH" -H "$JSON" -X POST "http://$CLIENT_HOST:$APP_PORT/api/v1/providers" \
+        -d "{\"id\":\"$LM_ID\",\"protocol\":\"openai_compatible\",\"base_origin\":\"$LOCAL_MODEL_ORIGIN\",\"authorized_private\":true,\"capabilities\":[\"chat/completions\",\"model:$LOCAL_MODEL_MODEL=$LOCAL_MODEL_MODEL\"]}" >/dev/null || true
+      for U in input output cached_input; do
+        curl -s -m 10 -H "$AUTH" -H "$JSON" -X POST "http://$CLIENT_HOST:$APP_PORT/api/v1/admin/pricing" \
+          -d "{\"subject_type\":\"model\",\"subject_id\":\"$LOCAL_MODEL_MODEL\",\"capability\":\"chat/completions\",\"unit\":\"$U\",\"rate_micros\":1,\"unit_quantity\":1000000,\"currency\":\"USD\"}" >/dev/null || true
+      done
+      curl -s -m 10 -H "$AUTH" -H "$JSON" -X POST "http://$CLIENT_HOST:$APP_PORT/api/v1/chatbots" \
+        -d "{\"name\":\"Local · $LOCAL_MODEL_MODEL\",\"model\":\"$LOCAL_MODEL_MODEL\",\"rag_collection_ids\":[],\"audience\":[\"*\"]}" >/dev/null || true
+      log "local model registered: $LOCAL_MODEL_MODEL on $LOCAL_MODEL_ORIGIN (assistant \"Local · $LOCAL_MODEL_MODEL\")"
+    else
+      log "LOCAL_MODEL_ORIGIN unreachable — skipping local model registration"
+    fi
+  fi
+
   log "walkthrough ready: http://<this host>:$APP_PORT/dashboard"
   log "  admin    $ADMIN_EMAIL / $ADMIN_PASSWORD"
   log "  manager  manager@e2e.local / E2e-pass-1234!"

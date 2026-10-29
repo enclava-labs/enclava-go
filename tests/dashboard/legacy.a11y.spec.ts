@@ -1,4 +1,4 @@
-import { test, expect, Page, APIRequestContext } from '@playwright/test';
+import { test, expect, Page, Locator, APIRequestContext } from '@playwright/test';
 
 declare global {
   interface Window {
@@ -109,7 +109,10 @@ test.beforeAll(async ({ browser }) => {
   const endpointID = await jsonField(await api(request, page, 'POST', '/api/v1/providers', {
     protocol: 'openai_compatible',
     base_origin: 'https://unreachable.a11y-spec.invalid',
-    capabilities: [`model:${UNPRICED_MODEL}=echo`],
+    // chat/completions must be advertised: submission-time routing rejects a
+    // model whose endpoint lacks the operation capability — the worker-side
+    // price-reserve failure the cases below assert never gets a chance.
+    capabilities: ['chat/completions', `model:${UNPRICED_MODEL}=echo`],
   }), 'unpriced endpoint create (POST /api/v1/providers)');
 
   const sourceID = await jsonField(await api(request, page, 'POST', '/api/v1/connectors/sources', {
@@ -196,9 +199,9 @@ function contrastRatio(fg: string, bg: string): number {
 
 // resolveOpaqueBg walks up the DOM from a node to its first opaque
 // background — pills tone their fg over --raised surfaces.
-async function effectiveBg(page: Page, selector: string): Promise<string> {
-  return page.evaluate((sel) => {
-    let n: HTMLElement | null = document.querySelector(sel);
+async function effectiveBg(el: Locator): Promise<string> {
+  return el.evaluate((node) => {
+    let n: HTMLElement | null = node;
     while (n) {
       const bg = getComputedStyle(n).backgroundColor;
       const m = bg.match(/rgba?\(([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+))?/);
@@ -206,7 +209,7 @@ async function effectiveBg(page: Page, selector: string): Promise<string> {
       n = n.parentElement;
     }
     return 'rgb(255, 255, 255)';
-  }, selector);
+  });
 }
 
 // Wait for the dashboard session to be ready on this page.
@@ -249,32 +252,28 @@ test('(1) drawer traps Tab, cycles last→first, never releases focus to the pag
     page.evaluate(() => document.getElementById('drawer')!.contains(document.activeElement)),
   ).toBe(true);
 
-
   // Walk the tab cycle forward; every stop must stay inside the drawer, and
   // at least one Tab must visibly wrap (last → first) to prove the cycle.
-  const focusables = page.locator('#drawer a[href], #drawer button:not([disabled]), #drawer input:not([disabled]), #drawer select, #drawer textarea');
-  const firstSel = '#drawer a[href], #drawer button:not([disabled]), #drawer input:not([disabled]), #drawer select, #drawer textarea';
-  const n = await focusables.count();
+  // The trap cycles VISIBLE controls (app.js visibleFocusables) — later
+  // wizard steps are [hidden] and Back/Continue start disabled, so the
+  // selector is filtered to visible controls the same way.
+  const vis = page.locator(
+    '#drawer a[href], #drawer button:not([disabled]), #drawer input:not([disabled]):not([type="hidden"]), #drawer select:not([disabled]), #drawer textarea:not([disabled]), #drawer [tabindex]:not([tabindex="-1"])',
+  ).filter({ visible: true });
+  const n = await vis.count();
   if (n < 2) {
     throw new Error(`drawer renders ${n} focusable controls — the wizard needs at least 2 for the wrap proof`);
   }
-  // Focus the last control directly, then Tab once: the trap must wrap to
-  // the first control instead of leaving the dialog.
-  await focusables.nth(n - 1).focus();
+  // Focus the last visible control, then Tab once: the trap must wrap to
+  // the first visible control instead of leaving the dialog.
+  await vis.last().focus();
   await page.keyboard.press('Tab');
-  await expect.poll(() =>
-    page.evaluate((sel) => document.activeElement === document.querySelector(sel), firstSel),
-  ).toBe(true);
+  await expect(vis.first()).toBeFocused();
   // Shift+Tab from the first control wraps back to the last.
   await page.keyboard.down('Shift');
   await page.keyboard.press('Tab');
   await page.keyboard.up('Shift');
-  await expect.poll(() =>
-    page.evaluate(({ sel, idx }) => {
-      const els = Array.from(document.querySelectorAll<HTMLElement>(sel));
-      return document.activeElement === els[idx];
-    }, { sel: firstSel, idx: n - 1 }),
-  ).toBe(true);
+  await expect(vis.last()).toBeFocused();
   // And a longer walk never escapes the dialog.
   for (let i = 0; i < Math.max(12, n); i++) {
     await page.keyboard.press('Tab');
@@ -319,25 +318,38 @@ test('(2) Esc and backdrop close the drawer and return focus to the opener', asy
 
 // ── (3) one overlay at a time ────────────────────────────────────────────
 
-test('(3) opening a popover replaces an open drawer and focus lands inside it', async ({ page }) => {
+test('(3) popover opens with focus inside, Escape restores, and a drawer replaces it', async ({ page }) => {
   await login(page);
-  await page.goto(`${BASE}/dashboard/sources?new=1`);
-  const drawer = page.locator('#drawer');
-  await expect(drawer).toHaveClass(/open/, { timeout: 15000 });
-
-  const userMenu = page.locator('.user-menu');
-  await userMenu.click();
+  await page.goto(`${BASE}/dashboard`);
   const pop = page.locator('#pop');
+  const userMenu = page.locator('.user-menu');
+
+  // The popover opens from the user menu with focus landed inside it.
+  await userMenu.click();
   await expect(pop).toBeVisible();
-  await expect(drawer).not.toHaveClass(/open/);
   await expect.poll(() =>
     page.evaluate(() => document.getElementById('pop')!.contains(document.activeElement)),
   ).toBe(true);
 
+  // Escape closes the popover and returns focus to its opener.
   await page.keyboard.press('Escape');
   await expect(pop).toBeHidden();
   await expect.poll(() =>
     page.evaluate(() => document.activeElement === document.querySelector('.user-menu')),
+  ).toBe(true);
+
+  // One overlay at a time, the workable direction: while a popover is open,
+  // opening a drawer closes it. (The reverse is blocked by design — the
+  // modal drawer's backdrop makes outside controls like the user menu
+  // unclickable, so the drawer cannot be replaced from underneath.)
+  await userMenu.click();
+  await expect(pop).toBeVisible();
+  await page.goto(`${BASE}/dashboard/sources?new=1`);
+  const drawer = page.locator('#drawer');
+  await expect(drawer).toHaveClass(/open/, { timeout: 15000 });
+  await expect(pop).toBeHidden();
+  await expect.poll(() =>
+    page.evaluate(() => document.getElementById('drawer')!.contains(document.activeElement)),
   ).toBe(true);
 });
 
@@ -491,9 +503,8 @@ test('contrast: rendered pills and primary ink meet 4.5:1 in both themes', async
       document.body.classList.toggle('light', t === 'light');
     }, theme);
     for (let i = 0; i < count; i++) {
-      const sel = `.pill >> nth=${i}`;
       const fg = await pills.nth(i).evaluate((n) => getComputedStyle(n).color);
-      const bg = await effectiveBg(page, sel);
+      const bg = await effectiveBg(pills.nth(i));
       const ratio = contrastRatio(fg, bg);
       if (ratio < 4.5) {
         throw new Error(`pill ${i} contrast ${ratio.toFixed(2)}:1 < 4.5 in ${theme || 'dark'} theme (fg ${fg} on ${bg})`);

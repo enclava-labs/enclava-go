@@ -72,18 +72,23 @@ interface Seed {
 }
 
 async function firstModelID(res: { json(): Promise<unknown> }): Promise<string> {
+  // Pin the seeded chat model — see legacy.chat-search's firstModelID.
   const payload: unknown = await res.json();
+  const ids: string[] = [];
   if (typeof payload === 'object' && payload !== null && 'data' in payload) {
     const data: unknown = payload.data;
     if (Array.isArray(data)) {
       for (const model of data) {
         if (typeof model === 'object' && model !== null && 'id' in model && typeof model.id === 'string') {
-          return model.id;
+          ids.push(model.id);
         }
       }
     }
   }
-  throw new Error('GET /v1/models returned no usable model id — the deployment has no model catalog');
+  if (!ids.includes('e2e-chat')) {
+    throw new Error(`GET /v1/models lacks the seeded chat model 'e2e-chat' (${ids.join(', ')}) — the deployment has no chat catalog`);
+  }
+  return 'e2e-chat';
 }
 
 async function firstEvidenceID(res: { json(): Promise<unknown> }): Promise<string> {
@@ -345,7 +350,7 @@ test.describe('Page-surface keyboard flows (OA-38 / 11-05)', () => {
     await expect(page.locator('.thread-body')).toContainText('Stopped by you', { timeout: 30_000 });
   });
 
-  test('reduced-motion emulation strips decorative animation and transitions', async ({ page }) => {
+  test('reduced-motion emulation strips decorative animation and transitions', async ({ page, request }) => {
     await page.emulateMedia({ reducedMotion: 'reduce' });
     await login(page);
     // Seed a live run so the Running-now row actually renders its pulse —

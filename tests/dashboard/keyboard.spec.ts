@@ -37,28 +37,23 @@ test.describe('overlays — drawer focus discipline (admin)', () => {
       page.evaluate(() => document.getElementById('drawer')!.contains(document.activeElement)),
     ).toBe(true);
 
-    const focusables = page.locator(
-      '#drawer a[href], #drawer button:not([disabled]), #drawer input:not([disabled]), #drawer select, #drawer textarea');
-    const firstSel =
-      '#drawer a[href], #drawer button:not([disabled]), #drawer input:not([disabled]), #drawer select, #drawer textarea';
-    const n = await focusables.count();
+    // The trap cycles VISIBLE controls (app.js visibleFocusables): a wizard
+    // drawer keeps later steps and the disabled Back/Continue out of the
+    // cycle, so the selector is filtered to visible controls the same way.
+    const vis = page.locator(
+      '#drawer a[href], #drawer button:not([disabled]), #drawer input:not([disabled]):not([type="hidden"]), #drawer select:not([disabled]), #drawer textarea:not([disabled]), #drawer [tabindex]:not([tabindex="-1"])',
+    ).filter({ visible: true });
+    const n = await vis.count();
     if (n < 2) {
       throw new Error(`drawer renders ${n} focusable controls — the wizard needs at least 2 for the wrap proof`);
     }
-    await focusables.nth(n - 1).focus();
+    await vis.last().focus();
     await page.keyboard.press('Tab');
-    await expect.poll(() =>
-      page.evaluate((sel) => document.activeElement === document.querySelector(sel), firstSel),
-    ).toBe(true);
+    await expect(vis.first()).toBeFocused();
     await page.keyboard.down('Shift');
     await page.keyboard.press('Tab');
     await page.keyboard.up('Shift');
-    await expect.poll(() =>
-      page.evaluate(({ sel, idx }) => {
-        const els = Array.from(document.querySelectorAll<HTMLElement>(sel));
-        return document.activeElement === els[idx];
-      }, { sel: firstSel, idx: n - 1 }),
-    ).toBe(true);
+    await expect(vis.last()).toBeFocused();
     for (let i = 0; i < Math.max(12, n); i++) {
       await page.keyboard.press('Tab');
       const inside = await page.evaluate(() =>
@@ -137,12 +132,15 @@ test.describe('overlays — drawer focus discipline (admin)', () => {
   test('the login form submits with the keyboard only', async ({ page }) => {
     await page.context().clearCookies();
     await page.goto(`${BASE}/dashboard/login`);
-    await page.keyboard.press('Tab');
+    // Tab past the skip link to the email control before typing.
+    for (let i = 0; i < 5 && await page.evaluate(() => (document.activeElement as HTMLElement | null)?.getAttribute('name') !== 'email'); i++) {
+      await page.keyboard.press('Tab');
+    }
     await page.keyboard.type(ADMIN_EMAIL);
     await page.keyboard.press('Tab');
     await page.keyboard.type(ADMIN_PASSWORD);
     await page.keyboard.press('Enter');
-    await page.waitForURL(/\/dashboard/, { timeout: 15_000 });
+    await page.waitForURL(/\/dashboard(?!\/login)/, { timeout: 15_000 });
     await expect(page.locator('#nav')).toBeVisible();
   });
 });
@@ -219,9 +217,12 @@ test.describe('page-surface keyboard flows (member)', () => {
     await page.goto(`${BASE}/dashboard/chat`);
     await page.evaluate(async () => {
       try {
-        await window.Enclava.api('POST', '/api/v1/agent-runs', {
-          assistant_id: 'ungranted',
-          input: 'a11y denied run',
+        // An admin-surface write: a real 403 (an unknown assistant is the
+        // uniform 404, which api() deliberately does not toast).
+        await window.Enclava.api('POST', '/api/v1/admin/budgets', {
+          name: 'denied', subject_type: 'tenant', kind: 'amount',
+          limit_value: 1, currency: 'USD', period: 'monthly',
+          starts_at: new Date().toISOString(),
         });
       } catch { /* rejection is the expected outcome */ }
     });

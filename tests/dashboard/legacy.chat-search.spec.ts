@@ -68,18 +68,25 @@ async function fieldString(res: { json(): Promise<unknown> }, field: string): Pr
 }
 
 async function firstModelID(res: { json(): Promise<unknown> }): Promise<string> {
+  // Pin the seeded chat model: the catalog lists every bound alias sorted,
+  // so "whatever is first" changes with later specs' endpoints (e.g. the
+  // a11y suite's deliberately unpriced alias sorts before e2e-chat).
   const payload: unknown = await res.json();
+  const ids: string[] = [];
   if (typeof payload === 'object' && payload !== null && 'data' in payload) {
     const data: unknown = payload.data;
     if (Array.isArray(data)) {
       for (const model of data) {
         if (typeof model === 'object' && model !== null && 'id' in model && typeof model.id === 'string') {
-          return model.id;
+          ids.push(model.id);
         }
       }
     }
   }
-  throw new Error('GET /v1/models returned no usable model id — seed a model before running the chat scenarios');
+  if (!ids.includes('e2e-chat')) {
+    throw new Error(`GET /v1/models lacks the seeded chat model 'e2e-chat' (${ids.join(', ')}) — the chat scenarios cannot run`);
+  }
+  return 'e2e-chat';
 }
 
 async function firstEvidenceID(res: { json(): Promise<unknown> }): Promise<string> {
@@ -497,7 +504,7 @@ async function uploadDoc(request: APIRequestContext, page: Page, collectionID: s
 async function seedSearchFixtures(request: APIRequestContext, page: Page): Promise<SearchSeed> {
   const member = await seedMember(request, page, ['rag', 'chatbot'], {
     assistants: { mode: 'list', items: [] },
-    models: { mode: 'list', items: [] },
+    models: { mode: 'list', items: ['e2e-embed'] }, // hybrid search embeds the query
   });
 
   const mkCol = async (name: string, audience: string[]) => {

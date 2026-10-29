@@ -97,16 +97,24 @@ test.describe('Home /dashboard — admin', () => {
     await login(page);
 
     // Seeds through the real surface: tenant-wide assistant, readable
-    // collection, an unverified confidential endpoint, and a tenant budget.
+    // collection, an unverified confidential endpoint, and a tenant budget
+    // (limit far above anything the run can spend — a binding budget here
+    // starves every later test with budget-exceeded admissions).
     const bot = await api(page, 'POST', '/api/v1/chatbots', {
       name: 'E2E Home Assistant', model: 'gpt-test', audience: ['*'],
     });
     expect(bot.id, 'POST /api/v1/chatbots must return the assistant id').toBeTruthy();
     const col = await api(page, 'POST', '/api/v1/rag/collections', { name: `E2E Home ${Date.now()}` });
     expect(col.id, 'POST /api/v1/rag/collections must return the collection id').toBeTruthy();
+    await api(page, 'POST', '/api/v1/providers', {
+      protocol: 'openai_compatible',
+      base_origin: 'https://unverified.home-spec.invalid',
+      capabilities: ['model:e2e-home-conf=echo'],
+      assurance_mode: 'tee',
+    });
     await api(page, 'POST', '/api/v1/admin/budgets', {
       name: `e2e-budget-${Date.now()}`, subject_type: 'tenant', kind: 'amount',
-      limit_value: 1, currency: 'USD', period: 'monthly',
+      limit_value: 1_000_000_000, currency: 'USD', period: 'monthly',
       starts_at: new Date().toISOString(),
     });
 
@@ -143,7 +151,7 @@ test.describe('Home /dashboard — admin', () => {
     // budgets. (Failed documents/syncs/tools kinds need live external
     // systems; they are asserted server-side in dashboard_home_test.go.)
     await expect(page.locator('#homeAttention')).toContainText('not verified');
-    await expect(page.locator('#homeAttention a[href="/dashboard/models"]')).toBeVisible();
+    await expect(page.locator('#homeAttention a[href="/dashboard/models"]').first()).toBeVisible();
   });
 
   test('running-now fragment polls a seeded job to terminal without a reload', async ({ page }) => {
