@@ -240,7 +240,17 @@ test.describe('wizard focus discipline (manager)', () => {
     const seed = seedData();
     await page.goto(`${BASE}/dashboard/sources?new=1`);
     const drawer = page.locator('#drawer');
-    await expect(drawer).toHaveClass(/open/);
+    // The target collection must be WRITABLE by the manager — the seeded
+    // set is admin-owned and never appears in the wizard's list.
+    const collectionID = await page.evaluate(async () => {
+      const c = await window.Enclava.api('POST', '/api/v1/rag/collections', {
+        name: `wiz-${Date.now()}`, chunk_size: 200, chunk_overlap: 20,
+      });
+      if (!(c && typeof c === 'object' && 'id' in c && typeof c.id === 'string')) {
+        throw new Error('collection create returned no id — the wizard needs a manager-writable target');
+      }
+      return c.id;
+    });
 
     const tile = drawer.locator('.tile[data-provider="github"]');
     await tile.focus();
@@ -263,7 +273,7 @@ test.describe('wizard focus discipline (manager)', () => {
     await expect(drawer.locator('#source-name')).toBeFocused({ timeout: 5_000 });
 
     await drawer.locator('#source-name').fill(`a11y src ${Date.now()}`);
-    await drawer.locator('#source-collection').selectOption(seed.collectionID);
+    await drawer.locator('#source-collection').selectOption(collectionID);
     await cont.focus();
     await cont.press('Enter');
     const submit = drawer.getByRole('button', { name: 'Create source and sync' });

@@ -99,8 +99,9 @@ test.describe('Authentication', () => {
 
 
   test('unauthenticated partial requests are denied', async ({ playwright }) => {
-    // A fresh context: the project's stored admin session must NOT be sent.
-    const anon = await playwright.request.newContext({ baseURL: BASE });
+    // A fresh context: the project's stored admin session must NOT be sent —
+    // inside the runner, request.newContext otherwise inherits it.
+    const anon = await playwright.request.newContext({ baseURL: BASE, storageState: { cookies: [], origins: [] } });
     for (const p of ['/dashboard/partials/home/running', '/dashboard/partials/access/api-keys', '/dashboard/partials/usage/overview']) {
       const res = await anon.get(`${BASE}${p}`, { maxRedirects: 0 });
       // GET page partials redirect to login — assert the redirect, not copy.

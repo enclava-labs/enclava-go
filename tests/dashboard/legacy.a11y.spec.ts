@@ -424,7 +424,10 @@ test('(4b) extract worker failure surfaces the same capability-filtered fix on t
       mimeType: 'text/plain',
       buffer: Buffer.from(`a11y extract probe ${Date.now()}`),
     });
+    // Wait for the submit's POST: navigating away first would abort it.
+    const submitted = page.waitForResponse((r) => r.method() === 'POST' && r.url().includes('/api/v1/extract/jobs'));
     await page.click('[data-action="extract:submit"]');
+    await submitted;
     await page.goto(`${BASE}/dashboard/extract?tab=jobs`);
     // The accepted job lands in the live jobs table and reaches a terminal
     // render once the worker fails it (the htmx fragment polls every 3s).

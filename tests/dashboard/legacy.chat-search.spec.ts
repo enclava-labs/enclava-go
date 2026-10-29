@@ -504,7 +504,7 @@ async function uploadDoc(request: APIRequestContext, page: Page, collectionID: s
 async function seedSearchFixtures(request: APIRequestContext, page: Page): Promise<SearchSeed> {
   const member = await seedMember(request, page, ['rag', 'chatbot'], {
     assistants: { mode: 'list', items: [] },
-    models: { mode: 'list', items: ['e2e-embed'] }, // hybrid search embeds the query
+    models: { mode: 'list', items: ['e2e-embed', 'e2e-chat'] }, // hybrid search embeds the query; Ask-about-this runs the chat assistant
   });
 
   const mkCol = async (name: string, audience: string[]) => {
