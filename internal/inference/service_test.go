@@ -37,6 +37,11 @@ type fakeUpstream struct {
 	stream    io.ReadCloser
 	streamErr error
 
+	// Discovery seams: per-capability probe outcomes and the model list.
+	models       []llm.Model
+	embedErr     error
+	responsesErr error
+
 	lastBody []byte
 	lastPath string
 	calls    int32
@@ -60,6 +65,9 @@ func (f *fakeUpstream) CreateChatCompletionStream(ctx context.Context, body []by
 func (f *fakeUpstream) CreateEmbeddings(ctx context.Context, body []byte) ([]byte, error) {
 	atomic.AddInt32(&f.calls, 1)
 	f.lastBody = body
+	if f.embedErr != nil {
+		return nil, f.embedErr
+	}
 	return f.resp, f.err
 }
 
@@ -67,7 +75,14 @@ func (f *fakeUpstream) DoResponsesRequest(ctx context.Context, method, path stri
 	atomic.AddInt32(&f.calls, 1)
 	f.lastBody = body
 	f.lastPath = path
+	if f.responsesErr != nil {
+		return nil, f.responsesErr
+	}
 	return f.resp, f.err
+}
+
+func (f *fakeUpstream) ListModels(ctx context.Context) (llm.ModelsResponse, error) {
+	return llm.ModelsResponse{Data: f.models}, nil
 }
 
 func (f *fakeUpstream) DoResponsesStream(ctx context.Context, method, path string, body []byte) (io.ReadCloser, error) {
