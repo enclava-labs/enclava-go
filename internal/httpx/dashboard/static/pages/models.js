@@ -91,10 +91,8 @@
       showFormError(form, aliases.error);
       return;
     }
-    const capabilities = Array.prototype.map.call(
-      form.querySelectorAll('input[name="capability"]:checked'),
-      (input) => input.value,
-    ).concat(aliases.bindings);
+    const capabilities = form.elements.capabilities.value
+      .split(',').map((s) => s.trim()).filter(Boolean).concat(aliases.bindings);
     const body = {
       protocol: form.elements.protocol.value,
       sdk_provider: form.elements.sdk_provider.value.trim(),
@@ -142,16 +140,29 @@
     if (models.length) {
       form.querySelector('#mep-models').value = models.join(', ');
     }
+
     let confirmed = 0;
-    form.querySelectorAll('input[name="capability"]').forEach((input) => {
-      const verdict = discovered.capabilities && discovered.capabilities[input.value];
-      if (verdict === 'yes' || verdict === 'no') {
-        input.checked = verdict === 'yes';
-        confirmed += input.checked ? 1 : 0;
-        const chip = input.closest('.chip');
-        if (chip) chip.classList.toggle('active', input.checked);
+    const yes = [];
+    form.querySelectorAll('[data-capability-chip]').forEach((chip) => {
+      const key = chip.dataset.capabilityChip;
+      const verdict = discovered.capabilities && discovered.capabilities[key];
+      const label = chip.textContent.replace(/ [✓✗?]$/, '');
+      if (verdict === 'yes') {
+        confirmed += 1;
+        yes.push(key);
+        chip.textContent = label + ' ✓';
+        chip.classList.add('active');
+      } else if (verdict === 'no') {
+        chip.textContent = label + ' ✗';
+        chip.classList.remove('active');
+      } else {
+        chip.textContent = label + ' ?';
+        chip.classList.remove('active');
       }
     });
+    // The saved capability set is exactly what the server confirmed;
+    // unknown stays out instead of silently retaining an old claim.
+    form.elements.capabilities.value = yes.join(',');
     showFormError(form,
       'Discovered ' + models.length + ' model' + (models.length === 1 ? '' : 's') +
       (discovered.probe_model ? ' (probed with ' + discovered.probe_model + ')' : '') +

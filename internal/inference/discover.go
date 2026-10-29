@@ -2,6 +2,7 @@ package inference
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -11,9 +12,9 @@ import (
 )
 
 // DiscoverReport is observed endpoint truth: the model ids the server lists
-// plus which capabilities answered a 1-token probe. Capabilities without a
-// cheap probe (vision, responses/compact, mcp) report "unknown" — never a
-// guess, never silently enabled.
+// plus which capabilities answered a probe (chat, vision, embeddings and
+// the responses surfaces are settled by 1-token requests; MCP tool calls
+// have no cheap probe and report "unknown" — never a guess).
 type DiscoverReport struct {
 	Models       []string          `json:"models"`
 	ProbeModel   string            `json:"probe_model,omitempty"`
@@ -52,24 +53,44 @@ func (s *Service) Discover(ctx context.Context, e Endpoint) (DiscoverReport, err
 		return report, nil
 	}
 	report.ProbeModel = report.Models[0]
-	report.Capabilities[CapabilityChat] = classifyProbe(func() error {
-		body := []byte(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"ping"}],"max_tokens":1}`, report.ProbeModel))
-		_, err := up.CreateChatCompletion(ctx, body)
-		return err
-	}())
+	chat := func(vision bool) string {
+		content := any("ping")
+		if vision {
+			// 1×1 red PNG: multimodal acceptance separates vision models.
+			content = []any{map[string]any{"type": "text", "text": "ping"}, map[string]any{
+				"type": "image_url",
+				"image_url": map[string]string{
+					"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+				},
+			}}
+		}
+		body, err := json.Marshal(map[string]any{
+			"model": report.ProbeModel, "max_tokens": 1,
+			"messages": []any{map[string]any{"role": "user", "content": content}},
+		})
+		if err != nil {
+			return "unknown"
+		}
+		_, err = up.CreateChatCompletion(ctx, body)
+		return classifyProbe(err)
+	}
+	report.Capabilities[CapabilityChat] = chat(false)
+	report.Capabilities[CapabilityVision] = chat(true)
 	report.Capabilities[CapabilityEmbeddings] = classifyProbe(func() error {
 		body := []byte(fmt.Sprintf(`{"model":%q,"input":"ping"}`, report.ProbeModel))
 		_, err := up.CreateEmbeddings(ctx, body)
 		return err
 	}())
-	report.Capabilities[CapabilityResponses] = classifyProbe(func() error {
+	responses := func(path string) string {
 		body := []byte(fmt.Sprintf(`{"model":%q,"input":"ping","max_output_tokens":1}`, report.ProbeModel))
-		_, err := up.DoResponsesRequest(ctx, http.MethodPost, "/responses", body)
-		return err
-	}())
-	for _, capability := range []string{CapabilityVision, CapabilityCompact, CapabilityMCP} {
-		report.Capabilities[capability] = "unknown"
+		_, err := up.DoResponsesRequest(ctx, http.MethodPost, path, body)
+		return classifyProbe(err)
 	}
+	report.Capabilities[CapabilityResponses] = responses("/responses")
+	report.Capabilities[CapabilityCompact] = responses("/responses/compact")
+	// MCP tool calls have no cheap distinguishing probe: accepting a tools
+	// param does not prove execution. Reported unknown, never guessed.
+	report.Capabilities[CapabilityMCP] = "unknown"
 	return report, nil
 }
 

@@ -60,10 +60,12 @@
     </div>
   </div>
   <fieldset class="filters" role="group" aria-label="Capabilities">
-    <legend class="label">Capabilities</legend>
-    {{range .Data.Checks}}
-    <label class="chip{{if .Checked}} active{{end}}"><input type="checkbox" name="capability" value="{{.Value}}"{{if .Checked}} checked{{end}}> {{.Label}}</label>
-    {{end}}
+    <legend class="label">Capabilities <span class="muted">— read from the server</span></legend>
+    <div class="chipgrid" data-models-capability-view>
+      {{range .Data.Checks}}<span class="chip{{if .Checked}} active{{end}}" data-capability-chip="{{.Value}}">{{.Label}}{{if .Checked}} ✓{{end}}</span>{{end}}
+    </div>
+    <input type="hidden" name="capabilities" value="{{range .Data.Checks}}{{if .Checked}}{{.Value}},{{end}}{{end}}">
+    <span class="help">Observed by probing the endpoint's server — run Discover after changing origin or credential. Unconfirmed capabilities are not saved.</span>
   </fieldset>
   <button type="button" class="btn ghost" data-models-discover>Discover from server</button>
   <span class="help">Fills capabilities and model aliases from the endpoint's own model list and 1-token probes.</span>

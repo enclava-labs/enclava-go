@@ -5,6 +5,7 @@
 package inference_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -41,6 +42,8 @@ type fakeUpstream struct {
 	models       []llm.Model
 	embedErr     error
 	responsesErr error
+	visionErr    error
+	compactErr   error
 
 	lastBody []byte
 	lastPath string
@@ -50,6 +53,9 @@ type fakeUpstream struct {
 func (f *fakeUpstream) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
 	atomic.AddInt32(&f.calls, 1)
 	f.lastBody = body
+	if f.visionErr != nil && bytes.Contains(body, []byte("image_url")) {
+		return nil, f.visionErr
+	}
 	return f.resp, f.err
 }
 
@@ -75,6 +81,9 @@ func (f *fakeUpstream) DoResponsesRequest(ctx context.Context, method, path stri
 	atomic.AddInt32(&f.calls, 1)
 	f.lastBody = body
 	f.lastPath = path
+	if path == "/responses/compact" && f.compactErr != nil {
+		return nil, f.compactErr
+	}
 	if f.responsesErr != nil {
 		return nil, f.responsesErr
 	}

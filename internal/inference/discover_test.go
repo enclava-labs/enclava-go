@@ -16,6 +16,8 @@ func TestDiscoverListsModelsSortedAndClassifiesProbes(t *testing.T) {
 	f.upstream.models = []llm.Model{{ID: "zeta"}, {ID: "alpha"}}
 	f.upstream.embedErr = &llm.UpstreamError{StatusCode: 400, Message: "embeddings not supported"}
 	f.upstream.responsesErr = &llm.UpstreamError{StatusCode: 401, Message: "bad key"}
+	f.upstream.visionErr = &llm.UpstreamError{StatusCode: 400, Message: "image not supported"}
+	f.upstream.compactErr = &llm.UpstreamError{StatusCode: 404, Message: "no compact surface"}
 	f.build(t)
 
 	report, err := f.svc.Discover(f.ctx, f.mkEndpoint(t))
@@ -32,8 +34,9 @@ func TestDiscoverListsModelsSortedAndClassifiesProbes(t *testing.T) {
 		inference.CapabilityChat:       "yes",
 		inference.CapabilityEmbeddings: "no",
 		inference.CapabilityResponses:  "unknown",
-		inference.CapabilityVision:     "unknown",
-		inference.CapabilityCompact:    "unknown",
+		inference.CapabilityVision:     "no",
+		inference.CapabilityCompact:    "no",
+
 		inference.CapabilityMCP:        "unknown",
 	}
 	if !reflect.DeepEqual(report.Capabilities, want) {
