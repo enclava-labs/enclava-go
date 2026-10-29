@@ -26,7 +26,11 @@ const (
 	maxRunInputBytes   = 32 << 10
 	maxRunContextBytes = 64 << 10
 	maxRunOutputBytes  = 16 << 10
-	maxRunWallTime     = 2 * time.Minute
+	// defaultRunMaxTokens bounds every agent-run model call: slow local
+	// models rambling past the output byte cap otherwise burn the whole
+	// wall clock and fail with "model output exceeds byte limit".
+	defaultRunMaxTokens = 1024
+	maxRunWallTime      = 2 * time.Minute
 )
 
 var ErrRunNotFound = errors.New("chatbot: run not found")
@@ -456,7 +460,7 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 	messages = applyRenderedPrompt(messages, userIndex, rendered)
 	inputRefs := mergeObjectRefs(historyRefs, ragInputs(ragResults))
 	evidenceIDs := mergeStrings(historyEvidence, evidenceIDsForResults(ragResults))
-	payload := map[string]any{"model": bot.Model, "messages": messages, "stream": false}
+	payload := map[string]any{"model": bot.Model, "messages": messages, "stream": false, "max_tokens": defaultRunMaxTokens}
 	var definitions []map[string]any
 	var mcpDefinitions []map[string]any
 	if s.mcpTools != nil {

@@ -98,6 +98,15 @@ async function inference(req, res) {
     // exercise mid-run reload/stop paths (the resumed-poll contract).
     const slowUser = messages.some((m) => m && m.role === 'user' && typeof m.content === 'string' && m.content.includes('Long-running'));
     if (slowUser) await new Promise((r) => setTimeout(r, 20_000));
+    // Grounding oracle: if the prompt carries a GROUNDING-MARKER sentence
+    // (only reachable through retrieved passages), quote it back — the
+    // grounding spec uses this to prove context reached the model.
+    const text = (m) => typeof m?.content === 'string' ? m.content
+      : Array.isArray(m?.content) ? m.content.map((p) => p?.text || '').join(' ') : '';
+    const marker = messages.map(text).join('\n').match(/GROUNDING-MARKER-[a-z0-9]+/);
+    if (marker) {
+      return send(res, 200, chatReply(model, `The handbook's secret marker is ${marker[0]} [1].`));
+    }
     const hasToolResult = messages.some((m) => m && m.role === 'tool');
     const tools = Array.isArray(body.tools) ? body.tools : [];
     const echo = tools.find((t) => t && t.function && t.function.name === 'e2e_echo');

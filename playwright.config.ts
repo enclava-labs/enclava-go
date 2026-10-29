@@ -30,7 +30,7 @@ export default defineConfig({
       name: 'admin',
       dependencies: ['setup'],
       use: { storageState: 'tests/dashboard/.auth/admin.json' },
-      testMatch: ['nav.spec.ts', 'flows.admin.spec.ts', 'keyboard.spec.ts', 'screenshots.spec.ts', 'legacy.*.spec.ts'],
+      testMatch: ['nav.spec.ts', 'flows.admin.spec.ts', 'flows.grounding.spec.ts', 'keyboard.spec.ts', 'screenshots.spec.ts', 'legacy.*.spec.ts'],
     },
     {
       name: 'manager',
