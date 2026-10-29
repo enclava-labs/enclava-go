@@ -59,7 +59,7 @@
       </select>
     </div>
   </div>
-  <fieldset class="filters" role="group" aria-label="Capabilities">
+  <fieldset class="filters" aria-label="Capabilities — observed from the endpoint server">
     <legend class="label">Capabilities <span class="muted">— read from the server</span></legend>
     <div class="chipgrid" data-models-capability-view>
       {{range .Data.Checks}}<span class="chip{{if .Checked}} active{{end}}" data-capability-chip="{{.Value}}">{{.Label}}{{if .Checked}} ✓{{end}}</span>{{end}}
