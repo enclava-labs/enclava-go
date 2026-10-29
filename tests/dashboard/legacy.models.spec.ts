@@ -50,6 +50,22 @@ interface PricingBody {
 test('Set price submits the admin pricing contract and the cell re-renders priced', async ({ page }) => {
   await login(page);
 
+  // Own unpriced row: pricing "whatever is first" would price e2e-chat-alt,
+  // which later worker-failure cases need UNPRICED.
+  const UNPRICED = `models-e2e-unpriced-${Date.now()}`;
+  await page.goto(`${BASE}/dashboard/models`);
+  const created = await page.evaluate(async (model) => {
+    const r = await window.Enclava.api('POST', '/api/v1/providers', {
+      protocol: 'openai_compatible',
+      base_origin: 'https://unreachable.models-spec.invalid',
+      capabilities: ['chat/completions', `model:${model}=echo`],
+    });
+    if (!(r && typeof r === 'object' && 'ID' in r && typeof r.ID === 'string')) {
+      throw new Error(`fixture endpoint create failed: ${JSON.stringify(r).slice(0, 160)}`);
+    }
+    return r.ID;
+  }, UNPRICED);
+
   const res = await page.goto(`${BASE}/dashboard/models/pricing`);
   if (!res || res.status() !== 200) {
     throw new Error(
@@ -58,18 +74,18 @@ test('Set price submits the admin pricing contract and the cell re-renders price
     );
   }
 
-  const firstSet = page.locator('button[data-action="models:price"]').first();
+  const firstSet = page.locator(`tr[data-price-row="${created}|${UNPRICED}"] button[data-action="models:price"][data-unit="input"]`).first();
   if ((await firstSet.count()) === 0) {
     throw new Error(
-      'no unpriced matrix cell found — seed a model binding whose route is missing at ' +
-        'least one required unit price (input/cached_input/output for chat/completions)',
+      `the fixture row ${created}|${UNPRICED} shows no unpriced input cell — ` +
+        'the pricing matrix did not render the new endpoint binding',
     );
   }
 
-  const endpoint = (await firstSet.getAttribute('data-endpoint')) as string;
-  const model = (await firstSet.getAttribute('data-model')) as string;
+  const endpoint = created;
+  const model = UNPRICED;
   const capability = (await firstSet.getAttribute('data-capability')) as string;
-  if (!endpoint || !model || !capability) {
+  if (!capability) {
     throw new Error(
       'Set price control carries no cell binding (data-endpoint/data-model/data-capability) — ' +
         'the popover cannot build the pricing contract',
