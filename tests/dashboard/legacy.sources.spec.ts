@@ -206,6 +206,9 @@ test('Teams wizard keeps the team and channel subset in the payload', async ({ p
   await drawer.locator('#teams-credential').fill('CONNECTOR_TEAMS_SPEC');
   await drawer.getByRole('button', { name: 'Continue' }).click();
   await drawer.getByRole('button', { name: 'Continue' }).click();
+  // (Destination is the second Continue's pane; the review pane's submit
+  // control only un-hides after a third.)
+
 
   const createBodies: Record<string, unknown>[] = [];
   const syncURLs: string[] = [];
@@ -229,6 +232,7 @@ test('Teams wizard keeps the team and channel subset in the payload', async ({ p
 
   await drawer.locator('[data-source-name]').fill('Spec teams');
   await drawer.locator('[data-source-collection]').selectOption(collectionID);
+  await drawer.getByRole('button', { name: 'Continue' }).click(); // → review
   await drawer.getByRole('button', { name: 'Create source and sync' }).click();
   await expect(drawer).not.toHaveClass(/open/, { timeout: 15000 });
 

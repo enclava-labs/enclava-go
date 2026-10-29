@@ -8,7 +8,7 @@ declare global {
 }
 
 import {
-  BASE, MEMBER_EMAIL, MEMBER_PASSWORD, login, seedData, api, sessionApi,
+  BASE, MANAGER_EMAIL, MEMBER_EMAIL, MEMBER_PASSWORD, login, seedData, api, sessionApi,
 } from './fixtures';
 
 // flows.manager.spec.ts — knowledge-manager §9.2 flows 3–4 plus the
@@ -58,6 +58,9 @@ async function pickProvider(drawer: Locator, provider: string) {
 
 test.describe('Knowledge — collection documents (flow 3)', () => {
   test('upload, retry and delete a real document', async ({ page }) => {
+    // Self-sufficient session: the setup-minted storage state may have been
+    // revoked by earlier logins — never depend on it.
+    await login(page, MANAGER_EMAIL, MEMBER_PASSWORD);
     const seed = seedData();
     // A scratch collection so the seed set stays stable for search/chat.
     // Create through the manager session — collectionManageable is
@@ -109,6 +112,7 @@ test.describe('Knowledge — collection documents (flow 3)', () => {
 test.describe('Sources — add-source wizard (flow 4)', () => {
   test('wizard creates a GitHub source for real and the first sync reaches the fixture', async ({ page }) => {
     test.setTimeout(180_000);
+    await login(page, MANAGER_EMAIL, MEMBER_PASSWORD);
     const seed = seedData();
     const connector = process.env.E2E_CONNECTOR_URL || '';
     if (!connector) throw new Error('E2E_CONNECTOR_URL unset — the credential fixture is missing');
@@ -198,8 +202,8 @@ test.describe('Sources — add-source wizard (flow 4)', () => {
   });
 
   test('Teams wizard keeps the team and channel subset in the payload', async ({ page }) => {
+    await login(page, MANAGER_EMAIL, MEMBER_PASSWORD);
     const seed = seedData();
-    // Destination options are drawer-rendered — the writable collection must
     // exist before the wizard opens.
     const col = await newWritableCollection(page, seed);
     const drawer = await openWizard(page);
