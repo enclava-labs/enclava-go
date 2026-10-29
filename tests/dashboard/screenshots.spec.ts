@@ -56,7 +56,9 @@ test.describe('screenshot matrix — both themes × 1440/390', () => {
 });
 
 test.describe('computed a11y cases (migrated)', () => {
-  test.skip(({}, testInfo) => testInfo.project.name !== 'manager');
+  // Admin-only: the seeded pending MCP tool guarantees rendered .pill rows on
+  // /dashboard/tools; member/manager surfaces have no guaranteed pill rows.
+  test.skip(({ storageState }) => !String(storageState).includes('admin.json'));
 
   function luminance(rgb: string): number {
     const m = rgb.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
@@ -68,28 +70,17 @@ test.describe('computed a11y cases (migrated)', () => {
     return 0.2126 * f(+m[1]) + 0.7152 * f(+m[2]) + 0.0722 * f(+m[3]);
   }
 
-  async function effectiveBg(page: Page, sel: string): Promise<string> {
-    return page.evaluate((s) => {
-      let el: HTMLElement | null = document.querySelector(s);
-      while (el) {
-        const bg = getComputedStyle(el).backgroundColor;
-        if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') return bg;
-        el = el.parentElement;
-      }
-      return 'rgb(255, 255, 255)';
-    }, sel);
-  }
 
   test('rendered pills and primary ink meet 4.5:1 in both themes', async ({ page }) => {
-    await page.goto(`${BASE}/dashboard/sources`);
+    await page.goto(`${BASE}/dashboard/tools`);
     const pills = page.locator('.pill');
     const count = await pills.count();
     if (count === 0) {
-      throw new Error('no rendered .pill elements on /dashboard/sources');
+      throw new Error('no rendered .pill elements on /dashboard/tools');
     }
     const btn = page.locator('.btn.primary').first();
     if ((await btn.count()) === 0) {
-      throw new Error('no rendered .btn.primary on /dashboard/sources');
+      throw new Error('no rendered .btn.primary on /dashboard/tools');
     }
     for (const theme of ['', 'light']) {
       await page.evaluate((t) => {
@@ -97,7 +88,15 @@ test.describe('computed a11y cases (migrated)', () => {
       }, theme);
       for (let i = 0; i < count; i++) {
         const fg = await pills.nth(i).evaluate((n) => getComputedStyle(n).color);
-        const bg = await effectiveBg(page, `.pill >> nth=${i}`);
+        const bg = await pills.nth(i).evaluate((n) => {
+          let el: HTMLElement | null = n;
+          while (el) {
+            const c = getComputedStyle(el).backgroundColor;
+            if (c && c !== 'rgba(0, 0, 0, 0)' && c !== 'transparent') return c;
+            el = el.parentElement;
+          }
+          return 'rgb(255, 255, 255)';
+        });
         const ratio = (Math.max(luminance(fg), luminance(bg)) + 0.05)
           / (Math.min(luminance(fg), luminance(bg)) + 0.05);
         if (ratio < 4.5) {

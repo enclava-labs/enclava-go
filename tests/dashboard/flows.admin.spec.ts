@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import type { Page } from '@playwright/test';
 import {
-  BASE, MANAGER_EMAIL, MEMBER_EMAIL,
+  BASE, MANAGER_EMAIL, MEMBER_EMAIL, ADMIN_EMAIL, ADMIN_PASSWORD,
   MEMBER_PASSWORD, login, seedData, sessionCookies, SESSION_COOKIE,
   awaitTerminal,
 } from './fixtures';
@@ -51,7 +51,7 @@ test.describe('Access — API keys (flow 8)', () => {
     await expect(row).toBeVisible({ timeout: 15_000 });
     const revoke = row.locator('button[data-access-confirm="key-revoke"]');
     await revoke.click();
-    await row.locator('button[data-confirm]:not([disabled])').click();
+    await revoke.click();
     await expect(page.locator(`#access-api-keys tr:has-text("${keyName}")`)).toHaveCount(0, { timeout: 15_000 });
   });
 
@@ -70,7 +70,7 @@ test.describe('Access — API keys (flow 8)', () => {
       headers: {
         Cookie: `${SESSION_COOKIE}=${session!.value}`,
         'Content-Type': 'application/json',
-        'X-CSRF-Token': csrf ?? '',
+        'X-CSRF-Token': csrf?.value ?? '',
       },
       data: '{"name":"csrf-ok"}',
     });
@@ -93,12 +93,14 @@ test.describe('Access — API keys (flow 8)', () => {
       });
       expect(res, `${email} admin key write`).toEqual({ ok: false, status: 403 });
     }
+    // The member/manager logins replaced this context's session — restore admin.
+    await login(page, ADMIN_EMAIL, ADMIN_PASSWORD);
   });
 
   test('a scoped key without platform.admin is denied on admin surfaces', async ({ request: req }) => {
     const minted = await req.post(`${BASE}/api/v1/admin/api-keys`, {
       headers: { Authorization: `Bearer ${process.env.E2E_ADMIN_API_KEY ?? ''}`, 'Content-Type': 'application/json' },
-      data: '{"name":"e2e-scoped","scopes":["runs.create"]}',
+      data: '{"name":"e2e-scoped","scopes":["chatbot"],"allowed_models":[],"allowed_endpoints":[],"allowed_chatbots":[],"allowed_agents":[],"allowed_extract_templates":[]}',
     });
     expect([200, 201]).toContain(minted.status());
     const body = await minted.json() as { secret_key?: string; key?: string };
@@ -116,17 +118,18 @@ test.describe('Access — API keys (flow 8)', () => {
 test.describe('admin shell + home cases', () => {
   test('theme toggle flips the rendered theme and persists via cookie', async ({ page }) => {
     await page.goto(`${BASE}/dashboard`);
-    const html = page.locator('html');
+    const body = page.locator('body');
     await page.click('button[aria-label="User menu"]');
     await page.click('button[data-action="theme"]');
-    const first = await html.getAttribute('class');
+    const first = await body.getAttribute('class');
+    await page.keyboard.press('Escape'); // theme click detaches the popover
     await page.click('button[aria-label="User menu"]');
     await page.click('button[data-action="theme"]');
-    const second = await html.getAttribute('class');
+    const second = await body.getAttribute('class');
     expect(first).not.toBe(second);
     // The server reads enclava_theme on the next render — reload keeps it.
     await page.reload();
-    expect(await html.getAttribute('class')).toBe(second);
+    expect(await body.getAttribute('class')).toBe(second);
   });
 
   test('admin home renders KPIs, running section and conf-card with real counts', async ({ page }) => {
@@ -154,9 +157,13 @@ test.describe('admin shell + home cases', () => {
 test.describe('admin error surfaces', () => {
   test('rejected write renders a sticky toast with no fix link', async ({ page }) => {
     await page.goto(`${BASE}/dashboard`);
+    // api() toasts only on 403 — a CSRF-mismatched session write is the
+    // genuine denied-write path through the client surface (403 → sticky
+    // error toast, and 403 copy carries no fix link).
     await page.evaluate(async () => {
+      document.cookie = 'enclava_csrf=bogus;path=/;SameSite=Lax';
       try {
-        await window.Enclava.api('POST', '/api/v1/admin/api-keys', { name: '' });
+        await window.Enclava.api('POST', '/api/v1/admin/api-keys', { name: 'probe' });
       } catch { /* rejection expected */ }
     });
     const toast = page.locator('#toast.show.error');

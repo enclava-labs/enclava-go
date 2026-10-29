@@ -56,18 +56,24 @@ function requirePrereqs() {
 }
 
 async function login(page: Page, email = ADMIN_EMAIL, password = ADMIN_PASSWORD) {
+  await page.context().clearCookies();
   await page.goto(`${BASE}/dashboard/login`);
   await page.fill('input[name="email"]', email);
   await page.fill('input[name="password"]', password);
   await page.click('button[type="submit"]');
   await page.waitForURL('**/dashboard');
+  // The app revokes a user's older session on a new login — persist the
+  // fresh one so the project's stored state never goes stale mid-file.
+  if (email === ADMIN_EMAIL) await page.context().storageState({ path: 'tests/dashboard/.auth/admin.json' });
 }
 
 async function api(request: APIRequestContext, page: Page, method: string, path: string, body?: unknown) {
   const csrf = (await page.context().cookies()).find((c) => c.name === 'enclava_csrf');
+  const sess = (await page.context().cookies()).find((c) => c.name === 'enclava_session');
   return request.fetch(`${BASE}${path}`, {
     method,
     headers: {
+      Cookie: sess ? `enclava_session=${sess.value}` : '',
       'X-CSRF-Token': csrf ? csrf.value : '',
       'Content-Type': 'application/json',
     },
@@ -80,8 +86,9 @@ async function jsonField(res: { ok(): boolean; status(): number; json(): Promise
     throw new Error(`${what} failed (${res.status()}): ${await res.text()} — seed prerequisite unmet`);
   }
   const payload: unknown = await res.json();
-  if (typeof payload === 'object' && payload !== null && 'id' in payload && typeof payload.id === 'string') {
-    return payload.id;
+  if (typeof payload === 'object' && payload !== null) {
+    const id = (payload as Record<string, unknown>).id ?? (payload as Record<string, unknown>).ID;
+    if (typeof id === 'string') return id;
   }
   throw new Error(`${what} carried no id — contract drift: ${JSON.stringify(payload).slice(0, 200)}`);
 }
@@ -216,12 +223,17 @@ async function submitAndAwaitFailure(page: Page, text: string) {
   await page.click('[data-action="chat:send"]');
   await page.waitForURL(/\/dashboard\/chat\/[^/]+$/);
   await expect
-    .poll(() => page.locator('.thread-body .runline:not(.muted)').count(), {
+    .poll(async () => {
+      const live = await page.locator('.thread-body .runline:not(.muted)').count();
+      if (live > 0) return 'running';
+      const muted = await page.locator('.thread-body .runline.muted').count();
+      return muted > 0 ? 'done' : 'waiting';
+    }, {
       timeout: 90_000,
       interval: 1_000,
       message: 'agent run never reached a terminal render — the deployment needs a running job worker for the 202→worker-failure flow',
     })
-    .toBe(0);
+    .toBe('done');
 }
 
 // ── (1) drawer focus trap ────────────────────────────────────────────────
@@ -258,10 +270,10 @@ test('(1) drawer traps Tab, cycles last→first, never releases focus to the pag
   await page.keyboard.press('Tab');
   await page.keyboard.up('Shift');
   await expect.poll(() =>
-    page.evaluate((sel, idx) => {
+    page.evaluate(({ sel, idx }) => {
       const els = Array.from(document.querySelectorAll<HTMLElement>(sel));
       return document.activeElement === els[idx];
-    }, firstSel, n - 1),
+    }, { sel: firstSel, idx: n - 1 }),
   ).toBe(true);
   // And a longer walk never escapes the dialog.
   for (let i = 0; i < Math.max(12, n); i++) {
@@ -396,9 +408,10 @@ test('(4b) extract worker failure surfaces the same capability-filtered fix on t
     await page.setInputFiles('[data-extract-file]', {
       name: fileName,
       mimeType: 'text/plain',
-      buffer: Buffer.from('a11y extract probe'),
+      buffer: Buffer.from(`a11y extract probe ${Date.now()}`),
     });
     await page.click('[data-action="extract:submit"]');
+    await page.goto(`${BASE}/dashboard/extract?tab=jobs`);
     // The accepted job lands in the live jobs table and reaches a terminal
     // render once the worker fails it (the htmx fragment polls every 3s).
     const failed = page.locator('#extract-jobs tr', { hasText: fileName }).first();
@@ -412,7 +425,7 @@ test('(4b) extract worker failure surfaces the same capability-filtered fix on t
   await expect(adminRow.locator('a[href="/dashboard/models/pricing"]')).toContainText('Set price', { timeout: 90_000 });
   // Capability-off (member): fallback sentence, no href.
   const memberRow = await submitExtractAs(seed.runnerUser.email, 'a11y-member.txt');
-  await expect(memberRow.locator('.subline')).toContainText('administrator', { timeout: 90_000 });
+  await expect(memberRow.locator('.subline.bad')).toContainText('administrator', { timeout: 90_000 });
   await expect(memberRow.locator('a[href]')).toHaveCount(0);
 });
 

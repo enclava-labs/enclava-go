@@ -21,11 +21,15 @@ async function sessionCookies(page: Page) {
 
 // Helper: login via the real local-credential form and return the session.
 async function login(page: Page) {
+  await page.context().clearCookies();
   await page.goto(`${BASE}/dashboard/login`);
   await page.fill('input[name="email"]', ADMIN_EMAIL);
   await page.fill('input[name="password"]', ADMIN_PASSWORD);
   await page.click('button[type="submit"]');
   await page.waitForURL('**/dashboard');
+  // The app revokes a user's older session on a new login — persist the
+  // fresh one so the project's stored state never goes stale mid-file.
+  await page.context().storageState({ path: 'tests/dashboard/.auth/admin.json' });
 }
 
 async function goToKeys(page: Page) {
@@ -58,11 +62,13 @@ test.describe('Health endpoints', () => {
 
 test.describe('Authentication', () => {
   test('GET /dashboard redirects to /dashboard/login when unauthenticated', async ({ page }) => {
+    await page.context().clearCookies();
     await page.goto(`${BASE}/dashboard`);
     await expect(page).toHaveURL(/\/dashboard\/login/);
   });
 
   test('login with a wrong password shows an accessible error', async ({ page }) => {
+    await page.context().clearCookies();
     await page.goto(`${BASE}/dashboard/login`);
     await page.fill('input[name="email"]', ADMIN_EMAIL);
     await page.fill('input[name="password"]', 'wrong-password');
@@ -81,6 +87,7 @@ test.describe('Authentication', () => {
   });
 
   test('login form submits with the keyboard only', async ({ page }) => {
+    await page.context().clearCookies();
     await page.goto(`${BASE}/dashboard/login`);
     await page.locator('input[name="email"]').fill(ADMIN_EMAIL);
     await page.locator('input[name="password"]').fill(ADMIN_PASSWORD);
@@ -91,29 +98,35 @@ test.describe('Authentication', () => {
   });
 
 
-  test('unauthenticated partial requests are denied', async ({ request }) => {
+  test('unauthenticated partial requests are denied', async ({ playwright }) => {
+    // A fresh context: the project's stored admin session must NOT be sent.
+    const anon = await playwright.request.newContext({ baseURL: BASE });
     for (const p of ['/dashboard/partials/home/running', '/dashboard/partials/access/api-keys', '/dashboard/partials/usage/overview']) {
-      const res = await request.get(`${BASE}${p}`, { maxRedirects: 0 });
+      const res = await anon.get(`${BASE}${p}`, { maxRedirects: 0 });
       // GET page partials redirect to login — assert the redirect, not copy.
       expect(res.status()).toBe(303);
-      expect(res.headers()['location']).toBe('/dashboard/login');
+      expect(res.headers()['location']).toContain('/dashboard/login');
     }
-    expect((await request.get(`${BASE}/api/v1/identities/users`)).status()).toBe(401);
+    expect((await anon.get(`${BASE}/api/v1/identities/users`)).status()).toBe(401);
+    await anon.dispose();
   });
 
-  test('cookie-authenticated logout requires the session CSRF token', async ({ page, request }) => {
+  test('cookie-authenticated logout requires the session CSRF token', async ({ page, playwright }) => {
     await login(page);
     const { session } = await sessionCookies(page);
-    const res = await request.post(`${BASE}/dashboard/logout`, {
+    const anon = await playwright.request.newContext({ baseURL: BASE });
+    const res = await anon.post(`${BASE}/dashboard/logout`, {
       headers: { Cookie: `${SESSION_COOKIE}=${session!.value}` },
     });
     // 401 (API-style denial) or 403 (CSRF denial) — never a successful logout.
     expect([401, 403]).toContain(res.status());
+    await anon.dispose();
   });
 
 
   test('OIDC provider link starts the real authorize flow', async ({ page }) => {
     test.skip(!OIDC_AUTHORIZE_SUBSTR, 'OIDC_AUTHORIZE_SUBSTR is required to exercise the configured IdP');
+    await page.context().clearCookies();
     await page.goto(`${BASE}/dashboard/login`);
     const link = page.locator('a[href*="/auth/oidc/"][href$="/start"], a[href*="/auth/oidc/"][href*="/start?"]').first();
     await expect(link).toBeVisible();
@@ -196,14 +209,16 @@ test.describe('Dashboard main page (authenticated)', () => {
   });
 
   test('theme toggle still works', async ({ page }) => {
-    const html = page.locator('html');
-    await expect(html).toHaveClass(/dark/);
+    // The theme cookie drives <body class="light">; dark is the default.
+    const body = page.locator('body');
+    const wasLight = await body.evaluate((b) => b.classList.contains('light'));
     await page.click('button[aria-label="User menu"]');
     await page.click('button[data-action="theme"]');
-    await expect(html).not.toHaveClass(/dark/);
+    await expect.poll(() => body.evaluate((b) => b.classList.contains('light'))).toBe(!wasLight);
+    await page.keyboard.press('Escape'); // the theme click detaches the popover
     await page.click('button[aria-label="User menu"]');
     await page.click('button[data-action="theme"]');
-    await expect(html).toHaveClass(/dark/);
+    await expect.poll(() => body.evaluate((b) => b.classList.contains('light'))).toBe(wasLight);
   });
 
   test('home running partial returns HTML with the session cookie', async ({ page, request }) => {
@@ -253,7 +268,8 @@ test.describe('API Keys management', () => {
 
   test('keys tab loads', async ({ page }) => {
     const content = await page.locator('#access-api-keys').textContent();
-    expect(content?.includes('active') || content?.includes('disabled') || content?.includes('No API keys')).toBeTruthy();
+    // Status column uses the glossary labels (active → "Ready").
+    expect(content?.includes('Ready') || content?.includes('Disabled') || content?.includes('No API keys')).toBeTruthy();
   });
 
   test('create API key end-to-end with one-time display', async ({ page }) => {
@@ -277,12 +293,13 @@ test.describe('API Keys management', () => {
     await page.click('button:has-text("Create key")');
     await expect(page.locator('#access-api-keys')).toContainText(keyName);
 
+    await page.keyboard.press('Escape'); // the key-result drawer is modal — close it before row actions
     const row = page.locator(`tr:has-text("${keyName}")`);
     await expect(row).toBeVisible();
-    const revoke = row.locator('button:has-text("Revoke")');
+    const revoke = row.locator('button[data-access-confirm="key-revoke"]');
     await revoke.click();
     // Two-step confirm: the button arms, the second click revokes.
-    await row.locator('button[data-confirm]:not([disabled])').click();
+    await revoke.click();
     await expect(page.locator(`tr:has-text("${keyName}")`)).not.toBeVisible();
   });
 

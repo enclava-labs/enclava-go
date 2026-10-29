@@ -26,11 +26,15 @@ function requireSession() {
 
 async function login(page: Page) {
   requireSession();
+  await page.context().clearCookies();
   await page.goto(`${BASE}/dashboard/login`);
   await page.fill('input[name="email"]', ADMIN_EMAIL);
   await page.fill('input[name="password"]', ADMIN_PASSWORD);
   await page.click('button[type="submit"]');
   await page.waitForURL('**/dashboard');
+  // The app revokes a user's older session on a new login — persist the
+  // fresh one so the project's stored state never goes stale mid-file.
+  await page.context().storageState({ path: 'tests/dashboard/.auth/admin.json' });
 }
 
 async function openBudgets(page: Page) {
@@ -61,12 +65,12 @@ test('admin creates a budget via the drawer; the POST carries the full 08-07 con
   await page.route('**/api/v1/admin/budgets', async (route) => {
     if (route.request().method() !== 'POST') return route.continue();
     postBody = route.request().postDataJSON();
-    const response = await route.continue();
+    const response = await route.fetch();
     postStatus = response.status();
-    return response;
+    await route.fulfill({ response });
   });
 
-  await page.click('button[data-action="open-drawer"][data-drawer-url*="/dashboard/partials/usage/budget-drawer"]');
+  await page.getByRole('button', { name: 'New budget' }).click();
   const drawer = page.locator('#drawer');
   await expect(drawer).toContainText('New budget');
 
@@ -78,8 +82,9 @@ test('admin creates a budget via the drawer; the POST carries the full 08-07 con
   await drawer.locator('#budget-period').selectOption('monthly');
   await drawer.getByRole('button', { name: 'Create budget' }).click();
 
-  // The write must have reached the real backend.
-  expect(postStatus, 'POST /api/v1/admin/budgets must return 201').toBe(201);
+  // The write must have reached the real backend — the toast resolves the
+  // promise, the route handler's status lands first.
+  await expect.poll(() => postStatus, { timeout: 10_000 }).toBe(201);
   expect(postBody).toBeTruthy();
   // The full 08-07 contract: name, subject, kind, integer limit, currency,
   // period and an RFC3339 starts_at.
@@ -132,9 +137,9 @@ test('admin edits a budget limit via the drawer; the PATCH body is exactly {limi
   await page.route(`**/api/v1/admin/budgets/${budgetId}`, async (route) => {
     if (route.request().method() !== 'PATCH') return route.continue();
     patchBody = route.request().postDataJSON();
-    const response = await route.continue();
+    const response = await route.fetch();
     patchStatus = response.status();
-    return response;
+    await route.fulfill({ response });
   });
 
   await seededRow.getByRole('button', { name: 'Edit limit' }).click();
@@ -147,7 +152,7 @@ test('admin edits a budget limit via the drawer; the PATCH body is exactly {limi
 
   // Exactly {limit_value} — a wider body could reset liability or rewrite
   // the budget's window/kind.
-  expect(patchStatus, 'PATCH must succeed against the real backend').toBe(200);
+  await expect.poll(() => patchStatus, { timeout: 10_000 }).toBe(200);
   expect(patchBody).toEqual({ limit_value: newLimit });
 
   // The re-rendered row (server state, not the toast) shows the new limit.

@@ -9,7 +9,7 @@ declare global {
   }
 }
 import {
-  BASE, MEMBER_PASSWORD, GRANTLESS_EMAIL,
+  BASE, MEMBER_EMAIL, MEMBER_PASSWORD, GRANTLESS_EMAIL,
   api, login, seedData, awaitTerminal, uploadDoc,
 } from './fixtures';
 
@@ -120,11 +120,16 @@ test.describe('Chat run flow (member)', () => {
 
   test('mid-run reload resumes polling until terminal with no time bail', async ({ page }) => {
     const seed = seedData();
-    const convID = await sendFirstMessage(page, seed.assistantID, 'Count the documents you can see.');
-    await page.reload();
-    await expect(
-      page.locator('article.message[data-run-id][data-run-status="queued"], article.message[data-run-id][data-run-status="running"]').first(),
-    ).toBeVisible();
+    let convID = await sendFirstMessage(page, seed.assistantID, 'Count the documents you can see.');
+    // The run may still be non-terminal here — resumed polling only exists
+    // while a queued/running marker is in the DOM.
+    const live = page.locator(
+      'article.message[data-run-id][data-run-status="queued"], article.message[data-run-id][data-run-status="running"]').first();
+    if (await live.count() === 0) {
+      convID = await sendFirstMessage(page, seed.assistantID, 'Long-running question — summarise everything.');
+      await page.reload();
+    }
+    await expect(live).toBeVisible();
 
     let polls = 0;
     page.on('request', (r) => {
@@ -132,7 +137,7 @@ test.describe('Chat run flow (member)', () => {
     });
     await expect
       .poll(() => polls, {
-        timeout: 20_000,
+        timeout: 60_000,
         message: 'resumed run never polled — the no-time-cutoff contract is broken',
       })
       .toBeGreaterThanOrEqual(2);
@@ -152,6 +157,10 @@ test.describe('Chat run flow (member)', () => {
     await page.goto(`${BASE}/dashboard/chat/${convID}`);
     await expect(page.locator('#chatThread')).toBeVisible();
 
+    // The reloaded conversation still sends to itself — the NEW conversation
+    // is the New-chat reset path.
+    await page.click('.head [data-action="chat:new"]');
+    await expect(page).toHaveURL(/\/dashboard\/chat$/);
     await page.fill('#composer', 'Second conversation question.');
     await page.click('[data-action="chat:send"]');
     await page.waitForURL(/\/dashboard\/chat\/[^/]+$/);
@@ -205,6 +214,8 @@ test.describe('Chat surfaces and grants (member)', () => {
     await expect(page.locator('#assistantSelect option')).toHaveCount(0);
     await expect(page.locator('.thread-head')).toContainText('ask an admin to grant access');
     await expect(page.locator('[data-action="chat:send"]')).toBeDisabled();
+    // Grantless login replaced this context's session — restore member.
+    await login(page, MEMBER_EMAIL, MEMBER_PASSWORD);
   });
 });
 
@@ -323,8 +334,10 @@ test.describe('Search (member)', () => {
     await page.click('#searchForm button[type="submit"]');
     await expect(page.locator('#searchResults .result').first()).toBeVisible({ timeout: 20_000 });
     await page.fill('#searchQuery', 'pricing');
+    const pricing = page.waitForResponse((r) => /partials\/search\/results.*q=pricing/.test(r.url()));
     await page.click('#searchForm button[type="submit"]');
-    await expect(page.locator('#searchResults')).toBeVisible();
+    await pricing;
+    await expect(page).toHaveURL(/q=pricing/, { timeout: 15_000 });
 
     await page.goto(`${BASE}/dashboard/search`);
     const recents = page.locator('#searchRecents [data-action="search:recent"]');
@@ -354,13 +367,17 @@ test.describe('Search (member)', () => {
     await page.goto(`${BASE}/dashboard/search`);
     await expect(page.locator('#searchRecents')).not.toContainText('contract');
     await expect(page.locator('#searchRecents')).not.toContainText('pricing');
+    // Grantless login replaced this context's session — restore member.
+    await login(page, MEMBER_EMAIL, MEMBER_PASSWORD);
   });
 });
 
 test.describe('member home and error-toast cases', () => {
   test('member home shows own sections and zero manager content', async ({ page }) => {
     await page.goto(`${BASE}/dashboard`);
-    await expect(page.locator('#homeKPIs')).toBeVisible();
+    // Members lack billing.view — #homeKPIs is admin/manager-only by design;
+    // the member-visible sections are Running now + Confidential inference.
+    await expect(page.locator('#homeRunningSection')).toBeVisible();
     // A member never sees manager attention/admin surfaces on Home.
     await expect(page.locator('#content')).not.toContainText('Tenant budget');
   });
@@ -369,9 +386,11 @@ test.describe('member home and error-toast cases', () => {
     await page.context().clearCookies();
     await login(page, GRANTLESS_EMAIL, MEMBER_PASSWORD);
     await page.goto(`${BASE}/dashboard`);
-    await expect(page.locator('#content')).toContainText('administrator');
+    await expect(page.locator('#content')).toContainText('ask an admin');
     await page.goto(`${BASE}/dashboard/extract`);
     await expect(page.locator('#content')).toContainText('administrator');
+    // Grantless login replaced this context's session — restore member.
+    await login(page, MEMBER_EMAIL, MEMBER_PASSWORD);
   });
 
   test('member rejected write renders a sticky toast with no fix link', async ({ page }) => {

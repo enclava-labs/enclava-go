@@ -270,9 +270,11 @@
     });
   });
 
-  document.addEventListener('htmx:afterSwap', (e) => {
-    const target = e.detail && e.detail.target;
-    bindCitations(target && target.querySelectorAll ? target : document);
+  document.addEventListener('htmx:afterSwap', () => {
+    // Always scan the document: the body-dispatched `refresh` event that
+    // re-renders the thread leaves e.detail.target as the triggered node,
+    // which can miss the swapped fragment's citation bubbles.
+    bindCitations(document);
   });
 
   // The shared evidence router (app.js) drops <760 evidence into the

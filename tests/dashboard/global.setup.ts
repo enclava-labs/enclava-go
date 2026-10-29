@@ -75,6 +75,16 @@ test('seed: stubs reachable, data seeded, three sessions minted', async ({ page 
   }
   const models = await fetch(`${llm}/models`);
   if (!models.ok) throw new Error(`inference stub GET /models → ${models.status}`);
+  // Idempotent across Playwright's per-invocation reruns: E2E_ADMIN_API_KEY
+  // is unique per bootstrap, so a seed.json stamped with the CURRENT key
+  // proves the whole object set below already exists on this schema.
+  if (fs.existsSync(SEED_FILE)) {
+    try {
+      const prev = JSON.parse(fs.readFileSync(SEED_FILE, 'utf8')) as Seed & { apiKey?: string };
+      if (prev.apiKey === (process.env.E2E_ADMIN_API_KEY || '')) return;
+    } catch { /* corrupt seed.json — reseed */ }
+  }
+
   const memberUser = await api<{ id: string }>('POST', '/api/v1/identities/users', {
     email: MEMBER_EMAIL, display_name: 'E2E Member',
     password: MEMBER_PASSWORD, role_ids: ['role_member'],
@@ -121,9 +131,9 @@ test('seed: stubs reachable, data seeded, three sessions minted', async ({ page 
       subject_type: 'model', subject_id: subjectID, capability,
       unit, rate_micros: rate, unit_quantity: 1_000_000, currency: 'USD',
     });
-  await price(CHAT_MODEL, 'chat', 'input', 2_500_000);
-  await price(CHAT_MODEL, 'chat', 'output', 5_000_000);
-  await price(CHAT_MODEL, 'chat', 'cached_input', 1_250_000);
+  await price(CHAT_MODEL, 'chat/completions', 'input', 2_500_000);
+  await price(CHAT_MODEL, 'chat/completions', 'output', 5_000_000);
+  await price(CHAT_MODEL, 'chat/completions', 'cached_input', 1_250_000);
   await price(EMBED_MODEL, 'embeddings', 'input', 500_000);
   await price(EMBED_MODEL, 'embeddings', 'cached_input', 250_000);
 
@@ -261,5 +271,5 @@ test('seed: stubs reachable, data seeded, three sessions minted', async ({ page 
     managerRoleID: 'role_knowledge_manager',
     memberUserID: memberUser.id,
   };
-  fs.writeFileSync(SEED_FILE, JSON.stringify(seed, null, 2));
+  fs.writeFileSync(SEED_FILE, JSON.stringify({ ...seed, apiKey: process.env.E2E_ADMIN_API_KEY || '' }, null, 2));
 });

@@ -27,7 +27,7 @@ declare global {
 // Sources wizard focus case, admin for the login + admin-surface cases.
 
 test.describe('overlays — drawer focus discipline (admin)', () => {
-  test.skip(({}, testInfo) => testInfo.project.name !== 'admin');
+  test.skip(({ storageState }) => !String(storageState).includes('admin.json'));
 
   test('drawer traps Tab, cycles last→first, never releases focus to the page', async ({ page }) => {
     await page.goto(`${BASE}/dashboard/sources?new=1`);
@@ -54,10 +54,10 @@ test.describe('overlays — drawer focus discipline (admin)', () => {
     await page.keyboard.press('Tab');
     await page.keyboard.up('Shift');
     await expect.poll(() =>
-      page.evaluate((sel, idx) => {
+      page.evaluate(({ sel, idx }) => {
         const els = Array.from(document.querySelectorAll<HTMLElement>(sel));
         return document.activeElement === els[idx];
-      }, firstSel, n - 1),
+      }, { sel: firstSel, idx: n - 1 }),
     ).toBe(true);
     for (let i = 0; i < Math.max(12, n); i++) {
       await page.keyboard.press('Tab');
@@ -102,7 +102,10 @@ test.describe('overlays — drawer focus discipline (admin)', () => {
     const drawer = page.locator('#drawer');
     await expect(drawer).toHaveClass(/open/, { timeout: 15_000 });
     const userMenu = page.locator('.user-menu');
-    await userMenu.click();
+    // The drawer backdrop covers the sidebar menu button (modal overlay) —
+    // a DOM click exercises the same data-action handler a pointer would hit
+    // once the popover supersedes the drawer.
+    await userMenu.evaluate((el) => el.click());
     const pop = page.locator('#pop');
     await expect(pop).toBeVisible();
     await expect(drawer).not.toHaveClass(/open/);
@@ -145,7 +148,7 @@ test.describe('overlays — drawer focus discipline (admin)', () => {
 });
 
 test.describe('page-surface keyboard flows (member)', () => {
-  test.skip(({}, testInfo) => testInfo.project.name !== 'member');
+  test.skip(({ storageState }) => !String(storageState).includes('member.json'));
 
   test('citation opens evidence by keyboard and close returns focus to it', async ({ page }) => {
     test.setTimeout(180_000);
@@ -229,7 +232,7 @@ test.describe('page-surface keyboard flows (member)', () => {
 });
 
 test.describe('wizard focus discipline (manager)', () => {
-  test.skip(({}, testInfo) => testInfo.project.name !== 'manager');
+  test.skip(({ storageState }) => !String(storageState).includes('manager.json'));
 
   test('Sources wizard Continue lands focus on the next step’s first control', async ({ page }) => {
     test.setTimeout(90_000);
@@ -243,15 +246,13 @@ test.describe('wizard focus discipline (manager)', () => {
     await tile.press('Enter');
     await expect(tile).toHaveAttribute('aria-pressed', 'true');
 
-    const cont = drawer.getByRole('button', { name: 'Continue' });
-    await expect(cont).toBeEnabled();
-    await cont.focus();
-    await cont.press('Enter');
     const step2First = drawer.locator('[data-provider-fields="github"]:not([hidden]) input').first();
     await expect(step2First).toBeFocused({ timeout: 5_000 });
 
+    const cont = drawer.getByRole('button', { name: 'Continue' });
     await drawer.locator('#github-owner').fill('acme');
     await drawer.locator('#github-repo').fill('repo');
+    await expect(cont).toBeEnabled();
     await cont.focus();
     await cont.press('Enter');
     await expect(drawer.locator('[data-step-pane="3"]')).toBeVisible();

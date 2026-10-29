@@ -11,5 +11,5 @@
 {{define "confirm-btn"}}<button class="btn danger" type="button" data-action="confirm" data-confirm="{{.Confirm}}">{{.Label}}</button>{{end}}
 {{define "drawer-shell"}}<div class="drawer-backdrop" id="backdrop" data-action="close-drawer"></div>
 <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="Panel"></aside>
-<div id="pop"></div>
+<div id="pop" class="pop" role="dialog" aria-modal="false" hidden></div>
 <div class="toast" id="toast" aria-live="polite"></div>{{end}}

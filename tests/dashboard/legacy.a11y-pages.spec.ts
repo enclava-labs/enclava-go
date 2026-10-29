@@ -27,19 +27,25 @@ function requireAdmin() {
 
 async function login(page: Page) {
   requireAdmin();
+  await page.context().clearCookies();
   await page.goto(`${BASE}/dashboard/login`);
   await page.fill('input[name="email"]', ADMIN_EMAIL);
   await page.fill('input[name="password"]', ADMIN_PASSWORD);
   await page.click('button[type="submit"]');
   await page.waitForURL('**/dashboard');
+  // The app revokes a user's older session on a new login — persist the
+  // fresh one so the project's stored state never goes stale mid-file.
+  await page.context().storageState({ path: 'tests/dashboard/.auth/admin.json' });
 }
 
 // Session-authenticated /api/v1 helper (same contract as chat-search.spec).
 async function api(request: APIRequestContext, page: Page, method: string, path: string, body?: unknown) {
   const csrf = (await page.context().cookies()).find((c) => c.name === 'enclava_csrf');
+  const sess = (await page.context().cookies()).find((c) => c.name === 'enclava_session');
   return request.fetch(`${BASE}${path}`, {
     method,
     headers: {
+      Cookie: sess ? `enclava_session=${sess.value}` : '',
       'X-CSRF-Token': csrf ? csrf.value : '',
       ...(body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
     },
@@ -111,7 +117,7 @@ async function seedChatFixtures(request: APIRequestContext, page: Page): Promise
     name: `a11y-e2e-${Date.now()}`,
     chunk_size: 200,
     chunk_overlap: 20,
-    acl: { public: true },
+    acl: {}, // owner-only: public ACLs inflate the member unscoped-search work bound
   });
   if (!colRes.ok()) {
     throw new Error(`POST /api/v1/rag/collections failed (${colRes.status()}): ${await colRes.text()}`);
@@ -178,8 +184,14 @@ async function sendFirstMessage(page: Page, assistantID: string, text: string): 
 
 async function awaitTerminal(page: Page, timeout = 90_000) {
   await expect
-    .poll(() => page.locator('.thread-body .runline').count(), { timeout, interval: 1_000 })
-    .toBe(0);
+    .poll(async () => {
+      const live = await page.locator('.thread-body .runline:not(.muted)').count();
+      if (live > 0) return 'running';
+      const answers = await page.locator('.thread-body article.message').count();
+      const muted = await page.locator('.thread-body .runline.muted').count();
+      return answers >= 2 || muted > 0 ? 'done' : 'waiting';
+    }, { timeout, interval: 1_000 })
+    .toBe('done');
 }
 
 // ── Cases ────────────────────────────────────────────────────────────────
@@ -254,7 +266,7 @@ test.describe('Page-surface keyboard flows (OA-38 / 11-05)', () => {
     // in the seeded admin fails loudly, never skips.
     const colRes = await api(request, page, 'POST', '/api/v1/rag/collections', {
       name: `a11y-wizard-${Date.now()}`,
-      acl: { public: true },
+      acl: {}, // owner-only: public ACLs inflate the member unscoped-search work bound
     });
     if (!colRes.ok()) {
       throw new Error(
@@ -273,19 +285,18 @@ test.describe('Page-surface keyboard flows (OA-38 / 11-05)', () => {
     await tile.press('Enter');
     await expect(tile).toHaveAttribute('aria-pressed', 'true');
 
-    // Continue is keyboard-clickable; step 2's first visible field takes focus.
-    const cont = drawer.getByRole('button', { name: 'Continue' });
-    await expect(cont).toBeEnabled();
-    await cont.focus();
-    await cont.press('Enter');
+    // Step 1→2 happens on the tile pick: focus lands on the Connect form's
+    // first control. Continue stays disabled until the required fields fill.
     const step2First = drawer.locator('[data-provider-fields="github"]:not([hidden]) input').first();
     await expect(step2First).toBeFocused({ timeout: 5000 });
 
+    const cont = drawer.getByRole('button', { name: 'Continue' });
     // Fill required step-2 fields and continue — focus lands in step 3
     // (GitHub access is informational, so the step's own Continue is the
     // reachable control inside the pane flow).
     await drawer.locator('#github-owner').fill('acme');
     await drawer.locator('#github-repo').fill('repo');
+    await expect(cont).toBeEnabled();
     await cont.focus();
     await cont.press('Enter');
     await expect(drawer.locator('[data-step-pane="3"]')).toBeVisible();
@@ -337,10 +348,17 @@ test.describe('Page-surface keyboard flows (OA-38 / 11-05)', () => {
   test('reduced-motion emulation strips decorative animation and transitions', async ({ page }) => {
     await page.emulateMedia({ reducedMotion: 'reduce' });
     await login(page);
+    // Seed a live run so the Running-now row actually renders its pulse —
+    // the stub holds 'Long-running' answers open ~20s.
+    const runSeed = await seedChatFixtures(request, page);
+    const runRes = await api(request, page, 'POST', '/api/v1/agent-runs', {
+      assistant_id: runSeed.assistantID,
+      input: 'Long-running question — summarise everything in the knowledge base.',
+    });
+    if (!runRes.ok() && runRes.status() !== 202) {
+      throw new Error(`run seed for the reduced-motion row failed (${runRes.status()}): ${await runRes.text()}`);
+    }
     await page.goto(`${BASE}/dashboard`);
-
-    // The running-fragment pulse and overlay transitions are the motion
-    // contract's named carriers — both must be animation/transition-free
     // under reduce, and must still be readable (the pill, not motion,
     // carries the state).
     const pulse = page.locator('.pulse').first();

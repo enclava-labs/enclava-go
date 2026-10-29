@@ -466,7 +466,7 @@ func stageReadableDoc(t *testing.T, db *postgres.DB, vector *readableSearchStore
 	if _, err := repo.UpsertObject(ctx, source.Object{
 		TenantID: tenant, ID: objectID, Kind: "document", NativeID: "native-" + objectID,
 		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: ownerID,
-		Audience: []string{ownerID, "*"},
+		Audience: []string{ownerID},
 	}); err != nil {
 		t.Fatal(err)
 	}

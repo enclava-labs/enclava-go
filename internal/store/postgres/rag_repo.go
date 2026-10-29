@@ -67,7 +67,29 @@ func (r *SourceRepo) UpdateConnection(ctx context.Context, c source.Connection) 
 }
 
 func (r *SourceRepo) DeleteConnection(ctx context.Context, tenantID, id string) error {
-	res, err := r.db.SQL.ExecContext(ctx,
+	tx, err := r.db.SQL.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("delete connection: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback-after-commit is a no-op
+	// Children first: grants → memberships → restricted refs → snapshots →
+	// objects/groups/identities → the connection itself (003_source FKs have
+	// no cascade).
+	steps := []string{
+		`DELETE FROM source_grants WHERE tenant_id = $1 AND object_id IN (SELECT id FROM source_objects WHERE tenant_id = $1 AND connection_id = $2)`,
+		`DELETE FROM source_group_memberships WHERE tenant_id = $1 AND group_id IN (SELECT id FROM source_groups WHERE tenant_id = $1 AND connection_id = $2)`,
+		`DELETE FROM source_restrictions WHERE tenant_id = $1 AND ((subject_type = 'connection' AND subject_id = $2) OR (subject_type = 'object' AND subject_id IN (SELECT id FROM source_objects WHERE tenant_id = $1 AND connection_id = $2)))`,
+		`DELETE FROM access_snapshots WHERE tenant_id = $1 AND connection_id = $2`,
+		`DELETE FROM source_objects WHERE tenant_id = $1 AND connection_id = $2`,
+		`DELETE FROM source_groups WHERE tenant_id = $1 AND connection_id = $2`,
+		`DELETE FROM source_identities WHERE tenant_id = $1 AND connection_id = $2`,
+	}
+	for _, q := range steps {
+		if _, err := tx.ExecContext(ctx, q, tenantID, id); err != nil {
+			return fmt.Errorf("delete connection: %w", err)
+		}
+	}
+	res, err := tx.ExecContext(ctx,
 		`DELETE FROM connections WHERE tenant_id = $1 AND id = $2`, tenantID, id)
 	if err != nil {
 		return fmt.Errorf("delete connection: %w", err)
@@ -75,7 +97,7 @@ func (r *SourceRepo) DeleteConnection(ctx context.Context, tenantID, id string) 
 	if n, _ := res.RowsAffected(); n == 0 {
 		return source.ErrDenied
 	}
-	return nil
+	return tx.Commit()
 }
 
 // ---------------------------------------------------------------------
@@ -704,9 +726,14 @@ func (r *RAGRepo) SaveParsedDocument(ctx context.Context, parserVersion string, 
 			if block.ParentID != "" {
 				parent = block.ParentID
 			}
+			// Block ids are content-hashes of the artifact — an identical
+			// payload parsed under another object yields the same id, and the
+			// retained row already carries the right locator (ids are
+			// content-determined), so duplicates are skipped, not errors.
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO blocks (tenant_id, id, parsed_document_id, ordinal, kind, parent_id, text, byte_start, byte_end, locator)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)`,
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+				ON CONFLICT (tenant_id, id) DO NOTHING`,
 				document.Ref.TenantID, block.ID, id, block.Ordinal, block.Kind, parent,
 				block.Text, block.ByteStart, block.ByteEnd, locator); err != nil {
 				return fmt.Errorf("insert parsed block: %w", err)

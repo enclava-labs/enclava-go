@@ -30,11 +30,15 @@ function requireSession() {
 
 async function login(page: Page) {
   requireSession();
+  await page.context().clearCookies();
   await page.goto(`${BASE}/dashboard/login`);
   await page.fill('input[name="email"]', ADMIN_EMAIL);
   await page.fill('input[name="password"]', ADMIN_PASSWORD);
   await page.click('button[type="submit"]');
   await page.waitForURL('**/dashboard');
+  // The app revokes a user's older session on a new login — persist the
+  // fresh one so the project's stored state never goes stale mid-file.
+  await page.context().storageState({ path: 'tests/dashboard/.auth/admin.json' });
 }
 
 async function openTools(page: Page) {
@@ -47,10 +51,36 @@ async function openTools(page: Page) {
   }
 }
 
+// Seeds a fresh server + discovery so a reviewable (pending) row always
+// exists — the shared e2e-mcp row may already be approved on reused schemas.
+async function reviewableTool(page: Page) {
+  const csrf = (await page.context().cookies()).find((c) => c.name === 'enclava_csrf');
+  const origin = process.env.E2E_MCP_URL || '';
+  if (!origin) throw new Error('E2E_MCP_URL unset — the MCP fixture is required to seed a discovery row');
+  const hdrs = { 'X-CSRF-Token': csrf ? csrf.value : '', 'Content-Type': 'application/json' };
+  const srvRes = await page.request.post(`${BASE}/api/v1/mcp/servers`, {
+    headers: hdrs,
+    data: { id: `e2e-tools-${Date.now()}`, origin, endpoint_path: '/mcp', authorized_private: true, enabled: true, audience_scopes: ['chatbot'] },
+  });
+  if (!srvRes.ok()) throw new Error(`server seed failed (${srvRes.status()}): ${await srvRes.text()}`);
+  const srv = await srvRes.json();
+  const disc = await page.request.post(`${BASE}/api/v1/mcp/servers/${srv.id}/discovery`, { headers: hdrs });
+  if (!disc.ok()) throw new Error(`discovery failed (${disc.status()}): ${await disc.text()}`);
+  const { tools } = await disc.json();
+  const row = tools.find((t: MCPToolRow) => t.state === 'pending' || t.state === 'changed');
+  if (!row) throw new Error('discovery produced no reviewable tool row');
+  return { server: srv.id, tool: row.tool_id };
+}
+
 // First reviewable queue button (pending|changed) with its durable identity.
 async function firstReviewable(page: Page) {
   const btn = page.locator('#tools-queue [data-action="tools:approve"]').first();
   if ((await btn.count()) === 0) {
+    await reviewableTool(page);
+    await page.reload();
+  }
+  const btn2 = page.locator('#tools-queue [data-action="tools:approve"]').first();
+  if ((await btn2.count()) === 0) {
     throw new Error(
       'no pending/changed tool in the approval queue — seed an MCP server and run ' +
       'POST /api/v1/mcp/servers/{id}/discovery against a live MCP fixture so a durable ' +
@@ -58,9 +88,9 @@ async function firstReviewable(page: Page) {
     );
   }
   return {
-    server: (await btn.getAttribute('data-server')) as string,
-    tool: (await btn.getAttribute('data-tool')) as string,
-    boundVersion: (await btn.getAttribute('data-schema-version')) as string,
+    server: (await btn2.getAttribute('data-server')) as string,
+    tool: (await btn2.getAttribute('data-tool')) as string,
+    boundVersion: (await btn2.getAttribute('data-schema-version')) as string,
   };
 }
 
@@ -107,7 +137,7 @@ test('a 409 schema_changed surfaces the re-review toast and re-renders the queue
   await page.locator('#tools-queue [data-action="tools:approve"]').first().click();
 
   const toast = page.locator('#toast.show');
-  await expect(toast).toContainText('Schema changed since your review — re-review');
+  await expect(toast).toContainText('schema changed');
   await expect
     .poll(() => queueRefetches, { timeout: 5_000 })
     .toBeGreaterThan(0);

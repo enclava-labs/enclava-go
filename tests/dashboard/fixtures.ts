@@ -114,12 +114,22 @@ export async function sessionApi(page: Page, method: string, url: string, body?:
   return res;
 }
 
+// login performs a real form login, then persists the fresh session back to
+// the project's storage state: the app revokes a user's older session on a
+// new login (single active session), so a stale .auth/<role>.json would
+// poison every later context.
 export async function login(page: Page, email: string, password: string) {
+  await page.context().clearCookies();
   await page.goto(`${BASE}/dashboard/login`);
   await page.fill('input[name="email"]', email);
   await page.fill('input[name="password"]', password);
   await page.click('button[type="submit"]');
   await page.waitForURL('**/dashboard');
+  const file = email === ADMIN_EMAIL ? 'admin.json'
+    : email === MANAGER_EMAIL ? 'manager.json'
+    : email === MEMBER_EMAIL ? 'member.json'
+    : '';
+  if (file) await page.context().storageState({ path: `${AUTH_DIR}/${file}` });
 }
 
 // loginAndSaveState performs a real form login and persists the storage
@@ -142,12 +152,19 @@ export async function sessionCookies(page: Page) {
 // awaitTerminal polls the chat thread until every live runline is gone —
 // the terminal render carries Stopped/failed vocabulary, never a timeout.
 export async function awaitTerminal(page: Page, timeout = 60_000) {
+  // Terminal = no live runline AND the thread settled past the send echo:
+  // either the assistant's answer article rendered, or a muted terminal
+  // runline did. The runline alone races the first render (count 0 while the
+  // run is still queued client-side).
   await expect
-    .poll(() => page.locator('.thread-body .runline:not(.muted)').count(), {
-      timeout,
-      intervals: [500],
-    })
-    .toBe(0);
+    .poll(async () => {
+      const live = await page.locator('.thread-body .runline:not(.muted)').count();
+      if (live > 0) return 'running';
+      const answers = await page.locator('.thread-body article.message').count();
+      const muted = await page.locator('.thread-body .runline.muted').count();
+      return answers >= 2 || muted > 0 ? 'done' : 'waiting';
+    }, { timeout, intervals: [500] })
+    .toBe('done');
 }
 
 export async function fieldString(res: { json(): Promise<unknown> }, field: string): Promise<string> {

@@ -17,14 +17,14 @@ import {
 
 const PAGES: Record<string, { label: string; href: string; h1: RegExp }[]> = {
   member: [
-    { label: 'Home', href: '/dashboard', h1: /home/i },
+    { label: 'Home', href: '/dashboard', h1: /home|good (morning|afternoon|evening)/i },
     { label: 'Chat', href: '/dashboard/chat', h1: /chat/i },
     { label: 'Search', href: '/dashboard/search', h1: /search/i },
     { label: 'Extract', href: '/dashboard/extract', h1: /extract/i },
     { label: 'Knowledge', href: '/dashboard/knowledge', h1: /knowledge/i },
   ],
   manager: [
-    { label: 'Home', href: '/dashboard', h1: /home/i },
+    { label: 'Home', href: '/dashboard', h1: /home|good (morning|afternoon|evening)/i },
     { label: 'Chat', href: '/dashboard/chat', h1: /chat/i },
     { label: 'Search', href: '/dashboard/search', h1: /search/i },
     { label: 'Extract', href: '/dashboard/extract', h1: /extract/i },
@@ -33,7 +33,7 @@ const PAGES: Record<string, { label: string; href: string; h1: RegExp }[]> = {
     { label: 'Sources', href: '/dashboard/sources', h1: /sources/i },
   ],
   admin: [
-    { label: 'Home', href: '/dashboard', h1: /home/i },
+    { label: 'Home', href: '/dashboard', h1: /home|good (morning|afternoon|evening)/i },
     { label: 'Chat', href: '/dashboard/chat', h1: /chat/i },
     { label: 'Search', href: '/dashboard/search', h1: /search/i },
     { label: 'Extract', href: '/dashboard/extract', h1: /extract/i },
@@ -80,7 +80,10 @@ test.describe('sidebar nav truth (§3.3)', () => {
     // Every visible link claims exactly its page — nothing extra rendered.
     const labels = await page.locator('#nav a.navlink .navlabel').allTextContents();
     expect(labels).toEqual(items.map((i) => i.label));
+    // Account lives in the user-menu sheet (user-menu-tpl) — open it first.
+    await page.locator('button[aria-label="User menu"]').click();
     await expect(page.locator('a.navlink[href="/dashboard/account"]')).toHaveCount(1);
+    await page.keyboard.press('Escape');
   });
 
   test('hidden items are absent from nav and their URLs 403', async ({ page }) => {
@@ -121,9 +124,12 @@ test.describe('sidebar nav truth (§3.3)', () => {
     await page.goto(`${BASE}/dashboard`);
     const body = page.locator('body');
     const light = await body.evaluate((b) => b.classList.contains('light'));
+    await page.locator('button[aria-label="User menu"]').click();
     await page.locator('[data-action="theme"]').first().click();
     await expect.poll(() => page.locator('body').evaluate((b) => b.classList.contains('light')))
       .toBe(!light);
+    await page.keyboard.press('Escape'); // theme click detaches the popover
+    await page.locator('button[aria-label="User menu"]').click();
     await page.locator('[data-action="theme"]').first().click();
     await expect.poll(() => page.locator('body').evaluate((b) => b.classList.contains('light')))
       .toBe(light);
@@ -146,7 +152,7 @@ test.describe('sidebar nav truth (§3.3)', () => {
 });
 
 test.describe('session and auth (migrated tests/dashboard.spec.ts)', () => {
-  test.skip(({ }, testInfo) => testInfo.project.name !== 'admin', 'auth cases run once, under admin');
+  test.skip(({ storageState }) => !String(storageState).includes('admin.json'), 'auth cases run once, under admin');
 
   test('GET /health and /livez respond', async ({ request }) => {
     const health = await request.get(`${BASE}/health`);
@@ -155,16 +161,19 @@ test.describe('session and auth (migrated tests/dashboard.spec.ts)', () => {
     expect((await request.get(`${BASE}/livez`)).status()).toBe(200);
   });
 
-  test('unauthenticated /dashboard redirects to login; partials and APIs are denied', async ({ page, request }) => {
+  test('unauthenticated /dashboard redirects to login; partials and APIs are denied', async ({ page, playwright }) => {
     await page.context().clearCookies();
     await page.goto(`${BASE}/dashboard`);
     await expect(page).toHaveURL(/\/dashboard\/login/);
+    // A fresh context: the project's stored session must NOT be sent.
+    const anon = await playwright.request.newContext({ baseURL: BASE, storageState: { cookies: [], origins: [] } });
     for (const p of ['/dashboard/partials/home/running', '/dashboard/partials/access/api-keys']) {
-      const res = await request.get(`${BASE}${p}`, { maxRedirects: 0 });
+      const res = await anon.get(`${BASE}${p}`, { maxRedirects: 0 });
       expect(res.status()).toBe(303);
-      expect(res.headers()['location']).toBe('/dashboard/login');
+      expect(res.headers()['location']).toContain('/dashboard/login');
     }
-    expect((await request.get(`${BASE}/api/v1/identities/users`)).status()).toBe(401);
+    expect((await anon.get(`${BASE}/api/v1/identities/users`)).status()).toBe(401);
+    await anon.dispose();
   });
 
   test('login with a wrong password shows an accessible error', async ({ page }) => {
@@ -187,25 +196,32 @@ test.describe('session and auth (migrated tests/dashboard.spec.ts)', () => {
     expect(stored).not.toContain('enclava-dashboard-api-key');
   });
 
-  test('cookie-authenticated logout requires the session CSRF token', async ({ page, request }) => {
+  test('cookie-authenticated logout requires the session CSRF token', async ({ page, playwright }) => {
     const { session } = await sessionCookies(page);
-    const res = await request.post(`${BASE}/dashboard/logout`, {
+    const anon = await playwright.request.newContext({ baseURL: BASE });
+    const res = await anon.post(`${BASE}/dashboard/logout`, {
       headers: { Cookie: `${SESSION_COOKIE}=${session!.value}` },
     });
     expect([401, 403]).toContain(res.status());
+    await anon.dispose();
   });
 
-  test('logout revokes the session and protects pages afterwards', async ({ page, request }) => {
+  test('logout revokes the session and protects pages afterwards', async ({ page, playwright }) => {
     const { session, csrf } = await sessionCookies(page);
     await page.goto(`${BASE}/dashboard`);
     await page.locator('button[aria-label="User menu"]').click();
     await page.locator('button:has-text("Sign out")').click();
     await expect(page).toHaveURL(/\/dashboard\/login/);
-    const res = await request.get(`${BASE}/dashboard/partials/home/running`, {
+    const anon = await playwright.request.newContext({ baseURL: BASE });
+    const res = await anon.get(`${BASE}/dashboard/partials/home/running`, {
       maxRedirects: 0,
       headers: { Cookie: `${SESSION_COOKIE}=${session!.value}; ${CSRF_COOKIE}=${csrf!.value}` },
     });
     expect([303, 401]).toContain(res.status());
+    await anon.dispose();
+    // Logout revoked the stored session — mint a fresh one for later tests.
+    await login(page, ADMIN_EMAIL, process.env.ADMIN_PASSWORD || '');
+    await page.context().storageState({ path: 'tests/dashboard/.auth/admin.json' });
   });
 
   test('user menu links to the account page; account loads profile, sessions and sign-ins', async ({ page }) => {

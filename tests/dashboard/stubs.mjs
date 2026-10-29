@@ -94,6 +94,10 @@ async function inference(req, res) {
     const body = JSON.parse(await readBody(req) || '{}');
     const model = body.model || STUB_CHAT_MODEL;
     const messages = Array.isArray(body.messages) ? body.messages : [];
+    // "Long-running" user inputs hold the reply open so the suite can
+    // exercise mid-run reload/stop paths (the resumed-poll contract).
+    const slowUser = messages.some((m) => m && m.role === 'user' && typeof m.content === 'string' && m.content.includes('Long-running'));
+    if (slowUser) await new Promise((r) => setTimeout(r, 20_000));
     const hasToolResult = messages.some((m) => m && m.role === 'tool');
     const tools = Array.isArray(body.tools) ? body.tools : [];
     const echo = tools.find((t) => t && t.function && t.function.name === 'e2e_echo');

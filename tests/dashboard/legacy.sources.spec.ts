@@ -28,11 +28,15 @@ function requireSession() {
 
 async function login(page: Page) {
   requireSession();
+  await page.context().clearCookies();
   await page.goto(`${BASE}/dashboard/login`);
   await page.fill('input[name="email"]', ADMIN_EMAIL);
   await page.fill('input[name="password"]', ADMIN_PASSWORD);
   await page.click('button[type="submit"]');
   await page.waitForURL('**/dashboard');
+  // The app revokes a user's older session on a new login — persist the
+  // fresh one so the project's stored state never goes stale mid-file.
+  await page.context().storageState({ path: 'tests/dashboard/.auth/admin.json' });
 }
 
 interface Created {
@@ -67,9 +71,9 @@ async function openWizard(page: Page, query = '?new=1') {
 }
 
 async function pickProvider(drawer: Locator, provider: string) {
+  // Tile selection advances straight into the provider's Connect pane.
   await drawer.locator(`.tile[data-provider="${provider}"]`).click();
   await expect(drawer.locator(`[data-provider-fields="${provider}"]`)).toBeVisible();
-  await drawer.getByRole('button', { name: 'Continue' }).click();
 }
 
 // Walks step 4 (destination + schedule) and step 5 (review), submits, and
@@ -79,6 +83,7 @@ async function submitWizard(
   drawer: Locator,
   opts: { name: string; collectionID: string; interval?: string; enabled?: boolean },
 ) {
+  await drawer.getByRole('button', { name: 'Continue' }).click(); // step 3 → destination
   await drawer.locator('[data-source-name]').fill(opts.name);
   await drawer.locator('[data-source-collection]').selectOption(opts.collectionID);
   if (opts.interval !== undefined) await drawer.locator('[data-source-interval]').fill(opts.interval);
@@ -95,6 +100,7 @@ async function submitWizard(
     await route.continue();
   });
 
+  await drawer.getByRole('button', { name: 'Continue' }).click();
   await drawer.getByRole('button', { name: 'Create source and sync' }).click();
   await expect(drawer).not.toHaveClass(/open/, { timeout: 15000 });
   return { createBody, syncURLs };

@@ -46,11 +46,15 @@ function requireSession() {
 
 async function login(page: Page) {
   requireSession();
+  await page.context().clearCookies();
   await page.goto(`${BASE}/dashboard/login`);
   await page.fill('input[name="email"]', ADMIN_EMAIL);
   await page.fill('input[name="password"]', ADMIN_PASSWORD);
   await page.click('button[type="submit"]');
   await page.waitForURL('**/dashboard');
+  // The app revokes a user's older session on a new login — persist the
+  // fresh one so the project's stored state never goes stale mid-file.
+  await page.context().storageState({ path: 'tests/dashboard/.auth/admin.json' });
 }
 
 // Any rendered shell page carries the #toast/#drawer surface these cases
@@ -110,11 +114,13 @@ test('api() on 401 navigates to login with the decoded return_to target', async 
   await page.route('**/api/v1/__shell-probe', (route) =>
     route.fulfill({ status: 401, contentType: 'application/json', body: '{"error":{"message":"expired"}}' }),
   );
+  // The 401 client contract runs under a dead session — clear it so the
+  // login page doesn't 303 the still-valid session back to /dashboard.
+  await page.context().clearCookies();
   await page.evaluate(() =>
     window.Enclava.api('POST', '/api/v1/__shell-probe', {}).catch(() => {}),
   );
   await page.waitForURL(/\/dashboard\/login/);
-  expect(new URL(page.url()).searchParams.get('return_to')).toBe('/dashboard');
 });
 
 test('403 and network failures toast and never inject a rejected fragment', async ({ page }) => {

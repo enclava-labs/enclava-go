@@ -1,4 +1,5 @@
 import { test, expect, Page, APIRequestContext } from '@playwright/test';
+import { seedData } from './fixtures';
 
 // home.spec.ts — per-role Home (OA-31) browser coverage: section composition
 // per capability (§6.2), the truthful /v1 API base, the zero-filled 30-point
@@ -22,11 +23,15 @@ const SESSION_COOKIE = 'enclava_session';
 const CSRF_COOKIE = 'enclava_csrf';
 
 async function login(page: Page, email = ADMIN_EMAIL, password = ADMIN_PASSWORD) {
+  await page.context().clearCookies();
   await page.goto(`${BASE}/dashboard/login`);
   await page.fill('input[name="email"]', email);
   await page.fill('input[name="password"]', password);
   await page.click('button[type="submit"]');
   await page.waitForURL('**/dashboard');
+  // The app revokes a user's older session on a new login — persist the
+  // fresh one so the project's stored state never goes stale mid-file.
+  if (email === ADMIN_EMAIL) await page.context().storageState({ path: 'tests/dashboard/.auth/admin.json' });
 }
 
 // api seeds through the real surface with the browser's session+CSRF pair.
@@ -51,6 +56,7 @@ async function seedText(page: Page, path: string, fileName: string, bytes: strin
   const cookies = await page.context().cookies();
   const csrf = cookies.find(c => c.name === CSRF_COOKIE);
   const form = new FormData();
+  form.append('template_id', seedData().extractTemplateID);
   form.append('file', new Blob([bytes], { type: 'text/plain' }), fileName);
   const res = await page.request.fetch(`${BASE}${path}`, {
     method: 'POST',
@@ -73,6 +79,7 @@ async function seededMember(page: Page, opts: {
     scopes: ['chatbot', 'rag', 'extract', 'models.list'],
     grants: {
       assistants: { mode: 'list', items: opts.assistantIDs },
+      extract_templates: { mode: 'list', items: [seedData().extractTemplateID] },
     },
   }).then(async role => {
     await api(page, 'POST', '/api/v1/identities/users', {
@@ -100,6 +107,7 @@ test.describe('Home /dashboard — admin', () => {
     await api(page, 'POST', '/api/v1/admin/budgets', {
       name: `e2e-budget-${Date.now()}`, subject_type: 'tenant', kind: 'amount',
       limit_value: 1, currency: 'USD', period: 'monthly',
+      starts_at: new Date().toISOString(),
     });
 
     await page.goto(`${BASE}/dashboard`);
@@ -223,14 +231,19 @@ test.describe('Home /dashboard — members (grant-shaped, D-25)', () => {
     const stamp = Date.now();
     const email = `e2e-home-grantless-${stamp}@example.com`;
     const password = 'member-pass-123';
-    // The default seeded Member role carries explicit empty mode:list
-    // grants (D-25) — invite with it and the picker must stay empty.
-    const roles = await api(page, 'GET', '/api/v1/identities/roles');
-    const memberRole = (roles.roles ?? roles).find?.((r: { name?: string }) =>
-      typeof r.name === 'string' && /^member$/i.test(r.name));
-    const roleIDs = memberRole ? [memberRole.id] : [];
+    // Grantless: a dedicated role whose mode:list grants are empty — the
+    // shared 'member' role carries real seeded grants now, so it can't
+    // stand in for the deny case.
+    const role = await api(page, 'POST', '/api/v1/identities/roles', {
+      name: `e2e-grantless-home-${stamp}`,
+      scopes: ['chatbot', 'rag'],
+      grants: {
+        assistants: { mode: 'list', items: [] },
+        models: { mode: 'list', items: [] },
+      },
+    });
     await api(page, 'POST', '/api/v1/identities/users', {
-      email, display_name: email, password, role_ids: roleIDs,
+      email, display_name: email, password, role_ids: [role.id],
     });
     const member = await page.context().browser()!.newContext().then(c => c.newPage());
     try {

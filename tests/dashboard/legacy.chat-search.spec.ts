@@ -25,20 +25,26 @@ function requireAdmin() {
 
 async function login(page: Page, email = ADMIN_EMAIL, password = ADMIN_PASSWORD) {
   requireAdmin();
+  await page.context().clearCookies();
   await page.goto(`${BASE}/dashboard/login`);
   await page.fill('input[name="email"]', email);
   await page.fill('input[name="password"]', password);
   await page.click('button[type="submit"]');
   await page.waitForURL('**/dashboard');
+  // The app revokes a user's older session on a new login — persist the
+  // fresh one so the project's stored state never goes stale mid-file.
+  if (email === ADMIN_EMAIL) await page.context().storageState({ path: 'tests/dashboard/.auth/admin.json' });
 }
 
 // Session-authenticated /api/v1 helper: cookies come from the browser context
 // and the CSRF cookie is echoed into X-CSRF-Token like app.js does.
 async function api(request: APIRequestContext, page: Page, method: string, path: string, body?: unknown) {
   const csrf = (await page.context().cookies()).find((c) => c.name === 'enclava_csrf');
+  const sess = (await page.context().cookies()).find((c) => c.name === 'enclava_session');
   const res = await request.fetch(`${BASE}${path}`, {
     method,
     headers: {
+      Cookie: sess ? `enclava_session=${sess.value}` : '',
       'X-CSRF-Token': csrf ? csrf.value : '',
       ...(body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
     },
@@ -126,7 +132,7 @@ async function seedChatFixtures(request: APIRequestContext, page: Page): Promise
     name: `chat-e2e-${Date.now()}`,
     chunk_size: 200,
     chunk_overlap: 20,
-    acl: { public: true },
+    acl: {}, // owner-only: public ACLs inflate the member unscoped-search work bound
   });
   if (!colRes.ok()) {
     throw new Error(`POST /api/v1/rag/collections failed (${colRes.status()}): ${await colRes.text()}`);
@@ -196,8 +202,14 @@ async function sendFirstMessage(page: Page, assistantID: string, text: string): 
 // Terminal is whatever the thread re-render shows once the runline is gone.
 async function awaitTerminal(page: Page, timeout = 90_000) {
   await expect
-    .poll(() => page.locator('.thread-body .runline').count(), { timeout, interval: 1_000 })
-    .toBe(0);
+    .poll(async () => {
+      const live = await page.locator('.thread-body .runline:not(.muted)').count();
+      if (live > 0) return 'running';
+      const answers = await page.locator('.thread-body article.message').count();
+      const muted = await page.locator('.thread-body .runline.muted').count();
+      return answers >= 2 || muted > 0 ? 'done' : 'waiting';
+    }, { timeout, interval: 1_000 })
+    .toBe('done');
 }
 
 test.describe('Chat run flow (OA-32)', () => {
@@ -260,7 +272,7 @@ test.describe('Chat run flow (OA-32)', () => {
     await login(page);
     const seed = await seedChatFixtures(request, page);
 
-    const convID = await sendFirstMessage(page, seed.assistantID, 'Count the documents you can see.');
+    const convID = await sendFirstMessage(page, seed.assistantID, 'Long-running question — summarise everything in the knowledge base.');
     // Reload mid-run: the server-rendered pending marker must resume polling.
     await page.reload();
     await expect(
@@ -376,19 +388,8 @@ test.describe('Chat surfaces and grants (OA-32)', () => {
       throw new Error(`member create failed (${userRes.status()}): ${await userRes.text()}`);
     }
 
-    // The member's deep link to the admin's conversation is the uniform 404.
-    await page.context().clearCookies();
-    await login(page, email, 'chat-member-pass');
-    await page.goto(`${BASE}/dashboard/chat/${adminConvID}`);
-    await expect(page.locator('.authwrap h1')).toHaveText('Page not found');
-
-    // Empty own history, only the granted assistant, none of the admin's rows.
-    await page.goto(`${BASE}/dashboard/chat`);
-    await expect(page.locator('#chatHistory .history-item')).toHaveCount(0);
-    await expect(page.locator('#assistantSelect option')).toHaveCount(1);
-    await expect(page.locator('#assistantSelect')).not.toBeDisabled();
-
-    // Grantless member: empty picker, grant-needed help, disabled Send.
+    // Grantless user seeded while the page still holds the ADMIN session —
+    // role/user writes are platform.admin APIs, not member calls.
     const gRole = await api(request, page, 'POST', '/api/v1/identities/roles', {
       name: `chat-grantless-${Date.now()}`,
       scopes: ['chatbot', 'rag'],
@@ -411,6 +412,20 @@ test.describe('Chat surfaces and grants (OA-32)', () => {
     if (!gUser.ok()) {
       throw new Error(`grantless member create failed (${gUser.status()}): ${await gUser.text()}`);
     }
+
+    // The member's deep link to the admin's conversation is the uniform 404.
+    await page.context().clearCookies();
+    await login(page, email, 'chat-member-pass');
+    await page.goto(`${BASE}/dashboard/chat/${adminConvID}`);
+    await expect(page.locator('.authwrap h1')).toHaveText('Page not found');
+
+    // Empty own history, only the granted assistant, none of the admin's rows.
+    await page.goto(`${BASE}/dashboard/chat`);
+    await expect(page.locator('#chatHistory .history-item')).toHaveCount(0);
+    await expect(page.locator('#assistantSelect option')).toHaveCount(1);
+    await expect(page.locator('#assistantSelect')).not.toBeDisabled();
+
+    // Grantless member: empty picker, grant-needed help, disabled Send.
     await page.context().clearCookies();
     await login(page, gEmail, 'grantless-pass');
     await page.goto(`${BASE}/dashboard/chat`);

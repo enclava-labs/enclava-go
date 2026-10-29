@@ -35,7 +35,7 @@ export default defineConfig({
     {
       name: 'manager',
       dependencies: ['setup'],
-      testMatch: ['nav.spec.ts', 'flows.manager.spec.ts', 'screenshots.spec.ts'],
+      testMatch: ['nav.spec.ts', 'flows.manager.spec.ts', 'keyboard.spec.ts', 'screenshots.spec.ts'],
       use: { storageState: 'tests/dashboard/.auth/manager.json' },
     },
     {

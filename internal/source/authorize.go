@@ -52,7 +52,7 @@ func (a *Authorizer) CanRead(ctx context.Context, p auth.Principal, obj Object, 
 		// Published audiences are explicit publisher-assigned Enclava
 		// audiences; upstream access loss arrives via object/connection
 		// status, handled above.
-		if contains(obj.Audience, p.ActorID) {
+		if contains(obj.Audience, p.ActorID) || contains(obj.Audience, "*") {
 			return nil
 		}
 		return ErrDenied

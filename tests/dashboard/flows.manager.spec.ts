@@ -8,7 +8,7 @@ declare global {
 }
 
 import {
-  BASE, MEMBER_EMAIL, MEMBER_PASSWORD, login, seedData, api,
+  BASE, MEMBER_EMAIL, MEMBER_PASSWORD, login, seedData, api, sessionApi,
 } from './fixtures';
 
 // flows.manager.spec.ts — knowledge-manager §9.2 flows 3–4 plus the
@@ -28,6 +28,21 @@ import {
 // and the chained first sync hits the stub for real — an errored submit
 // never counts.
 
+async function newWritableCollection(page: Page, seed: { embedModel: string }) {
+  // The wizard's destination select offers manager-owned collections only
+  // (collectionManageable) — seed collections are admin-owned, so tests
+  // mint a writable scratch collection through the manager session.
+  const res = await sessionApi(page, 'POST', '/api/v1/rag/collections', {
+    name: `e2e-wiz-${Date.now()}`,
+    embedding_model: seed.embedModel,
+    // Owner-only ACL — a public collection inflates every member's
+    // unscoped-search work bound (SearchWorkExceeded past ~20 readable).
+    acl: {},
+  });
+  if (!res.ok()) throw new Error(`wizard collection create failed: ${res.status()}`);
+  return (await res.json()) as { id: string };
+}
+
 async function openWizard(page: Page, query = '?new=1') {
   await page.goto(`${BASE}/dashboard/sources${query}`);
   const drawer = page.locator('#drawer');
@@ -36,20 +51,24 @@ async function openWizard(page: Page, query = '?new=1') {
   return drawer;
 }
 async function pickProvider(drawer: Locator, provider: string) {
+  // Tile selection advances straight into the provider's Connect pane.
   await drawer.locator(`.tile[data-provider="${provider}"]`).click();
-  await expect(drawer.locator(`[data-provider-fields="${provider}"]`)).toBeVisible();
-  await drawer.getByRole('button', { name: 'Continue' }).click();
+  await expect(drawer.locator(`[data-provider-fields="${provider}"]`)).toBeVisible({ timeout: 15_000 });
 }
 
 test.describe('Knowledge — collection documents (flow 3)', () => {
   test('upload, retry and delete a real document', async ({ page }) => {
     const seed = seedData();
     // A scratch collection so the seed set stays stable for search/chat.
-    const col = await api<{ id: string }>('POST', '/api/v1/rag/collections', {
+    // Create through the manager session — collectionManageable is
+    // owner-only, so the admin-key principal cannot upload into it.
+    const colRes = await sessionApi(page, 'POST', '/api/v1/rag/collections', {
       name: `e2e-scratch-${Date.now()}`,
       embedding_model: seed.embedModel,
-      acl: { public: true },
+      acl: {},
     });
+    expect(colRes.ok(), 'scratch collection create').toBeTruthy();
+    const col = await colRes.json() as { id: string };
     await page.goto(`${BASE}/dashboard/knowledge/${col.id}`);
     await expect(page.locator('h1')).toBeVisible();
 
@@ -93,7 +112,8 @@ test.describe('Sources — add-source wizard (flow 4)', () => {
     const seed = seedData();
     const connector = process.env.E2E_CONNECTOR_URL || '';
     if (!connector) throw new Error('E2E_CONNECTOR_URL unset — the credential fixture is missing');
-    const name = 'E2E GitHub source';
+    const name = `E2E GitHub source ${Date.now()}`;
+    const col = await newWritableCollection(page, seed);
 
     const drawer = await openWizard(page);
     await expect(drawer.getByRole('button', { name: 'Continue' })).toBeDisabled();
@@ -108,6 +128,7 @@ test.describe('Sources — add-source wizard (flow 4)', () => {
     await expect(drawer.locator('#cred-github option[value="CONNECTOR_GITHUB_E2E"]')).toHaveCount(1);
     await cred.fill('CONNECTOR_GITHUB_E2E');
     await expect(drawer.locator('[data-provider-access="github"]')).toContainText('collaborator');
+    await drawer.getByRole('button', { name: 'Continue' }).click();
     await drawer.getByRole('button', { name: 'Continue' }).click();
 
     const createBodies: Record<string, unknown>[] = [];
@@ -128,8 +149,9 @@ test.describe('Sources — add-source wizard (flow 4)', () => {
     });
 
     await drawer.locator('[data-source-name]').fill(name);
-    await drawer.locator('[data-source-collection]').selectOption(seed.collectionID);
+    await drawer.locator('[data-source-collection]').selectOption(col.id);
     await drawer.locator('[data-source-interval]').fill('30m');
+    await drawer.getByRole('button', { name: 'Continue' }).click();
     await drawer.getByRole('button', { name: 'Create source and sync' }).click();
     await expect(drawer).not.toHaveClass(/open/, { timeout: 15_000 });
 
@@ -139,7 +161,7 @@ test.describe('Sources — add-source wizard (flow 4)', () => {
     const body = createBodies[0];
     expect(body.type).toBe('github');
     expect(body.name).toBe(name);
-    expect(body.target_collection_id).toBe(seed.collectionID);
+    expect(body.target_collection_id).toBe(col.id);
     expect(body.is_enabled).toBe(true);
     expect(body.credential_ref).toBe('CONNECTOR_GITHUB_E2E');
     const config = body.config as Record<string, unknown>;
@@ -177,6 +199,9 @@ test.describe('Sources — add-source wizard (flow 4)', () => {
 
   test('Teams wizard keeps the team and channel subset in the payload', async ({ page }) => {
     const seed = seedData();
+    // Destination options are drawer-rendered — the writable collection must
+    // exist before the wizard opens.
+    const col = await newWritableCollection(page, seed);
     const drawer = await openWizard(page);
     await pickProvider(drawer, 'teams');
     await drawer.locator('#teams-tenant').fill('tenant-1');
@@ -186,8 +211,9 @@ test.describe('Sources — add-source wizard (flow 4)', () => {
     await drawer.locator('#teams-chats').fill('chat-9');
     await expect(drawer.locator('[data-provider-fields="teams"]')).toContainText('No Teams credentials configured');
     await drawer.locator('#teams-credential').fill('CONNECTOR_TEAMS_SPEC');
-    await drawer.getByRole('button', { name: 'Continue' }).click();
-    await drawer.getByRole('button', { name: 'Continue' }).click();
+    await drawer.getByRole('button', { name: 'Continue' }).click(); // → Access
+    await drawer.getByRole('button', { name: 'Continue' }).click(); // → Destination
+
 
     const createBodies: Record<string, unknown>[] = [];
     const syncURLs: string[] = [];
@@ -211,7 +237,8 @@ test.describe('Sources — add-source wizard (flow 4)', () => {
     });
 
     await drawer.locator('[data-source-name]').fill('Spec teams');
-    await drawer.locator('[data-source-collection]').selectOption(seed.collectionID);
+    await drawer.locator('[data-source-collection]').selectOption(col.id);
+    await drawer.getByRole('button', { name: 'Continue' }).click();
     await drawer.getByRole('button', { name: 'Create source and sync' }).click();
     await expect(drawer).not.toHaveClass(/open/, { timeout: 15_000 });
 
@@ -230,12 +257,13 @@ test.describe('Sources — add-source wizard (flow 4)', () => {
 
   test('?new=1&collection={id} presets the destination step', async ({ page }) => {
     const seed = seedData();
-    const drawer = await openWizard(page, `?new=1&collection=${seed.collectionID}`);
+    const col = await newWritableCollection(page, seed);
+    const drawer = await openWizard(page, `?new=1&collection=${col.id}`);
     await pickProvider(drawer, 'github');
     await drawer.locator('#github-owner').fill('e2e');
     await drawer.locator('#github-repo').fill('preset');
     await drawer.getByRole('button', { name: 'Continue' }).click();
-    await expect(drawer.locator('[data-source-collection]')).toHaveValue(seed.collectionID);
+    await expect(drawer.locator('[data-source-collection]')).toHaveValue(col.id);
   });
 
   test('?edit= opens the credential step; members never see it', async ({ page }) => {
@@ -287,15 +315,15 @@ test.describe('manager error surfaces', () => {
     await select.selectOption(seed.extractTemplateID);
     await page.setInputFiles('[data-extract-file]', {
       name: 'e2e-manager.txt',
-      mimeType: 'text/plain',
-      buffer: Buffer.from('manager extract probe'),
+      buffer: Buffer.from(`manager extract probe ${Date.now()}`),
     });
     await page.click('[data-action="extract:submit"]');
+    await page.goto(`${BASE}/dashboard/extract?tab=jobs`);
     // Accepted job fails at the worker's price reserve (the template's
     // model is deliberately unpriced) — capability-off copy, no href.
     const failed = page.locator('#extract-jobs tr', { hasText: 'e2e-manager.txt' }).first();
     await expect(failed.locator('.pill.bad')).toBeVisible({ timeout: 90_000 });
-    await expect(failed.locator('.subline')).toContainText('administrator');
+    await expect(failed.locator('.subline.bad')).toContainText('administrator');
     await expect(failed.locator('a[href]')).toHaveCount(0);
   });
 });

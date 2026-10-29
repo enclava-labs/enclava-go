@@ -26,11 +26,15 @@ function requireSession() {
 
 async function login(page: Page) {
   requireSession();
+  await page.context().clearCookies();
   await page.goto(`${BASE}/dashboard/login`);
   await page.fill('input[name="email"]', ADMIN_EMAIL);
   await page.fill('input[name="password"]', ADMIN_PASSWORD);
   await page.click('button[type="submit"]');
   await page.waitForURL('**/dashboard');
+  // The app revokes a user's older session on a new login — persist the
+  // fresh one so the project's stored state never goes stale mid-file.
+  await page.context().storageState({ path: 'tests/dashboard/.auth/admin.json' });
 }
 
 interface PricingBody {
@@ -88,10 +92,11 @@ test('Set price submits the admin pricing contract and the cell re-renders price
   // Price the row's missing units until none is left "Not priced" — the
   // whole-set display only shows the new rates once the endpoint set covers
   // every required unit, which is exactly what the matrix promises.
-  for (let i = 0; i < 3; i++) {
-    const setButton = row.locator('button[data-action="models:price"]').first();
-    if ((await setButton.count()) === 0) break;
-    const unit = (await setButton.getAttribute('data-unit')) as string;
+  // The row only flips to priced once the endpoint set covers EVERY required
+  // unit — until then the input cell still reads "Not priced", so the walk
+  // must address each unit's own Set price control by data-unit.
+  for (const [i, unit] of ['input', 'cached_input', 'output'].entries()) {
+    const setButton = row.locator(`button[data-action="models:price"][data-unit="${unit}"]`).first();
     await setButton.click();
     await page.fill('#models-price-rate', '2500000');
     await page.fill('#models-price-currency', 'usd');

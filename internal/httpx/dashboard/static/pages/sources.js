@@ -419,6 +419,9 @@
     switch (trigger.dataset.action) {
       case 'sources:provider':
         setProvider(trigger.dataset.provider);
+        // Selecting a provider is the step-1 answer — move straight into
+        // its Connect form.
+        applyStep(2);
         break;
       case 'sources:next': {
         var step = currentStep();

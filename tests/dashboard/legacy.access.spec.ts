@@ -23,11 +23,15 @@ test.skip(!BASE || !ADMIN_EMAIL || !ADMIN_PASSWORD,
 test.use({ baseURL: BASE });
 
 async function login(page: Page) {
+  await page.context().clearCookies();
   await page.goto('/dashboard/login');
   await page.fill('input[name="email"]', ADMIN_EMAIL);
   await page.fill('input[name="password"]', ADMIN_PASSWORD);
   await page.click('button[type="submit"]');
   await page.waitForURL('**/dashboard');
+  // The app revokes a user's older session on a new login — persist the
+  // fresh one so the project's stored state never goes stale mid-file.
+  await page.context().storageState({ path: 'tests/dashboard/.auth/admin.json' });
 }
 
 // api drives the same JSON surface the page module uses, with the browser
