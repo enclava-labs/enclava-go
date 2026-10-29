@@ -133,7 +133,10 @@ var uploadMIMEs = map[string]string{
 	".png": "image/png", ".txt": "text/plain", ".md": "text/markdown",
 	".markdown": "text/markdown", ".html": "text/html", ".htm": "text/html",
 	".csv": "text/csv", ".json": "application/json",
+	".jsonl": "application/json", ".ndjson": "application/json",
+	".tif": "image/tiff", ".tiff": "image/tiff",
 	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".epub": "application/epub+zip",
 }
 
 // SeedDefaults seeds the tenant's default templates (idempotent upserts).
