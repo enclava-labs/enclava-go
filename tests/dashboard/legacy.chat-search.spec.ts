@@ -628,19 +628,23 @@ test.describe('Search (OA-33)', () => {
     await expect(page.locator('#searchResults .result').first()).toBeVisible({ timeout: 15_000 });
 
     // Evidence drawer: shared #drawer at every width — no Search container.
-    const evBtn = page.locator('#searchResults [data-action="evidence:open"]').first();
+    // The row is the SEEDED one: setup's public collections match 'contract'
+    // too and outrank it once earlier specs add documents.
+    const row = page.locator('#searchResults .result', { hasText: seed.docA }).first();
+    await expect(row).toBeVisible({ timeout: 15_000 });
+    const evBtn = row.locator('[data-action="evidence:open"]').first();
     await expect(evBtn).toBeVisible();
     const evidenceID = await evBtn.getAttribute('data-evidence-id');
     if (!evidenceID) throw new Error('result row carried no data-evidence-id — the evidence persistence contract (08-08) is missing');
     await evBtn.click();
     const drawer = page.locator('#drawer .evidence-card');
     await expect(drawer).toBeVisible({ timeout: 15_000 });
-    await expect(drawer).toContainText('alpha-contract');
+    await expect(drawer).toContainText(seed.docA.replace(/\.txt$/, ''));
     await expect(drawer.locator('.quote')).toBeVisible();
     await drawer.locator('[data-action="evidence:close"]').click();
 
     // Ask about this: a real link carrying ONLY the evidence id.
-    const ask = page.locator('#searchResults a[data-action="search:ask-about"]').first();
+    const ask = row.locator('a[data-action="search:ask-about"]').first();
     const href = await ask.getAttribute('href');
     if (!href || !href.startsWith('/dashboard/chat?evidence=') || href.includes('contract')) {
       throw new Error(`ask-about link must carry only the evidence id, got ${href}`);
