@@ -18,7 +18,7 @@
       </thead>
       <tbody>
 {{range .Data.Rows}}        <tr>
-          <td data-label="Collection"><a class="btn ghost" href="/dashboard/knowledge/{{.Collection.ID}}"><b>{{.Collection.Name}}</b></a>{{if .Collection.Description}}<span class="subline">{{.Collection.Description}}</span>{{end}}</td>
+          <td data-label="Collection"><a href="/dashboard/knowledge/{{.Collection.ID}}"><b>{{.Collection.Name}}</b></a>{{if .Collection.Description}}<span class="subline">{{.Collection.Description}}</span>{{end}}</td>
           <td data-label="Documents">{{count .DocCount}}{{if .DocMore}}+{{end}}</td>
           <td data-label="Updated">{{relTime .LastUpdate}}</td>
 {{if $.Can.KnowledgeManage}}          <td data-label="Health">{{statusPill "collection" .Health}}</td>

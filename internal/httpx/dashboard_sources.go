@@ -116,9 +116,9 @@ func (a *App) handleDashboardPageSources(w http.ResponseWriter, r *http.Request)
 	anySyncing = anySyncing && len(rows) > 0 && anyRowSyncing(rows)
 	data := dashboardSourcesData{
 		Header: dashboardHeader{
-			Crumb: "Build",
+			Crumb: "Sources",
 			Title: "Sources",
-			Desc:  "First-party source sync into the knowledge base",
+			Desc:  "Connected content, synced with the right permissions.",
 			Actions: template.HTML(`<button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/sources/drawer">` +
 				string(dashboardIconPlus()) + `Add source</button>`),
 		},

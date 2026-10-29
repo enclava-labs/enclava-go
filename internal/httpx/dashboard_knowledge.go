@@ -136,7 +136,7 @@ func (a *App) knowledgeListView(w http.ResponseWriter, r *http.Request, p auth.P
 	}
 	data := knowledgeListData{
 		Header: dashboardHeader{
-			Crumb: "Build",
+			Crumb: "Knowledge",
 			Title: "Knowledge",
 			Desc:  "Collections of documents your assistants can search and cite.",
 		},
@@ -384,7 +384,7 @@ func knowledgeAccessLabel(c rag.Collection) string {
 		}
 	}
 	if len(c.Audience) > 0 {
-		return strconv.Itoa(len(c.Audience)) + " members"
+		return strconv.Itoa(len(c.Audience)) + " " + plural(len(c.Audience), "member", "members")
 	}
 	return "Owner only"
 }

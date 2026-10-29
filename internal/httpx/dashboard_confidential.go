@@ -130,14 +130,34 @@ func laterStamp(a, b *time.Time) *time.Time {
 	}
 }
 
-// endpointCardLabel humanizes protocol + host ("Tinfoil · enclave.example").
+// endpointCardLabel names protocol + host ("OpenAI-compatible · api.example",
+// "Tinfoil · enclave.example").
 func endpointCardLabel(e inference.Endpoint) string {
 	host := e.BaseOrigin
 	if u, err := url.Parse(e.BaseOrigin); err == nil && u.Host != "" {
 		host = u.Host
 	}
-	return dashboardHumanize(e.Protocol) + " · " + host
+	return endpointProtocolLabel(e.Protocol) + " · " + host
 }
+
+// endpointProtocolLabels names the protocols whose mechanical humanization
+// reads wrong; the rest (tinfoil, privatemode) humanize to their brand name.
+var endpointProtocolLabels = map[string]string{
+	"openai_compatible": "OpenAI-compatible",
+	"confidential_sdk":  "Confidential SDK",
+	"redpill":           "RedPill",
+}
+
+// endpointProtocolLabel is the one display name for an inference protocol —
+// card labels, the Models table and the endpoint drawer's choices.
+func endpointProtocolLabel(protocol string) string {
+	if label, ok := endpointProtocolLabels[protocol]; ok {
+		return label
+	}
+	return dashboardHumanize(protocol)
+}
+
+func init() { dashboardBaseFuncs["protocolLabel"] = endpointProtocolLabel }
 
 // confidentialSummary assembles the card state for the request's tenant.
 // Read-only by contract (B13): List + AttestationSnapshot only.

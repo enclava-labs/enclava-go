@@ -3,8 +3,8 @@
 // kinds with their fix links, member-scoped own-work attention, the
 // zero-filled sparkline asserted on seeded known daily values, per-currency
 // spend, the polling running fragment, explicit /dashboard registration
-// (no mux 301), the subtree designed-404 contract, the operation-filtered
-// extraction total and the truthful /v1 API base label.
+// (no mux 301), the subtree designed-404 contract and the operation-filtered
+// extraction total.
 package httpx
 
 import (
@@ -283,7 +283,7 @@ func TestDashboardHomeAttentionKindsAndFixLinks(t *testing.T) {
 		"failed processing", "/dashboard/knowledge/",
 		"sync failed", "/dashboard/sources",
 		"not verified", "/dashboard/models",
-		"cannot price", "/dashboard/models/pricing",
+		"requests that need them are refused", "/dashboard/models/pricing",
 		"Budget", "/dashboard/usage/budgets",
 		"changed on their server", "/dashboard/tools",
 	} {
@@ -365,18 +365,6 @@ func TestDashboardHomeExtractionTotalExcludesOtherOperations(t *testing.T) {
 	}
 	if strings.Contains(body, "Extract · ") || strings.Contains(body, "Sync") {
 		t.Fatalf("non-extraction job labels leaked into Recent extractions\n%s", body)
-	}
-}
-
-func TestDashboardHomeAPIBaseLabel(t *testing.T) {
-	f := newHomeFixture(t)
-	_, sess := homeUser(t, f, "home-base@example.com", []string{"chatbot"}, auth.ResourceGrants{}, "pw")
-	body := homeGet(t, f, "/dashboard", sess)
-	if !strings.Contains(body, "API base · /v1") {
-		t.Fatalf("greeting must carry the truthful /v1 API base\n%s", body)
-	}
-	if strings.Contains(body, "/api/v1") {
-		t.Fatalf("home must not label the API base /api/v1\n%s", body)
 	}
 }
 

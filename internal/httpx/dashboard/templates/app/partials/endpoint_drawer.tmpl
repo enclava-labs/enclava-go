@@ -28,11 +28,11 @@
     <div>
       <label class="label" for="mep-protocol">Protocol</label>
       <select class="field" id="mep-protocol" name="protocol">
-        <option value="tinfoil"{{if eq .Data.Endpoint.Protocol "tinfoil"}} selected{{end}}>tinfoil</option>
-        <option value="privatemode"{{if eq .Data.Endpoint.Protocol "privatemode"}} selected{{end}}>privatemode</option>
-        <option value="openai_compatible"{{if eq .Data.Endpoint.Protocol "openai_compatible"}} selected{{end}}>openai_compatible</option>
-        <option value="redpill"{{if eq .Data.Endpoint.Protocol "redpill"}} selected{{end}}>redpill</option>
-        <option value="confidential_sdk"{{if eq .Data.Endpoint.Protocol "confidential_sdk"}} selected{{end}}>confidential_sdk</option>
+        <option value="tinfoil"{{if eq .Data.Endpoint.Protocol "tinfoil"}} selected{{end}}>{{protocolLabel "tinfoil"}}</option>
+        <option value="privatemode"{{if eq .Data.Endpoint.Protocol "privatemode"}} selected{{end}}>{{protocolLabel "privatemode"}}</option>
+        <option value="openai_compatible"{{if eq .Data.Endpoint.Protocol "openai_compatible"}} selected{{end}}>{{protocolLabel "openai_compatible"}}</option>
+        <option value="redpill"{{if eq .Data.Endpoint.Protocol "redpill"}} selected{{end}}>{{protocolLabel "redpill"}}</option>
+        <option value="confidential_sdk"{{if eq .Data.Endpoint.Protocol "confidential_sdk"}} selected{{end}}>{{protocolLabel "confidential_sdk"}}</option>
       </select>
     </div>
     <div>

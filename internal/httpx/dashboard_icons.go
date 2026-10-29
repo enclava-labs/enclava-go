@@ -1,9 +1,13 @@
 // dashboard_icons.go — the 45 inline-SVG icon path bodies ported verbatim
-// from docs/ux-proposals/data.js. Colors/sizing come from CSS (stroke uses
-// currentColor); unknown names render the loud "alert" glyph, never blank.
+// from docs/ux-proposals/data.js. Color comes from CSS (stroke uses
+// currentColor), size from the width/height attributes icon() emits; unknown
+// names render the loud "alert" glyph, never blank.
 package httpx
 
-import "html/template"
+import (
+	"html/template"
+	"strconv"
+)
 
 var dashboardIconPaths = map[string]string{
 	"home":         `<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-6h4v6"/>`,
@@ -53,12 +57,19 @@ var dashboardIconPaths = map[string]string{
 	"more":         `<circle cx="5" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.6" fill="currentColor" stroke="none"/>`,
 }
 
-// icon renders the named icon as an inline decorative SVG; unknown names fall
-// back to the alert glyph (loud failure, T-07-02-02). Class/size via CSS.
-func icon(name string) template.HTML {
+// icon renders the named icon as an inline decorative SVG at size px (default
+// 16, as in the option-a mockup's icon(name, size = 16)); unknown names fall
+// back to the alert glyph (loud failure, T-07-02-02). The width/height
+// attributes are what keep an icon from stretching to its container.
+func icon(name string, size ...int) template.HTML {
 	body, ok := dashboardIconPaths[name]
 	if !ok {
 		body = dashboardIconPaths["alert"]
 	}
-	return template.HTML(`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">` + body + `</svg>`)
+	px := 16
+	if len(size) > 0 && size[0] > 0 {
+		px = size[0]
+	}
+	dim := strconv.Itoa(px)
+	return template.HTML(`<svg width="` + dim + `" height="` + dim + `" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">` + body + `</svg>`)
 }

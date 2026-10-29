@@ -23,7 +23,7 @@
         <tbody>
           {{range .Data.Endpoints}}
           <tr>
-            <td data-label="Endpoint"><b>{{.ID}}</b><span class="subline">{{.Protocol}}{{if .Origin}} · {{.Origin}}{{end}}</span>{{if not .Enabled}}<span class="subline">Disabled</span>{{end}}</td>
+            <td data-label="Endpoint"><b>{{.ID}}</b><span class="subline">{{protocolLabel .Protocol}}{{if .Origin}} · {{.Origin}}{{end}}</span>{{if not .Enabled}}<span class="subline">Disabled</span>{{end}}</td>
             <td data-label="Assurance">
               {{if eq .AssuranceState "verified"}}{{statusPill "assurance" "verified"}}<span class="subline">TEE · checked {{relTime .AssuranceChecked}}</span>
               {{else if eq .AssuranceState "none"}}{{statusPill "assurance" "none"}}
@@ -31,7 +31,7 @@
             </td>
             <td data-label="Health">{{statusPill "model" .Runtime}}{{if .Latency}}<span class="subline">{{.Latency}} p50</span>{{end}}{{if .RuntimeNote}}{{$fix := dashboardErrorAction .RuntimeNote $.Can}}<span class="subline">{{if $fix.Href}}<a href="{{$fix.Href}}">{{$fix.Text}}</a>{{else}}{{$fix.Text}}{{end}}</span>{{end}}</td>
             <td data-label="Models">{{range $i, $m := .Models}}{{if $i}}, {{end}}{{$m}}{{else}}<span class="muted">—</span>{{end}}</td>
-            <td data-label="Capabilities">{{range .Caps}}<span class="chip">{{.}}</span> {{else}}<span class="muted">—</span>{{end}}</td>
+            <td data-label="Capabilities">{{if .Caps}}<div class="row">{{range .Caps}}<span class="chip">{{.}}</span>{{end}}</div>{{else}}<span class="muted">—</span>{{end}}</td>
             <td data-label="Traffic">{{if .Share}}{{.Share}}{{else}}<span class="muted">—</span>{{end}}</td>
             <td data-label="Actions"><button type="button" class="btn" data-action="models:endpoint" data-endpoint-id="{{.ID}}">Edit</button></td>
           </tr>

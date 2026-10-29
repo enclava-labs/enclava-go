@@ -24,7 +24,7 @@
     <nav class="navgroups" id="nav">
 {{range .Nav}}{{if .Items}}      <div class="group">
         <div class="group-title">{{.Title}}</div>
-{{range .Items}}        <a class="navlink{{if .Active}} active{{end}}" href="{{.Href}}"{{if .Active}} aria-current="page"{{end}}>{{icon .Icon}}<span class="navlabel">{{.Label}}</span>{{if .Admin}}<span class="lockhint" title="Visible to admins">{{icon "lock"}}</span>{{end}}</a>
+{{range .Items}}        <a class="navlink{{if .Active}} active{{end}}" href="{{.Href}}"{{if .Active}} aria-current="page"{{end}}>{{icon .Icon}}<span class="navlabel">{{.Label}}</span>{{if .Admin}}<span class="lockhint" title="Visible to admins">{{icon "lock" 11}}</span>{{end}}</a>
 {{end}}      </div>{{end}}{{end}}
       <button type="button" class="iconbtn desktop-collapse" data-action="desktop-collapse" aria-label="Collapse sidebar">{{icon "chevronLeft"}}</button>
     </nav>

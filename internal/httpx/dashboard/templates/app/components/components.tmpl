@@ -5,8 +5,8 @@
      "page-head", []dashboardTab → "tabs", dashboardConfirm → "confirm-btn";
      "drawer-shell" takes nil and is invoked exactly once by layout.tmpl —
      app.js owns everything injected into #drawer/#pop/#toast. */}}
-{{define "empty"}}<div class="empty">{{icon .Icon}}<p class="muted">{{.Text}}</p>{{if and .ActionLabel .ActionHref}}<a class="btn primary" href="{{.ActionHref}}">{{.ActionLabel}}</a>{{else if and .ActionDrawerLabel .ActionDrawerURL}}<button class="btn primary" type="button" data-action="open-drawer" data-drawer-url="{{.ActionDrawerURL}}">{{.ActionDrawerLabel}}</button>{{end}}</div>{{end}}
-{{define "page-head"}}<header class="head"><div class="headcopy">{{if .Crumb}}<div class="crumb">{{.Crumb}}</div>{{end}}<h1>{{.Title}}</h1>{{if .Desc}}<p class="desc">{{.Desc}}</p>{{end}}</div>{{.Actions}}</header>{{end}}
+{{define "empty"}}<div class="empty">{{icon .Icon 28}}<p class="muted">{{.Text}}</p>{{if and .ActionLabel .ActionHref}}<a class="btn primary" href="{{.ActionHref}}">{{.ActionLabel}}</a>{{else if and .ActionDrawerLabel .ActionDrawerURL}}<button class="btn primary" type="button" data-action="open-drawer" data-drawer-url="{{.ActionDrawerURL}}">{{.ActionDrawerLabel}}</button>{{end}}</div>{{end}}
+{{define "page-head"}}{{$h := .Data.Header}}<header class="head"><div class="headcopy">{{if $h.Crumb}}<div class="crumb">{{.Org}} / {{$h.Crumb}}</div>{{end}}<h1>{{$h.Title}}</h1>{{if $h.Desc}}<p class="desc">{{$h.Desc}}</p>{{end}}</div>{{$h.Actions}}</header>{{end}}
 {{define "tabs"}}<nav class="tabs">{{range .}}<a class="tab{{if .Active}} active{{end}}" href="{{.Href}}"{{if .Active}} aria-current="page"{{end}}>{{.Label}}</a>{{end}}</nav>{{end}}
 {{define "confirm-btn"}}<button class="btn danger" type="button" data-action="confirm" data-confirm="{{.Confirm}}">{{.Label}}</button>{{end}}
 {{define "drawer-shell"}}<div class="drawer-backdrop" id="backdrop" data-action="close-drawer"></div>

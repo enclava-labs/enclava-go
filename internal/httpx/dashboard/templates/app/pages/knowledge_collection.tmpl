@@ -3,7 +3,7 @@
      for members — the tab bar is server-built per capability. The Search tab
      binds the shared results fragment via collection= (D-24: 10-03's
      frag-search-results is the only renderer — zero result markup here). */}}
-{{template "page-head" .Data.Header}}
+{{template "page-head" .}}
 {{template "tabs" .Data.Tabs}}
 
 {{if eq .Data.Tab "documents"}}

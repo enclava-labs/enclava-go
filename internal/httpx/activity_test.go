@@ -574,6 +574,7 @@ func TestDashboardAttentionCapabilityMatrix(t *testing.T) {
 			t.Fatalf("admin must not receive member/ungated kind %s: %#v", kind, activityKinds(adminItems))
 		}
 	}
+	unpricedRows := 0
 	for _, it := range adminItems {
 		switch it.Kind {
 		case "unverified_endpoint":
@@ -581,7 +582,9 @@ func TestDashboardAttentionCapabilityMatrix(t *testing.T) {
 				t.Fatalf("unverified endpoint text = %q, want the tri-state count", it.Text)
 			}
 		case "unpriced_units":
-			if !strings.Contains(it.Text, "chat/completions") || it.ActionHref != "/dashboard/models/pricing" {
+			// Plain words, never the raw capability or unit ids (glossary).
+			unpricedRows++
+			if !strings.Contains(it.Text, "requests that need them are refused") || strings.Contains(it.Text, "chat/completions") || strings.Contains(it.Text, "cached_input") || it.ActionHref != "/dashboard/models/pricing" {
 				t.Fatalf("unpriced item = %+v", it)
 			}
 		case "budget":
@@ -597,6 +600,10 @@ func TestDashboardAttentionCapabilityMatrix(t *testing.T) {
 				t.Fatalf("tool pending item = %+v", it)
 			}
 		}
+	}
+	// One row per endpoint, never one per capability of the same endpoint.
+	if unpricedRows != 1 {
+		t.Fatalf("unpriced rows = %d, want one for the single seeded endpoint", unpricedRows)
 	}
 }
 

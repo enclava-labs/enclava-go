@@ -35,7 +35,6 @@ const (
 // links plus the shared polling machinery — no page module.
 type homeData struct {
 	Greeting        string
-	APIBase         string
 	Attention       []AttentionItem
 	AttentionLive   bool // any non-terminal attention row → the fragment polls
 	KPIs            homeKPIs
@@ -138,7 +137,7 @@ func (a *App) handleDashboardHomeRunning(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	caps, _ := capsFromContext(r.Context())
-	d := homeData{APIBase: "/v1", Attention: []AttentionItem{}}
+	d := homeData{Attention: []AttentionItem{}}
 	d.Running = a.dashboardHomeRunning(r.Context(), caps)
 	a.renderDashboardFragment(w, r, "home", "running", d)
 }
@@ -152,7 +151,7 @@ func (a *App) handleDashboardHomeAttention(w http.ResponseWriter, r *http.Reques
 	}
 	caps, _ := capsFromContext(r.Context())
 	p, _ := auth.PrincipalFromContext(r.Context())
-	d := homeData{APIBase: "/v1", Attention: []AttentionItem{}}
+	d := homeData{Attention: []AttentionItem{}}
 	d.fillEmptyStates(caps)
 	if items, err := a.dashboardAttention(r.Context(), p, caps); err != nil {
 		log.Printf("dashboard home: attention: %v", err)
@@ -175,7 +174,6 @@ func (a *App) dashboardHomeData(ctx context.Context, caps dashboardCaps) homeDat
 	p, _ := auth.PrincipalFromContext(ctx)
 	d := homeData{
 		Greeting:  homeGreeting(time.Now()),
-		APIBase:   "/v1", // OpenAI-compatible routes live under /v1, never /api/v1
 		Attention: []AttentionItem{},
 	}
 	d.fillEmptyStates(caps)

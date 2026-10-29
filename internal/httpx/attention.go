@@ -215,8 +215,11 @@ func (a *App) attentionEndpoints(ctx context.Context, p auth.Principal, caps das
 
 // attentionUnpricedUnits: models.manage → 08-07's capability-aware
 // PriceCoverage over each enabled endpoint's advertised capabilities, probed
-// for every model alias the endpoint binds (the selector's alias parse). A
-// capability PriceCoverage does not know is simply skipped.
+// for every model alias the endpoint binds (the selector's alias parse). One
+// plain-words row per endpoint ("e2e-chat on OpenAI-compatible · host is
+// missing input and output prices — requests that need them are refused"),
+// never one row per raw capability id. A capability PriceCoverage does not
+// know is simply skipped.
 func (a *App) attentionUnpricedUnits(ctx context.Context, p auth.Principal, caps dashboardCaps, items *[]AttentionItem) {
 	if !caps.ModelsManage || a.executor == nil || a.endpoints == nil {
 		return
@@ -236,34 +239,64 @@ func (a *App) attentionUnpricedUnits(ctx context.Context, p auth.Principal, caps
 		if len(aliases) == 0 {
 			continue // nothing routable — a binding gap, not a pricing gap
 		}
+		// shortcut: the probe budget can undercount models on very large
+		// endpoints; the Pricing matrix the row links to is authoritative.
+		var models, units []string
+		seen := map[string]bool{}
+	probe:
 		for _, capability := range advertisedPriceableCapabilities(e) {
 			for _, alias := range aliases {
 				if probes >= unpricedProbeBudget {
-					return
+					break probe
 				}
 				probes++
 				missing, err := a.executor.PriceCoverage(ctx, p.TenantID, e.ID, alias, capability, now)
 				if err != nil || len(missing) == 0 {
 					continue
 				}
-				kinds := make([]string, 0, len(missing))
-				for _, k := range missing {
-					kinds = append(kinds, string(k))
+				if !seen["model:"+alias] {
+					seen["model:"+alias] = true
+					models = append(models, alias)
 				}
-				fix := dashboardErrorAction("required price missing: "+strings.Join(kinds, ", "), caps)
-				*items = append(*items, AttentionItem{
-					Kind:     "unpriced_units",
-					Severity: "warn",
-					Text: fmt.Sprintf("Endpoint %s cannot price %s for model %q (missing: %s)",
-						endpointCardLabel(e), capability, alias, strings.Join(kinds, ", ")),
-					ActionLabel: "Set prices",
-					ActionHref:  "/dashboard/models/pricing",
-					FixText:     fix.Text, FixLabel: fix.Label, FixHref: fix.Href,
-				})
-				break // one item per endpoint+capability
+				for _, k := range missing {
+					if unit := strings.ToLower(dashboardHumanize(string(k))); !seen["unit:"+unit] {
+						seen["unit:"+unit] = true
+						units = append(units, unit)
+					}
+				}
 			}
 		}
+		if len(models) == 0 {
+			continue
+		}
+		subject, verb := models[0], "is"
+		if n := len(models) - 1; n > 0 {
+			subject, verb = fmt.Sprintf("%s and %d other %s", subject, n, plural(n, "model", "models")), "are"
+		}
+		*items = append(*items, AttentionItem{
+			Kind:        "unpriced_units",
+			Severity:    "warn",
+			Text:        fmt.Sprintf("%s on %s %s missing %s prices — requests that need them are refused", subject, endpointCardLabel(e), verb, joinAnd(units)),
+			ActionLabel: "Set prices",
+			ActionHref:  "/dashboard/models/pricing",
+		})
 	}
+}
+
+// joinAnd renders a plain-English list: "a", "a and b", "a, b and c".
+func joinAnd(items []string) string {
+	if len(items) < 2 {
+		return strings.Join(items, "")
+	}
+	return strings.Join(items[:len(items)-1], ", ") + " and " + items[len(items)-1]
+}
+
+// plural picks the noun form for n ("1 tool", "3 tools").
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // boundModelAliases extracts the public aliases an endpoint binds — the
@@ -378,7 +411,7 @@ func (a *App) attentionToolSchemas(ctx context.Context, p auth.Principal, caps d
 		*items = append(*items, AttentionItem{
 			Kind:        "tool_schema_changed",
 			Severity:    "warn",
-			Text:        fmt.Sprintf("%d approved tool(s) changed on their server — review before further use", changed),
+			Text:        fmt.Sprintf("%d approved %s changed on their server — review before further use", changed, plural(changed, "tool", "tools")),
 			ActionLabel: "Review tools",
 			ActionHref:  "/dashboard/tools",
 		})
@@ -387,7 +420,7 @@ func (a *App) attentionToolSchemas(ctx context.Context, p auth.Principal, caps d
 		*items = append(*items, AttentionItem{
 			Kind:        "tool_schema_pending",
 			Severity:    "warn",
-			Text:        fmt.Sprintf("%d newly discovered tool(s) awaiting review", pending),
+			Text:        fmt.Sprintf("%d newly discovered %s awaiting review", pending, plural(pending, "tool", "tools")),
 			ActionLabel: "Review tools",
 			ActionHref:  "/dashboard/tools",
 		})

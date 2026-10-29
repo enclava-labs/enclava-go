@@ -86,6 +86,21 @@ test.describe('sidebar nav truth (§3.3)', () => {
     await page.keyboard.press('Escape');
   });
 
+  test('every page draws icons at icon size and the phone bar only on phones', async ({ page }) => {
+    // Regression: unsized inline SVGs stretched to their container (203px nav
+    // glyphs over the sidebar) and the phone app bar took 75px on desktop.
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({ width, height: 900 });
+      for (const item of PAGES[test.info().project.name]) {
+        await page.goto(`${BASE}${item.href}`);
+        const oversized = await page.locator('svg:not(.spark):not(.bar)').evaluateAll((svgs) =>
+          svgs.filter((s) => { const r = s.getBoundingClientRect(); return r.width > 32 || r.height > 32; }).length);
+        expect(oversized, `${item.href} at ${width}px: icons drawn larger than 32px`).toBe(0);
+        await expect(page.locator('.mobilebar'), `${item.href} at ${width}px: phone bar`).toBeVisible({ visible: width < 760 });
+      }
+    }
+  });
+
   test('hidden items are absent from nav and their URLs 403', async ({ page }) => {
     const hidden = HIDDEN[test.info().project.name];
     if (hidden.length === 0) {

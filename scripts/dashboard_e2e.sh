@@ -23,6 +23,12 @@
 #                                      admin@e2e.local / generated)
 #   E2E_PROJECTS                       optional extra playwright args, e.g.
 #                                      "--project=setup" to scope a dev run
+#   E2E_WALKTHROUGH=1                  manual §9.3 walkthrough: seed with the
+#                                      setup project only, print the role
+#                                      credentials and keep the stack up until
+#                                      interrupted (teardown still runs). Pair
+#                                      with APP_HOST=0.0.0.0 to reach it over
+#                                      the tailnet.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -163,12 +169,17 @@ TENANT_ID="$(pgctl query "$APP_DSN" "SELECT id::text FROM tenants WHERE slug='bo
 export SECRET_BINDINGS="CONNECTOR_GITHUB_E2E|$TENANT_ID|connector|$E2E_CONNECTOR_URL|CONNECTOR_GITHUB_E2E"
 
 # 5. Start the app binary on a clean port.
-# The manual §9.3 walkthrough overrides APP_HOST (e.g. the Tailscale IP) via
-# the environment; the automated run stays loopback.
+# The manual §9.3 walkthrough overrides APP_HOST (e.g. 0.0.0.0 for the
+# tailnet) via the environment; the automated run stays loopback.
 export APP_HOST="${APP_HOST:-127.0.0.1}"
 export APP_PORT
-BASE_URL="http://$APP_HOST:$APP_PORT"
-log "starting app on $BASE_URL"
+CLIENT_HOST="$APP_HOST"
+[ "$CLIENT_HOST" = "0.0.0.0" ] && CLIENT_HOST=127.0.0.1
+BASE_URL="http://$CLIENT_HOST:$APP_PORT"
+log "starting app on $APP_HOST:$APP_PORT"
+./enclava >"$DATA_DIR/app.log" 2>&1 &
+APP_PID=$!
+
 ready=0
 for _ in $(seq 1 300); do
   if curl -fsS "$BASE_URL/livez" >/dev/null 2>&1; then ready=1; break; fi
@@ -186,6 +197,18 @@ export BASE_URL ADMIN_EMAIL ADMIN_PASSWORD E2E_ADMIN_API_KEY
 export E2E_LLM_URL E2E_MCP_URL E2E_CONNECTOR_URL
 export E2E_QDRANT_URL="$QDRANT_URL"
 export ENCLAVA_DATA_DIR
+
+if [ -n "${E2E_WALKTHROUGH:-}" ]; then
+  log "seeding walkthrough data (setup project)"
+  npx playwright test --workers=1 --project=setup
+  log "walkthrough ready: http://<this host>:$APP_PORT/dashboard"
+  log "  admin    $ADMIN_EMAIL / $ADMIN_PASSWORD"
+  log "  manager  manager@e2e.local / E2e-pass-1234!"
+  log "  member   member@e2e.local / E2e-pass-1234!"
+  log "stop with Ctrl-C — the EXIT trap drops the schema and collections"
+  wait "$APP_PID"
+  exit 0
+fi
 
 log "running playwright"
 set +e

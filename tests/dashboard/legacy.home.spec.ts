@@ -2,7 +2,7 @@ import { test, expect, Page, APIRequestContext } from '@playwright/test';
 import { seedData } from './fixtures';
 
 // home.spec.ts — per-role Home (OA-31) browser coverage: section composition
-// per capability (§6.2), the truthful /v1 API base, the zero-filled 30-point
+// per capability (§6.2), the zero-filled 30-point
 // sparkline, real extraction totals, grant-shaped member visibility (D-25)
 // and the running-now polling lifecycle (OA-36). Every prerequisite is
 // seeded through the real /api/v1 surface with the admin session; a seed
@@ -93,7 +93,7 @@ async function seededMember(page: Page, opts: {
 }
 
 test.describe('Home /dashboard — admin', () => {
-  test('renders sections in §6.2 order with a truthful /v1 API base and a 30-point zero-filled spark', async ({ page }) => {
+  test('renders sections in §6.2 order and a 30-point zero-filled spark', async ({ page }) => {
     await login(page);
 
     // Seeds through the real surface: tenant-wide assistant, readable
@@ -111,11 +111,6 @@ test.describe('Home /dashboard — admin', () => {
     });
 
     await page.goto(`${BASE}/dashboard`);
-
-    // Truthful API base: /v1, never /api/v1.
-    await expect(page.locator('.home-greeting')).toContainText('API base · /v1');
-    const body = await page.content();
-    expect(body).not.toContain('/api/v1');
 
     // §6.2 order: attention → KPIs → running → confidential → conversations
     // → start a chat → extractions → knowledge.

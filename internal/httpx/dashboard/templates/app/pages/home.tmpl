@@ -7,14 +7,15 @@
 <header class="head">
   <div class="headcopy">
     <div class="crumb">{{.Org}} / Home</div>
-    <h1>{{.Data.Greeting}}, {{.User.Name}}</h1>
-    <p class="desc">Your workspace at {{.Org}} — work, health and what needs attention.</p>
+    <h1>Home</h1>
+    <p class="desc">Your workspace at a glance — work, health and what needs attention.</p>
   </div>
+  {{if .Can.Chat}}<a class="btn primary" href="/dashboard/chat">{{icon "plus" 15}}New chat</a>{{end}}
 </header>
 
-<section class="card home-greeting">
-  <div class="row"><b>{{.Data.Greeting}}, {{.User.Name}}</b><span class="muted">{{.User.RoleLabel}}</span></div>
-  <span class="muted">API base · {{.Data.APIBase}}</span>
+<section class="card section home-greeting">
+  <b>{{.Data.Greeting}}, {{.User.Name}}</b>
+  <div class="card-sub">Here’s what’s happening across {{.Org}} today.</div>
 </section>
 
 <section class="section" id="homeAttention">
