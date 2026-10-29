@@ -359,7 +359,9 @@
   }
 
   async function openDrawer(urlOrHTML) {
-    const html = typeof urlOrHTML === 'string' && urlOrHTML.charAt(0) === '<'
+    // Leading whitespace (templated markup) must not defeat the inline-HTML
+    // sniff — otherwise the markup is fetched as a URL.
+    const html = typeof urlOrHTML === 'string' && urlOrHTML.trim().charAt(0) === '<'
       ? urlOrHTML
       : await fetchHTML(urlOrHTML);
     showOverlay(html, false);

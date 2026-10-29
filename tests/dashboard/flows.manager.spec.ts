@@ -311,6 +311,18 @@ test.describe('manager error surfaces', () => {
     await expect(toast.locator('a[href]')).toHaveCount(0);
   });
 
+  test('the template editor drawer opens from the Templates tab', async ({ page }) => {
+    await login(page, MANAGER_EMAIL, MEMBER_PASSWORD);
+    await page.goto(`${BASE}/dashboard/extract?tab=templates`);
+    await page.locator('[data-action="extract:edit-template"][data-template-id]').first().click();
+    const drawer = page.locator('#drawer');
+    await expect(drawer).toHaveClass(/open/);
+    // Regression: the editor markup begins with whitespace, which defeated
+    // openDrawer's inline-HTML sniff and fetched the markup as a URL (404).
+    await expect(drawer.locator('[data-editor-title]')).toHaveText('Edit template');
+    await expect(drawer.locator('[data-editor-save]')).toBeVisible();
+  });
+
   test('extract worker failure surfaces the administrator fallback on the failed job row', async ({ page }) => {
     test.setTimeout(120_000);
     const seed = seedData();
