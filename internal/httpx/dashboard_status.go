@@ -191,6 +191,12 @@ func dashboardErrorAction(message string, caps dashboardCaps) dashboardErrorActi
 			return dashboardErrorActionResult{Text: text + ".", Label: "View budgets", Href: "/dashboard/usage/budgets"}
 		}
 		return dashboardErrorActionResult{Text: text + dashboardAdminFallback}
+	case strings.Contains(msg, "no eligible endpoint"):
+		text := "No model endpoint can serve this request right now"
+		if caps.ModelsManage {
+			return dashboardErrorActionResult{Text: text + ".", Label: "Review models", Href: "/dashboard/models"}
+		}
+		return dashboardErrorActionResult{Text: text + dashboardAdminFallback}
 	case strings.Contains(msg, "rate limit"), strings.Contains(msg, "overloaded"), strings.Contains(msg, "timed out"), strings.Contains(msg, "timeout"):
 		return dashboardErrorActionResult{Text: "That request couldn't complete — try again."}
 	case strings.Contains(msg, "schema"):

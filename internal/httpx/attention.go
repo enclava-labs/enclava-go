@@ -441,15 +441,12 @@ func (a *App) attentionOwnFailedExtractions(ctx context.Context, p auth.Principa
 		return
 	}
 	for _, job := range failed {
-		text := "Your extraction failed"
-		if job.Error != "" {
-			text += ": " + truncateAttention(job.Error, 120)
-		}
+		// The cause is said once, in the mapped next-step subline.
 		fix := dashboardErrorAction(job.Error, caps)
 		*items = append(*items, AttentionItem{
 			Kind:        "failed_extraction",
 			Severity:    "bad",
-			Text:        text,
+			Text:        "Your extraction failed",
 			ActionLabel: "Open Extract",
 			ActionHref:  "/dashboard/extract",
 			Cause:       job.Error,
@@ -470,13 +467,11 @@ func (a *App) attentionOwnFailedRuns(ctx context.Context, p auth.Principal, caps
 		return
 	}
 	for _, run := range runs {
-		cause := run.Error
-		if cause == "" {
-			cause = run.Input
-		}
+		// The headline names the run by its question; the cause is said once,
+		// in the mapped next-step subline (raw only when nothing maps).
 		text := "Your assistant run failed"
-		if cause != "" {
-			text += ": " + truncateAttention(cause, 120)
+		if run.Input != "" {
+			text += ": " + truncateAttention(run.Input, 120)
 		}
 		fix := dashboardErrorAction(run.Error, caps)
 		*items = append(*items, AttentionItem{

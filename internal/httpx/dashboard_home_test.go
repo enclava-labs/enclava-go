@@ -300,6 +300,16 @@ func TestDashboardHomeAttentionKindsAndFixLinks(t *testing.T) {
 	if !strings.Contains(memberBody, "Your extraction failed") || !strings.Contains(memberBody, "Your assistant run failed") {
 		t.Fatalf("member attention missing own failed work\n%s", memberBody)
 	}
+	// Each failure names its work once and states its cause once — never the
+	// raw error twice (headline + subline).
+	for _, cause := range []string{"admission denied", "template not allowed"} {
+		if n := strings.Count(memberBody, cause); n != 1 {
+			t.Fatalf("cause %q rendered %d times, want once\n%s", cause, n, memberBody)
+		}
+	}
+	if !strings.Contains(memberBody, "Your assistant run failed: tell me a joke") {
+		t.Fatalf("failed run must be named by its question\n%s", memberBody)
+	}
 	for _, forbidden := range []string{"failed processing", "sync failed", "unverified", "schema changed"} {
 		if strings.Contains(memberBody, forbidden) {
 			t.Fatalf("member attention leaked manager kind %q\n%s", forbidden, memberBody)
