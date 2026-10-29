@@ -123,6 +123,52 @@
     }
   }
 
+  // Discover reads the endpoint's own server (/v1/models plus 1-token
+  // capability probes) and prefills capabilities and aliases with observed
+  // fact. Vision/compact/MCP have no cheap probe — they stay untouched.
+  async function discoverEndpoint(form, button) {
+  button.disabled = true;
+  const body = {
+    protocol: form.elements.protocol.value,
+    sdk_provider: form.elements.sdk_provider.value.trim(),
+    base_origin: form.elements.base_origin.value.trim(),
+    credential_ref: form.elements.credential_ref.value.trim(),
+    authorized_private: form.elements.authorized_private.checked,
+  };
+  try {
+    const res = await Enclava.api('POST', '/api/v1/providers/discover', body);
+    const discovered = (res && res.discovered) || {};
+    const models = discovered.models || [];
+    if (models.length) {
+      form.querySelector('#mep-models').value = models.join(', ');
+    }
+    let confirmed = 0;
+    form.querySelectorAll('input[name="capability"]').forEach((input) => {
+      const verdict = discovered.capabilities && discovered.capabilities[input.value];
+      if (verdict === 'yes' || verdict === 'no') {
+        input.checked = verdict === 'yes';
+        confirmed += input.checked ? 1 : 0;
+        const chip = input.closest('.chip');
+        if (chip) chip.classList.toggle('active', input.checked);
+      }
+    });
+    showFormError(form,
+      'Discovered ' + models.length + ' model' + (models.length === 1 ? '' : 's') +
+      (discovered.probe_model ? ' (probed with ' + discovered.probe_model + ')' : '') +
+      ' · ' + confirmed + (confirmed === 1 ? ' capability' : ' capabilities') + ' confirmed');
+
+    const slot = form.querySelector('[data-models-form-error]');
+    if (slot) slot.classList.add('muted');
+    Enclava.toast('success', 'Discovery complete');
+  } catch (err) {
+    const slot = form.querySelector('[data-models-form-error]');
+    if (slot) slot.classList.remove('muted');
+    showFormError(form, err.message || 'Discovery failed');
+  } finally {
+    button.disabled = false;
+  }
+}
+
   async function disableEndpoint(button) {
     const id = button.dataset.endpointId;
     if (!id) return;
@@ -202,7 +248,7 @@
 
   document.addEventListener('click', (e) => {
     if (!(e.target instanceof Element)) return;
-    const trigger = e.target.closest('[data-action="models:endpoint"],[data-action="models:price"],[data-action="models:history"]');
+    const trigger = e.target.closest('[data-action="models:endpoint"],[data-action="models:price"],[data-action="models:history"],[data-models-discover]');
     if (!trigger) return;
     switch (trigger.dataset.action) {
       case 'models:endpoint': {
@@ -217,7 +263,12 @@
         openHistory(trigger);
         break;
     }
+    if (trigger.matches('[data-models-discover]')) {
+      e.preventDefault();
+      discoverEndpoint(trigger.closest('[data-models-endpoint-form]'), trigger);
+    }
   });
+
 
   document.addEventListener('submit', (e) => {
     if (!(e.target instanceof Element)) return;

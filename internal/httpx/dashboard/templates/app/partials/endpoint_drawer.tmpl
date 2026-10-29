@@ -65,6 +65,8 @@
     <label class="chip{{if .Checked}} active{{end}}"><input type="checkbox" name="capability" value="{{.Value}}"{{if .Checked}} checked{{end}}> {{.Label}}</label>
     {{end}}
   </fieldset>
+  <button type="button" class="btn ghost" data-models-discover>Discover from server</button>
+  <span class="help">Fills capabilities and model aliases from the endpoint's own model list and 1-token probes.</span>
   <label class="label" for="mep-models">Model aliases</label>
   <input class="field" id="mep-models" name="model_aliases" value="{{.Data.Aliases}}" placeholder="gpt-4o, acme=upstream-id">
   <span class="help">Comma-separated alias or alias=upstream-id bindings — the aliases chat requests may use on this endpoint.</span>

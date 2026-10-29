@@ -125,6 +125,46 @@ func (a *App) handleProviders(w http.ResponseWriter, r *http.Request, p auth.Pri
 	}
 }
 
+// handleProviderDiscover reads the endpoint's own server: /v1/models plus
+// 1-token capability probes, so capabilities and model bindings come from
+// observed fact instead of operator selection. Accepts the same DTO as
+// create (all drawer fields); nothing is persisted.
+func (a *App) handleProviderDiscover(w http.ResponseWriter, r *http.Request, p auth.Principal) {
+	setNoStoreHeaders(w)
+	if a.endpoints == nil || a.executor == nil {
+		WriteOpenAIError(w, http.StatusNotImplemented, "providers are not configured", "server_error", "not_configured")
+		return
+	}
+	tenantID, ok := a.providerTenantID(w, p)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	var req endpointRequest
+	if err := DecodeJSON(r, &req); err != nil {
+		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
+		return
+	}
+	endpoint, err := endpointFromCreateRequest(tenantID, req)
+	if err != nil {
+		WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "provider_invalid")
+		return
+	}
+	// Constant id: the transport cache keeps one probe entry per tenant
+	// instead of one per discovery click.
+	endpoint.ID = "discover-probe"
+	endpoint.Enabled = true
+	report, err := a.executor.Discover(r.Context(), endpoint)
+	if err != nil {
+		WriteOpenAIError(w, http.StatusBadGateway, err.Error(), "server_error", "provider_discovery_failed")
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{"discovered": report})
+}
+
 func (a *App) handleProviderByID(w http.ResponseWriter, r *http.Request, p auth.Principal) {
 	setNoStoreHeaders(w)
 	if a.endpoints == nil {

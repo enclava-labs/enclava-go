@@ -171,6 +171,8 @@ func (a *App) registerBaseRoutes() {
 	// Paid paths not backed by the shared executor remain unmounted; only
 	// owned metadata and authentication surfaces are registered here.
 	a.mux.HandleFunc("/api/v1/providers", a.authenticated("pricing.manage", a.handleProviders))
+	// Registered before the /providers/ subtree so discovery wins the exact match.
+	a.mux.HandleFunc("/api/v1/providers/discover", a.authenticated("pricing.manage", a.handleProviderDiscover))
 	a.mux.HandleFunc("/api/v1/providers/", a.authenticated("pricing.manage", a.handleProviderByID))
 	a.mux.HandleFunc("/api/v1/processing-restrictions", a.authenticated("pricing.manage", a.handleProcessingRestrictions))
 	a.mux.HandleFunc("/api/v1/rag/collections", a.authenticated("rag", a.handleRAGCollections))
