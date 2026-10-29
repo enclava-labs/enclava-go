@@ -238,10 +238,10 @@ test.describe('wizard focus discipline (manager)', () => {
   test('Sources wizard Continue lands focus on the next step’s first control', async ({ page }) => {
     test.setTimeout(90_000);
     const seed = seedData();
-    await page.goto(`${BASE}/dashboard/sources?new=1`);
-    const drawer = page.locator('#drawer');
-    // The target collection must be WRITABLE by the manager — the seeded
-    // set is admin-owned and never appears in the wizard's list.
+    // Create the manager's target collection BEFORE opening the wizard — the
+    // drawer renders its collection list when it opens. The seeded set is
+    // admin-owned; the wizard needs one this manager can write.
+    await page.goto(`${BASE}/dashboard/sources`);
     const collectionID = await page.evaluate(async () => {
       const c = await window.Enclava.api('POST', '/api/v1/rag/collections', {
         name: `wiz-${Date.now()}`, chunk_size: 200, chunk_overlap: 20,
@@ -251,7 +251,8 @@ test.describe('wizard focus discipline (manager)', () => {
       }
       return c.id;
     });
-
+    await page.goto(`${BASE}/dashboard/sources?new=1`);
+    const drawer = page.locator('#drawer');
     const tile = drawer.locator('.tile[data-provider="github"]');
     await tile.focus();
     await tile.press('Enter');

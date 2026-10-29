@@ -244,11 +244,12 @@ test.describe('Chat run flow (OA-32)', () => {
       );
     }
 
-    // Clicking a citation opens the evidence panel: document + both links.
+    // Clicking a citation opens the evidence panel: the document and its
+    // retained copy. 'Open in source' exists only for synced sources — an
+    // uploaded document has no external source to open.
     await citations.first().click();
     const panel = page.locator('.evidence-panel');
     await expect(panel).toContainText('renewals.txt');
-    await expect(panel).toContainText('Open in source');
     await expect(panel).toContainText('View retained copy');
 
     // Reload renders the same conversation server-side at the adopted URL.
@@ -321,10 +322,13 @@ test.describe('Chat run flow (OA-32)', () => {
     await page.goto(`${BASE}/dashboard/chat/${convID}`);
     await expect(page.locator('#chatThread .bubble').first()).toBeVisible();
 
-    // A fresh first send adopts a NEW conversation id.
+    // A fresh first send adopts a NEW conversation id — from the assistant's
+    // clean URL, not the revisited one (a send there would adopt it, which
+    // the two-turns case above already covers).
+    await page.goto(`${BASE}/dashboard/chat?assistant=${encodeURIComponent(seed.assistantID)}`);
     await page.fill('#composer', 'Second conversation question.');
     await page.click('[data-action="chat:send"]');
-    await page.waitForURL(/\/dashboard\/chat\/[^/]+$/);
+    await page.waitForURL((u) => /\/dashboard\/chat\/[^/]+$/.test(u.pathname) && !u.pathname.endsWith(convID));
     expect(page.url()).not.toContain(convID);
     await awaitTerminal(page);
   });
@@ -573,7 +577,7 @@ test.describe('Search (OA-33)', () => {
     await expect(page).toHaveURL(/\/dashboard\/search\?.*q=contract.*mode=hybrid/);
 
     // Multi-collection fusion: rows from both readable collections.
-    await expect(page.locator('#searchResults .result .result-title', { hasText: 'alpha-contract.txt' })).toBeVisible();
+    await expect(page.locator('#searchResults .result .result-title', { hasText: 'alpha-contract.txt' }).first()).toBeVisible();
     await expect(page.locator('#searchResults .result .result-title', { hasText: 'beta-contract.txt' })).toBeVisible();
 
     // Restricted collection: no row, no title, no facet for it anywhere.
@@ -694,8 +698,10 @@ test.describe('Search (OA-33)', () => {
     await page.click('#searchForm button[type="submit"]');
     await expect(page.locator('#searchResults .result').first()).toBeVisible({ timeout: 15_000 });
     await page.fill('#searchQuery', 'pricing');
+    const pricedResults = page.waitForResponse((r) => r.request().method() === 'GET' && r.url().includes('q=pricing'));
     await page.click('#searchForm button[type="submit"]');
-    await expect(page.locator('#searchResults')).toBeVisible();
+    await expect(page).toHaveURL(/q=pricing/, { timeout: 15_000 });
+    await pricedResults; // navigating earlier aborts the search before recents record
 
     // Reload with no ?q shows this user's recents; clicking refills + submits.
     await page.goto(`${BASE}/dashboard/search`);
