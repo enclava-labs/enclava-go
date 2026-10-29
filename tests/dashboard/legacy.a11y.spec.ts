@@ -339,12 +339,14 @@ test('(3) popover opens with focus inside, Escape restores, and a drawer replace
   ).toBe(true);
 
   // One overlay at a time, the workable direction: while a popover is open,
-  // opening a drawer closes it. (The reverse is blocked by design — the
-  // modal drawer's backdrop makes outside controls like the user menu
-  // unclickable, so the drawer cannot be replaced from underneath.)
+  // opening a drawer closes it in-document (a navigation would hide #pop on
+  // its own and prove nothing). The reverse is blocked by design — the modal
+  // drawer's backdrop makes outside controls like the user menu unclickable.
+  await page.goto(`${BASE}/dashboard/sources`);
+  const addSource = page.locator('[data-action="open-drawer"]').first();
   await userMenu.click();
   await expect(pop).toBeVisible();
-  await page.goto(`${BASE}/dashboard/sources?new=1`);
+  await addSource.dispatchEvent('click');
   const drawer = page.locator('#drawer');
   await expect(drawer).toHaveClass(/open/, { timeout: 15000 });
   await expect(pop).toBeHidden();
