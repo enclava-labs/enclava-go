@@ -146,9 +146,6 @@
       if (convID && convID !== state.conversation) {
         state.conversation = convID;
         history.replaceState(null, '', '/dashboard/chat/' + encodeURIComponent(convID));
-        const name = select && select.selectedOptions && select.selectedOptions[0];
-        const label = el('chatAssistantName');
-        if (name && name.textContent && label && !label.textContent) label.textContent = name.textContent;
         loadThread();
       }
       if (run && run.id) startPolling(run.id);

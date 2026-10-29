@@ -174,7 +174,7 @@ func (a *OpenAICompatibleAdapter) doStream(ctx context.Context, method, path str
 	}
 	if resp.StatusCode >= 300 {
 		upstreamBody, _ := readBoundedBody(resp.Body, maxErrorBodyBytes)
-		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: upstreamBody}
+		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: upstreamBody, Message: upstreamErrorMessage(upstreamBody)}
 	}
 	return newBoundedStreamBody(resp.Body, a.streamIdle, a.streamWall), nil
 }

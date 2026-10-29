@@ -109,7 +109,7 @@ const chatHistoryPageSize = 20
 // assistant picker distinguishes "none exist" (manager cap) from "none
 // granted to you" (member, D-25) via the caller's caps.
 func (d *chatViewData) fillEmptyStates(caps dashboardCaps) {
-	// No action: the history column's own New chat button sits right above.
+	// No action: the page header's New chat button is directly above.
 	d.HistoryEmpty = dashboardEmpty{Icon: "chat", Text: "No conversations yet."}
 	d.AssistantsEmpty = dashboardEmpty{Icon: "assistant",
 		Text: "No assistants you can use yet — ask an admin to grant access."}
