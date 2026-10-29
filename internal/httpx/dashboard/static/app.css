@@ -372,7 +372,7 @@ th,td{padding:12px 14px;border-bottom:1px solid var(--border);vertical-align:mid
 tr:last-child td{border:0}
 td{font-size:13px}
 td b{font-size:13.5px;font-weight:600}
-.subline{display:block;color:var(--muted);font-size:12px;margin-top:2px}
+.subline{display:block;color:var(--muted);font-size:12px;margin-top:2px;overflow-wrap:anywhere}
 
 /* ---------- Tabs ---------- */
 .tabs{
@@ -402,6 +402,9 @@ td b{font-size:13.5px;font-weight:600}
   font-size:13px;
   color:var(--muted);
   white-space:nowrap;
+  max-width:100%;
+  overflow:hidden;
+  text-overflow:ellipsis;
 }
 .chip:hover{color:var(--text)}
 .chip.active{color:var(--accent-fg);border-color:var(--accent);background:var(--accentbg)}
@@ -462,11 +465,13 @@ mark{background:var(--accentbg);color:var(--accent-fg)}
   padding:13px 15px;
   border-bottom:1px solid var(--border);
   display:flex;
+  flex-wrap:wrap;
   align-items:flex-end;
   gap:14px;
 }
 .thread-head .stack{gap:0;min-width:min(220px,100%)}
-.threadmeta{display:flex;align-items:center;gap:10px;min-height:38px}
+.threadmeta{display:flex;align-items:center;gap:10px;min-height:38px;min-width:0}
+.threadmeta .muted{overflow-wrap:anywhere}
 .thread-body{padding:18px 20px 80px;overflow:auto;flex:1}
 .message{margin-bottom:18px;max-width:min(780px,94%)}
 .message.user{margin-left:auto}
