@@ -458,6 +458,8 @@ interface SearchSeed {
   colB: string;
   colSecret: string;
   docA: string;
+  docB: string;
+  docSecret: string;
   evidenceID: string;
   memberEmail: string;
   memberPass: string;
