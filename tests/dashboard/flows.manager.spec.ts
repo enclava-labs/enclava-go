@@ -318,7 +318,7 @@ test.describe('manager error surfaces', () => {
       buffer: Buffer.from(`manager extract probe ${Date.now()}`),
     });
     // Wait for the submit's POST: navigating away first would abort it.
-    const submitted = page.waitForResponse((r) => r.method() === 'POST' && r.url().includes('/api/v1/extract/jobs'));
+    const submitted = page.waitForResponse((r) => r.request().method() === 'POST' && r.url().includes('/api/v1/extract/jobs'));
     await page.click('[data-action="extract:submit"]');
     await submitted;
     await page.goto(`${BASE}/dashboard/extract?tab=jobs`);

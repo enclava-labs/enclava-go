@@ -505,6 +505,7 @@ async function seedSearchFixtures(request: APIRequestContext, page: Page): Promi
   const member = await seedMember(request, page, ['rag', 'chatbot'], {
     assistants: { mode: 'list', items: [] },
     models: { mode: 'list', items: ['e2e-embed', 'e2e-chat'] }, // hybrid search embeds the query; Ask-about-this runs the chat assistant
+    endpoints: { mode: 'list', items: ['openai_compatible'] }, // an empty endpoint grant denies inference routing outright
   });
 
   const mkCol = async (name: string, audience: string[]) => {

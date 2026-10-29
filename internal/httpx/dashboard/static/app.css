@@ -10,6 +10,10 @@
    system font stack only. Mockup-only artifacts (demo badge, unused mobile
    history list, inline demo wiring, [style*] hacks) are not ported.
    ========================================================================== */
+/* Any author display rule beats the UA's [hidden]{display:none} — restore
+   it globally or hidden-but-classed controls (the wizard's submit) render. */
+[hidden]{display:none !important}
+
 
 /* ---------- Tokens: dark (default) ---------- */
 :root{

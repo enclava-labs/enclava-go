@@ -171,8 +171,8 @@ test.beforeAll(async ({ browser }) => {
     assistants: { mode: 'list', items: [botID] },
     extract_templates: { mode: 'list', items: [templateID] },
     models: { mode: 'list', items: [UNPRICED_MODEL] },
+    endpoints: { mode: 'list', items: [endpointID] }, // empty endpoint grants deny inference routing
   });
-
   seed = { sourceID, botID, templateID, endpointID, deniedUser, runnerUser };
   await context.close();
 });
@@ -425,7 +425,7 @@ test('(4b) extract worker failure surfaces the same capability-filtered fix on t
       buffer: Buffer.from(`a11y extract probe ${Date.now()}`),
     });
     // Wait for the submit's POST: navigating away first would abort it.
-    const submitted = page.waitForResponse((r) => r.method() === 'POST' && r.url().includes('/api/v1/extract/jobs'));
+    const submitted = page.waitForResponse((r) => r.request().method() === 'POST' && r.url().includes('/api/v1/extract/jobs'));
     await page.click('[data-action="extract:submit"]');
     await submitted;
     await page.goto(`${BASE}/dashboard/extract?tab=jobs`);
