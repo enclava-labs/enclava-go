@@ -163,13 +163,12 @@ TENANT_ID="$(pgctl query "$APP_DSN" "SELECT id::text FROM tenants WHERE slug='bo
 export SECRET_BINDINGS="CONNECTOR_GITHUB_E2E|$TENANT_ID|connector|$E2E_CONNECTOR_URL|CONNECTOR_GITHUB_E2E"
 
 # 5. Start the app binary on a clean port.
-export APP_HOST=127.0.0.1
+# The manual §9.3 walkthrough overrides APP_HOST (e.g. the Tailscale IP) via
+# the environment; the automated run stays loopback.
+export APP_HOST="${APP_HOST:-127.0.0.1}"
 export APP_PORT
-BASE_URL="http://127.0.0.1:$APP_PORT"
+BASE_URL="http://$APP_HOST:$APP_PORT"
 log "starting app on $BASE_URL"
-./enclava >"$DATA_DIR/app.log" 2>&1 &
-APP_PID=$!
-
 ready=0
 for _ in $(seq 1 300); do
   if curl -fsS "$BASE_URL/livez" >/dev/null 2>&1; then ready=1; break; fi
