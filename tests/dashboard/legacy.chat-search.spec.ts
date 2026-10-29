@@ -519,15 +519,21 @@ async function seedSearchFixtures(request: APIRequestContext, page: Page): Promi
     if (!res.ok()) throw new Error(`collection ${name} failed (${res.status()}): ${await res.text()}`);
     return fieldString(res, 'id');
   };
-  const colA = await mkCol(`search-a-${Date.now()}`, [member.memberID]);
-  const colB = await mkCol(`search-b-${Date.now()}`, [member.memberID]);
-  const colSecret = await mkCol(`search-secret-${Date.now()}`, ['actor_outsider']);
+  const stamp = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  const colA = await mkCol(`search-a-${stamp}`, [member.memberID]);
+  const colB = await mkCol(`search-b-${stamp}`, [member.memberID]);
+  const colSecret = await mkCol(`search-secret-${stamp}`, ['actor_outsider']);
+  // Unique filenames: the member also reads setup's public collections, whose
+  // own alpha/beta documents would otherwise collide with these rows.
+  const docA = `alpha-contract-${stamp}.txt`;
+  const docB = `beta-contract-${stamp}.txt`;
+  const docSecret = `secret-contract-${stamp}.txt`;
 
-  await uploadDoc(request, page, colA, 'alpha-contract.txt',
+  await uploadDoc(request, page, colA, docA,
     'The contract renewal clause requires notice ninety days before expiry.');
-  await uploadDoc(request, page, colB, 'beta-contract.txt',
+  await uploadDoc(request, page, colB, docB,
     'Contract pricing terms are reviewed each quarter by the committee.');
-  await uploadDoc(request, page, colSecret, 'secret-contract.txt',
+  await uploadDoc(request, page, colSecret, docSecret,
     'Secret contract annex the member must never see.');
 
   const modelRes = await api(request, page, 'GET', '/v1/models');
@@ -556,7 +562,7 @@ async function seedSearchFixtures(request: APIRequestContext, page: Page): Promi
   });
   if (!searchRes.ok()) throw new Error(`seed search failed (${searchRes.status()}): ${await searchRes.text()}`);
   const evidenceID = await firstEvidenceID(searchRes);
-  return { colA, colB, colSecret, docA: 'alpha-contract.txt', evidenceID, memberEmail: member.email, memberPass: member.pass, memberID: member.memberID, assistantID };
+  return { colA, colB, colSecret, docA, docB, docSecret, evidenceID, memberEmail: member.email, memberPass: member.pass, memberID: member.memberID, assistantID };
 }
 
 test.describe('Search (OA-33)', () => {
@@ -577,8 +583,8 @@ test.describe('Search (OA-33)', () => {
     await expect(page).toHaveURL(/\/dashboard\/search\?.*q=contract.*mode=hybrid/);
 
     // Multi-collection fusion: rows from both readable collections.
-    await expect(page.locator('#searchResults .result .result-title', { hasText: 'alpha-contract.txt' }).first()).toBeVisible();
-    await expect(page.locator('#searchResults .result .result-title', { hasText: 'beta-contract.txt' })).toBeVisible();
+    await expect(page.locator('#searchResults .result .result-title', { hasText: seed.docA })).toBeVisible();
+    await expect(page.locator('#searchResults .result .result-title', { hasText: seed.docB })).toBeVisible();
 
     // Restricted collection: no row, no title, no facet for it anywhere.
     await expect(page.locator('#searchResults')).not.toContainText('secret-contract');
@@ -596,8 +602,8 @@ test.describe('Search (OA-33)', () => {
 
     // Collection-scoped fragment — the 09-01 contract shape.
     await page.selectOption('#searchCollection', seed.colA);
-    await expect(page.locator('#searchResults .result', { hasText: 'alpha-contract.txt' })).toBeVisible({ timeout: 15_000 });
-    await expect(page.locator('#searchResults .result', { hasText: 'beta-contract.txt' })).toHaveCount(0);
+    await expect(page.locator('#searchResults .result', { hasText: seed.docA })).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator('#searchResults .result', { hasText: seed.docB })).toHaveCount(0);
 
     // Semantic mode executes — a 5xx/empty fragment here fails naming the
     // embedding prerequisite, never a skip.
