@@ -219,11 +219,7 @@ test.describe('page-surface keyboard flows (member)', () => {
       try {
         // An admin-surface write: a real 403 (an unknown assistant is the
         // uniform 404, which api() deliberately does not toast).
-        await window.Enclava.api('POST', '/api/v1/admin/budgets', {
-          name: 'denied', subject_type: 'tenant', kind: 'amount',
-          limit_value: 1, currency: 'USD', period: 'monthly',
-          starts_at: new Date().toISOString(),
-        });
+        await window.Enclava.api('POST', '/api/v1/admin/budgets', {});
       } catch { /* rejection is the expected outcome */ }
     });
     const toast = page.locator('#toast.show.error');

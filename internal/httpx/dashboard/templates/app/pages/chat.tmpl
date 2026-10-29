@@ -19,7 +19,6 @@
 <div class="thread-layout">
   <aside class="history" aria-label="Chat history">
     <input class="field" type="search" placeholder="Search chats" aria-label="Search chats" data-chat-search>
-    <button type="button" class="btn primary" data-action="chat:new">{{icon "plus"}} New chat</button>
     {{template "frag-chat-history" .}}
   </aside>
 
@@ -33,7 +32,7 @@
         {{if not .Data.Assistants}}<span class="help">{{.Data.AssistantsEmpty.Text}}</span>{{end}}
       </div>
       {{with .Data.Thread}}{{if .AssistantName}}<div class="threadmeta">
-        <strong id="chatAssistantName">{{.AssistantName}}</strong>
+        {{/* No assistant name here: the select already shows it. */}}
         {{if .Subline}}<span class="muted" id="chatAssistantSubline">{{.Subline}}</span>{{end}}
         {{if .ConfText}}<button type="button" class="conf-card{{if .ConfWarn}} warn{{end}}" data-action="conf-pop" aria-haspopup="dialog" aria-expanded="false" aria-controls="pop">
           <span class="conf-title">{{icon "shield"}}<strong>{{.ConfText}}</strong></span>

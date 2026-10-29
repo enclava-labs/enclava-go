@@ -115,7 +115,7 @@ test.describe('Authentication', () => {
   test('cookie-authenticated logout requires the session CSRF token', async ({ page, playwright }) => {
     await login(page);
     const { session } = await sessionCookies(page);
-    const anon = await playwright.request.newContext({ baseURL: BASE });
+    const anon = await playwright.request.newContext({ baseURL: BASE, storageState: { cookies: [], origins: [] } });
     const res = await anon.post(`${BASE}/dashboard/logout`, {
       headers: { Cookie: `${SESSION_COOKIE}=${session!.value}` },
     });

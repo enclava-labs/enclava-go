@@ -10,7 +10,7 @@
      hx-trigger="refresh from:body{{if and .Data.Thread .Data.Thread.Live}}, every 3s{{end}}" hx-target="this" hx-swap="outerHTML"{{end}}>
   {{if .Data.Thread}}
     {{range .Data.Thread.Messages}}
-    <article class="message"{{if .EvidAttr}} data-evidence-ids="{{.EvidAttr}}"{{end}}{{if .RunID}} data-run-id="{{.RunID}}"{{if .RunStatus}} data-run-status="{{.RunStatus}}"{{end}}{{end}}>
+    <article class="message{{if eq .Role "user"}} user{{else}} assistant{{end}}"{{if .EvidAttr}} data-evidence-ids="{{.EvidAttr}}"{{end}}{{if .RunID}} data-run-id="{{.RunID}}"{{if .RunStatus}} data-run-status="{{.RunStatus}}"{{end}}{{end}}>
       <div class="author">{{.Author}} · {{relTime .CreatedAt}}</div>
       {{if .Steps}}<details class="toolstep">
         <summary>{{icon "check"}} {{len .Steps}} tool {{if eq (len .Steps) 1}}step{{else}}steps{{end}}</summary>

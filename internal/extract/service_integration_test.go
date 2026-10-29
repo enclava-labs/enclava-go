@@ -21,6 +21,7 @@ import (
 	"enclava-go/internal/extract"
 	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
+	"enclava-go/internal/llm"
 	"enclava-go/internal/source"
 	"enclava-go/internal/store/postgres"
 	"enclava-go/internal/testdb"
@@ -45,7 +46,7 @@ func (f *fakeUpstream) CreateChatCompletion(ctx context.Context, body []byte) ([
 	copy(bodyCopy, body)
 	f.bodies = append(f.bodies, bodyCopy)
 	if f.refuseResponseFormat.Load() && bytes.Contains(body, []byte(`"response_format"`)) {
-		return nil, errors.New("400: structured output (response_format and the guided_* fields) is not supported by this engine yet")
+		return nil, &llm.UpstreamError{StatusCode: 400, Message: "structured output (response_format and the guided_* fields) is not supported by this engine yet"}
 	}
 	if f.response != nil {
 		return f.response, nil

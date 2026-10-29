@@ -336,7 +336,8 @@ test.describe('manager error surfaces', () => {
     // Wait for the submit's POST: navigating away first would abort it.
     const submitted = page.waitForResponse((r) => r.request().method() === 'POST' && r.url().includes('/api/v1/extract/jobs'));
     await page.click('[data-action="extract:submit"]');
-    await submitted;
+    const res = await submitted;
+    expect(res.status(), await res.text()).toBe(202);
     await page.goto(`${BASE}/dashboard/extract?tab=jobs`);
     // Accepted job fails at the worker's price reserve (the template's
     // model is deliberately unpriced) — capability-off copy, no href.
