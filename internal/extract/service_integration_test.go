@@ -1,6 +1,7 @@
 package extract_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -31,10 +32,21 @@ import (
 type fakeUpstream struct {
 	response  []byte
 	callCount atomic.Int32
+	// refuseResponseFormat: bodies carrying response_format fail the way
+	// engines without structured-output support do — the degrade-retry
+	// regression drives this.
+	refuseResponseFormat atomic.Bool
+	bodies               [][]byte
 }
 
 func (f *fakeUpstream) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
 	f.callCount.Add(1)
+	bodyCopy := make([]byte, len(body))
+	copy(bodyCopy, body)
+	f.bodies = append(f.bodies, bodyCopy)
+	if f.refuseResponseFormat.Load() && bytes.Contains(body, []byte(`"response_format"`)) {
+		return nil, errors.New("400: structured output (response_format and the guided_* fields) is not supported by this engine yet")
+	}
 	if f.response != nil {
 		return f.response, nil
 	}
@@ -421,6 +433,54 @@ func TestAttemptPricedModelReservesAndSettles(t *testing.T) {
 	}
 	if detail.Job.Status != jobs.StatusSucceeded {
 		t.Fatalf("job status=%s", detail.Job.Status)
+	}
+}
+
+func TestAttemptDegradesResponseFormatWhenEngineRefuses(t *testing.T) {
+	f := newFixture(t)
+	f.upstream.refuseResponseFormat.Store(true)
+	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract")
+	f.putPrice(t, "priced-extract", billing.UnitInput, 1000)
+	f.putPrice(t, "priced-extract", billing.UnitOutput, 2000)
+	f.seedTemplate(t, extract.Template{
+		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u",
+		DefaultModel: "priced-extract", Enabled: true,
+	})
+
+	out, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
+		TemplateID: "invoice", FileName: "invoice.txt", MimeType: "text/plain",
+		Bytes: []byte("invoice text"),
+	})
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	claim := f.leaseClaim(t)
+	resultRef, err := f.svc.JobHandler()(ctx, claim, inputOpener(f, claim))
+	if err != nil {
+		t.Fatalf("attempt: %v", err)
+	}
+	if resultRef == "" {
+		t.Fatal("empty result ref")
+	}
+	if got := f.upstream.callCount.Load(); got != 2 {
+		t.Fatalf("provider calls=%d, want 2 (refused structured output, then retried without)", got)
+	}
+	if !bytes.Contains(f.upstream.bodies[0], []byte(`"response_format"`)) {
+		t.Fatal("first provider call carried no response_format")
+	}
+	if bytes.Contains(f.upstream.bodies[1], []byte(`"response_format"`)) {
+		t.Fatal("retry still carried response_format")
+	}
+	if _, err := claim.Complete(ctx, resultRef); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	detail, err := f.svc.GetJob(ctx, f.principal, out.JobID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if detail.Job.Status != jobs.StatusSucceeded || detail.Result == nil || detail.Result.Data["total"] != json.Number("1") {
+		t.Fatalf("unexpected result after degrade: %s %+v", detail.Job.Status, detail.Result)
 	}
 }
 func TestVisionJobUsesImagePayloadAndStoresGeneratedResult(t *testing.T) {

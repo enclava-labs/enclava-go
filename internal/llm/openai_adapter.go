@@ -199,8 +199,28 @@ func (a *OpenAICompatibleAdapter) doJSON(ctx context.Context, method, path strin
 		return nil, err
 	}
 	if resp.StatusCode >= 300 {
-		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: respBody}
+		// Carry the provider's own message ({"error":{"message":…}}) —
+		// "upstream provider error" alone hides why the call was refused.
+		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: respBody, Message: upstreamErrorMessage(respBody)}
 	}
 
 	return respBody, nil
+}
+
+// upstreamErrorMessage pulls error.message out of an OpenAI-shaped error
+// body, truncated for logs and job rows.
+func upstreamErrorMessage(body []byte) string {
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	msg := strings.TrimSpace(payload.Error.Message)
+	if len(msg) > 300 {
+		msg = msg[:300]
+	}
+	return msg
 }

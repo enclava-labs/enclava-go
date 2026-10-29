@@ -445,30 +445,49 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 	if err := claim.MarkDispatched(ctx); err != nil {
 		return "", err
 	}
-	payload, err := json.Marshal(s.buildProviderRequest(model, template, promptSystem, promptUser, inInput))
+	request := s.buildProviderRequest(model, template, promptSystem, promptUser, inInput)
+	payload, err := json.Marshal(request)
 	if err != nil {
 		return "", fmt.Errorf("marshal provider request: %w", err)
 	}
 
 	inputVersion, _ := job.Policy["input_version"].(float64)
-	res, err := s.executor.Execute(ctx, p, inference.Request{
-		Capability: capability,
-		Model:      model,
-		EndpointID: endpointID,
-		Payload:    payload,
-		Artifacts: []artifacts.Ref{{
-			TenantID: job.TenantID,
-			ID:       job.InputRef,
-			Version:  int(inputVersion),
-		}},
-		Estimate: billing.Usage{
-			InputUnits:  estimateInputTokens(int64(len(inBytes)), promptSystem, promptUser),
-			OutputUnits: maxExtractOutputTokens,
-		},
-		JobID:     job.ID,
-		AttemptID: claim.AttemptID(),
-	})
-	if err != nil {
+	send := func(body []byte) (*inference.Result, error) {
+		return s.executor.Execute(ctx, p, inference.Request{
+			Capability: capability,
+			Model:      model,
+			EndpointID: endpointID,
+			Payload:    body,
+			Artifacts: []artifacts.Ref{{
+				TenantID: job.TenantID,
+				ID:       job.InputRef,
+				Version:  int(inputVersion),
+			}},
+			Estimate: billing.Usage{
+				InputUnits:  estimateInputTokens(int64(len(inBytes)), promptSystem, promptUser),
+				OutputUnits: maxExtractOutputTokens,
+			},
+			JobID:     job.ID,
+			AttemptID: claim.AttemptID(),
+		})
+	}
+	res, err := send(payload)
+	if err == nil {
+		// fall through
+	} else if refusesResponseFormat(err) {
+		// Engines without structured-output support reject the parameter.
+		// The prompts already demand JSON and the validator catches the
+		// rest — retry once without it rather than failing the job.
+		delete(request, "response_format")
+		payload, err = json.Marshal(request)
+		if err != nil {
+			return "", fmt.Errorf("marshal provider request: %w", err)
+		}
+		res, err = send(payload)
+		if err != nil {
+			return "", fmt.Errorf("provider chat completion: %w", err)
+		}
+	} else {
 		return "", fmt.Errorf("provider chat completion: %w", err)
 	}
 	defer func() { _ = res.Body.Close() }()
@@ -874,6 +893,14 @@ func (s *Service) resolveEndpoint(ctx context.Context, tenantID, model, capabili
 		}
 	}
 	return "", fmt.Errorf("selected model %q has no enabled %s endpoint", model, capability)
+}
+
+// refusesResponseFormat reports whether an upstream error explicitly rejects
+// the structured-output parameters (response_format / guided_*), as engines
+// without structured-output support do.
+func refusesResponseFormat(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "response_format") || strings.Contains(msg, "guided_")
 }
 
 func (s *Service) buildProviderRequest(model string, template Template, systemPrompt, userPrompt string, input ProcessInput) map[string]any {
