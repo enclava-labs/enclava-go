@@ -72,13 +72,15 @@ var bootstrapRoles = []bootstrapRole{
 
 // runBootstrap implements `enclava bootstrap` — the operator-only first-login
 // path (AUTH-01). It creates the first tenant and an admin user with a
-// generated password printed exactly once. There is no fixed credential and
-// no HTTP signup: database access is the authorization.
+// generated password printed exactly once; --password overrides generation
+// for reproducible environments (e2e, walkthroughs) where the credential is
+// public anyway. There is no HTTP signup: database access is the authorization.
 func runBootstrap(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("bootstrap", flag.ContinueOnError)
 	tenantSlug := fs.String("tenant", "default", "slug for the first tenant")
 	email := fs.String("email", "admin@local", "admin user email")
 	name := fs.String("name", "Administrator", "admin display name")
+	passwordFlag := fs.String("password", "", "fixed admin password (default: generated, printed once)")
 	issueKey := fs.Bool("issue-key", false, "also issue a bootstrap API key (printed once)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -104,6 +106,9 @@ func runBootstrap(ctx context.Context, args []string) error {
 	password, err := generatedSecret(24) // 32+ chars base64url
 	if err != nil {
 		return err
+	}
+	if *passwordFlag != "" {
+		password = *passwordFlag
 	}
 	passwordHash, err := auth.HashPassword(password)
 	if err != nil {

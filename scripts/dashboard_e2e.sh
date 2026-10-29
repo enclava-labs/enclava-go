@@ -37,7 +37,10 @@ BASE_DSN="${E2E_DATABASE_URL:-${DATABASE_URL:-postgres://localhost:5432/enclava}
 QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 APP_PORT="${APP_PORT:-18080}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@e2e.local}"
-ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
+# Fixed test credential: the walkthrough is a disposable public-password
+# instance; a stable admin password keeps manual QA logins working across
+# restarts. Override with ADMIN_PASSWORD for anything else.
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-E2e-admin-1234!}"
 E2E_PROJECTS="${E2E_PROJECTS:-}"
 
 SCHEMA="e2e_run_$$"
@@ -155,7 +158,7 @@ export SSL_CERT_FILE="$CONNECTOR_CA_FILE"
 export NODE_EXTRA_CA_CERTS="$CONNECTOR_CA_FILE"
 
 log "bootstrapping tenant bootstrap as $ADMIN_EMAIL"
-BOOT_OUT="$(./enclava bootstrap --tenant bootstrap --email "$ADMIN_EMAIL" --issue-key)"
+BOOT_OUT="$(./enclava bootstrap --tenant bootstrap --email "$ADMIN_EMAIL" --password "$ADMIN_PASSWORD" --issue-key)"
 echo "$BOOT_OUT" >"$DATA_DIR/bootstrap.out"
 if [ -z "$ADMIN_PASSWORD" ]; then
   ADMIN_PASSWORD="$(printf '%s' "$BOOT_OUT" | sed -n 's/^password: //p')"
