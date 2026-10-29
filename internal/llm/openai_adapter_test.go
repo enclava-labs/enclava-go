@@ -112,6 +112,22 @@ func TestAdapterMutationIsNotReplayed(t *testing.T) {
 	}
 }
 
+func TestAdapterJSONHeaderTimeoutCoversAttemptBudget(t *testing.T) {
+	// Regression: the JSON transport's response-header timeout was the 30s
+	// default while non-streaming completions send headers only once
+	// generation finishes — slow (local-model) generations were cut off at
+	// 30s even with a 5-minute attempt budget.
+	a := NewOpenAICompatibleAdapter("http://127.0.0.1:1/v1", "k", 90*time.Second).
+		WithAllowPrivateEndpoint()
+	tr, ok := a.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("json transport is %T, want *http.Transport", a.client.Transport)
+	}
+	if got := tr.ResponseHeaderTimeout; got < 90*time.Second {
+		t.Fatalf("json header timeout = %v, want ≥ the attempt budget (90s)", got)
+	}
+}
+
 func TestAdapterStreamCancelClosesUpstreamBody(t *testing.T) {
 	bodyClosed := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

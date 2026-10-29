@@ -57,7 +57,15 @@ func (a *OpenAICompatibleAdapter) rebuildClients(timeout time.Duration) {
 	}
 	a.cfgErr = nil
 	origin := originOf(u)
-	jsonTransport := endpointTransport(origin, a.allowPrivate, defaultResponseHeader)
+	// Non-streaming completions send no response headers until generation
+	// finishes, so the header timeout must cover the whole attempt budget —
+	// the 30s default cut off slow (local-model) generations mid-flight;
+	// client.Timeout still caps the call.
+	headerTimeout := defaultResponseHeader
+	if timeout > headerTimeout {
+		headerTimeout = timeout
+	}
+	jsonTransport := endpointTransport(origin, a.allowPrivate, headerTimeout)
 	streamTransport := endpointTransport(origin, a.allowPrivate, defaultStreamHeader)
 	// Streaming client has no overall Timeout: long-running SSE streams are
 	// bounded by response-header, idle and wall limits on the body instead.
