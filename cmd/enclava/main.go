@@ -342,11 +342,11 @@ func runtimeProviderConfig(cfg config.Config) inference.Endpoint {
 	}
 	switch cfg.Provider {
 	case "privatemode":
-		endpoint.BaseOrigin = cfg.UpstreamOpenAIBaseURL
+		endpoint.BaseOrigin = envOrigin(cfg.UpstreamOpenAIBaseURL)
 	case "openai_compatible":
-		endpoint.BaseOrigin = cfg.OpenAICompatibleBaseURL
+		endpoint.BaseOrigin = envOrigin(cfg.OpenAICompatibleBaseURL)
 	case "redpill":
-		endpoint.BaseOrigin = cfg.RedPillBaseURL
+		endpoint.BaseOrigin = envOrigin(cfg.RedPillBaseURL)
 	case "tinfoil":
 		endpoint.BaseOrigin = "https://inference.tinfoil.sh"
 		if cfg.TinfoilEnclave != "" {
@@ -476,12 +476,20 @@ func buildProvider(cfg config.Config) (llm.Provider, error) {
 	}
 }
 
-// envAdapter builds the env provider's transport. A cleartext (http://)
-// origin mirrors runtimeProviderConfig's AuthorizedPrivate marking: the
-// operator explicitly configured this origin, so the adapter is approved
-// for the same private target the seeded endpoint record carries.
+// envOrigin reduces a configured provider URL to the origin endpoint records
+// store: both "https://host" and the documented "https://host/v1" forms give
+// "https://host", and every transport re-adds /v1 (inference.defaultTransport).
+func envOrigin(raw string) string {
+	return strings.TrimSuffix(strings.TrimSuffix(strings.TrimSpace(raw), "/"), "/v1")
+}
+
+// envAdapter builds the env provider's transport under the same /v1 contract
+// as the seeded endpoint record. A cleartext (http://) origin mirrors
+// runtimeProviderConfig's AuthorizedPrivate marking: the operator explicitly
+// configured this origin, so the adapter is approved for the same private
+// target the seeded endpoint record carries.
 func envAdapter(baseURL, apiKey string, timeout time.Duration, provider string) *llm.OpenAICompatibleAdapter {
-	a := llm.NewOpenAICompatibleAdapter(baseURL, apiKey, timeout).WithProviderName(provider)
+	a := llm.NewOpenAICompatibleAdapter(envOrigin(baseURL)+"/v1", apiKey, timeout).WithProviderName(provider)
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(baseURL)), "http://") {
 		a.WithAllowPrivateEndpoint()
 	}

@@ -28,7 +28,6 @@ interface Run {
 }
 
 test('book → embeddings → grounded assistant answer, end to end over the API', async () => {
-  const seed = seedData();
   const suffix = Date.now();
   let botID = '';
   let collectionID = '';
@@ -73,19 +72,22 @@ test('book → embeddings → grounded assistant answer, end to end over the API
       assistant_id: botID,
       input: 'What is the secret marker in the handbook? Quote it exactly.',
     });
+    // Stop at any terminal status — a failed run must surface its error,
+    // not poll out the timeout.
     await expect
       .poll(
         async () => {
           const r = await api<Run>('GET', `/api/v1/agent-runs/${run.id}`);
-          return ['succeeded', 'failed', 'cancelled'].includes(r.status) ? r.status : 'running';
+          return ['succeeded', 'failed', 'cancelled'].includes(r.status);
         },
         { timeout: RUN_TIMEOUT, message: 'grounded run never reached a terminal status' },
       )
-      .toBe('succeeded');
+      .toBe(true);
 
     const finished = await api<Run>('GET', `/api/v1/agent-runs/${run.id}`);
+    expect(finished.status, `run error: ${finished.error || 'none'}`).toBe('succeeded');
     // The answer quotes the marker: the retrieved passage reached the model.
-    expect(finished.output || '', `run error: ${finished.error || 'none'}`).toContain(MARKER);
+    expect(finished.output || '').toContain(MARKER);
     // The run cites the passage it answered from.
     expect((finished.evidence_ids || []).length).toBeGreaterThan(0);
   } finally {
