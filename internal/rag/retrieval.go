@@ -103,7 +103,9 @@ func (s *Service) authorizedCandidates(ctx context.Context, p auth.Principal, co
 		} else if failure != nil {
 			return nil, examined, failure
 		}
-		if doc.Status != DocumentStatusReady || doc.ObjectVersionID != generation.ObjectVersionID {
+		// A document being re-embedded (or whose re-embed failed) keeps
+		// serving its published generation of the same version.
+		if doc.Status == DocumentStatusRemoved || doc.ObjectVersionID != generation.ObjectVersionID {
 			continue
 		}
 		candidates = append(candidates, authorizedCandidate{generation: generation, object: object, version: version})
@@ -166,14 +168,98 @@ func (s *Service) searchCollection(ctx context.Context, p auth.Principal, collec
 	if input.Rewrite && strings.TrimSpace(input.RewriteModel) != "" && utf8.RuneCountInString(query) <= 512 {
 		query = s.rewriteQuery(ctx, p, query, refs, input.RewriteModel)
 	}
-	filterGenerations := make([]IndexGeneration, 0, len(current))
-	for _, candidate := range current {
-		filterGenerations = append(filterGenerations, candidate.generation)
+	limit := input.Limit
+	if limit <= 0 {
+		limit = 5
 	}
-	filter := FilterBuilder(p.TenantID, filterGenerations, input.Filter)
+	if limit > 50 {
+		limit = 50
+	}
+	// Each generation is read from the index it was embedded into: while a
+	// collection re-embeds under new settings, documents not yet done are
+	// searched in the previous index with the previous model, and the
+	// per-index rankings are fused.
+	type binding struct {
+		index, model string
+		dims         int
+	}
+	groups := make(map[binding][]IndexGeneration)
+	for _, candidate := range current {
+		g := candidate.generation
+		b := binding{g.QdrantCollection, g.EmbeddingModel, g.EmbeddingDimensions}
+		groups[b] = append(groups[b], g)
+	}
+	bindings := make([]binding, 0, len(groups))
+	for b := range groups {
+		bindings = append(bindings, b)
+	}
+	sort.Slice(bindings, func(i, j int) bool {
+		if bindings[i].index != bindings[j].index {
+			return bindings[i].index < bindings[j].index
+		}
+		if bindings[i].model != bindings[j].model {
+			return bindings[i].model < bindings[j].model
+		}
+		return bindings[i].dims < bindings[j].dims
+	})
+	// Canonical source kinds resolve once per connection per collection.
+	connectionKinds := make(map[string]string)
+	chunkCache := make(map[string]map[string]DocumentChunk)
+	lists := make([]rankedSearchList, 0, len(bindings))
+	for _, b := range bindings {
+		points, err := s.queryIndex(ctx, p, b.index, b.model, b.dims, groups[b], query, input, refs, limit)
+		if err != nil {
+			return nil, err
+		}
+		results := make([]SearchResult, 0, len(points))
+		for _, point := range points {
+			payload := point.Payload
+			objectID := stringFromPayload(payload, "document_id")
+			versionID := stringFromPayload(payload, "object_version_id")
+			generation := int64FromAny(payload["generation"])
+			candidate, ok := current[versionID]
+			if !ok || candidate.generation.ObjectID != objectID || candidate.generation.Generation != generation {
+				continue
+			}
+			chunkID := stringFromPayload(payload, "chunk_id")
+			key := versionID + "\x00" + fmt.Sprint(generation)
+			chunksByID, cached := chunkCache[key]
+			if !cached {
+				chunks, err := s.repo.ListGenerationChunks(ctx, p.TenantID, collection.ID, versionID, generation)
+				if err != nil {
+					return nil, err
+				}
+				chunksByID = make(map[string]DocumentChunk, len(chunks))
+				for _, chunk := range chunks {
+					chunksByID[chunk.ID] = chunk
+				}
+				chunkCache[key] = chunksByID
+			}
+			chunk, found := chunksByID[chunkID]
+			if !found {
+				continue
+			}
+			results = append(results, SearchResult{DocumentID: objectID, CollectionID: collection.ID, ObjectVersionID: versionID, ChunkID: chunkID, Generation: generation, Spans: chunk.SpanRefs, ObservedSeq: candidate.version.ObservedSeq, ChunkStart: chunk.ChunkIndex, ChunkEnd: chunk.ChunkIndex, Score: point.Score, Content: chunk.Content, SourceURI: stringFromPayload(payload, "source_uri"), FileName: stringFromPayload(payload, "file_name"), HeaderPath: chunk.HeaderPath, Metadata: chunk.Metadata, CollectionName: collection.Name, SourceKind: s.sourceKindFor(ctx, p.TenantID, candidate, connectionKinds)})
+		}
+		lists = append(lists, rankedSearchList{results: results})
+	}
+	results := lists[0].results
+	if len(lists) > 1 {
+		results = fuseRankedResults(lists, limit)
+	}
+	if input.SelectSections && strings.TrimSpace(input.SectionModel) != "" && len(results) > 0 {
+		results = s.selectSections(ctx, p, results, refs, input.SectionModel)
+	}
+	return results, nil
+}
+
+// queryIndex embeds the query with one index's model and size, then searches
+// that index within the given generations.
+func (s *Service) queryIndex(ctx context.Context, p auth.Principal, index, model string, dims int, generations []IndexGeneration, query string, input SearchInput, refs []source.ObjectRef, limit int) ([]QdrantSearchPoint, error) {
+	filter := FilterBuilder(p.TenantID, generations, input.Filter)
 	var vector []float64
 	if input.Mode != QueryLexical {
-		vectors, err := s.embed(ctx, p, collection.EmbeddingModel, []string{query}, embedScope{Inputs: refs})
+		vectors, err := s.embed(ctx, p, model, dims, []string{query}, embedScope{Inputs: refs})
 		if err != nil {
 			return nil, err
 		}
@@ -182,79 +268,23 @@ func (s *Service) searchCollection(ctx context.Context, p auth.Principal, collec
 		}
 		vector = vectors[0]
 	}
-	limit := input.Limit
-	if limit <= 0 {
-		limit = 5
-	}
-	if limit > 50 {
-		limit = 50
-	}
-	var points []QdrantSearchPoint
-	if client, ok := s.vectorStore.(queryClient); ok {
-		var err error
-		if qdrant, ok := s.vectorStore.(*QdrantClient); ok && input.Mode == QueryHybrid {
-			hasSparse, _, err := qdrant.collectionVectors(ctx, collection.QdrantCollection)
-			if err != nil {
-				return nil, err
-			}
-			if !hasSparse {
-				points, err = s.vectorStore.SearchHybrid(ctx, collection.QdrantCollection, vector, SparseVector{}, limit, filter)
-			} else {
-				points, err = client.Query(ctx, collection.QdrantCollection, QueryInput{Mode: input.Mode, DenseVector: vector, LexicalText: query, Filter: filter, Limit: limit})
-			}
-		} else {
-			points, err = client.Query(ctx, collection.QdrantCollection, QueryInput{Mode: input.Mode, DenseVector: vector, LexicalText: query, Filter: filter, Limit: limit})
-		}
-		if err != nil {
-			return nil, err
-		}
-	} else {
+	client, ok := s.vectorStore.(queryClient)
+	if !ok {
 		if input.Mode == QueryLexical {
 			return nil, errors.New("lexical search is unavailable for this vector store")
 		}
-		var err error
-		points, err = s.vectorStore.SearchHybrid(ctx, collection.QdrantCollection, vector, SparseVector{}, limit, filter)
+		return s.vectorStore.SearchHybrid(ctx, index, vector, SparseVector{}, limit, filter)
+	}
+	if qdrant, ok := s.vectorStore.(*QdrantClient); ok && input.Mode == QueryHybrid {
+		hasSparse, _, err := qdrant.collectionVectors(ctx, index)
 		if err != nil {
 			return nil, err
 		}
-	}
-	// Canonical source kinds resolve once per connection per collection.
-	connectionKinds := make(map[string]string)
-	results := make([]SearchResult, 0, len(points))
-	chunkCache := make(map[string]map[string]DocumentChunk)
-	for _, point := range points {
-		payload := point.Payload
-		objectID := stringFromPayload(payload, "document_id")
-		versionID := stringFromPayload(payload, "object_version_id")
-		generation := int64FromAny(payload["generation"])
-		candidate, ok := current[versionID]
-		if !ok || candidate.generation.ObjectID != objectID || candidate.generation.Generation != generation {
-			continue
+		if !hasSparse {
+			return s.vectorStore.SearchHybrid(ctx, index, vector, SparseVector{}, limit, filter)
 		}
-		chunkID := stringFromPayload(payload, "chunk_id")
-		key := versionID + "\x00" + fmt.Sprint(generation)
-		chunksByID, cached := chunkCache[key]
-		if !cached {
-			chunks, err := s.repo.ListGenerationChunks(ctx, p.TenantID, collection.ID, versionID, generation)
-			if err != nil {
-				return nil, err
-			}
-			chunksByID = make(map[string]DocumentChunk, len(chunks))
-			for _, chunk := range chunks {
-				chunksByID[chunk.ID] = chunk
-			}
-			chunkCache[key] = chunksByID
-		}
-		chunk, found := chunksByID[chunkID]
-		if !found {
-			continue
-		}
-		results = append(results, SearchResult{DocumentID: objectID, CollectionID: collection.ID, ObjectVersionID: versionID, ChunkID: chunkID, Generation: generation, Spans: chunk.SpanRefs, ObservedSeq: candidate.version.ObservedSeq, ChunkStart: chunk.ChunkIndex, ChunkEnd: chunk.ChunkIndex, Score: point.Score, Content: chunk.Content, SourceURI: stringFromPayload(payload, "source_uri"), FileName: stringFromPayload(payload, "file_name"), HeaderPath: chunk.HeaderPath, Metadata: chunk.Metadata, CollectionName: collection.Name, SourceKind: s.sourceKindFor(ctx, p.TenantID, candidate, connectionKinds)})
 	}
-	if input.SelectSections && strings.TrimSpace(input.SectionModel) != "" && len(results) > 0 {
-		results = s.selectSections(ctx, p, results, refs, input.SectionModel)
-	}
-	return results, nil
+	return client.Query(ctx, index, QueryInput{Mode: input.Mode, DenseVector: vector, LexicalText: query, Filter: filter, Limit: limit})
 }
 
 // sourceKindFor resolves the canonical source kind of a candidate: the
@@ -653,7 +683,7 @@ func (s *Service) rewriteQuery(ctx context.Context, p auth.Principal, query stri
 	}
 	result, err := s.executor.Execute(ctx, p, inference.Request{
 		Capability: inference.CapabilityChat, Model: model, Payload: payload, Inputs: refs,
-		Estimate: billing.Usage{InputUnits: int64((utf8.RuneCountInString(query)+3)/4 + 64), OutputUnits: 128},
+		Estimate: billing.Usage{InputUnits: int64((utf8.RuneCountInString(query)+3)/4 + 64)},
 	})
 	if err != nil || result == nil || result.Body == nil {
 		return query
@@ -713,7 +743,7 @@ func (s *Service) selectSections(ctx context.Context, p auth.Principal, results 
 	}
 	result, err := s.executor.Execute(ctx, p, inference.Request{
 		Capability: inference.CapabilityChat, Model: model, Payload: payload, Inputs: refs,
-		Estimate: billing.Usage{InputUnits: 2048, OutputUnits: 256},
+		Estimate: billing.Usage{InputUnits: 2048},
 	})
 	if err != nil || result == nil || result.Body == nil {
 		return results

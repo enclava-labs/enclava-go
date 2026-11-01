@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -48,7 +49,8 @@ func (f *fakeEmbeddingUpstream) DoResponsesStream(ctx context.Context, method, p
 func (f *fakeEmbeddingUpstream) CreateEmbeddings(ctx context.Context, body []byte) ([]byte, error) {
 	f.calls++
 	var payload struct {
-		Input any `json:"input"`
+		Model string `json:"model"`
+		Input any    `json:"input"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
@@ -65,10 +67,13 @@ func (f *fakeEmbeddingUpstream) CreateEmbeddings(ctx context.Context, body []byt
 	}
 	data := make([]map[string]any, 0, len(inputs))
 	for i, input := range inputs {
-		data = append(data, map[string]any{
-			"index":     i,
-			"embedding": []float64{float64(len(input)), float64(strings.Count(input, "enclava") + 1), 1},
-		})
+		vector := []float64{float64(len(input)), float64(strings.Count(input, "enclava") + 1), 1}
+		if payload.Model == "embed-wide" { // a second, 40-dimension model to switch to
+			for len(vector) < 40 {
+				vector = append(vector, 0.5)
+			}
+		}
+		data = append(data, map[string]any{"index": i, "embedding": vector})
 	}
 	return json.Marshal(map[string]any{
 		"object": "list",
@@ -82,36 +87,11 @@ func (f *fakeEmbeddingUpstream) CreateEmbeddings(ctx context.Context, body []byt
 // attempt must resolve through.
 func newExecutor(t *testing.T, db *postgres.DB, tenant string, upstream inference.Upstream) *inference.Service {
 	t.Helper()
-	ctx := context.Background()
-	endpoints := postgres.NewEndpointsRepo(db)
 	sources := postgres.NewSourceRepo(db)
 	billingRepo := postgres.NewBillingRepo(db)
-	if err := endpoints.Create(ctx, inference.Endpoint{
-		ID:           "ep-embed",
-		TenantID:     tenant,
-		Protocol:     "openai_compatible",
-		BaseOrigin:   "https://embed.upstream.example",
-		Capabilities: []string{inference.CapabilityEmbeddings, "model:embed-test"},
-		Enabled:      true,
-	}); err != nil {
-		t.Fatalf("create endpoint: %v", err)
-	}
-	if err := billingRepo.PutPrice(ctx, tenant, fmt.Sprintf("p-embed-%s", newTestID()), billing.Price{
-		SubjectType: billing.PriceSubjectEndpoint, SubjectID: "ep-embed",
-		Capability: inference.CapabilityEmbeddings, Unit: billing.UnitInput,
-		RateMicros: 1, UnitQuantity: 1, Currency: "USD",
-	}, "tester", time.Now().UTC().Add(-time.Minute)); err != nil {
-		t.Fatalf("put price: %v", err)
-	}
-	if err := billingRepo.PutPrice(ctx, tenant, fmt.Sprintf("p-embed-cached-%s", newTestID()), billing.Price{
-		SubjectType: billing.PriceSubjectEndpoint, SubjectID: "ep-embed",
-		Capability: inference.CapabilityEmbeddings, Unit: billing.UnitCachedInput,
-		RateMicros: 1, UnitQuantity: 1, Currency: "USD",
-	}, "tester", time.Now().UTC().Add(-time.Minute)); err != nil {
-		t.Fatalf("put price: %v", err)
-	}
+	addEmbeddingEndpoint(t, db, tenant, "ep-embed", "embed-test")
 	svc, err := inference.NewService(inference.Deps{
-		Endpoints:  endpoints,
+		Endpoints:  postgres.NewEndpointsRepo(db),
 		Sources:    sources,
 		Authorizer: source.NewAuthorizer(sources, 0),
 		Billing:    billing.NewService(billingRepo),
@@ -125,10 +105,39 @@ func newExecutor(t *testing.T, db *postgres.DB, tenant string, upstream inferenc
 	return svc
 }
 
+// addEmbeddingEndpoint binds model on a priced embeddings endpoint served by
+// the executor's fake transport.
+func addEmbeddingEndpoint(t *testing.T, db *postgres.DB, tenant, endpointID, model string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := postgres.NewEndpointsRepo(db).Create(ctx, inference.Endpoint{
+		ID:           endpointID,
+		TenantID:     tenant,
+		Protocol:     "openai_compatible",
+		BaseOrigin:   "https://" + endpointID + ".upstream.example",
+		Capabilities: []string{inference.CapabilityEmbeddings, "model:" + model},
+		Enabled:      true,
+	}); err != nil {
+		t.Fatalf("create endpoint: %v", err)
+	}
+	billingRepo := postgres.NewBillingRepo(db)
+	for _, unit := range []billing.UnitKind{billing.UnitInput, billing.UnitCachedInput} {
+		if err := billingRepo.PutPrice(ctx, tenant, fmt.Sprintf("p-%s-%s-%s", endpointID, unit, newTestID()), billing.Price{
+			SubjectType: billing.PriceSubjectEndpoint, SubjectID: endpointID,
+			Capability: inference.CapabilityEmbeddings, Unit: unit,
+			RateMicros: 1, UnitQuantity: 1, Currency: "USD",
+		}, "tester", time.Now().UTC().Add(-time.Minute)); err != nil {
+			t.Fatalf("put price: %v", err)
+		}
+	}
+}
+
 func newTestID() string { return fmt.Sprintf("t%d", time.Now().UnixNano()) }
 
 type fakeVectorStore struct {
-	points map[string][]rag.QdrantPoint
+	points    map[string][]rag.QdrantPoint
+	lastQuery []float64
+	queried   []string // index names, in query order
 }
 
 func newFakeVectorStore() *fakeVectorStore {
@@ -220,6 +229,8 @@ func (f *fakeVectorStore) SearchHybrid(ctx context.Context, collection string, v
 	return out, nil
 }
 func (f *fakeVectorStore) Query(ctx context.Context, collection string, input rag.QueryInput) ([]rag.QdrantSearchPoint, error) {
+	f.lastQuery = input.DenseVector
+	f.queried = append(f.queried, collection)
 	return f.SearchHybrid(ctx, collection, input.DenseVector, rag.SparseVector{}, input.Limit, input.Filter)
 }
 
@@ -371,6 +382,179 @@ func TestServiceUploadIndexSearchDelete(t *testing.T) {
 	}
 	if got := len(f.vector.points[c.QdrantCollection]); got != 0 {
 		t.Fatalf("expected qdrant points removed, got %d", got)
+	}
+}
+
+// TestCollectionEmbeddingDimensions: a collection on the default model gets
+// the deployment vector size, documents and queries are both cut to it, and
+// a size the model cannot produce is refused when it is configured.
+func TestCollectionEmbeddingDimensions(t *testing.T) {
+	f := newFixture(t)
+	f.svc.SetDefaultEmbeddingDimensions(2) // the fake model returns 3 dimensions
+	ctx := context.Background()
+	c := f.collection(t)
+	if c.EmbeddingModel != "embed-test" || c.EmbeddingDimensions != 2 {
+		t.Fatalf("default collection = %s/%d, want embed-test/2", c.EmbeddingModel, c.EmbeddingDimensions)
+	}
+	other, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{Name: "other", EmbeddingModel: "other-embed"})
+	if err != nil || other.EmbeddingDimensions != 0 {
+		t.Fatalf("other model = %d dims, %v; want full size", other.EmbeddingDimensions, err)
+	}
+	tiny, wide := 8, 64
+	if _, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{Name: "tiny", EmbeddingDimensions: &tiny}); !errors.Is(err, rag.ErrInvalidInput) {
+		t.Fatalf("8 dimensions = %v, want ErrInvalidInput", err)
+	}
+	if _, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{Name: "wide", EmbeddingDimensions: &wide}); !errors.Is(err, rag.ErrInvalidInput) {
+		t.Fatalf("64 dimensions from a 3-dimension model = %v, want ErrInvalidInput", err)
+	}
+
+	if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "note.txt", MimeType: "text/plain", Bytes: []byte("enclava vector size"),
+	}); err != nil {
+		t.Fatalf("upload document: %v", err)
+	}
+	f.runNextJob(t)
+	points := f.vector.points[c.QdrantCollection]
+	if len(points) == 0 {
+		t.Fatal("no points indexed")
+	}
+	for _, pt := range points {
+		if len(pt.Vector) != 2 || math.Abs(pt.Vector[0]*pt.Vector[0]+pt.Vector[1]*pt.Vector[1]-1) > 1e-9 {
+			t.Fatalf("indexed vector %v, want a unit-length 2-vector", pt.Vector)
+		}
+	}
+	if _, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "enclava", Mode: rag.QuerySemantic}); err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(f.vector.lastQuery) != 2 {
+		t.Fatalf("query vector %v, want 2 dimensions", f.vector.lastQuery)
+	}
+	if _, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{EmbeddingDimensions: &wide}); !errors.Is(err, rag.ErrInvalidInput) {
+		t.Fatalf("resize past the model = %v, want ErrInvalidInput", err)
+	}
+	if got, _ := f.svc.GetCollection(ctx, f.principal, c.ID); got.EmbeddingDimensions != 2 || got.QdrantCollection != c.QdrantCollection {
+		t.Fatalf("refused resize changed the collection: %d dims in %s", got.EmbeddingDimensions, got.QdrantCollection)
+	}
+}
+
+// TestCollectionReembedsInBackground: switching model and size re-embeds
+// every document into a new index while search keeps reading each document
+// from the index it is published in; the old index is dropped once the last
+// document has moved, even with an abandoned attempt still bound to it.
+func TestCollectionReembedsInBackground(t *testing.T) {
+	f := newFixture(t)
+	addEmbeddingEndpoint(t, f.db, f.tenant, "ep-embed-wide", "embed-wide")
+	ctx := context.Background()
+	c := f.collection(t)
+	var versionID string
+	for _, name := range []string{"a.txt", "b.txt"} {
+		upload, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+			FileName: name, MimeType: "text/plain", Bytes: []byte("enclava background " + name),
+		})
+		if err != nil {
+			t.Fatalf("upload %s: %v", name, err)
+		}
+		versionID = upload.Document.ObjectVersionID
+		f.runNextJob(t)
+	}
+	oldIndex := c.QdrantCollection
+	// A failed attempt older than the published generation, bound to the old
+	// index — what an import that died at upsert leaves behind.
+	if _, err := f.db.SQL.ExecContext(ctx, `
+		INSERT INTO index_generations (tenant_id, id, collection_id, object_version_id, generation, state,
+		                               qdrant_collection, embedding_model, created_at)
+		VALUES ($1, 'idxgen_abandoned', $2, $3, 0, 'staging', $4, 'embed-test', now() - interval '1 hour')`,
+		f.tenant, c.ID, versionID, oldIndex); err != nil {
+		t.Fatalf("seed abandoned attempt: %v", err)
+	}
+	search := func() map[string]bool {
+		t.Helper()
+		f.vector.queried = nil
+		results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "enclava background", Mode: rag.QuerySemantic, Limit: 10})
+		if err != nil {
+			t.Fatalf("search: %v", err)
+		}
+		found := map[string]bool{}
+		for _, r := range results {
+			found[r.DocumentID] = true
+		}
+		return found
+	}
+
+	dims, model := 32, "embed-wide"
+	updated, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{EmbeddingModel: &model, EmbeddingDimensions: &dims})
+	if err != nil {
+		t.Fatalf("switch model: %v", err)
+	}
+	newIndex := updated.QdrantCollection
+	if newIndex == oldIndex || updated.EmbeddingModel != model || updated.EmbeddingDimensions != dims {
+		t.Fatalf("switched collection = %s %s/%d", newIndex, updated.EmbeddingModel, updated.EmbeddingDimensions)
+	}
+	if found := search(); len(found) != 2 || len(f.vector.queried) != 1 || f.vector.queried[0] != oldIndex {
+		t.Fatalf("before re-embedding: found %v via %v, want both docs from %s", found, f.vector.queried, oldIndex)
+	}
+
+	f.runNextJob(t) // one document moves to the new index
+	if found := search(); len(found) != 2 || len(f.vector.queried) != 2 {
+		t.Fatalf("mid re-embedding: found %v via %v, want both docs from both indexes", found, f.vector.queried)
+	}
+	if _, kept := f.vector.points[oldIndex]; !kept {
+		t.Fatal("old index dropped while a document still reads it")
+	}
+
+	f.runNextJob(t) // the last document moves
+	if found := search(); len(found) != 2 || len(f.vector.queried) != 1 || f.vector.queried[0] != newIndex || len(f.vector.lastQuery) != dims {
+		t.Fatalf("after re-embedding: found %v via %v (query %d dims)", found, f.vector.queried, len(f.vector.lastQuery))
+	}
+	for _, pt := range f.vector.points[newIndex] {
+		if len(pt.Vector) != dims {
+			t.Fatalf("re-embedded vector has %d dimensions, want %d", len(pt.Vector), dims)
+		}
+	}
+	if _, kept := f.vector.points[oldIndex]; kept {
+		t.Fatal("old index kept after every document moved")
+	}
+	if got, _ := f.svc.GetCollection(ctx, f.principal, c.ID); len(got.RetiredQdrantCollections) != 0 {
+		t.Fatalf("retired indexes still listed: %v", got.RetiredQdrantCollections)
+	}
+}
+
+// TestCollectionEmbedsDocumentTitles: chunks embed behind their document's
+// name unless the collection turns it off, which re-embeds in place.
+func TestCollectionEmbedsDocumentTitles(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	if !c.EmbedTitles {
+		t.Fatal("a new collection does not embed document names")
+	}
+	text := "enclava titled chunk"
+	if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "note.txt", MimeType: "text/plain", Bytes: []byte(text),
+	}); err != nil {
+		t.Fatalf("upload document: %v", err)
+	}
+	f.runNextJob(t)
+	// The fake model's first component is the embedded input's length.
+	embeddedLen := func() float64 {
+		t.Helper()
+		points := f.vector.points[c.QdrantCollection]
+		if len(points) != 1 {
+			t.Fatalf("points = %d, want 1", len(points))
+		}
+		return points[0].Vector[0]
+	}
+	if got, want := embeddedLen(), float64(len("note.txt\n"+text)); got != want {
+		t.Fatalf("embedded input length %v, want %v with the name prefixed", got, want)
+	}
+	off := false
+	updated, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{EmbedTitles: &off})
+	if err != nil || updated.EmbedTitles || updated.QdrantCollection != c.QdrantCollection {
+		t.Fatalf("turn names off = %+v, %v; want same index without names", updated, err)
+	}
+	f.runNextJob(t)
+	if got, want := embeddedLen(), float64(len(text)); got != want {
+		t.Fatalf("embedded input length %v after turning names off, want %v", got, want)
 	}
 }
 

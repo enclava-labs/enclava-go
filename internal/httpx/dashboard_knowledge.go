@@ -31,13 +31,17 @@ import (
 // per-row count read the same way the sources table bounds itself.
 const dashboardKnowledgeLimit = 100
 
-// knowledgeListData is the list-page view model; EmbeddingModels feeds the
-// New-collection drawer's select (managers only ever see the control).
+// knowledgeListData is the list-page view model; EmbeddingModels and the
+// vector-size fields feed the New-collection drawer (managers only ever see
+// the control).
 type knowledgeListData struct {
-	Header          dashboardHeader
-	Rows            []knowledgeCollectionRow
-	EmbeddingModels []string
-	Empty           dashboardEmpty
+	Header                     dashboardHeader
+	Rows                       []knowledgeCollectionRow
+	EmbeddingModels            []string
+	DefaultEmbeddingModel      string
+	DefaultEmbeddingDimensions int
+	DimensionChoices           []int
+	Empty                      dashboardEmpty
 }
 
 func (d knowledgeListData) DashboardTitle() string  { return "Knowledge" }
@@ -58,19 +62,20 @@ type knowledgeCollectionRow struct {
 
 // knowledgeCollectionData is the collection page AND tab-fragment model.
 type knowledgeCollectionData struct {
-	Header          dashboardHeader
-	Collection      rag.Collection
-	Tabs            []dashboardTab
-	Tab             string // documents|sources|search|settings
-	Status          string // active document filter bucket
-	Docs            []rag.Document
-	DocMore         bool
-	AnyProcessing   bool
-	Empty           dashboardEmpty
-	SourcesEmpty    dashboardEmpty
-	Sources         []connectors.Source
-	EmbeddingModels []string
-	Everyone        bool // audience contains "*" — the settings access select
+	Header           dashboardHeader
+	Collection       rag.Collection
+	Tabs             []dashboardTab
+	Tab              string // documents|sources|search|settings
+	Status           string // active document filter bucket
+	Docs             []rag.Document
+	DocMore          bool
+	AnyProcessing    bool
+	Empty            dashboardEmpty
+	SourcesEmpty     dashboardEmpty
+	Sources          []connectors.Source
+	EmbeddingModels  []string
+	DimensionChoices []int
+	Everyone         bool // audience contains "*" — the settings access select
 }
 
 func (d knowledgeCollectionData) DashboardTitle() string  { return d.Collection.Name }
@@ -147,6 +152,8 @@ func (a *App) knowledgeListView(w http.ResponseWriter, r *http.Request, p auth.P
 		data.Header.Actions = template.HTML(`<button type="button" class="btn primary" data-action="knowledge:new">` +
 			string(dashboardIconPlus()) + `New collection</button>`)
 		data.EmbeddingModels = a.knowledgeEmbeddingModels(ctx, p.TenantID)
+		data.DefaultEmbeddingModel, data.DefaultEmbeddingDimensions = a.ragSvc.DefaultEmbedding()
+		data.DimensionChoices = knowledgeDimensionChoices(0)
 	}
 	// Sources are read once and bucketed per target collection; the count is
 	// a manager column, so members never pay for it (or see it).
@@ -257,6 +264,7 @@ func (a *App) handleDashboardKnowledgeCollection(w http.ResponseWriter, r *http.
 		data.Sources = a.knowledgeCollectionSources(ctx, p, c.ID)
 	case "settings":
 		data.EmbeddingModels = a.knowledgeEmbeddingModels(ctx, p.TenantID)
+		data.DimensionChoices = knowledgeDimensionChoices(c.EmbeddingDimensions)
 	}
 	a.renderDashboard(w, r, "knowledge_collection", data)
 }
@@ -420,6 +428,22 @@ func (a *App) knowledgeEmbeddingModels(ctx context.Context, tenantID string) []s
 	}
 	sort.Strings(models)
 	return models
+}
+
+// knowledgeDimensionChoices is the vector-size menu, always carrying the
+// current size so a settings save never silently changes it.
+func knowledgeDimensionChoices(current int) []int {
+	choices := []int{2048, 1536, 1024, 768, 512, 256}
+	for _, n := range choices {
+		if n == current {
+			return choices
+		}
+	}
+	if current > 0 {
+		choices = append(choices, current)
+		sort.Sort(sort.Reverse(sort.IntSlice(choices)))
+	}
+	return choices
 }
 
 // --- tab fragments ---------------------------------------------------------

@@ -22,23 +22,30 @@ const (
 // knowledge_collections + chunk_profiles; Audience carries actor IDs (or "*"
 // for tenant-wide read) decoded to/from the stored audience JSON list.
 type Collection struct {
-	TenantID              string         `json:"-"`
-	ChunkProfileVersionID string         `json:"chunk_profile_version_id,omitempty"`
-	ID                    string         `json:"id"`
-	Name                  string         `json:"name"`
-	Description           string         `json:"description,omitempty"`
-	OwnerActorID          string         `json:"owner_actor_id,omitempty"`
-	QdrantCollection      string         `json:"qdrant_collection"`
-	EmbeddingProvider     string         `json:"embedding_provider,omitempty"`
-	EmbeddingModel        string         `json:"embedding_model"`
-	ChunkSize             int            `json:"chunk_size"`
-	ChunkOverlap          int            `json:"chunk_overlap"`
-	ACL                   map[string]any `json:"acl,omitempty"`
-	Audience              []string       `json:"audience,omitempty"`
-	Metadata              map[string]any `json:"metadata,omitempty"`
-	IsActive              bool           `json:"is_active"`
-	CreatedAt             time.Time      `json:"created_at"`
-	UpdatedAt             time.Time      `json:"updated_at"`
+	TenantID              string `json:"-"`
+	ChunkProfileVersionID string `json:"chunk_profile_version_id,omitempty"`
+	ID                    string `json:"id"`
+	Name                  string `json:"name"`
+	Description           string `json:"description,omitempty"`
+	OwnerActorID          string `json:"owner_actor_id,omitempty"`
+	QdrantCollection      string `json:"qdrant_collection"`
+	// RetiredQdrantCollections are indexes the collection switched away
+	// from; documents not yet re-embedded are still searched there.
+	RetiredQdrantCollections []string `json:"-"`
+	EmbeddingProvider        string   `json:"embedding_provider,omitempty"`
+	EmbeddingModel           string   `json:"embedding_model"`
+	EmbeddingDimensions      int      `json:"embedding_dimensions"` // 0 = the model's full output
+	// EmbedTitles prefixes each chunk with its document's name before
+	// embedding: better across many documents, worse inside a single one.
+	EmbedTitles  bool           `json:"embed_titles"`
+	ChunkSize    int            `json:"chunk_size"`
+	ChunkOverlap int            `json:"chunk_overlap"`
+	ACL          map[string]any `json:"acl,omitempty"`
+	Audience     []string       `json:"audience,omitempty"`
+	Metadata     map[string]any `json:"metadata,omitempty"`
+	IsActive     bool           `json:"is_active"`
+	CreatedAt    time.Time      `json:"created_at"`
+	UpdatedAt    time.Time      `json:"updated_at"`
 }
 
 // Document is the legacy-stable JSON view over a source.Object row joined to
@@ -86,14 +93,19 @@ type DocumentChunk struct {
 	CreatedAt        time.Time      `json:"created_at"`
 }
 
+// IndexGeneration is one published (or staged) document generation and the
+// index it was embedded into: queries for it must use the same model, size
+// and Qdrant collection.
 type IndexGeneration struct {
-	CollectionID     string
-	QdrantCollection string
-	ObjectID         string
-	ObjectVersionID  string
-	Generation       int64
-	State            string
-	Tombstoned       bool
+	CollectionID        string
+	QdrantCollection    string
+	EmbeddingModel      string
+	EmbeddingDimensions int
+	ObjectID            string
+	ObjectVersionID     string
+	Generation          int64
+	State               string
+	Tombstoned          bool
 }
 
 type IndexReconciliation struct {
@@ -116,6 +128,8 @@ type CreateCollectionInput struct {
 	Name                  string         `json:"name"`
 	Description           string         `json:"description,omitempty"`
 	EmbeddingModel        string         `json:"embedding_model,omitempty"`
+	EmbeddingDimensions   *int           `json:"embedding_dimensions,omitempty"`
+	EmbedTitles           *bool          `json:"embed_titles,omitempty"` // default true
 	ChunkProfileVersionID *string        `json:"chunk_profile_version_id,omitempty"`
 	ChunkSize             int            `json:"chunk_size,omitempty"`
 	ChunkOverlap          int            `json:"chunk_overlap,omitempty"`
@@ -127,6 +141,8 @@ type UpdateCollectionInput struct {
 	Name                  *string        `json:"name,omitempty"`
 	Description           *string        `json:"description,omitempty"`
 	EmbeddingModel        *string        `json:"embedding_model,omitempty"`
+	EmbeddingDimensions   *int           `json:"embedding_dimensions,omitempty"`
+	EmbedTitles           *bool          `json:"embed_titles,omitempty"`
 	ChunkProfileVersionID *string        `json:"chunk_profile_version_id,omitempty"`
 	ChunkSize             *int           `json:"chunk_size,omitempty"`
 	ChunkOverlap          *int           `json:"chunk_overlap,omitempty"`

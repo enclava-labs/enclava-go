@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"unicode/utf8"
 )
 
@@ -57,7 +58,9 @@ type embedScope struct {
 // createEmbeddings batches embedding calls through the shared executor —
 // policy resolution, pricing, dispatch and settlement all live inside
 // inference.Service.Execute; there is no direct-provider or key-zero path.
-func createEmbeddings(ctx context.Context, executor Executor, p auth.Principal, model string, inputs []string, scope embedScope) ([][]float64, error) {
+// dims > 0 keeps only each vector's first dims components (see
+// truncateEmbedding); 0 keeps the model's full output.
+func createEmbeddings(ctx context.Context, executor Executor, p auth.Principal, model string, dims int, inputs []string, scope embedScope) ([][]float64, error) {
 	vectors := make([][]float64, len(inputs))
 	var dim int
 	for offset := 0; offset < len(inputs); {
@@ -86,7 +89,35 @@ func createEmbeddings(ctx context.Context, executor Executor, p auth.Principal, 
 		}
 		offset = end
 	}
+	if dims > 0 {
+		if dims > dim {
+			return nil, fmt.Errorf("embedding model %q returns %d dimensions, fewer than the collection's %d", model, dim, dims)
+		}
+		for i := range vectors {
+			vectors[i] = truncateEmbedding(vectors[i], dims)
+		}
+	}
 	return vectors, nil
+}
+
+// truncateEmbedding keeps the first dims components rescaled to unit length:
+// Matryoshka-trained models front-load information, so the prefix is itself
+// an embedding — the same vector a server-side `dimensions` request returns.
+// Done here because not every server supports that parameter (vLLM rejects it).
+func truncateEmbedding(vec []float64, dims int) []float64 {
+	vec = vec[:dims]
+	var sum float64
+	for _, v := range vec {
+		sum += v * v
+	}
+	if sum == 0 {
+		return vec
+	}
+	norm := math.Sqrt(sum)
+	for i := range vec {
+		vec[i] /= norm
+	}
+	return vec
 }
 
 func createEmbeddingBatch(ctx context.Context, executor Executor, p auth.Principal, model string, inputs []string, estimate int64, scope embedScope) ([][]float64, error) {

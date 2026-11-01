@@ -99,6 +99,39 @@ func TestLoadDataDirAndSessionTTLDefaults(t *testing.T) {
 	}
 }
 
+// TestLoadDefaultEmbeddingDimensions: 1024 is the default only for the
+// default model, other models default to full size, and sizes no model
+// could use are rejected at startup.
+func TestLoadDefaultEmbeddingDimensions(t *testing.T) {
+	for _, tc := range []struct {
+		model, dims string
+		want        int
+		wantErr     bool
+	}{
+		{model: "", dims: "", want: 1024},
+		{model: "nomic-embed-text", dims: "", want: 0},
+		{model: "nomic-embed-text", dims: "512", want: 512},
+		{model: "", dims: "0", want: 0},
+		{model: "", dims: "16", wantErr: true},
+	} {
+		clearConfigEnv(t)
+		t.Setenv("PRIVATEMODE_API_KEY", "pm_test_key")
+		t.Setenv("PRIVATEMODE_BASE_URL", "https://example.invalid/v1")
+		t.Setenv("DEFAULT_EMBEDDING_MODEL", tc.model)
+		t.Setenv("DEFAULT_EMBEDDING_DIMENSIONS", tc.dims)
+		cfg, err := Load()
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("model %q dims %q loaded, want an error", tc.model, tc.dims)
+			}
+			continue
+		}
+		if err != nil || cfg.DefaultEmbeddingDimensions != tc.want {
+			t.Fatalf("model %q dims %q = %d, %v; want %d", tc.model, tc.dims, cfg.DefaultEmbeddingDimensions, err, tc.want)
+		}
+	}
+}
+
 func TestLoadAllowsTinfoilDefaultRouting(t *testing.T) {
 	clearConfigEnv(t)
 	t.Setenv("INFERENCE_PROVIDER", "tinfoil")
@@ -269,6 +302,7 @@ func clearConfigEnv(t *testing.T) {
 		"PROVIDER_MODEL_CACHE_TTL",
 		"QDRANT_URL",
 		"DEFAULT_EMBEDDING_MODEL",
+		"DEFAULT_EMBEDDING_DIMENSIONS",
 		"TINFOIL_API_KEY",
 		"TINFOIL_ENCLAVE",
 		"TINFOIL_REPO",

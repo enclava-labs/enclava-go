@@ -25,10 +25,23 @@
     <div>
       <label class="label" for="knc-model">Embedding model</label>
       <select class="field" id="knc-model" name="embedding_model">
-        <option value="">Deployment default</option>
+        <option value="">Deployment default ({{.Data.DefaultEmbeddingModel}})</option>
         {{range .Data.EmbeddingModels}}<option value="{{.}}">{{.}}</option>{{end}}
       </select>
       <span class="help">Only models on enabled embeddings-capable endpoints are listed.</span>
+    </div>
+    <div>
+      <label class="label" for="knc-dims">Vector size</label>
+      <select class="field" id="knc-dims" name="embedding_dimensions">
+        <option value="">Recommended</option>
+        <option value="0">Full size</option>
+        {{range .Data.DimensionChoices}}<option value="{{.}}">{{.}} dimensions</option>{{end}}
+      </select>
+      <span class="help">Recommended is {{if .Data.DefaultEmbeddingDimensions}}{{.Data.DefaultEmbeddingDimensions}} dimensions for {{.Data.DefaultEmbeddingModel}} and {{end}}full size for other models. Smaller vectors take less storage; shorten only models trained for it (Matryoshka), such as Qwen3-Embedding.</span>
+    </div>
+    <div>
+      <label class="row"><input type="checkbox" name="embed_titles" checked> Add the document name to each chunk</label>
+      <span class="help">Helps tell many documents apart; turn it off for a collection that holds one long document, such as a book.</span>
     </div>
     <div>
       <label class="label" for="knc-profile">Processing profile</label>

@@ -48,6 +48,18 @@
         </select>
       </div>
       <div>
+        <label class="label" for="kcs-dims">Vector size</label>
+        <select class="field" id="kcs-dims" name="embedding_dimensions">
+          <option value="0"{{if eq .Data.Collection.EmbeddingDimensions 0}} selected{{end}}>Full size</option>
+          {{range .Data.DimensionChoices}}<option value="{{.}}"{{if eq . $.Data.Collection.EmbeddingDimensions}} selected{{end}}>{{.}} dimensions</option>{{end}}
+        </select>
+        <span class="help">{{if .Data.Collection.RetiredQdrantCollections}}Re-embedding documents with the current settings — each stays searchable from the previous index until it is done.{{else}}Changing the model or size re-embeds every document in the background; search keeps working meanwhile. Shorten only models trained for it (Matryoshka), such as Qwen3-Embedding.{{end}}</span>
+      </div>
+      <div>
+        <label class="row"><input type="checkbox" name="embed_titles"{{if .Data.Collection.EmbedTitles}} checked{{end}}> Add the document name to each chunk</label>
+        <span class="help">Helps tell many documents apart; turn it off for a collection that holds one long document, such as a book. Changing it re-embeds every document in the background.</span>
+      </div>
+      <div>
         <label class="label" for="kcs-profile">Processing profile</label>
         <select class="field" id="kcs-profile" name="chunk_profile_version_id" data-knowledge-profile-select data-current="{{.Data.Collection.ChunkProfileVersionID}}">
           <option value="">Keep current profile</option>

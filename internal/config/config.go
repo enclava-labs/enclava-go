@@ -35,17 +35,20 @@ type Config struct {
 	ProviderModelCacheTTL   time.Duration
 	QdrantURL               string
 	DefaultEmbeddingModel   string
-	ConnectorSyncInterval   time.Duration
-	TinfoilAPIKey           string
-	TinfoilEnclave          string
-	TinfoilRepo             string
-	TinfoilVerifyAtStart    bool
-	TinfoilVerifyPerCall    bool
-	TinfoilVerifyMaxAge     time.Duration
-	APIKeyHashAlgo          string
-	APIKeyPepper            string
-	APIKeyPrefix            string
-	CORSAllowedOrigins      []string
+	// DefaultEmbeddingDimensions is the vector size collections on the
+	// default model get unless they choose one; 0 = the model's full output.
+	DefaultEmbeddingDimensions int
+	ConnectorSyncInterval      time.Duration
+	TinfoilAPIKey              string
+	TinfoilEnclave             string
+	TinfoilRepo                string
+	TinfoilVerifyAtStart       bool
+	TinfoilVerifyPerCall       bool
+	TinfoilVerifyMaxAge        time.Duration
+	APIKeyHashAlgo             string
+	APIKeyPepper               string
+	APIKeyPrefix               string
+	CORSAllowedOrigins         []string
 	// Dashboard login runs on server sessions only — there is no
 	// ADMIN_EMAIL/ADMIN_PASSWORD path; the `enclava bootstrap` CLI is the
 	// first-login story (AUTH-01/AUTH-03).
@@ -110,7 +113,7 @@ func Load() (Config, error) {
 		ProviderProbeTimeout:    getEnvDuration("PROVIDER_PROBE_TIMEOUT", 10*time.Second),
 		ProviderModelCacheTTL:   getEnvDuration("PROVIDER_MODEL_CACHE_TTL", 5*time.Minute),
 		QdrantURL:               strings.TrimSpace(getEnv("QDRANT_URL", "http://localhost:6333")),
-		DefaultEmbeddingModel:   strings.TrimSpace(getEnv("DEFAULT_EMBEDDING_MODEL", "nomic-embed-text")),
+		DefaultEmbeddingModel:   strings.TrimSpace(getEnv("DEFAULT_EMBEDDING_MODEL", "qwen3-embedding-4b")),
 		ConnectorSyncInterval:   getEnvDuration("CONNECTOR_SYNC_INTERVAL", 0),
 		TinfoilAPIKey:           getEnv("TINFOIL_API_KEY", ""),
 		TinfoilEnclave:          getEnv("TINFOIL_ENCLAVE", ""),
@@ -186,6 +189,17 @@ func Load() (Config, error) {
 	}
 	if cfg.DefaultEmbeddingModel == "" {
 		return Config{}, fmt.Errorf("DEFAULT_EMBEDDING_MODEL must be non-empty")
+	}
+	// 1024 belongs to qwen3-embedding-4b (measured: same retrieval as its full
+	// 2560 at 40% of the storage); other models default to full size because
+	// only Matryoshka-trained ones shorten safely.
+	defaultDims := 0
+	if cfg.DefaultEmbeddingModel == "qwen3-embedding-4b" {
+		defaultDims = 1024
+	}
+	cfg.DefaultEmbeddingDimensions = getEnvInt("DEFAULT_EMBEDDING_DIMENSIONS", defaultDims)
+	if d := cfg.DefaultEmbeddingDimensions; d != 0 && (d < 32 || d > 8192) {
+		return Config{}, fmt.Errorf("DEFAULT_EMBEDDING_DIMENSIONS must be 0 (full size) or between 32 and 8192")
 	}
 	if cfg.ConnectorSyncInterval < 0 {
 		return Config{}, fmt.Errorf("CONNECTOR_SYNC_INTERVAL must be >= 0")

@@ -200,6 +200,7 @@ func main() {
 
 	qdrantClient := rag.NewQdrantClient(cfg.QdrantURL, cfg.UpstreamTimeout)
 	ragSvc := rag.NewService(ragRepo, qdrantClient, inferenceSvc, cfg.DefaultEmbeddingModel, artifactStore, jobsSvc)
+	ragSvc.SetDefaultEmbeddingDimensions(cfg.DefaultEmbeddingDimensions)
 	previewSvc := extract.NewPreviewService(chunkProfilesRepo, jobsRepoPG, jobsSvc, artifactStore, sourceRepo, cfg.MaxUploadSizeMB)
 	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG)
 	connectorSvc.SetCredentialResolver(secretResolver)

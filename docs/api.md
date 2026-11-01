@@ -65,6 +65,21 @@ Uploads dedupe by content hash; a re-upload of the same bytes returns the
 existing document. On failure, `documents[].error_message` carries the
 parser's reason (e.g. malformed document).
 
+A collection embeds with the deployment default (`DEFAULT_EMBEDDING_MODEL`,
+`DEFAULT_EMBEDDING_DIMENSIONS`) unless the create body sets
+`embedding_model` and/or `embedding_dimensions` (0 = the model's full output;
+otherwise 32–8192, vectors truncated and re-normalized — only for
+Matryoshka-trained models such as Qwen3-Embedding). A shortened size is
+checked with one test embedding at create time (400 if the model can't
+produce it). Changing either with `PUT` is checked the same way, then every
+document re-embeds into a new index in the background; search keeps reading
+each document from its previous index until it is done, and the old index is
+dropped once no document uses it.
+
+`embed_titles` (default `true` for new collections) embeds each chunk behind
+its document's name — better across many documents, worse inside a single
+long one such as a book. Changing it with `PUT` re-embeds in the background.
+
 ## 3. Structured extraction
 
 ```bash

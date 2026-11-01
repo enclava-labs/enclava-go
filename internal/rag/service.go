@@ -2,10 +2,13 @@ package rag
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"path/filepath"
 	"strings"
 	"time"
@@ -91,6 +94,13 @@ type Repository interface {
 	RecordKnowledgeImport(ctx context.Context, tenantID, collectionID, importRef, objectID, kind string) error
 	GetStoredResult(ctx context.Context, tenantID, jobID string) (StoredResult, error)
 	PublishGenerationFenced(ctx context.Context, tenantID, collectionID, objectID, versionID string, generation int64, jobID, leaseOwner, attemptID string, fenceToken int64) error
+	// BindGeneration records the index a staged generation is written to.
+	BindGeneration(ctx context.Context, tenantID, versionID string, generation int64, c Collection) error
+	// LiveIndexNames lists indexes bound to a published or staging
+	// generation of a live document; ForgetRetiredIndex drops one name from
+	// the collection's retired list once its index is gone.
+	LiveIndexNames(ctx context.Context, tenantID, collectionID string) (map[string]struct{}, error)
+	ForgetRetiredIndex(ctx context.Context, tenantID, collectionID, name string) error
 }
 
 type VectorStore interface {
@@ -110,15 +120,16 @@ type Executor interface {
 }
 
 type Service struct {
-	repo                  Repository
-	vectorStore           VectorStore
-	executor              Executor
-	defaultEmbeddingModel string
-	artifacts             *artifacts.Store
-	parser                *extract.Parser
-	jobs                  *jobs.Service
-	authorizer            *source.Authorizer
-	maxUploadMB           int64
+	repo                       Repository
+	vectorStore                VectorStore
+	executor                   Executor
+	defaultEmbeddingModel      string
+	defaultEmbeddingDimensions int
+	artifacts                  *artifacts.Store
+	parser                     *extract.Parser
+	jobs                       *jobs.Service
+	authorizer                 *source.Authorizer
+	maxUploadMB                int64
 }
 
 // NewService builds the ported rag.Service. artifactStore and jobSvc may be
@@ -127,7 +138,7 @@ type Service struct {
 // required for any embedding operation.
 func NewService(repo Repository, vectorStore VectorStore, executor Executor, defaultEmbeddingModel string, artifactStore *artifacts.Store, jobSvc *jobs.Service) *Service {
 	if strings.TrimSpace(defaultEmbeddingModel) == "" {
-		defaultEmbeddingModel = "nomic-embed-text"
+		defaultEmbeddingModel = "qwen3-embedding-4b"
 	}
 	return &Service{
 		repo:                  repo,
@@ -140,6 +151,110 @@ func NewService(repo Repository, vectorStore VectorStore, executor Executor, def
 		authorizer:            source.NewAuthorizer(repo, 0),
 		maxUploadMB:           512,
 	}
+}
+
+// SetDefaultEmbeddingDimensions sets the vector size a collection on the
+// default model gets when it picks none (0 = the model's full output).
+func (s *Service) SetDefaultEmbeddingDimensions(n int) { s.defaultEmbeddingDimensions = n }
+
+// DefaultEmbedding reports the deployment default model and its vector size.
+func (s *Service) DefaultEmbedding() (string, int) {
+	return s.defaultEmbeddingModel, s.defaultEmbeddingDimensions
+}
+
+// embeddingDimensions resolves a collection's vector size: an explicit choice
+// wins; otherwise the default model gets the deployment default and any other
+// model its full output, since only Matryoshka-trained models shorten safely.
+func (s *Service) embeddingDimensions(model string, requested *int) (int, error) {
+	if requested == nil {
+		if model == s.defaultEmbeddingModel {
+			return s.defaultEmbeddingDimensions, nil
+		}
+		return 0, nil
+	}
+	if n := *requested; n != 0 && (n < 32 || n > 8192) {
+		return 0, fmt.Errorf("%w: embedding_dimensions must be 0 (full size) or between 32 and 8192", ErrInvalidInput)
+	}
+	return *requested, nil
+}
+
+// probeEmbedding embeds one short string so a model that is unreachable or
+// returns fewer dimensions than asked fails when the collection is
+// configured, not at its first ingest.
+func (s *Service) probeEmbedding(ctx context.Context, p auth.Principal, model string, dims int) error {
+	if s.executor == nil {
+		return nil
+	}
+	if _, err := s.embed(ctx, p, model, dims, []string{"embedding probe"}, embedScope{}); err != nil {
+		return fmt.Errorf("%w: cannot embed with %q: %v", ErrInvalidInput, model, err)
+	}
+	return nil
+}
+
+// indexName names the Qdrant collection of one embedding configuration, so
+// the same settings always land in the same index.
+func indexName(collectionID, model string, dims int) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d", model, dims)))
+	return "rag_" + safeCollectionName(collectionID) + "_" + hex.EncodeToString(sum[:4])
+}
+
+// reembedDocuments queues a new generation of every live document under the
+// collection's current settings; each keeps serving its published
+// generation from the previous index until the new one publishes.
+// shortcut: enqueues inline in the request; move to a fan-out job if
+// collections reach tens of thousands of documents.
+func (s *Service) reembedDocuments(ctx context.Context, p auth.Principal, c Collection) error {
+	const page = 200
+	for offset := 0; ; offset += page {
+		docs, err := s.repo.ListDocuments(ctx, p.TenantID, c.ID, "", page, offset)
+		if err != nil {
+			return err
+		}
+		for _, doc := range docs {
+			gen, err := s.repo.NextGeneration(ctx, p.TenantID, c.ID, doc.ObjectVersionID)
+			if err != nil {
+				return err
+			}
+			if err := s.enqueueEmbed(ctx, p, c, doc.ID, doc.ObjectVersionID, doc.ObservedSeq, gen); err != nil {
+				return err
+			}
+		}
+		if len(docs) < page {
+			return nil
+		}
+	}
+}
+
+// retireIndexes drops the collection's retired indexes that no live
+// generation reads or writes any more. Best effort: a failure keeps the name
+// listed, and the next publish or delete retries it.
+func (s *Service) retireIndexes(ctx context.Context, tenantID, collectionID string) {
+	if err := s.dropUnusedIndexes(ctx, tenantID, collectionID); err != nil {
+		log.Printf("rag: retire indexes of %s: %v", collectionID, err)
+	}
+}
+
+func (s *Service) dropUnusedIndexes(ctx context.Context, tenantID, collectionID string) error {
+	c, err := s.repo.GetCollection(ctx, tenantID, collectionID)
+	if err != nil || len(c.RetiredQdrantCollections) == 0 || s.vectorStore == nil {
+		return err
+	}
+	live, err := s.repo.LiveIndexNames(ctx, tenantID, collectionID)
+	if err != nil {
+		return err
+	}
+	for _, name := range c.RetiredQdrantCollections {
+		if _, used := live[name]; used || name == c.QdrantCollection {
+			continue
+		}
+		if err := s.vectorStore.DeleteCollection(ctx, name); err != nil {
+			return err
+		}
+		if err := s.repo.ForgetRetiredIndex(ctx, tenantID, collectionID, name); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func requireTenant(p auth.Principal) error {
@@ -168,6 +283,16 @@ func (s *Service) CreateCollection(ctx context.Context, p auth.Principal, input 
 	if embeddingModel == "" {
 		embeddingModel = s.defaultEmbeddingModel
 	}
+	embeddingDimensions, err := s.embeddingDimensions(embeddingModel, input.EmbeddingDimensions)
+	if err != nil {
+		return Collection{}, err
+	}
+	// Only a shortened size can be wrong for a model; check it up front.
+	if embeddingDimensions > 0 {
+		if err := s.probeEmbedding(ctx, p, embeddingModel, embeddingDimensions); err != nil {
+			return Collection{}, err
+		}
+	}
 	id := newID("ragcol")
 	profileVersionID := ""
 	if input.ChunkProfileVersionID != nil {
@@ -181,6 +306,8 @@ func (s *Service) CreateCollection(ctx context.Context, p auth.Principal, input 
 		OwnerActorID:          p.ActorID,
 		QdrantCollection:      "rag_" + safeCollectionName(id),
 		EmbeddingModel:        embeddingModel,
+		EmbeddingDimensions:   embeddingDimensions,
+		EmbedTitles:           input.EmbedTitles == nil || *input.EmbedTitles,
 		ChunkSize:             chunkSize,
 		ChunkOverlap:          chunkOverlap,
 		ChunkProfileVersionID: profileVersionID,
@@ -262,11 +389,33 @@ func (s *Service) UpdateCollection(ctx context.Context, p auth.Principal, id str
 	if input.Description != nil {
 		c.Description = strings.TrimSpace(*input.Description)
 	}
+	model, dims := c.EmbeddingModel, c.EmbeddingDimensions
 	if input.EmbeddingModel != nil {
 		c.EmbeddingModel = strings.TrimSpace(*input.EmbeddingModel)
 	}
 	if c.EmbeddingModel == "" {
 		return Collection{}, errors.New("embedding_model is required")
+	}
+	if input.EmbeddingDimensions != nil || c.EmbeddingModel != model {
+		if c.EmbeddingDimensions, err = s.embeddingDimensions(c.EmbeddingModel, input.EmbeddingDimensions); err != nil {
+			return Collection{}, err
+		}
+	}
+	newIndex := c.EmbeddingModel != model || c.EmbeddingDimensions != dims
+	if newIndex {
+		// One Qdrant collection holds one model's vectors at one size: the new
+		// settings get their own index while every document re-embeds in the
+		// background, and search reads the previous index until each is done.
+		if err := s.probeEmbedding(ctx, p, c.EmbeddingModel, c.EmbeddingDimensions); err != nil {
+			return Collection{}, err
+		}
+		c.QdrantCollection = indexName(c.ID, c.EmbeddingModel, c.EmbeddingDimensions)
+	}
+	reembed := newIndex
+	if input.EmbedTitles != nil && *input.EmbedTitles != c.EmbedTitles {
+		// Only passages change: re-embed in place, generation by generation.
+		c.EmbedTitles = *input.EmbedTitles
+		reembed = true
 	}
 	if input.ChunkSize != nil || input.ChunkOverlap != nil {
 		chunkSize := c.ChunkSize
@@ -315,7 +464,19 @@ func (s *Service) UpdateCollection(ctx context.Context, p auth.Principal, id str
 	if err := s.repo.UpdateCollection(ctx, c); err != nil {
 		return Collection{}, err
 	}
-	return s.repo.GetCollection(ctx, p.TenantID, id)
+	updated, err := s.repo.GetCollection(ctx, p.TenantID, id)
+	if err != nil {
+		return Collection{}, err
+	}
+	if reembed {
+		if err := s.reembedDocuments(ctx, p, updated); err != nil {
+			return Collection{}, err
+		}
+	}
+	// Drops an old index nothing reads any more — at once for an empty
+	// collection, and a retry point for an earlier failed cleanup.
+	s.retireIndexes(ctx, p.TenantID, c.ID)
+	return updated, nil
 }
 
 func (s *Service) DeleteCollection(ctx context.Context, p auth.Principal, id string) error {
@@ -327,8 +488,10 @@ func (s *Service) DeleteCollection(ctx context.Context, p auth.Principal, id str
 		return source.ErrDenied
 	}
 	if s.vectorStore != nil {
-		if err := s.vectorStore.DeleteCollection(ctx, c.QdrantCollection); err != nil {
-			return err
+		for _, name := range append([]string{c.QdrantCollection}, c.RetiredQdrantCollections...) {
+			if err := s.vectorStore.DeleteCollection(ctx, name); err != nil {
+				return err
+			}
 		}
 	}
 	return s.repo.DeleteCollection(ctx, p.TenantID, c.ID)
@@ -571,8 +734,10 @@ func (s *Service) DeleteDocument(ctx context.Context, p auth.Principal, document
 		return source.ErrDenied
 	}
 	if s.vectorStore != nil {
-		if err := s.vectorStore.DeleteDocumentPoints(ctx, c.QdrantCollection, doc.ID); err != nil {
-			return err
+		for _, name := range append([]string{c.QdrantCollection}, c.RetiredQdrantCollections...) {
+			if err := s.vectorStore.DeleteDocumentPoints(ctx, name, doc.ID); err != nil {
+				return err
+			}
 		}
 	}
 	// Soft delete: the object tombstone blocks reads (and evidence) while
@@ -582,7 +747,12 @@ func (s *Service) DeleteDocument(ctx context.Context, p auth.Principal, document
 	if err := s.repo.TombstoneObject(ctx, p.TenantID, doc.ID); err != nil {
 		return err
 	}
-	return s.repo.MarkCollectionItemRemoved(ctx, p.TenantID, doc.CollectionID, doc.ID)
+	if err := s.repo.MarkCollectionItemRemoved(ctx, p.TenantID, doc.CollectionID, doc.ID); err != nil {
+		return err
+	}
+	// The last document still on a retired index may just have left it.
+	s.retireIndexes(ctx, p.TenantID, doc.CollectionID)
+	return nil
 }
 
 func (s *Service) ReprocessDocument(ctx context.Context, p auth.Principal, documentID string) (UploadDocumentOutput, error) {
@@ -919,6 +1089,16 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	for _, chunk := range structuredChunks {
 		chunkTexts = append(chunkTexts, chunk.Text)
 	}
+	// The document name ahead of each chunk tells documents apart (measured:
+	// +4.5 MRR points across 11 docs, −4.6 inside one book); only the
+	// embedding input changes, never the stored chunk.
+	embedTexts := chunkTexts
+	if title := strings.TrimSpace(ver.OriginalFilename); c.EmbedTitles && title != "" {
+		embedTexts = make([]string, len(chunkTexts))
+		for i, text := range chunkTexts {
+			embedTexts[i] = title + "\n" + text
+		}
+	}
 
 	if err := claim.MarkDispatched(ctx); err != nil {
 		return "", err
@@ -927,7 +1107,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	// Priced embedding attempt: the shared executor resolves current actor
 	// and input restrictions, reserves the immutable rate, dispatches and
 	// settles or retains unknown liability — no direct-provider path.
-	vectors, err := s.embed(ctx, p, c.EmbeddingModel, chunkTexts, embedScope{
+	vectors, err := s.embed(ctx, p, c.EmbeddingModel, c.EmbeddingDimensions, embedTexts, embedScope{
 		Inputs: []source.ObjectRef{{TenantID: job.TenantID, ObjectID: objectID, ObservedSeq: seq}},
 		Artifacts: []artifacts.Ref{{
 			TenantID: job.TenantID,
@@ -997,6 +1177,11 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	if err := s.repo.ReplaceVersionChunksAndStage(ctx, job.TenantID, c.ID, obj.ID, versionRowID(ver), seq, generation, profileVersionID, chunks); err != nil {
 		return "", err
 	}
+	// The generation records the index this attempt writes to — the settings
+	// read at its start, even if the collection switches meanwhile.
+	if err := s.repo.BindGeneration(ctx, job.TenantID, versionRowID(ver), generation, c); err != nil {
+		return "", err
+	}
 	if err := s.vectorStore.EnsureCollection(ctx, c.QdrantCollection, len(vectors[0])); err != nil {
 		return "", err
 	}
@@ -1010,16 +1195,17 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	if err := s.ReconcileIndexPoints(ctx, job.TenantID); err != nil {
 		return "", err
 	}
+	s.retireIndexes(ctx, job.TenantID, c.ID)
 	return versionRowID(ver), nil
 }
 
 // embed dispatches one bounded embedding attempt through the shared
 // executor; nil-executor tests that never embed stay usable.
-func (s *Service) embed(ctx context.Context, p auth.Principal, model string, inputs []string, scope embedScope) ([][]float64, error) {
+func (s *Service) embed(ctx context.Context, p auth.Principal, model string, dims int, inputs []string, scope embedScope) ([][]float64, error) {
 	if s.executor == nil {
 		return nil, errors.New("rag: inference executor is not configured")
 	}
-	return createEmbeddings(ctx, s.executor, p, model, inputs, scope)
+	return createEmbeddings(ctx, s.executor, p, model, dims, inputs, scope)
 }
 
 // ---------------------------------------------------------------------

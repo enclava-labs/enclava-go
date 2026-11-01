@@ -71,6 +71,9 @@
     };
     var model = form.elements.embedding_model.value;
     if (model) payload.embedding_model = model;
+    var dims = form.elements.embedding_dimensions.value;
+    if (dims !== '') payload.embedding_dimensions = Number(dims);
+    payload.embed_titles = form.elements.embed_titles.checked;
     var profile = form.elements.chunk_profile_version_id.value;
     if (profile) payload.chunk_profile_version_id = profile;
     payload.acl = form.elements.access.value === 'org' ? { audience: ['*'] } : {};
@@ -138,13 +141,19 @@
       name: (form.elements.name.value || '').trim(),
       description: (form.elements.description.value || '').trim(),
       embedding_model: form.elements.embedding_model.value,
+      embedding_dimensions: Number(form.elements.embedding_dimensions.value),
+      embed_titles: form.elements.embed_titles.checked,
     };
     var profile = form.elements.chunk_profile_version_id.value;
     if (profile) payload.chunk_profile_version_id = profile;
     payload.acl = form.elements.access.value === 'org' ? { audience: ['*'] } : { audience: [] };
+    var titles = form.elements.embed_titles;
+    var reembed = titles.checked !== titles.defaultChecked || [form.elements.embedding_model, form.elements.embedding_dimensions].some(function (s) {
+      return s.selectedIndex >= 0 && !s.options[s.selectedIndex].defaultSelected;
+    });
     Enclava.api('PUT', '/api/v1/rag/collections/' + encodeURIComponent(id), payload)
       .then(function () {
-        Enclava.toast('success', 'Collection saved');
+        Enclava.toast('success', reembed ? 'Saved — re-embedding documents in the background' : 'Collection saved');
         Enclava.refresh();
       })
       .catch(function (e) {
