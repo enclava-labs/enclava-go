@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -29,10 +30,9 @@ import (
 
 func init() { registerDashboardPage((*App).registerDashboardModelsRoutes) }
 
-// modelsUnitKinds is the priced unit set of the matrix capability in column
-// order (Input / Cached input / Output) — the exact set requiredUnits
-// derives for chat, the LLM dispatch capability every matrix row prices
-// (§6.10's "model @ endpoint" matrix has no capability dimension).
+// modelsUnitKinds is the matrix column order (Input / Cached input /
+// Output); which of them a row requires is inference.RequiredUnits of the
+// row's capability.
 func modelsUnitKinds() []billing.UnitKind {
 	return []billing.UnitKind{billing.UnitInput, billing.UnitCachedInput, billing.UnitOutput}
 }
@@ -69,15 +69,17 @@ type modelsEndpointRow struct {
 	Share            string // "34%" only when endpoint usage data exists
 }
 
-// modelsPriceRow is one matrix row: alias @ endpoint priced for the matrix
-// capability through the shared coverage rule (endpoint set when complete,
-// else the whole model set — never a per-unit merge).
+// modelsPriceRow is one matrix row: alias @ endpoint priced for one
+// capability the endpoint advertises, through the shared coverage rule
+// (endpoint set when complete, else the whole model set — never a per-unit
+// merge).
 type modelsPriceRow struct {
-	EndpointID string
-	Model      string // public alias
-	Upstream   string // resolved upstream model id
-	Capability string
-	Cells      []modelsPriceCell
+	EndpointID      string
+	Model           string // public alias
+	Upstream        string // resolved upstream model id
+	Capability      string
+	CapabilityLabel string
+	Cells           []modelsPriceCell
 }
 
 // modelsPriceCell is one Input/Cached/Output cell.
@@ -90,6 +92,7 @@ type modelsPriceCell struct {
 	UnitQuantity int64
 	Currency     string
 	Basis        string // endpoint | model — which price set supplied the rate
+	SubjectID    string // the Basis set's subject: a Set price write lands in the set the cell shows
 }
 
 type modelsDrawerData struct {
@@ -429,24 +432,30 @@ func (a *App) modelsPricingData(r *http.Request) modelsData {
 			if !isModel {
 				continue
 			}
-			row := a.modelsPriceRow(r.Context(), p.TenantID, e.ID, alias, upstream, now)
-			data.Rows = append(data.Rows, row)
+			for _, capability := range advertisedPriceableCapabilities(e) {
+				if len(inference.RequiredUnits(capability)) == 0 {
+					continue // never priced (MCP): nothing to set
+				}
+				data.Rows = append(data.Rows, a.modelsPriceRow(r.Context(), p.TenantID, e.ID, alias, upstream, capability, now))
+			}
 		}
 	}
 	return data
 }
 
-// modelsPriceRow prices one (model, endpoint) pair through the shared
-// coverage rule: the endpoint price set when it covers every required unit,
-// otherwise the whole model set (the fallback Reserve applies; the sets are
-// never merged). Missing units — the reserve path would refuse the request —
-// render "Not priced" with an inline Set price control.
-func (a *App) modelsPriceRow(ctx context.Context, tenantID, endpointID, alias, upstream string, now time.Time) modelsPriceRow {
+// modelsPriceRow prices one (model, endpoint) pair for one capability through
+// the shared coverage rule: the endpoint price set when it covers every
+// required unit, otherwise the whole model set (the fallback Reserve
+// applies; the sets are never merged). Missing units — the reserve path
+// would refuse the request — render "Not priced" with an inline Set price
+// control.
+func (a *App) modelsPriceRow(ctx context.Context, tenantID, endpointID, alias, upstream, capability string, now time.Time) modelsPriceRow {
 	row := modelsPriceRow{
-		EndpointID: endpointID,
-		Model:      alias,
-		Upstream:   upstream,
-		Capability: inference.CapabilityChat,
+		EndpointID:      endpointID,
+		Model:           alias,
+		Upstream:        upstream,
+		Capability:      capability,
+		CapabilityLabel: modelsCapabilityLabel(capability),
 	}
 	endpointRates, err := a.billingRepo.LatestPrices(ctx, tenantID, billing.PriceSubjectEndpoint, endpointID, row.Capability, now)
 	if err != nil {
@@ -456,7 +465,7 @@ func (a *App) modelsPriceRow(ctx context.Context, tenantID, endpointID, alias, u
 	if err != nil {
 		log.Printf("models page: latest model prices: %v", err)
 	}
-	kinds := modelsUnitKinds()
+	kinds := inference.RequiredUnits(capability)
 	useEndpoint := missingPriceKinds(endpointRates, kinds) == nil
 	var missing []billing.UnitKind
 	if a.executor != nil {
@@ -468,9 +477,9 @@ func (a *App) modelsPriceRow(ctx context.Context, tenantID, endpointID, alias, u
 		}
 	}
 	effective := modelRates
-	basis := billing.PriceSubjectModel
+	basis, subjectID := billing.PriceSubjectModel, upstream
 	if useEndpoint {
-		effective, basis = endpointRates, billing.PriceSubjectEndpoint
+		effective, basis, subjectID = endpointRates, billing.PriceSubjectEndpoint, endpointID
 		if missing == nil {
 			missing = missingPriceKinds(endpointRates, kinds)
 		}
@@ -485,8 +494,8 @@ func (a *App) modelsPriceRow(ctx context.Context, tenantID, endpointID, alias, u
 		}
 		return billing.Price{}, false
 	}
-	for _, k := range kinds {
-		cell := modelsPriceCell{Unit: string(k), UnitLabel: unitLabel(k), Required: true, Basis: basis}
+	for _, k := range modelsUnitKinds() {
+		cell := modelsPriceCell{Unit: string(k), UnitLabel: unitLabel(k), Required: slices.Contains(kinds, k), Basis: basis, SubjectID: subjectID}
 		if rate, ok := rateFor(k); ok {
 			cell.Priced = true
 			cell.RateMicros = rate.RateMicros

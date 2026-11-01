@@ -3,10 +3,11 @@ import { test, expect, Page } from '@playwright/test';
 // models.spec.ts — the Models + Pricing Set-price regression (OA-27): the
 // old pricing.js was never served, so the popover never submitted. This spec
 // proves the REAL flow in Chromium: the popover POSTs the full
-// adminPricingCreateRequest contract (subject_type endpoint, the cell's
-// capability + unit, integer micros, unit_quantity 1000000) with the CSRF
-// header, and the matrix re-renders with the persisted rate — the row's
-// required units end up priced, never "Not priced".
+// adminPricingCreateRequest contract (the price set the cell shows — the
+// model set for an unpriced cell —, the cell's capability + unit, integer
+// micros, unit_quantity 1000000) with the CSRF header, and each save shows
+// in its own cell on the re-render — never "Not priced" after a save. Change
+// reopens a priced cell prefilled with its rate and edits it in place.
 //
 // House rule: a missing app/seed prerequisite FAILS the case naming what is
 // absent — a skip never counts as passing.
@@ -47,7 +48,7 @@ interface PricingBody {
   currency: string;
 }
 
-test('Set price submits the admin pricing contract and the cell re-renders priced', async ({ page }) => {
+test('Set price and Change submit the admin pricing contract and the cell re-renders priced', async ({ page }) => {
   await login(page);
 
   // Own unpriced row: pricing "whatever is first" would price e2e-chat-alt,
@@ -58,7 +59,8 @@ test('Set price submits the admin pricing contract and the cell re-renders price
     const r = await window.Enclava.api('POST', '/api/v1/providers', {
       protocol: 'openai_compatible',
       base_origin: 'https://unreachable.models-spec.invalid',
-      capabilities: ['chat/completions', `model:${model}=echo`],
+      // Unique upstream: the model-set prices this spec writes stay its own.
+      capabilities: ['chat/completions', `model:${model}`],
     });
     if (!(r && typeof r === 'object' && 'ID' in r && typeof r.ID === 'string')) {
       throw new Error(`fixture endpoint create failed: ${JSON.stringify(r).slice(0, 160)}`);
@@ -74,7 +76,7 @@ test('Set price submits the admin pricing contract and the cell re-renders price
     );
   }
 
-  const firstSet = page.locator(`tr[data-price-row="${created}|${UNPRICED}"] button[data-action="models:price"][data-unit="input"]`).first();
+  const firstSet = page.locator(`tr[data-price-row="${created}|${UNPRICED}|chat/completions"] button[data-action="models:price"][data-unit="input"]`).first();
   if ((await firstSet.count()) === 0) {
     throw new Error(
       `the fixture row ${created}|${UNPRICED} shows no unpriced input cell — ` +
@@ -92,7 +94,7 @@ test('Set price submits the admin pricing contract and the cell re-renders price
     );
   }
 
-  const row = page.locator(`tr[data-price-row="${endpoint}|${model}"]`);
+  const row = page.locator(`tr[data-price-row="${endpoint}|${model}|${capability}"]`);
   await expect(row).toHaveCount(1);
 
   // Intercept (not mock): every POST must carry the exact contract.
@@ -105,12 +107,9 @@ test('Set price submits the admin pricing contract and the cell re-renders price
     await route.continue();
   });
 
-  // Price the row's missing units until none is left "Not priced" — the
-  // whole-set display only shows the new rates once the endpoint set covers
-  // every required unit, which is exactly what the matrix promises.
-  // The row only flips to priced once the endpoint set covers EVERY required
-  // unit — until then the input cell still reads "Not priced", so the walk
-  // must address each unit's own Set price control by data-unit.
+  // Each save must show in its own cell right away: the regression wrote a
+  // one-unit endpoint price the whole-set rule ignores, so the cell kept
+  // reading "Not priced" after "Price saved".
   for (const [i, unit] of ['input', 'cached_input', 'output'].entries()) {
     const setButton = row.locator(`button[data-action="models:price"][data-unit="${unit}"]`).first();
     await setButton.click();
@@ -123,8 +122,8 @@ test('Set price submits the admin pricing contract and the cell re-renders price
       .toBeGreaterThan(i);
     const captured = posts[posts.length - 1];
     expect(captured.body).toEqual({
-      subject_type: 'endpoint',
-      subject_id: endpoint,
+      subject_type: 'model',
+      subject_id: model,
       capability,
       unit,
       rate_micros: 2500000,
@@ -133,9 +132,10 @@ test('Set price submits the admin pricing contract and the cell re-renders price
     } satisfies PricingBody);
     expect(captured.headers['x-csrf-token']).toBeTruthy();
 
-    // The success path closes the popover and re-renders the section; wait
-    // for the swap so the next iteration resolves fresh markup.
+    // The success path closes the popover and re-renders the section; the
+    // saved cell is priced before the next unit is touched.
     await expect(page.locator('#pop')).toBeHidden({ timeout: 10_000 });
+    await expect(row.locator(`td[data-price-cell="${endpoint}|${unit}"]`)).toContainText('$2.50', { timeout: 10_000 });
   }
 
   if (posts.length === 0) {
@@ -146,7 +146,18 @@ test('Set price submits the admin pricing contract and the cell re-renders price
   // refusal copy — a dead button would leave the row "Not priced".
   await expect(row).not.toContainText('Not priced — requests refused', { timeout: 15_000 });
   await expect(row).toContainText('$2.50');
-  await expect(row).toContainText('via endpoint');
+  await expect(row).toContainText('via model');
+
+  // Change: the priced cell reopens prefilled, names the price set the save
+  // lands in, and the edited rate replaces the old one in that cell.
+  const inputCell = row.locator(`td[data-price-cell="${endpoint}|input"]`);
+  await inputCell.locator('button[data-action="models:price"]').click();
+  await expect(page.locator('#models-price-rate')).toHaveValue('2500000');
+  await expect(page.locator('#pop')).toContainText(`Model price — also applies to ${model}`);
+  await page.fill('#models-price-rate', '3000000');
+  await page.click('[data-models-price-form] button[type="submit"]');
+  await expect(inputCell).toContainText('$3.00', { timeout: 10_000 });
+  expect(posts[posts.length - 1].body).toMatchObject({ subject_type: 'model', subject_id: model, unit: 'input', rate_micros: 3000000 });
 });
 
 test('price history drawer lists the real price rows for the pair', async ({ page }) => {

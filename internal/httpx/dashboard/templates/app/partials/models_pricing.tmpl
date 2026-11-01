@@ -1,8 +1,11 @@
 {{define "frag-models-pricing"}}{{/* Pricing matrix (OA-27): one row per
-     model @ endpoint binding, columns Input / Cached input / Output per 1M
-     tokens. Unpriced required cells carry the exact refusal copy plus an
-     inline Set price popover trigger bound to that cell's unit (T-09-06-02:
-     capability + unit travel with the button; the API validates the write).
+     model @ endpoint binding and priced capability the endpoint advertises,
+     columns Input / Cached input / Output per 1M tokens. Unpriced required
+     cells carry the exact refusal copy plus a Set price popover trigger;
+     priced cells carry a Change trigger prefilled with the current rate.
+     Both are bound to the cell's unit and to the price set the cell shows
+     (data-subject-*), so a save lands where the cell reads it (T-09-06-02:
+     the API validates the write).
      data-price-row/data-price-cell hook the browser spec and refresh swaps. */}}
 <section class="section" id="models-pricing" hx-get="/dashboard/partials/models/pricing" hx-trigger="refresh from:body" hx-swap="outerHTML">
   <div class="card">
@@ -21,15 +24,15 @@
         </thead>
         <tbody>
           {{range .Data.Rows}}
-          <tr data-price-row="{{.EndpointID}}|{{.Model}}">
-            <td data-label="Model @ endpoint"><b>{{.Model}}</b><span class="subline">@{{.EndpointID}}{{if .Upstream}} → {{.Upstream}}{{end}}</span></td>
+          <tr data-price-row="{{.EndpointID}}|{{.Model}}|{{.Capability}}">
+            <td data-label="Model @ endpoint"><b>{{.Model}}</b><span class="subline">{{.CapabilityLabel}} · @{{.EndpointID}}{{if .Upstream}} → {{.Upstream}}{{end}}</span></td>
             {{$row := .}}
             {{range .Cells}}
             <td data-label="{{.UnitLabel}}" data-price-cell="{{$row.EndpointID}}|{{.Unit}}">
               {{if .Priced}}<b>{{money .RateMicros .Currency}}</b><span class="subline">per {{count .UnitQuantity}} tokens · via {{.Basis}}</span>
               {{else if .Required}}<span class="price-warning">Not priced — requests refused</span>
-              <button type="button" class="btn" data-action="models:price" aria-haspopup="dialog" aria-expanded="false" data-endpoint="{{$row.EndpointID}}" data-model="{{$row.Model}}" data-capability="{{$row.Capability}}" data-unit="{{.Unit}}" data-unit-label="{{.UnitLabel}}">Set price</button>
               {{else}}<span class="muted">—</span>{{end}}
+              {{if or .Priced .Required}}<button type="button" class="btn{{if .Priced}} ghost{{end}}" data-action="models:price" aria-haspopup="dialog" aria-expanded="false"{{if .Priced}} aria-label="Change {{.UnitLabel}} price" data-rate-micros="{{.RateMicros}}" data-unit-quantity="{{.UnitQuantity}}" data-currency="{{.Currency}}"{{end}} data-endpoint="{{$row.EndpointID}}" data-model="{{$row.Model}}" data-capability="{{$row.Capability}}" data-unit="{{.Unit}}" data-unit-label="{{.UnitLabel}}" data-subject-type="{{.Basis}}" data-subject-id="{{.SubjectID}}">{{if .Priced}}Change{{else}}Set price{{end}}</button>{{end}}
             </td>
             {{end}}
             <td data-label="History"><button type="button" class="btn ghost" data-action="models:history"

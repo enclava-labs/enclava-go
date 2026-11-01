@@ -2,7 +2,7 @@
  *
  * Namespaced data-actions (page-local; shared actions stay in app.js):
  *   models:endpoint  open the add/edit endpoint drawer (data-endpoint-id)
- *   models:price     open the Set price popover bound to the cell's unit
+ *   models:price     open the Set/Change price popover bound to the cell's unit
  *   models:history   open the price-history drawer for the row pair
  *
  * Writes go through Enclava.api → /api/v1 (D-17) and fragments re-render
@@ -193,6 +193,7 @@
     }
   }
 
+  // Aliases and ids are admin-entered: they go in as text, never markup.
   function openPricePopover(anchor) {
     const d = anchor.dataset;
     const form = document.createElement('form');
@@ -201,16 +202,33 @@
     form.dataset.model = d.model;
     form.dataset.capability = d.capability;
     form.dataset.unit = d.unit;
+    form.dataset.subjectType = d.subjectType;
+    form.dataset.subjectId = d.subjectId;
     form.innerHTML =
-      '<b>Set ' + d.unitLabel + ' price</b>' +
-      '<p class="help">' + d.model + ' @ ' + d.endpoint + ' · ' + d.capability + '</p>' +
+      '<b data-models-price-title></b>' +
+      '<p class="help" data-models-price-pair></p>' +
+      '<p class="help" data-models-price-scope></p>' +
       '<label class="label" for="models-price-rate">Rate — millionths of the currency unit, per 1M tokens</label>' +
       '<input class="field" id="models-price-rate" name="rate_micros" type="number" min="0" step="1" required aria-describedby="models-price-help">' +
       '<span class="help" id="models-price-help" data-models-price-preview>Enter a rate to preview it.</span>' +
       '<label class="label" for="models-price-currency">Currency</label>' +
-      '<input class="field" id="models-price-currency" name="currency" value="USD" maxlength="3">' +
+      '<input class="field" id="models-price-currency" name="currency" maxlength="3">' +
       '<p class="field-error" data-models-price-error hidden></p>' +
       '<div class="row"><button type="submit" class="btn primary">Save price</button></div>';
+    const currency = d.currency || 'USD';
+    form.querySelector('[data-models-price-title]').textContent = (d.rateMicros ? 'Change ' : 'Set ') + d.unitLabel + ' price';
+    form.querySelector('[data-models-price-pair]').textContent = d.model + ' @ ' + d.endpoint + ' · ' + d.capability;
+    form.querySelector('[data-models-price-scope]').textContent = d.subjectType === 'endpoint'
+      ? 'Endpoint price — applies to every model on ' + d.subjectId + '.'
+      : 'Model price — also applies to ' + d.subjectId + ' on other endpoints that don\u2019t set all of their own prices.';
+    form.querySelector('#models-price-currency').setAttribute('value', currency);
+    // Change prefills the current rate restated per 1M tokens (what this form
+    // saves); a rate that is not whole micros per 1M stays blank, not rounded.
+    const perMillion = d.rateMicros ? Number(d.rateMicros) * (1000000 / Number(d.unitQuantity)) : NaN;
+    if (Number.isInteger(perMillion)) {
+      form.querySelector('#models-price-rate').setAttribute('value', String(perMillion));
+      form.querySelector('[data-models-price-preview]').textContent = fmtMicros(perMillion, currency) + ' per 1,000,000 tokens';
+    }
     const holder = document.createElement('div');
     holder.appendChild(form);
     Enclava.popover(anchor, holder.innerHTML);
@@ -228,9 +246,11 @@
       return;
     }
     try {
+      // The cell's own price set (data-subject-*): a write anywhere else is
+      // hidden by the whole-set rule and the cell stays "Not priced".
       await Enclava.api('POST', '/api/v1/admin/pricing', {
-        subject_type: 'endpoint',
-        subject_id: form.dataset.endpoint,
+        subject_type: form.dataset.subjectType,
+        subject_id: form.dataset.subjectId,
         capability: form.dataset.capability,
         unit: form.dataset.unit,
         rate_micros: rate,

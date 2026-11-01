@@ -7,8 +7,10 @@ package httpx
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -183,10 +185,11 @@ func TestDashboardModelsEndpointsRuntime(t *testing.T) {
 	}
 }
 
-// TestDashboardModelsPricingMatrix: rows price every model binding; the
-// endpoint set wins when complete, otherwise the whole model set supplies
-// the rates (never a per-unit merge); unpriced required cells carry the
-// exact refusal copy with a Set price control bound to that unit.
+// TestDashboardModelsPricingMatrix: rows price every model binding for each
+// priced capability its endpoint advertises; the endpoint set wins when
+// complete, otherwise the whole model set supplies the rates (never a
+// per-unit merge); unpriced required cells carry the exact refusal copy with
+// a Set price control bound to that unit.
 func TestDashboardModelsPricingMatrix(t *testing.T) {
 	f := newModelsFixture(t)
 	session, csrf := modelsLogin(t, f, "admin@models.test", "pricing.manage")
@@ -194,7 +197,7 @@ func TestDashboardModelsPricingMatrix(t *testing.T) {
 
 	modelsSeedEndpoint(t, f, inference.Endpoint{
 		ID: "ep-a", Protocol: "openai_compatible", BaseOrigin: "https://a.example", Enabled: true,
-		Capabilities: []string{inference.CapabilityChat, "model:ma=up-a"},
+		Capabilities: []string{inference.CapabilityChat, inference.CapabilityVision, "model:ma=up-a"},
 	})
 	for _, unit := range []string{"input", "cached_input", "output"} {
 		modelsSeedPrice(t, f, past, "endpoint", "ep-a", unit, 1000000)
@@ -211,14 +214,24 @@ func TestDashboardModelsPricingMatrix(t *testing.T) {
 		ID: "ep-c", Protocol: "openai_compatible", BaseOrigin: "https://c.example", Enabled: true,
 		Capabilities: []string{inference.CapabilityChat, "model:mc"},
 	})
+	modelsSeedEndpoint(t, f, inference.Endpoint{
+		ID: "ep-e", Protocol: "openai_compatible", BaseOrigin: "https://e.example", Enabled: true,
+		Capabilities: []string{inference.CapabilityEmbeddings, "model:me=up-e"},
+	})
+	for _, unit := range []string{"input", "cached_input"} {
+		price := `{"subject_type":"model","subject_id":"up-e","capability":"embeddings","unit":"` + unit + `","rate_micros":500000,"unit_quantity":1000000}`
+		if rec := sessionDo(t, f.app, http.MethodPost, "/api/v1/admin/pricing", price, session, csrf); rec.Code != http.StatusCreated {
+			t.Fatalf("seed embeddings price: %d %s", rec.Code, rec.Body.String())
+		}
+	}
 
 	rec := modelsGet(t, f, "/dashboard/models/pricing", session, csrf)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /dashboard/models/pricing: expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if got := strings.Count(body, "Not priced — requests refused"); got != 3 {
-		t.Fatalf("Not priced cells = %d, want 3 (ep-c's required units)\n%s", got, body)
+	if got := strings.Count(body, "Not priced — requests refused"); got != 6 {
+		t.Fatalf("Not priced cells = %d, want 6 (ep-c chat + ep-a vision required units)\n%s", got, body)
 	}
 	if !strings.Contains(body, `$1.00`) || !strings.Contains(body, "via endpoint") {
 		t.Fatalf("complete endpoint set must render its own rates via endpoint\n%s", body)
@@ -230,9 +243,92 @@ func TestDashboardModelsPricingMatrix(t *testing.T) {
 		t.Fatalf("cells must state the per-1M basis\n%s", body)
 	}
 	for _, unit := range []string{"input", "cached_input", "output"} {
-		want := `data-endpoint="ep-c" data-model="mc" data-capability="chat/completions" data-unit="` + unit + `"`
-		if !strings.Contains(body, want) {
-			t.Fatalf("ep-c Set price control missing binding %q\n%s", want, body)
+		for _, want := range []string{
+			`data-endpoint="ep-c" data-model="mc" data-capability="chat/completions" data-unit="` + unit + `"`,
+			`data-endpoint="ep-a" data-model="ma" data-capability="vision" data-unit="` + unit + `"`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("Set price control missing binding %q\n%s", want, body)
+			}
+		}
+	}
+	// Rows follow the endpoint's advertised capabilities: an embeddings-only
+	// endpoint is priced for embeddings (no output unit), never for chat.
+	if strings.Contains(body, `data-price-row="ep-e|me|chat/completions"`) {
+		t.Fatalf("embeddings-only endpoint must not get a chat row\n%s", body)
+	}
+	embedRow := regexp.MustCompile(`(?s)data-price-row="ep-e\|me\|embeddings">.*?</tr>`).FindString(body)
+	if strings.Count(embedRow, "$0.50") != 2 || strings.Contains(embedRow, "Not priced") {
+		t.Fatalf("embeddings row must show its two priced units and no refusal: %q\n%s", embedRow, body)
+	}
+}
+
+// TestDashboardModelsSetPriceShowsInCell: a save made through a cell's price
+// control — Set price on a gap, Change on a priced cell — shows in that cell
+// right away. The control targets the price set the cell reads; a one-unit
+// write into an incomplete endpoint set is ignored by the whole-set rule and
+// would leave the cell "Not priced".
+func TestDashboardModelsSetPriceShowsInCell(t *testing.T) {
+	f := newModelsFixture(t)
+	session, csrf := modelsLogin(t, f, "admin@models.test", "pricing.manage")
+	hourAgo := time.Now().UTC().Add(-time.Hour)
+	// ep-s: an incomplete endpoint set, so its cells read the (empty) model set.
+	modelsSeedEndpoint(t, f, inference.Endpoint{
+		ID: "ep-s", Protocol: "openai_compatible", BaseOrigin: "https://s.example", Enabled: true,
+		Capabilities: []string{inference.CapabilityChat, "model:ms=up-s"},
+	})
+	modelsSeedPrice(t, f, hourAgo, "endpoint", "ep-s", "input", 1000000)
+	// ep-f: a complete endpoint set, so its cells read the endpoint set.
+	modelsSeedEndpoint(t, f, inference.Endpoint{
+		ID: "ep-f", Protocol: "openai_compatible", BaseOrigin: "https://f.example", Enabled: true,
+		Capabilities: []string{inference.CapabilityChat, "model:mf=up-f"},
+	})
+	for _, unit := range []string{"input", "cached_input", "output"} {
+		modelsSeedPrice(t, f, hourAgo, "endpoint", "ep-f", unit, 1000000)
+	}
+
+	cellOf := func(endpoint, unit string) string {
+		body := modelsGet(t, f, "/dashboard/partials/models/pricing", session, csrf).Body.String()
+		cell := regexp.MustCompile(`(?s)data-price-cell="` + endpoint + `\|` + unit + `">.*?</td>`).FindString(body)
+		if cell == "" {
+			t.Fatalf("no %s|%s cell\n%s", endpoint, unit, body)
+		}
+		return cell
+	}
+	// save posts what models.js submitPrice builds from the cell's control.
+	save := func(endpoint, unit string, micros int64) string {
+		cell := cellOf(endpoint, unit)
+		button := regexp.MustCompile(`<button[^>]*data-action="models:price"[^>]*>`).FindString(cell)
+		attr := func(name string) string {
+			m := regexp.MustCompile(` ` + name + `="([^"]*)"`).FindStringSubmatch(button)
+			if m == nil {
+				t.Fatalf("%s|%s price control has no %s: %q", endpoint, unit, name, cell)
+			}
+			return m[1]
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"subject_type": attr("data-subject-type"), "subject_id": attr("data-subject-id"),
+			"capability": attr("data-capability"), "unit": attr("data-unit"),
+			"rate_micros": micros, "unit_quantity": 1000000, "currency": "USD",
+		})
+		if rec := sessionDo(t, f.app, http.MethodPost, "/api/v1/admin/pricing", string(payload), session, csrf); rec.Code != http.StatusCreated {
+			t.Fatalf("save %s|%s: %d %s", endpoint, unit, rec.Code, rec.Body.String())
+		}
+		return cellOf(endpoint, unit)
+	}
+
+	for _, tc := range []struct {
+		endpoint, unit string
+		micros         int64
+		rate, basis    string
+	}{
+		{"ep-s", "output", 3000000, "$3.00", "via model"},   // Set price on a gap
+		{"ep-s", "output", 4000000, "$4.00", "via model"},   // Change a model-set price
+		{"ep-f", "input", 2000000, "$2.00", "via endpoint"}, // Change an endpoint-set price
+	} {
+		cell := save(tc.endpoint, tc.unit, tc.micros)
+		if !strings.Contains(cell, tc.rate) || !strings.Contains(cell, tc.basis) || strings.Contains(cell, "Not priced") {
+			t.Fatalf("%s|%s saved %d: cell must show %s %s: %q", tc.endpoint, tc.unit, tc.micros, tc.rate, tc.basis, cell)
 		}
 	}
 }
