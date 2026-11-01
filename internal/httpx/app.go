@@ -71,7 +71,7 @@ const (
 	preAuthRateLimitPerDay    = 20000
 
 	maxSSELineBytes  = 256 * 1024
-	maxSSEEventBytes = 128 * 1024
+	maxSSEEventBytes = 4 * 1024 * 1024
 )
 
 type rateLimitCheck struct {
@@ -223,6 +223,10 @@ func (a *App) registerBaseRoutes() {
 	// api-key route stay no-ops; these routes are the real budget surface.
 	a.mux.HandleFunc("/api/v1/admin/budgets", a.authenticated("platform.admin", a.handleAdminBudgets))
 	a.mux.HandleFunc("/api/v1/admin/budgets/", a.authenticated("platform.admin", a.handleAdminBudgetByID))
+	// Unknown-reservation reconciliation: list outstanding canonical
+	// reservations and settle unknown holds with reconciled usage.
+	a.mux.HandleFunc("/api/v1/admin/reservations", a.authenticated("platform.admin", a.handleAdminReservations))
+	a.mux.HandleFunc("/api/v1/admin/reservations/", a.authenticated("platform.admin", a.handleAdminReservationByID))
 
 	// 01-24 identity administration: tenant-scoped user/role/service-account
 	// and session/link management over the shared auth services. Mutations on

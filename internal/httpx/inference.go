@@ -152,7 +152,9 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request, prin
 		Model:      meta.Model,
 		Payload:    requestBytes,
 		Stream:     meta.Stream,
-		Estimate:   chatEstimate(requestBytes),
+		// The executor derives the output bound from the payload's
+		// declared generation cap; callers bound input only.
+		Estimate: billing.Usage{InputUnits: tokenEstimate(requestBytes)},
 	})
 	if err != nil {
 		a.writeInferenceError(w, err)
@@ -306,21 +308,16 @@ func (a *App) writeInferenceError(w http.ResponseWriter, err error) {
 		WriteOpenAIError(w, http.StatusTooManyRequests, "budget exceeded", "rate_limit_error", "budget_exceeded")
 	case errors.Is(err, billing.ErrPriceMissing):
 		WritePriceMissing(w, err.Error())
+	case errors.Is(err, billing.ErrCurrencyMismatch):
+		// A mixed-currency price set is an operator configuration
+		// conflict: the request cannot be priced coherently and retrying
+		// changes nothing until the rates are fixed.
+		WriteOpenAIError(w, http.StatusConflict, "price rates for this route mix currencies; fix the endpoint price set", "invalid_request_error", "billing_currency_mismatch")
 	case errors.Is(err, context.DeadlineExceeded):
 		WriteOpenAIError(w, http.StatusGatewayTimeout, "upstream request timed out", "server_error", "gateway_timeout")
 	default:
 		log.Printf("inference request failed: %v", err)
 		WriteOpenAIError(w, http.StatusBadGateway, "upstream provider unavailable", "server_error", "upstream_unavailable")
-	}
-}
-
-// chatEstimate declares the per-kind unit bound for one chat attempt: input
-// sized from the marshaled payload (~4 bytes per token) and output at the
-// operation's configured maximum, matching the assistant estimate shape.
-func chatEstimate(payload []byte) billing.Usage {
-	return billing.Usage{
-		InputUnits:  tokenEstimate(payload),
-		OutputUnits: 1 << 17,
 	}
 }
 

@@ -609,3 +609,31 @@ func TestOfficialSDKInProcessContract(t *testing.T) {
 		t.Fatal("disallowed model must fail")
 	}
 }
+
+// A mixed-currency price set is an operator conflict: the executor refuses
+// to price the attempt and the public surface maps it to a 409 — never the
+// generic 502 the unmapped sentinel used to produce.
+func TestChatCompletionCurrencyMismatchIs409(t *testing.T) {
+	f := newOpenAIContractFixture(t)
+	// Same-kind latest row in EUR makes the snapshot mixed-currency.
+	id := fmt.Sprintf("price-mixed-%d", time.Now().UnixNano())
+	if err := f.brepo.PutPrice(context.Background(), f.tenant, id, billing.Price{
+		SubjectType: billing.PriceSubjectEndpoint, SubjectID: "ep-chat",
+		Capability: inference.CapabilityChat, Unit: billing.UnitCachedInput,
+		RateMicros: 1, UnitQuantity: 1, Currency: "EUR",
+	}, "tester", time.Now().Add(-time.Minute).UTC()); err != nil {
+		t.Fatalf("put price: %v", err)
+	}
+	rec := f.do(t, http.MethodPost, "/v1/chat/completions",
+		`{"model":"gpt-fast","messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("currency mismatch: %d %s", rec.Code, rec.Body.String())
+	}
+	env := decodeErr(t, rec)
+	if env.Error.Code != "billing_currency_mismatch" {
+		t.Fatalf("error code = %q", env.Error.Code)
+	}
+	if atomic.LoadInt32(&f.up.chatCalls) != 0 {
+		t.Fatal("unpriceable request dispatched")
+	}
+}

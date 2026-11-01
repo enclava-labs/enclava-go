@@ -47,6 +47,7 @@
         limit_value: Number(fd.get('limit_value')),
         currency: String(fd.get('currency') || '').trim().toUpperCase(),
         period: String(fd.get('period') || ''),
+        timezone: String(fd.get('timezone') || '').trim() || 'UTC',
         starts_at: isoFromDay(fd.get('starts_at'), true),
       };
       if (subjectType !== 'tenant') {
@@ -67,6 +68,24 @@
       window.Enclava.toast('error', action.text || (err && err.message) || 'Request failed',
         { action: action });
     });
+  });
+
+  // Deactivate is a DELETE against the same budget row behind the shared
+  // two-click confirm (app.js re-arms and fires enclava:confirm on the
+  // second click); the row stays listed as inactive and admission stops
+  // checking it.
+  document.addEventListener('enclava:confirm', (e) => {
+    const btn = e.target instanceof Element ? e.target.closest('[data-budget-id]') : null;
+    if (!btn || !btn.dataset.budgetId) return;
+    window.Enclava.api('DELETE', '/api/v1/admin/budgets/' + encodeURIComponent(btn.dataset.budgetId))
+      .then(() => {
+        window.Enclava.toast('success', 'Budget deactivated');
+        window.Enclava.refresh();
+      }).catch((err) => {
+        const action = window.Enclava.errorAction(err);
+        window.Enclava.toast('error', action.text || (err && err.message) || 'Request failed',
+          { action: action });
+      });
   });
 
   // The subject type select shows exactly one bounded picker; the server

@@ -87,7 +87,9 @@ func (r *BillingRepo) PutPrice(ctx context.Context, tenantID, id string, p billi
 }
 
 // CreateBudget inserts an enforceable limit row. Amount budgets carry their
-// bound currency; token budgets store NULL currency.
+// bound currency; token budgets store NULL currency. Timezone selects the
+// zone whose day/week/month boundaries define the liability window
+// ("" normalizes to UTC).
 func (r *BillingRepo) CreateBudget(ctx context.Context, tenantID, id string, b billing.Budget) error {
 	var currency any
 	if b.Kind == billing.BudgetKindAmount {
@@ -97,13 +99,17 @@ func (r *BillingRepo) CreateBudget(ctx context.Context, tenantID, id string, b b
 	if name == "" {
 		name = "budget"
 	}
+	tz := b.Timezone
+	if tz == "" {
+		tz = "UTC"
+	}
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO budgets
 			(tenant_id, id, name, subject_type, subject_id, kind, limit_value,
-			 currency, period, starts_at, ends_at)
-		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			 currency, period, timezone, starts_at, ends_at)
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		tenantID, id, name, b.Subject.Type, b.Subject.ID, b.Kind,
-		b.LimitAmountMicros, currency, b.Period, b.StartsAt, b.EndsAt)
+		b.LimitAmountMicros, currency, b.Period, tz, b.StartsAt, b.EndsAt)
 	if err != nil {
 		return fmt.Errorf("insert budget: %w", err)
 	}
@@ -153,7 +159,7 @@ func (t billingTx) LockActiveBudgets(ctx context.Context, tenantID string, subje
 // active-window predicates on top of it.
 const budgetCols = `
 	id, name, subject_type, subject_id, kind, period, limit_value,
-	COALESCE(currency, ''), starts_at, ends_at`
+	COALESCE(currency, ''), timezone, starts_at, ends_at`
 
 const budgetSelectSQL = `
 	SELECT ` + budgetCols + `
@@ -171,7 +177,8 @@ func scanBudgets(rows *sql.Rows) ([]billing.Budget, error) {
 		var b billing.Budget
 		var endsAt sql.NullTime
 		if err := rows.Scan(&b.ID, &b.Name, &b.Subject.Type, &b.Subject.ID, &b.Kind,
-			&b.Period, &b.LimitAmountMicros, &b.Currency, &b.StartsAt, &endsAt); err != nil {
+			&b.Period, &b.LimitAmountMicros, &b.Currency, &b.Timezone,
+			&b.StartsAt, &endsAt); err != nil {
 			return nil, fmt.Errorf("scan budget: %w", err)
 		}
 		if endsAt.Valid {
@@ -213,8 +220,12 @@ func (t billingTx) SelectPrices(ctx context.Context, tenantID, subjectType, subj
 }
 
 // Liabilities reconstructs outstanding plus settled liability attributed to
-// scope. Held and unknown reservations always count (liability is retained);
-// settled usage counts when recorded inside the window. Tenant scope is
+// scope, aggregated in SQL to one row per (state, currency). Held rows
+// always count; unknown rows count only when created inside the window
+// (stale unknowns age out instead of blocking budgets forever); settled
+// usage counts when recorded inside it. Held/unknown unit sums fold the
+// prompt kinds once per row — max(input, cached_input) under 'input' —
+// matching the reserve bound; settled units stay disjoint. Tenant scope is
 // tenant-wide over canonical rows; other subjects match their own
 // attribution rows, then their settled usage via the usage record's subject.
 func (t billingTx) Liabilities(ctx context.Context, tenantID string, scope billing.Subject, from time.Time) ([]billing.LiabilityRow, error) {
@@ -227,76 +238,170 @@ type billingQuerier interface {
 }
 
 func queryLiabilities(ctx context.Context, q billingQuerier, tenantID string, scope billing.Subject, from time.Time) ([]billing.LiabilityRow, error) {
+	acc := map[[2]string]*billing.LiabilityRow{}
+	order := [][2]string{}
+	add := func(state, currency string, amount int64) *billing.LiabilityRow {
+		k := [2]string{state, currency}
+		l := acc[k]
+		if l == nil {
+			l = &billing.LiabilityRow{State: state, Currency: currency, Units: map[billing.UnitKind]int64{}}
+			acc[k] = l
+			order = append(order, k)
+		}
+		l.AmountMicros += amount
+		return l
+	}
+
+	// Held always counts; unknown only inside the window.
 	rows, err := q.QueryContext(ctx, `
-		SELECT state, limit_amount_micros, currency::text, reserved_units::text
+		SELECT state, currency::text, COALESCE(SUM(limit_amount_micros), 0)
 		FROM reservations
 		WHERE tenant_id = $1::uuid
-		  AND state IN ('held','unknown')
+		  AND (state = 'held' OR (state = 'unknown' AND created_at >= $4))
 		  AND (CASE WHEN $2 = 'tenant' THEN id NOT LIKE '%/%'
-		            ELSE subject_type = $2 AND subject_id = $3 END)`,
-		tenantID, scope.Type, scope.ID)
+		            ELSE subject_type = $2 AND subject_id = $3 END)
+		GROUP BY state, currency`,
+		tenantID, scope.Type, scope.ID, from)
 	if err != nil {
 		return nil, fmt.Errorf("held liabilities: %w", err)
 	}
-	out, err := scanLiabilityRows(rows)
-	if err != nil {
+	if err := scanAmountRows(rows, add); err != nil {
 		return nil, err
 	}
 
-	var urows *sql.Rows
-	if scope.Type == billing.BudgetSubjectTenant {
-		urows, err = q.QueryContext(ctx, `
-			SELECT 'settled', amount_micros, currency::text, units::text
-			FROM usage_records
-			WHERE tenant_id = $1::uuid AND created_at >= $2`,
-			tenantID, from)
-	} else if scope.Type == billing.BudgetSubjectAPIKey {
-		// Key-scoped settled usage matches the verified credential
-		// attribution column (canonical subject stays the owner) plus rows
-		// whose canonical subject is itself the key — a row is returned
-		// once either way, so nothing double-counts.
-		urows, err = q.QueryContext(ctx, `
-			SELECT 'settled', amount_micros, currency::text, units::text
-			FROM usage_records
-			WHERE tenant_id = $1::uuid AND created_at >= $2
-			  AND (credential_id = $3
-			       OR (subject_type = 'api_key' AND subject_id = $3))`,
-			tenantID, from, scope.ID)
-	} else {
-		urows, err = q.QueryContext(ctx, `
-			SELECT 'settled', amount_micros, currency::text, units::text
-			FROM usage_records
-			WHERE tenant_id = $1::uuid AND created_at >= $2
-			  AND subject_type = $3 AND subject_id = $4`,
-			tenantID, from, scope.Type, scope.ID)
+	// Per-kind unit sums over the same held/unknown rows, folding each row's
+	// prompt kinds to max(input, cached_input) once under 'input'.
+	rows, err = q.QueryContext(ctx, `
+		SELECT state, currency::text, kind, SUM(units) FROM (
+			SELECT state, currency,
+			       CASE WHEN e.key = 'cached_input' THEN 'input' ELSE e.key END AS kind,
+			       CASE WHEN e.key IN ('input','cached_input') AND reserved_units ? 'input' AND reserved_units ? 'cached_input'
+			            THEN GREATEST((reserved_units->>'input')::bigint, (reserved_units->>'cached_input')::bigint)
+			            ELSE e.value::bigint END AS units
+			FROM reservations, LATERAL jsonb_each_text(reserved_units) e
+			WHERE NOT (e.key = 'cached_input' AND reserved_units ? 'input')
+			  AND tenant_id = $1::uuid
+			  AND (state = 'held' OR (state = 'unknown' AND created_at >= $4))
+			  AND (CASE WHEN $2 = 'tenant' THEN id NOT LIKE '%/%'
+			            ELSE subject_type = $2 AND subject_id = $3 END)
+		) u GROUP BY state, currency, kind`,
+		tenantID, scope.Type, scope.ID, from)
+	if err != nil {
+		return nil, fmt.Errorf("held liability units: %w", err)
 	}
+	if err := scanUnitRows(rows, add); err != nil {
+		return nil, err
+	}
+
+	// Settled usage inside the window: disjoint plain sums per scope rule.
+	var settledScope string
+	args := []any{tenantID, from}
+	switch {
+	case scope.Type == billing.BudgetSubjectTenant:
+		settledScope = ""
+	case scope.Type == billing.BudgetSubjectAPIKey:
+		// Key-scoped settled usage matches the verified credential
+		// attribution column plus rows whose canonical subject is the key —
+		// a row is returned once either way, so nothing double-counts.
+		settledScope = ` AND (credential_id = $3 OR (subject_type = 'api_key' AND subject_id = $3))`
+		args = append(args, scope.ID)
+	default:
+		settledScope = ` AND subject_type = $3 AND subject_id = $4`
+		args = append(args, scope.Type, scope.ID)
+	}
+	rows, err = q.QueryContext(ctx, `
+		SELECT 'settled', currency::text, COALESCE(SUM(amount_micros), 0)
+		FROM usage_records
+		WHERE tenant_id = $1::uuid AND created_at >= $2`+settledScope+`
+		GROUP BY currency`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("settled liabilities: %w", err)
 	}
-	more, err := scanLiabilityRows(urows)
-	if err != nil {
+	if err := scanAmountRows(rows, add); err != nil {
 		return nil, err
 	}
-	return append(out, more...), nil
+	rows, err = q.QueryContext(ctx, `
+		SELECT 'settled', currency::text, e.key, SUM(e.value::bigint)
+		FROM usage_records, LATERAL jsonb_each_text(units) e
+		WHERE tenant_id = $1::uuid AND created_at >= $2`+settledScope+`
+		GROUP BY currency, e.key`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("settled liability units: %w", err)
+	}
+	if err := scanUnitRows(rows, add); err != nil {
+		return nil, err
+	}
+
+	out := make([]billing.LiabilityRow, 0, len(order))
+	for _, k := range order {
+		out = append(out, *acc[k])
+	}
+	return out, nil
 }
 
-func scanLiabilityRows(rows *sql.Rows) ([]billing.LiabilityRow, error) {
+// scanAmountRows folds (state, currency, sum) aggregate rows into the
+// accumulator keyed by add.
+func scanAmountRows(rows *sql.Rows, add func(state, currency string, amount int64) *billing.LiabilityRow) error {
 	defer rows.Close()
-	var out []billing.LiabilityRow
 	for rows.Next() {
-		var l billing.LiabilityRow
-		var unitsJSON string
-		if err := rows.Scan(&l.State, &l.AmountMicros, &l.Currency, &unitsJSON); err != nil {
-			return nil, fmt.Errorf("scan liability: %w", err)
+		var state, currency string
+		var amount int64
+		if err := rows.Scan(&state, &currency, &amount); err != nil {
+			return fmt.Errorf("scan liability amount: %w", err)
 		}
-		units, err := decodeUnits(json.RawMessage(unitsJSON))
-		if err != nil {
-			return nil, err
-		}
-		l.Units = units
-		out = append(out, l)
+		add(state, currency, amount)
 	}
-	return out, rows.Err()
+	return rows.Err()
+}
+
+// scanUnitRows folds (state, currency, kind, sum) aggregate rows into the
+// accumulator.
+func scanUnitRows(rows *sql.Rows, add func(state, currency string, amount int64) *billing.LiabilityRow) error {
+	defer rows.Close()
+	for rows.Next() {
+		var state, currency, kind string
+		var units int64
+		if err := rows.Scan(&state, &currency, &kind, &units); err != nil {
+			return fmt.Errorf("scan liability units: %w", err)
+		}
+		add(state, currency, 0).Units[billing.UnitKind(kind)] += units
+	}
+	return rows.Err()
+}
+
+// SweepStaleHolds ages out stale holds across every tenant in two updates:
+// never-dispatched stale holds release (no request bytes could have been
+// sent); dispatched ones become unknown so liability is retained for
+// reconciliation. It returns per-outcome row counts.
+func (r *BillingRepo) SweepStaleHolds(ctx context.Context, olderThan time.Time) (released, unknown int, err error) {
+	err = WithTx(ctx, r.db, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE reservations SET state = 'released'
+			WHERE state = 'held' AND dispatched_at IS NULL AND created_at < $1`,
+			olderThan)
+		if err != nil {
+			return fmt.Errorf("sweep undispatched holds: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		released = int(n)
+		res, err = tx.ExecContext(ctx, `
+			UPDATE reservations SET state = 'unknown'
+			WHERE state = 'held' AND dispatched_at IS NOT NULL AND created_at < $1`,
+			olderThan)
+		if err != nil {
+			return fmt.Errorf("sweep dispatched holds: %w", err)
+		}
+		n, err = res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		unknown = int(n)
+		return nil
+	})
+	return released, unknown, err
 }
 
 // InsertReservations writes every liability row the service assigned: the

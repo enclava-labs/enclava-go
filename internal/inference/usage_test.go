@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"enclava-go/internal/billing"
 )
@@ -122,6 +123,20 @@ func TestAccountingStreamResponsesTerminal(t *testing.T) {
 	}
 }
 
+// waitStreamFinalized polls until the stream's once-only accounting ran —
+// Close returns promptly now that terminal usage drains in the background.
+func waitStreamFinalized(t *testing.T, s *accountingStream) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if s.finalized.Load() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("stream accounting never finalized")
+}
+
 func TestAccountingStreamEarlyCloseRetainsLiability(t *testing.T) {
 	var calls int32
 	var terminal bool
@@ -136,6 +151,7 @@ func TestAccountingStreamEarlyCloseRetainsLiability(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
+	waitStreamFinalized(t, s)
 	if atomic.LoadInt32(&calls) != 1 || terminal {
 		t.Fatalf("early close must be non-terminal: calls=%d terminal=%v", calls, terminal)
 	}
@@ -143,6 +159,80 @@ func TestAccountingStreamEarlyCloseRetainsLiability(t *testing.T) {
 	_ = s.Close()
 	if atomic.LoadInt32(&calls) != 1 {
 		t.Fatalf("double close ran finish twice")
+	}
+}
+
+// A client-abandoned stream keeps reading the upstream body and settles the
+// provider's real terminal usage — never unknown while the drain succeeds.
+func TestAccountingStreamEarlyCloseDrainsTerminalUsage(t *testing.T) {
+	var calls int32
+	var terminal bool
+	var usage []byte
+	finish := func(raw []byte, term bool) {
+		atomic.AddInt32(&calls, 1)
+		terminal = term
+		usage = raw
+	}
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2}}\n\n" +
+		"data: [DONE]\n\n"
+	s := newAccountingStream(io.NopCloser(strings.NewReader(sse)), finish)
+	buf := make([]byte, 32)
+	if _, err := s.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	// Caller abandons mid-stream: Close returns promptly, the drain reads
+	// out the terminal usage event and finalizes exactly.
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitStreamFinalized(t, s)
+	if atomic.LoadInt32(&calls) != 1 || !terminal {
+		t.Fatalf("drained stream must be terminal: calls=%d terminal=%v", calls, terminal)
+	}
+	u, ok := usageFromJSON(usage)
+	if !ok || u.InputUnits != 9 || u.OutputUnits != 2 {
+		t.Fatalf("drained usage wrong: %+v", u)
+	}
+}
+
+// usageFromMap ignores non-token numerics and breakdown fields already
+// inside a priced kind; DeepSeek's flat cache-hit count fills in when the
+// details object reports no cached input.
+func TestUsageFromMapDeepSeekAndIgnoredNumerics(t *testing.T) {
+	u := usageFromMap(map[string]any{
+		"prompt_tokens":            float64(100),
+		"completion_tokens":        float64(40),
+		"total_tokens":             float64(140),
+		"prompt_cache_hit_tokens":  float64(30),
+		"prompt_cache_miss_tokens": float64(70),
+		"cost":                     float64(0.02),
+		"latency_time":             float64(1.5),
+		"audio_tokens":             float64(7),
+	})
+	if u.InputUnits != 70 || u.OutputUnits != 40 || u.CachedInputUnits != 30 {
+		t.Fatalf("deepseek units wrong: %+v", u)
+	}
+	if len(u.OtherUnits) != 1 || u.OtherUnits[billing.UnitKind("audio_tokens")] != 7 {
+		t.Fatalf("other units wrong: %+v", u.OtherUnits)
+	}
+
+	// A details-object cached count wins over the flat field, and cached
+	// never exceeds input.
+	u = usageFromMap(map[string]any{
+		"prompt_tokens":           float64(10),
+		"prompt_cache_hit_tokens": float64(99),
+		"prompt_tokens_details":   map[string]any{"cached_tokens": float64(4)},
+	})
+	if u.CachedInputUnits != 4 || u.InputUnits != 6 {
+		t.Fatalf("details cached must win: %+v", u)
+	}
+	u = usageFromMap(map[string]any{
+		"prompt_tokens":           float64(10),
+		"prompt_cache_hit_tokens": float64(99),
+	})
+	if u.CachedInputUnits != 10 || u.InputUnits != 0 {
+		t.Fatalf("cached must clamp to input: %+v", u)
 	}
 }
 

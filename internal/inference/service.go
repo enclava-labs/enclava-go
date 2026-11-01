@@ -16,10 +16,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,6 +34,10 @@ type Billing interface {
 	MarkUnknown(ctx context.Context, p auth.Principal, reservationID string) error
 	MarkDispatched(ctx context.Context, p auth.Principal, reservationID string) error
 	ReleaseUndispatched(ctx context.Context, p auth.Principal, reservationID string) error
+	// ReleaseUnsent frees a held reservation even after dispatch was
+	// marked, when the caller guarantees no request bytes reached the
+	// provider.
+	ReleaseUnsent(ctx context.Context, p auth.Principal, reservationID string) error
 	LatestPrices(ctx context.Context, tenantID, subjectType, subjectID, capability string, now time.Time) ([]billing.Price, error)
 }
 
@@ -68,10 +74,11 @@ type Service struct {
 	billing       Billing
 	secrets       *auth.SecretResolver
 
-	newTransport   func(ctx context.Context, e Endpoint, credential string) (Upstream, error)
-	payloadLimit   int64
-	attemptTimeout time.Duration
-	admission      *Admission
+	newTransport     func(ctx context.Context, e Endpoint, credential string) (Upstream, error)
+	payloadLimit     int64
+	attemptTimeout   time.Duration
+	defaultMaxOutput int64
+	admission        *Admission
 
 	mu         sync.Mutex
 	transports map[string]transportEntry
@@ -144,6 +151,13 @@ func WithAttemptTimeout(d time.Duration) Option {
 	return func(s *Service) { s.attemptTimeout = d }
 }
 
+// WithDefaultMaxOutputTokens sets the output bound injected into payloads
+// that declare none (chat: max_tokens, responses: max_output_tokens). Zero
+// disables injection — those attempts hold the operation bound.
+func WithDefaultMaxOutputTokens(n int64) Option {
+	return func(s *Service) { s.defaultMaxOutput = n }
+}
+
 // WithAdmission overrides the process-local concurrency gate. Tests pass a
 // small AdmissionConfig to observe explicit bounds; nil uses the defaults.
 func WithAdmission(a *Admission) Option {
@@ -160,18 +174,19 @@ func NewService(deps Deps, opts ...Option) (*Service, error) {
 		return nil, errors.New("inference: endpoints, sources, authorizer and billing are required")
 	}
 	s := &Service{
-		endpoints:      deps.Endpoints,
-		sources:        deps.Sources,
-		authorizer:     deps.Authorizer,
-		artifacts:      deps.Artifacts,
-		conversations:  deps.Conversations,
-		billing:        deps.Billing,
-		secrets:        deps.Secrets,
-		payloadLimit:   maxPayloadBytes,
-		attemptTimeout: defaultAttemptTimeout,
-		admission:      NewAdmission(AdmissionConfig{}),
-		transports:     map[string]transportEntry{},
-		runtime:        map[string][]dispatchSample{},
+		endpoints:        deps.Endpoints,
+		sources:          deps.Sources,
+		authorizer:       deps.Authorizer,
+		artifacts:        deps.Artifacts,
+		conversations:    deps.Conversations,
+		billing:          deps.Billing,
+		secrets:          deps.Secrets,
+		payloadLimit:     maxPayloadBytes,
+		attemptTimeout:   defaultAttemptTimeout,
+		defaultMaxOutput: defaultMaxOutputTokens,
+		admission:        NewAdmission(AdmissionConfig{}),
+		transports:       map[string]transportEntry{},
+		runtime:          map[string][]dispatchSample{},
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -199,6 +214,10 @@ func (s *Service) Close() error {
 const (
 	maxPayloadBytes       int64 = 8 * 1024 * 1024
 	defaultAttemptTimeout       = 5 * time.Minute
+	// defaultMaxOutputTokens bounds generated output when a payload does
+	// not declare max_tokens/max_output_tokens — the reserved hold can
+	// never be larger than what the provider is asked to produce.
+	defaultMaxOutputTokens int64 = 16384
 )
 
 // Execute is the single entry point every model call must use: resolve policy,
@@ -230,6 +249,16 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 	if req.Estimate.CachedInputUnits < req.Estimate.InputUnits {
 		req.Estimate.CachedInputUnits = req.Estimate.InputUnits
 	}
+	// The output bound is owned here, never by callers: the payload's
+	// declared generation cap (times n) sizes the hold, the configured
+	// default is injected upstream when absent, and the operation bound
+	// holds as the last resort. A request declaring more than the bound
+	// refuses 4xx — it can never dispatch.
+	outUnits, err := s.resolveOutputEstimate(capability, req, info.root)
+	if err != nil {
+		return nil, err
+	}
+	req.Estimate.OutputUnits = outUnits
 	if err := checkEstimate(capability, req.Estimate); err != nil {
 		return nil, err
 	}
@@ -243,6 +272,17 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 		return nil, err
 	}
 	upstreamModel := decision.UpstreamModel
+
+	// The transport is resolved before reserving so unsupported
+	// capability/stream combinations refuse cleanly — a reservation must
+	// never exist for an attempt this transport cannot dispatch.
+	up, err := s.transportFor(ctx, endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("transport for endpoint: %w", err)
+	}
+	if err := dispatchSupports(up, capability, req.Stream); err != nil {
+		return nil, err
+	}
 	body, err := marshalPayload(info.root, upstreamModel, req)
 	if err != nil {
 		return nil, err
@@ -270,30 +310,46 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 		return nil, err
 	}
 
-	// Everything before MarkDispatched is provable never-dispatched; the
-	// reservation releases. After it, outcomes may be accepted upstream and
-	// liability is settled or retained — never released or retried.
-	up, err := s.transportFor(ctx, endpoint)
-	if err != nil {
-		permit.Release()
-		s.releaseUndispatched(ctx, p, res.ID)
-		return nil, fmt.Errorf("transport for endpoint: %w", err)
-	}
 	if err := s.billing.MarkDispatched(ctx, p, res.ID); err != nil {
 		permit.Release()
+		// Dispatch never happened; the hold releases on a detached
+		// context even when the caller already walked away.
+		s.releaseUndispatched(ctx, p, res.ID)
 		return nil, fmt.Errorf("mark dispatched: %w", err)
 	}
-	dctx, cancel := context.WithTimeout(ctx, s.attemptTimeout)
-	defer cancel()
+
+	// obs watches the transport's writes: on a dispatch failure, sent is
+	// the only truthful evidence that request bytes may have reached the
+	// provider. A failure with no send proof releases the hold instead of
+	// permanently consuming budget. The upstream call runs detached from the
+	// caller: a client disconnect must not abort it (the provider may still
+	// be executing), so the exact token counts can still be settled — for
+	// streams the accounting body drains to the terminal usage event.
+	obs := &sendObserver{}
+	tctx := httptrace.WithClientTrace(context.WithoutCancel(ctx), &httptrace.ClientTrace{
+		GetConn:           func(string) { obs.any.Store(true) },
+		GotConn:           func(httptrace.GotConnInfo) { obs.any.Store(true) },
+		DNSStart:          func(httptrace.DNSStartInfo) { obs.any.Store(true) },
+		ConnectStart:      func(string, string) { obs.any.Store(true) },
+		TLSHandshakeStart: func() { obs.any.Store(true) },
+		WroteHeaders:      func() { obs.sent.Store(true); obs.any.Store(true) },
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			obs.any.Store(true)
+			if info.Err == nil {
+				obs.sent.Store(true)
+			}
+		},
+		GotFirstResponseByte: func() { obs.sent.Store(true); obs.any.Store(true) },
+	})
 
 	if req.Stream {
 		// Streams bound their own lifetime via idle/wall limits on the body;
 		// the attempt timeout would kill valid held streams on return.
-		raw, err := s.dispatchStream(ctx, up, capability, req, body)
+		raw, err := s.dispatchStream(tctx, up, capability, req, body)
 		if err != nil {
 			permit.Release()
 			s.observeDispatchFailure(endpoint, err)
-			s.failAttempt(ctx, p, res, err)
+			s.settleDispatchError(ctx, p, res, err, obs)
 			return nil, err
 		}
 		// The permit stays held until the stream body actually closes —
@@ -324,29 +380,14 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 		}, nil
 	}
 
+	dctx, cancel := context.WithTimeout(tctx, s.attemptTimeout)
+	defer cancel()
 	dstart := time.Now()
 	raw, err := s.dispatch(dctx, up, capability, req, body)
 	if err != nil {
 		permit.Release()
 		s.observeDispatchFailure(endpoint, err)
-		if isUpstreamError(err) {
-			// A definitive upstream error response settles its (possibly
-			// zero) reported usage honestly.
-			var ue *llm.UpstreamError
-			var usage billing.Usage
-			if errors.As(err, &ue) && len(ue.Body) > 0 {
-				if u, ok := usageFromJSON(ue.Body); ok {
-					usage = u
-				}
-			}
-			rec, serr := s.settleReservation(ctx, p, res, usage, true)
-			_ = rec
-			if serr != nil {
-				return nil, fmt.Errorf("upstream error %w; settlement also failed: %v", err, serr)
-			}
-		} else {
-			s.failAttempt(ctx, p, res, err)
-		}
+		s.settleDispatchError(ctx, p, res, err, obs)
 		return nil, err
 	}
 	permit.Release()
@@ -369,6 +410,76 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 		result.SettlementError = serr
 	}
 	return result, nil
+}
+
+// sendObserver is the httptrace evidence that a dispatched attempt actually
+// placed request bytes on the wire. sent is set by WroteRequest completing
+// cleanly, headers written, or any response byte; any marks that the
+// net/http transport engaged the trace-carrying context at all — transports
+// that do not (FFI, ctx-ignoring fakes) are "possibly sent" unless their
+// error is a typed llm.NotDispatched.
+type sendObserver struct {
+	sent atomic.Bool
+	any  atomic.Bool
+}
+
+// neverSent reports whether a failed dispatch provably never placed request
+// bytes on the provider: an explicit llm.NotDispatched, or an engaged
+// net/http trace that never observed a complete request write.
+func neverSent(obs *sendObserver, err error) bool {
+	if obs.sent.Load() {
+		return false
+	}
+	return llm.IsNotDispatched(err) || obs.any.Load()
+}
+
+// settleDispatchError applies the once-only accounting decision for a
+// dispatch or stream-open failure: never-sent releases the hold, a
+// definitive upstream error settles its (possibly zero) reported usage, and
+// anything ambiguous retains unknown liability.
+func (s *Service) settleDispatchError(ctx context.Context, p auth.Principal, res billing.Reservation, err error, obs *sendObserver) {
+	if neverSent(obs, err) {
+		s.releaseUnsent(ctx, p, res.ID)
+		return
+	}
+	if isUpstreamError(err) {
+		var ue *llm.UpstreamError
+		var usage billing.Usage
+		if errors.As(err, &ue) && len(ue.Body) > 0 {
+			if u, ok := usageFromJSON(ue.Body); ok {
+				usage = u
+			}
+		}
+		if _, serr := s.settleReservation(ctx, p, res, usage, true); serr != nil {
+			// The reservation is already marked unknown inside
+			// settleReservation; nothing further to do.
+			_ = serr
+		}
+		return
+	}
+	s.failAttempt(ctx, p, res, err)
+}
+
+// releaseUnsent frees the hold on a provably never-sent reservation; a
+// release failure leaves the hold — also safe, the sweep reclaims it.
+func (s *Service) releaseUnsent(ctx context.Context, p auth.Principal, reservationID string) {
+	_ = accounting(ctx, accountingTimeout, func(c context.Context) error {
+		return s.billing.ReleaseUnsent(c, p, reservationID)
+	})
+}
+
+// dispatchSupports verifies the transport can serve this capability and, for
+// streams, the streamed variant — before any reservation exists.
+func dispatchSupports(up Upstream, capability string, stream bool) error {
+	if unsupported, ok := up.(interface{ Supports(string) bool }); ok && !unsupported.Supports(capability) {
+		return &llm.NotDispatched{Err: ErrUnsupportedCapability}
+	}
+	if stream {
+		if unsupported, ok := up.(interface{ SupportsStream(string) bool }); ok && !unsupported.SupportsStream(capability) {
+			return &llm.NotDispatched{Err: ErrUnsupportedCapability}
+		}
+	}
+	return nil
 }
 
 // Manage dispatches one unpriced lifecycle follow-up — retrieve, cancel,

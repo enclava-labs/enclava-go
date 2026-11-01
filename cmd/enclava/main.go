@@ -11,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	// Budget windows use IANA zones; the alpine runtime image ships no zoneinfo.
+	_ "time/tzdata"
 
 	"enclava-go/internal/artifacts"
 	"enclava-go/internal/auth"
@@ -156,7 +158,7 @@ func main() {
 			MaxActive: cfg.InferenceFanOutActive,
 			MaxQueued: cfg.InferenceFanOutQueued,
 		},
-	})))
+	})), inference.WithDefaultMaxOutputTokens(cfg.InferenceDefaultMaxOutputTokens))
 	if err != nil {
 		log.Fatalf("inference service init error: %v", err)
 	}
@@ -253,6 +255,29 @@ func main() {
 		connectors.NewScheduler(connectorSvc).Run(runnerCtx)
 	}()
 
+	// Stale holds: a crash between reserve and settle would otherwise keep a
+	// held reservation counting against budgets forever. An hour outlives
+	// every legitimate attempt (stream header 5m + wall 30m, unary 5m).
+	sweeperDone := make(chan struct{})
+	go func() {
+		defer close(sweeperDone)
+		tick := time.NewTicker(5 * time.Minute)
+		defer tick.Stop()
+		for {
+			released, unknown, err := billingSvc.SweepStaleHolds(runnerCtx, time.Now().Add(-time.Hour))
+			if err != nil && runnerCtx.Err() == nil {
+				log.Printf("stale hold sweep failed: %v", err)
+			} else if released+unknown > 0 {
+				log.Printf("stale hold sweep: %d released (never dispatched), %d marked unknown", released, unknown)
+			}
+			select {
+			case <-runnerCtx.Done():
+				return
+			case <-tick.C:
+			}
+		}
+	}()
+
 	promptSvc := prompts.NewService(promptRepo, chatbotSvc)
 
 	// Browser dashboard login runs on the server-session handlers from 01-12;
@@ -318,6 +343,7 @@ func main() {
 	stopRunner()
 	<-runnerDone
 	<-schedulerDone
+	<-sweeperDone
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {

@@ -356,6 +356,10 @@ func classifyChatbotCompletionError(ctx context.Context, err error) (int, string
 		return http.StatusUnprocessableEntity,
 			strings.TrimSpace(strings.TrimPrefix(err.Error(), "billing: ")), "price_missing"
 	}
+	if errors.Is(err, billing.ErrCurrencyMismatch) {
+		return http.StatusConflict,
+			"price rates for this route mix currencies; fix the endpoint price set", "billing_currency_mismatch"
+	}
 	if isChatbotDeadline(ctx, err) {
 		return http.StatusGatewayTimeout, "upstream request timed out", "gateway_timeout"
 	}

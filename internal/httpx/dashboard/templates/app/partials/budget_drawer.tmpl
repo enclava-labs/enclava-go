@@ -75,6 +75,9 @@
     <option value="weekly">Weekly</option>
     <option value="monthly" selected>Monthly</option>
   </select>
+  <label class="label" for="budget-timezone">Timezone</label>
+  <input class="field" id="budget-timezone" name="timezone" type="text" value="UTC" placeholder="Europe/Berlin">
+  <span class="help">IANA name — the daily/weekly/monthly window starts at midnight in this zone.</span>
   <label class="label" for="budget-starts">Starts at</label>
   <input class="field" id="budget-starts" name="starts_at" type="date" value="{{.Data.Drawer.Today}}">
   <label class="label" for="budget-ends">Ends at</label>

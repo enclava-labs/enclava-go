@@ -89,6 +89,10 @@ type Subject struct {
 // Budget is an enforceable limit. Amount budgets bind a currency and reject
 // incompatible reservations. StartsAt/EndsAt bound applicability; Period
 // selects the rolling liability window.
+// Budget is an enforceable limit. Amount budgets bind a currency and reject
+// incompatible reservations. StartsAt/EndsAt bound applicability; Period
+// selects the rolling liability window whose day/ISO-week/month boundaries
+// are computed in Timezone (IANA name, "" = UTC).
 type Budget struct {
 	ID                string
 	Subject           Subject
@@ -96,6 +100,7 @@ type Budget struct {
 	Period            string // Period* const set
 	LimitAmountMicros int64
 	Currency          string
+	Timezone          string // IANA zone; "" or invalid = UTC
 	StartsAt          time.Time
 	EndsAt            *time.Time
 
@@ -153,11 +158,20 @@ type UsageRecord struct {
 	AmountMicros  int64
 	Currency      string
 	Price         PriceSnapshot
-	Outcome       string // completed|unknown|not_dispatched
+	Outcome       string // Outcome* const set; legacy rows may read unknown|not_dispatched
 	// CredentialID mirrors the reservation's admitted api-key credential.
 	CredentialID string
 	CreatedAt    time.Time
 }
+
+// Usage outcomes: completed is a normal settle; unpriced_units records all
+// units but charges only the kinds the snapshot priced; reconciled is an
+// admin resolution of an unknown reservation (zero usage = write-off).
+const (
+	OutcomeCompleted     = "completed"
+	OutcomeUnpricedUnits = "unpriced_units"
+	OutcomeReconciled    = "reconciled"
+)
 
 // Usage is raw reported per-kind usage — never clipped. CachedInputUnits is a
 // subset of input settled disjointly, never double-counted. AmountMicros is

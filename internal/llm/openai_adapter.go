@@ -157,12 +157,12 @@ func (a *OpenAICompatibleAdapter) DoResponsesStream(ctx context.Context, method,
 
 func (a *OpenAICompatibleAdapter) doStream(ctx context.Context, method, path string, body []byte) (io.ReadCloser, error) {
 	if a.cfgErr != nil {
-		return nil, fmt.Errorf("endpoint not approved: %w", a.cfgErr)
+		return nil, &NotDispatched{Err: fmt.Errorf("endpoint not approved: %w", a.cfgErr)}
 	}
 	requestURL := a.baseURL + path
 	req, err := http.NewRequestWithContext(ctx, method, requestURL, noRetryBody(body))
 	if err != nil {
-		return nil, fmt.Errorf("build stream request: %w", err)
+		return nil, &NotDispatched{Err: fmt.Errorf("build stream request: %w", err)}
 	}
 	req.Header.Set("Authorization", "Bearer "+a.apiKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -181,12 +181,12 @@ func (a *OpenAICompatibleAdapter) doStream(ctx context.Context, method, path str
 
 func (a *OpenAICompatibleAdapter) doJSON(ctx context.Context, method, path string, body []byte) ([]byte, error) {
 	if a.cfgErr != nil {
-		return nil, fmt.Errorf("endpoint not approved: %w", a.cfgErr)
+		return nil, &NotDispatched{Err: fmt.Errorf("endpoint not approved: %w", a.cfgErr)}
 	}
 	url := a.baseURL + path
 	req, err := http.NewRequestWithContext(ctx, method, url, noRetryBody(body))
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, &NotDispatched{Err: fmt.Errorf("build request: %w", err)}
 	}
 	req.Header.Set("Authorization", "Bearer "+a.apiKey)
 	if body != nil {

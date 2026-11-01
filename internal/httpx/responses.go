@@ -182,11 +182,9 @@ func (a *App) responsesPriced(w http.ResponseWriter, r *http.Request, principal 
 		return
 	}
 	req.Payload = body
-	if upstreamPath == "/responses/input_tokens" {
-		req.Estimate = billing.Usage{InputUnits: tokenEstimate(requestBytes)}
-	} else {
-		req.Estimate = responsesEstimate(requestBytes)
-	}
+	// The executor derives the output bound from the payload's declared
+	// max_output_tokens; callers bound input only.
+	req.Estimate = billing.Usage{InputUnits: tokenEstimate(requestBytes)}
 
 	res, err := a.executor.Execute(r.Context(), principal, req)
 	if err != nil {
@@ -739,16 +737,6 @@ func (a *App) proxyBoundResponsesStream(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		event = append(event, append([]byte(nil), line...))
-	}
-}
-
-// responsesEstimate declares the per-kind bound for one Responses attempt:
-// input sized from the payload, output at the operation's configured
-// maximum — the same shape the chat estimate uses.
-func responsesEstimate(payload []byte) billing.Usage {
-	return billing.Usage{
-		InputUnits:  tokenEstimate(payload),
-		OutputUnits: 1 << 17,
 	}
 }
 

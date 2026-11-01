@@ -99,18 +99,23 @@ func (s *Service) Reserve(ctx context.Context, p auth.Principal, req ReserveRequ
 			return err
 		}
 
-		bound, err := charge(estimate, snapshot)
+		// Prompt tokens are held once: any input token may come back
+		// cached, so the bound prices max(input, cached) units at the
+		// higher prompt rate. The merged unit map is what token budgets
+		// and the persisted reserved_units count.
+		boundUnits, boundSnap := boundEstimate(estimate, snapshot)
+		bound, err := charge(boundUnits, boundSnap)
 		if err != nil {
 			return err
 		}
 
 		for _, b := range budgets {
-			from := liabilityFrom(b, now)
+			from := LiabilityFrom(b, now)
 			rows, err := tx.Liabilities(ctx, p.TenantID, b.Subject, from)
 			if err != nil {
 				return err
 			}
-			if err := admit(b, rows, bound, estimate, snapshot.Currency); err != nil {
+			if err := admit(b, rows, bound, boundUnits, snapshot.Currency); err != nil {
 				return err
 			}
 		}
@@ -122,7 +127,7 @@ func (s *Service) Reserve(ctx context.Context, p auth.Principal, req ReserveRequ
 			Price:             snapshot,
 			LimitAmountMicros: bound,
 			Currency:          snapshot.Currency,
-			Units:             estimate,
+			Units:             boundUnits,
 			Capability:        req.Capability,
 			Model:             req.Model,
 			EndpointID:        req.EndpointID,
@@ -153,8 +158,10 @@ func (s *Service) Reserve(ctx context.Context, p auth.Principal, req ReserveRequ
 // Settle charges the actual reported usage once — raw units are stored
 // unclipped and the amount is computed under the reservation's immutable
 // snapshot, so a later price change or an overrun above the bound is recorded
-// truthfully. A repeated settle of the same reservation returns the existing
-// evidence.
+// truthfully. Held and unknown (late-arriving upstream outcome) reservations
+// both settle; a kind with no snapshot rate is recorded but unpriced
+// (Outcome "unpriced_units") rather than failing the settlement. A repeated
+// settle of the same reservation returns the existing evidence.
 func (s *Service) Settle(ctx context.Context, p auth.Principal, reservationID string, actual Usage) (UsageRecord, error) {
 	units, err := unitMap(actual)
 	if err != nil {
@@ -171,14 +178,18 @@ func (s *Service) Settle(ctx context.Context, p auth.Principal, reservationID st
 			out, err = tx.GetUsageRecord(ctx, p.TenantID, reservationID)
 			return err
 		}
-		if res.State != ReservationHeld {
+		if res.State != ReservationHeld && res.State != ReservationUnknown {
 			return fmt.Errorf("%w: %s is %s", ErrReservationState, reservationID, res.State)
 		}
-		amount, err := charge(units, res.Price)
+		amount, missing, err := chargeLenient(units, res.Price)
 		if err != nil {
 			return err
 		}
-		n, err := tx.Transition(ctx, p.TenantID, reservationID, ReservationHeld, ReservationSettled)
+		outcome := OutcomeCompleted
+		if len(missing) > 0 {
+			outcome = OutcomeUnpricedUnits
+		}
+		n, err := tx.Transition(ctx, p.TenantID, reservationID, res.State, ReservationSettled)
 		if err != nil {
 			return err
 		}
@@ -197,7 +208,7 @@ func (s *Service) Settle(ctx context.Context, p auth.Principal, reservationID st
 			AmountMicros:  amount,
 			Currency:      res.Currency,
 			Price:         res.Price,
-			Outcome:       "completed",
+			Outcome:       outcome,
 			CredentialID:  res.CredentialID,
 			CreatedAt:     s.now(),
 		}
@@ -247,6 +258,88 @@ func (s *Service) ReleaseUndispatched(ctx context.Context, p auth.Principal, res
 		_, err = tx.Transition(ctx, p.TenantID, reservationID, ReservationHeld, ReservationReleased)
 		return err
 	})
+}
+
+// ReleaseUnsent frees a held reservation even after dispatch was marked: the
+// caller guarantees no request bytes reached the provider (connection or
+// write failure before send). Already released is a no-op; settled or
+// unknown reservations refuse.
+func (s *Service) ReleaseUnsent(ctx context.Context, p auth.Principal, reservationID string) error {
+	return s.repo.InTx(ctx, func(tx BillingTx) error {
+		res, err := tx.GetReservationForUpdate(ctx, p.TenantID, reservationID)
+		if err != nil {
+			return err
+		}
+		if res.State == ReservationReleased {
+			return nil
+		}
+		if res.State != ReservationHeld {
+			return fmt.Errorf("%w: %s is %s", ErrReservationState, reservationID, res.State)
+		}
+		_, err = tx.Transition(ctx, p.TenantID, reservationID, ReservationHeld, ReservationReleased)
+		return err
+	})
+}
+
+// ResolveUnknown settles an unknown reservation with the reconciled usage an
+// administrator established — zero usage writes the hold off. Other states
+// refuse except settled, which returns the existing record like Settle.
+func (s *Service) ResolveUnknown(ctx context.Context, p auth.Principal, reservationID string, actual Usage) (UsageRecord, error) {
+	units, err := unitMap(actual)
+	if err != nil {
+		return UsageRecord{}, err
+	}
+	var out UsageRecord
+	err = s.repo.InTx(ctx, func(tx BillingTx) error {
+		res, err := tx.GetReservationForUpdate(ctx, p.TenantID, reservationID)
+		if err != nil {
+			return err
+		}
+		if res.State == ReservationSettled {
+			out, err = tx.GetUsageRecord(ctx, p.TenantID, reservationID)
+			return err
+		}
+		if res.State != ReservationUnknown {
+			return fmt.Errorf("%w: %s is %s", ErrReservationState, reservationID, res.State)
+		}
+		amount, _, err := chargeLenient(units, res.Price)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Transition(ctx, p.TenantID, reservationID, ReservationUnknown, ReservationSettled); err != nil {
+			return err
+		}
+		rec := UsageRecord{
+			TenantID:      p.TenantID,
+			ID:            newID("use"),
+			ReservationID: reservationID,
+			Subject:       res.Subject,
+			Capability:    res.Capability,
+			Model:         res.Model,
+			EndpointID:    res.EndpointID,
+			Units:         units,
+			AmountMicros:  amount,
+			Currency:      res.Currency,
+			Price:         res.Price,
+			Outcome:       OutcomeReconciled,
+			CredentialID:  res.CredentialID,
+			CreatedAt:     s.now(),
+		}
+		if err := tx.InsertUsageRecord(ctx, rec); err != nil {
+			return err
+		}
+		out = rec
+		return nil
+	})
+	return out, err
+}
+
+// SweepStaleHolds is cross-tenant maintenance: a stale hold that was never
+// dispatched is released (no bytes could have been sent), while one marked
+// dispatched becomes unknown (the upstream outcome is unrecoverable but
+// liability is retained).
+func (s *Service) SweepStaleHolds(ctx context.Context, olderThan time.Time) (released, unknown int, err error) {
+	return s.repo.SweepStaleHolds(ctx, olderThan)
 }
 
 // GetReservation exposes the canonical reservation row for tests/dashboards.
@@ -399,10 +492,83 @@ func snapshotFor(prices []Price, estimate map[UnitKind]int64) (PriceSnapshot, er
 	return snap, nil
 }
 
+// boundEstimate merges the prompt kinds: any input token may return cached,
+// so the hold prices max(input, cached) prompt units ONCE under the higher
+// prompt rate. It returns the merged unit map (what token budgets and
+// reserved_units count) and the rate set to charge it with; when the
+// surviving rate is cached_input the returned snapshot renames it to input
+// so charge prices it (the reservation keeps its own stored snapshot).
+func boundEstimate(estimate map[UnitKind]int64, snap PriceSnapshot) (map[UnitKind]int64, PriceSnapshot) {
+	in, cached := estimate[UnitInput], estimate[UnitCachedInput]
+	if in == 0 && cached == 0 {
+		return estimate, snap
+	}
+	rateOf := map[UnitKind]SnapshotRate{}
+	for i := range snap.Rates {
+		rateOf[snap.Rates[i].Unit] = snap.Rates[i]
+	}
+	ir, hasIn := rateOf[UnitInput]
+	cr, hasCr := rateOf[UnitCachedInput]
+	var promptRate SnapshotRate
+	switch {
+	case hasIn && hasCr:
+		promptRate = ir
+		if rateGreater(cr, ir) {
+			promptRate = cr
+		}
+	case hasIn:
+		promptRate = ir
+	case hasCr:
+		promptRate = cr
+	default:
+		return estimate, snap // no prompt rate: charge() reports it missing
+	}
+	out := make(map[UnitKind]int64, len(estimate)+1)
+	for k, v := range estimate {
+		if k != UnitInput && k != UnitCachedInput {
+			out[k] = v
+		}
+	}
+	prompt := in
+	if cached > prompt {
+		prompt = cached
+	}
+	out[UnitInput] = prompt
+	promptRate.Unit = UnitInput
+	snap.Rates = append(append([]SnapshotRate{}, snap.Rates...), promptRate)
+	return out, snap
+}
+
+// rateGreater reports whether rational rate a exceeds b via exact
+// cross-multiplication in 128 bits.
+func rateGreater(a, b SnapshotRate) bool {
+	if a.UnitQuantity <= 0 || b.UnitQuantity <= 0 {
+		return false
+	}
+	ahi, alo := bits.Mul64(uint64(a.RateMicros), uint64(b.UnitQuantity))
+	bhi, blo := bits.Mul64(uint64(b.RateMicros), uint64(a.UnitQuantity))
+	return ahi > bhi || (ahi == bhi && alo > blo)
+}
+
 // charge computes Σ per-kind rate_micros×units ÷ unit_quantity under the
 // snapshot's rounding rule with checked 128-bit arithmetic. Overrun is never
 // clipped — units larger than the reserved bound produce a larger amount.
+// Every unit kind must have a snapshot rate.
 func charge(units map[UnitKind]int64, snap PriceSnapshot) (int64, error) {
+	total, missing, err := chargeLenient(units, snap)
+	if err != nil {
+		return 0, err
+	}
+	if len(missing) > 0 {
+		return 0, fmt.Errorf("%w: %s", ErrPriceMissing, missing[0])
+	}
+	return total, nil
+}
+
+// chargeLenient is charge that records kinds missing from the snapshot
+// instead of failing: their units are stored but contribute nothing to the
+// amount — settlement must never strand usage for a pricing gap.
+func chargeLenient(units map[UnitKind]int64, snap PriceSnapshot) (int64, []UnitKind, error) {
 	rateOf := map[UnitKind]SnapshotRate{}
 	for _, r := range snap.Rates {
 		rateOf[r.Unit] = r
@@ -413,44 +579,54 @@ func charge(units map[UnitKind]int64, snap PriceSnapshot) (int64, error) {
 	}
 	sort.Strings(kinds)
 	total := new(big128)
+	var missing []UnitKind
 	for _, name := range kinds {
 		k := UnitKind(name)
 		r, ok := rateOf[k]
 		if !ok {
-			return 0, fmt.Errorf("%w: %s", ErrPriceMissing, k)
+			missing = append(missing, k)
+			continue
 		}
 		if r.UnitQuantity <= 0 || r.RateMicros < 0 {
-			return 0, fmt.Errorf("billing: invalid snapshot rate for %s", k)
+			return 0, nil, fmt.Errorf("billing: invalid snapshot rate for %s", k)
 		}
 		total.addRatMul(r.RateMicros, units[k], r.UnitQuantity, snap.RoundingRule)
 		if total.overflow {
-			return 0, ErrArithmeticOverflow
+			return 0, nil, ErrArithmeticOverflow
 		}
 	}
-	return total.i64(), nil
+	return total.i64(), missing, nil
 }
 
-// liabilityFrom is the earlier of the budget's period window start and its own
+// LiabilityFrom is the LATER of the budget's period window start and its own
 // starts_at — settled usage before it does not count.
-func liabilityFrom(b Budget, now time.Time) time.Time {
-	start := periodStart(b.Period, now)
+func LiabilityFrom(b Budget, now time.Time) time.Time {
+	start := periodStart(b.Period, b.Timezone, now)
 	if b.StartsAt.After(start) {
 		start = b.StartsAt
 	}
 	return start
 }
 
-func periodStart(period string, now time.Time) time.Time {
-	now = now.UTC()
+// periodStart computes the current day/ISO-week/month boundary in the
+// budget's IANA timezone; "" or an invalid name falls back to UTC.
+func periodStart(period, timezone string, now time.Time) time.Time {
+	loc := time.UTC
+	if timezone != "" {
+		if l, err := time.LoadLocation(timezone); err == nil {
+			loc = l
+		}
+	}
+	now = now.In(loc)
 	switch period {
 	case PeriodDaily:
-		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 	case PeriodWeekly:
 		// ISO week starts Monday.
-		d := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+		d := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 		return d.AddDate(0, 0, -int((int(now.Weekday())+6)%7))
 	case PeriodMonthly:
-		return time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+		return time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, loc)
 	default:
 		return time.Time{}
 	}

@@ -112,8 +112,8 @@ func NewService(
 	}
 }
 
-// maxExtractOutputTokens bounds the reserved output-side estimate; settle
-// records the truthful actual usage without clipping.
+// maxExtractOutputTokens caps generation per attempt and sizes the
+// reservation's output-side hold.
 const maxExtractOutputTokens = 8192
 
 // writeLeaseTTL covers the input upload stream; the attempt's own writes
@@ -467,8 +467,7 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 				Version:  int(inputVersion),
 			}},
 			Estimate: billing.Usage{
-				InputUnits:  estimateInputTokens(int64(len(inBytes)), promptSystem, promptUser),
-				OutputUnits: maxExtractOutputTokens,
+				InputUnits: estimateInputTokens(int64(len(inBytes)), promptSystem, promptUser),
 			},
 			JobID:     job.ID,
 			AttemptID: claim.AttemptID(),
@@ -944,6 +943,7 @@ func (s *Service) buildProviderRequest(model string, template Template, systemPr
 			{"role": "user", "content": content},
 		},
 		"response_format": responseFormat,
+		"max_tokens":      maxExtractOutputTokens,
 		"temperature":     0,
 	}
 }

@@ -10,10 +10,13 @@ import (
 	"time"
 )
 
-// LiabilityRow is one outstanding (held/unknown reservation) or settled
-// (usage_records) charge inside a budget window. AmountMicros is the
-// reservation bound or the settled amount; Units is the reserved or settled
-// per-kind units so token budgets reconstruct liability even at zero rates.
+// LiabilityRow is one aggregated (state, currency) liability line inside a
+// budget window: AmountMicros is Σ reservation bound or settled amount and
+// Units is Σ per-kind units — computed in SQL, not one row per record. Held
+// reservations always count; unknown ones only when created inside the
+// window; settled usage counts when recorded inside it. Held/unknown units
+// fold prompt kinds once (max(input, cached_input) → input) matching the
+// reserve bound.
 type LiabilityRow struct {
 	State        string
 	AmountMicros int64
@@ -85,4 +88,9 @@ type BillingRepository interface {
 
 	// GetUsageRecord returns the settlement evidence for a reservation.
 	GetUsageRecord(ctx context.Context, tenantID, reservationID string) (UsageRecord, error)
+
+	// SweepStaleHolds is cross-tenant maintenance: held reservations created
+	// before olderThan that were never dispatched are released; dispatched
+	// ones become unknown (liability retained).
+	SweepStaleHolds(ctx context.Context, olderThan time.Time) (released, unknown int, err error)
 }

@@ -63,6 +63,7 @@ type homeKPIs struct {
 	Requests30d   int64
 	Spark         []float64
 	Spend         []MoneyAmount
+	Unsettled     []MoneyAmount
 	Budget        *homeBudget
 	Documents     int64
 	Conversations int64
@@ -196,6 +197,7 @@ func (a *App) dashboardHomeData(ctx context.Context, caps dashboardCaps) homeDat
 				Requests30d:   m.Requests30d,
 				Spark:         homeSparkSeries(m.Series30d),
 				Spend:         m.Spend30d,
+				Unsettled:     m.Unsettled30d,
 				Documents:     m.DocumentTotal,
 				Conversations: m.ConversationTotal,
 			}

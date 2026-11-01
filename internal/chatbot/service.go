@@ -131,10 +131,6 @@ func (s *Service) ConfigureRuns(repo RunRepository, jobSvc *jobs.Service, extrac
 	s.runRepo, s.jobSvc, s.extractor, s.principalResolver = repo, jobSvc, extractor, resolver
 }
 
-// maxOutputEstimate is the declared upper bound for generated units; it
-// matches the executor's operation bound for chat/vision.
-const maxOutputEstimate = 1 << 17
-
 func requireTenant(p auth.Principal) error {
 	if strings.TrimSpace(p.TenantID) == "" {
 		return fmt.Errorf("%w: principal tenant is required", source.ErrDenied)
@@ -947,12 +943,11 @@ func ragInputs(results []rag.SearchResult) []source.ObjectRef {
 	return refs
 }
 
-// completionEstimate declares the per-kind unit bound: input is sized from
-// the marshaled payload, output at the operation's configured maximum.
+// completionEstimate declares the input-side unit bound; the executor owns
+// the output bound derived from the payload's declared generation cap.
 func completionEstimate(payload []byte) billing.Usage {
 	return billing.Usage{
-		InputUnits:  int64((utf8.RuneCount(payload) + 3) / 4),
-		OutputUnits: maxOutputEstimate,
+		InputUnits: int64((utf8.RuneCount(payload) + 3) / 4),
 	}
 }
 

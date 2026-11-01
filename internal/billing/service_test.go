@@ -371,9 +371,13 @@ func TestMarkUnknownRetainsLiability(t *testing.T) {
 	if _, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 40})); err != nil {
 		t.Fatalf("remaining 40 must admit, got %v", err)
 	}
-	// Unknown reservations never settle.
-	if _, err := f.svc.Settle(ctx, f.principal, res.ID, billing.Usage{InputUnits: 1}); !errors.Is(err, billing.ErrReservationState) {
-		t.Fatalf("settle of unknown must fail, got %v", err)
+	// Unknown reservations settle late with the reconciled usage.
+	rec, err := f.svc.Settle(ctx, f.principal, res.ID, billing.Usage{InputUnits: 1})
+	if err != nil {
+		t.Fatalf("late settle of unknown must succeed, got %v", err)
+	}
+	if rec.AmountMicros != 1 || rec.Outcome != billing.OutcomeCompleted {
+		t.Fatalf("late settle record: %+v", rec)
 	}
 }
 
@@ -428,5 +432,320 @@ func TestTenantBudgetAggregatesAcrossBillingSubjects(t *testing.T) {
 	req2.SubjectKeys = []billing.Subject{{Type: billing.BudgetSubjectAPIKey, ID: "key-2"}}
 	if _, err := f.svc.Reserve(ctx, p2, req2); !errors.Is(err, billing.ErrBudgetExceeded) {
 		t.Fatalf("tenant budget must count key-1's hold tenant-wide, got %v", err)
+	}
+}
+
+func TestReleaseUnsentFreesDispatchedHold(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.flatPrices(t)
+	f.budget(t, "b1", billing.BudgetSubjectAPIKey, f.keyID, billing.BudgetKindAmount, 200, "USD")
+
+	res, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 60}))
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if err := f.svc.MarkDispatched(ctx, f.principal, res.ID); err != nil {
+		t.Fatalf("mark dispatched: %v", err)
+	}
+	// Dispatch was marked but no request bytes reached the provider.
+	if err := f.svc.ReleaseUnsent(ctx, f.principal, res.ID); err != nil {
+		t.Fatalf("release unsent on dispatched hold: %v", err)
+	}
+	if err := f.svc.ReleaseUnsent(ctx, f.principal, res.ID); err != nil {
+		t.Fatalf("release unsent must be idempotent: %v", err)
+	}
+	// Freed liability admits again.
+	if _, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 100})); err != nil {
+		t.Fatalf("released hold must free budget, got %v", err)
+	}
+
+	// Settled and unknown reservations refuse.
+	res2, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 1}))
+	if err != nil {
+		t.Fatalf("reserve2: %v", err)
+	}
+	if _, err := f.svc.Settle(ctx, f.principal, res2.ID, billing.Usage{InputUnits: 1}); err != nil {
+		t.Fatalf("settle2: %v", err)
+	}
+	if err := f.svc.ReleaseUnsent(ctx, f.principal, res2.ID); !errors.Is(err, billing.ErrReservationState) {
+		t.Fatalf("release unsent of settled must fail, got %v", err)
+	}
+	res3, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 1}))
+	if err != nil {
+		t.Fatalf("reserve3: %v", err)
+	}
+	if err := f.svc.MarkUnknown(ctx, f.principal, res3.ID); err != nil {
+		t.Fatalf("mark unknown: %v", err)
+	}
+	if err := f.svc.ReleaseUnsent(ctx, f.principal, res3.ID); !errors.Is(err, billing.ErrReservationState) {
+		t.Fatalf("release unsent of unknown must fail, got %v", err)
+	}
+}
+
+func TestResolveUnknown(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.flatPrices(t)
+
+	// Reconcile with actual usage: charged under the snapshot.
+	res, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 50}))
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if err := f.svc.MarkUnknown(ctx, f.principal, res.ID); err != nil {
+		t.Fatalf("mark unknown: %v", err)
+	}
+	rec, err := f.svc.ResolveUnknown(ctx, f.principal, res.ID, billing.Usage{InputUnits: 42})
+	if err != nil {
+		t.Fatalf("resolve unknown: %v", err)
+	}
+	if rec.AmountMicros != 42 || rec.Outcome != billing.OutcomeReconciled {
+		t.Fatalf("reconciled record: %+v", rec)
+	}
+
+	// Write-off: zero usage frees the hold entirely.
+	res2, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 10}))
+	if err != nil {
+		t.Fatalf("reserve2: %v", err)
+	}
+	if err := f.svc.MarkUnknown(ctx, f.principal, res2.ID); err != nil {
+		t.Fatalf("mark unknown 2: %v", err)
+	}
+	rec2, err := f.svc.ResolveUnknown(ctx, f.principal, res2.ID, billing.Usage{})
+	if err != nil {
+		t.Fatalf("write-off: %v", err)
+	}
+	if rec2.AmountMicros != 0 || rec2.Outcome != billing.OutcomeReconciled {
+		t.Fatalf("write-off record: %+v", rec2)
+	}
+
+	// Held and released reservations refuse.
+	res3, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 1}))
+	if err != nil {
+		t.Fatalf("reserve3: %v", err)
+	}
+	if _, err := f.svc.ResolveUnknown(ctx, f.principal, res3.ID, billing.Usage{}); !errors.Is(err, billing.ErrReservationState) {
+		t.Fatalf("resolve held must fail, got %v", err)
+	}
+	if err := f.svc.ReleaseUndispatched(ctx, f.principal, res3.ID); err != nil {
+		t.Fatalf("release3: %v", err)
+	}
+	if _, err := f.svc.ResolveUnknown(ctx, f.principal, res3.ID, billing.Usage{}); !errors.Is(err, billing.ErrReservationState) {
+		t.Fatalf("resolve released must fail, got %v", err)
+	}
+}
+
+func TestSweepStaleHolds(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.flatPrices(t)
+
+	stale, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 10}))
+	if err != nil {
+		t.Fatalf("reserve stale: %v", err)
+	}
+	staleDisp, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 10}))
+	if err != nil {
+		t.Fatalf("reserve stale dispatched: %v", err)
+	}
+	if err := f.svc.MarkDispatched(ctx, f.principal, staleDisp.ID); err != nil {
+		t.Fatalf("mark dispatched: %v", err)
+	}
+	fresh, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 10}))
+	if err != nil {
+		t.Fatalf("reserve fresh: %v", err)
+	}
+	// Backdate the two stale holds.
+	cutoff := time.Now().UTC().Add(-time.Hour)
+	for _, id := range []string{stale.ID, staleDisp.ID} {
+		if _, err := f.db.SQL.ExecContext(ctx,
+			`UPDATE reservations SET created_at = $2 WHERE tenant_id = $1::uuid AND (id = $3 OR id LIKE $3 || '/%')`,
+			f.tenant, cutoff.Add(-time.Hour), id); err != nil {
+			t.Fatalf("backdate %s: %v", id, err)
+		}
+	}
+
+	released, unknown, err := f.svc.SweepStaleHolds(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	// Each reservation writes a canonical api_key row plus a tenant row.
+	if released != 2 || unknown != 2 {
+		t.Fatalf("sweep counts released=%d unknown=%d, want 2/2", released, unknown)
+	}
+	got, err := f.svc.GetReservation(ctx, f.principal, stale.ID)
+	if err != nil || got.State != billing.ReservationReleased {
+		t.Fatalf("stale undispatched must release, got %+v err=%v", got, err)
+	}
+	got, err = f.svc.GetReservation(ctx, f.principal, staleDisp.ID)
+	if err != nil || got.State != billing.ReservationUnknown {
+		t.Fatalf("stale dispatched must become unknown, got %+v err=%v", got, err)
+	}
+	got, err = f.svc.GetReservation(ctx, f.principal, fresh.ID)
+	if err != nil || got.State != billing.ReservationHeld {
+		t.Fatalf("fresh hold untouched, got %+v err=%v", got, err)
+	}
+}
+
+func TestLiabilityWindowDropsStaleUnknown(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.flatPrices(t)
+	f.budget(t, "b1", billing.BudgetSubjectAPIKey, f.keyID, billing.BudgetKindAmount, 100, "USD")
+
+	old, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 90}))
+	if err != nil {
+		t.Fatalf("reserve old: %v", err)
+	}
+	if err := f.svc.MarkUnknown(ctx, f.principal, old.ID); err != nil {
+		t.Fatalf("mark unknown: %v", err)
+	}
+	// Backdate the unknown row out of the monthly window — it stops counting.
+	if _, err := f.db.SQL.ExecContext(ctx,
+		`UPDATE reservations SET created_at = $2 WHERE tenant_id = $1::uuid AND (id = $3 OR id LIKE $3 || '/%')`,
+		f.tenant, time.Now().UTC().AddDate(0, -2, 0), old.ID); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	if _, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 90})); err != nil {
+		t.Fatalf("aged-out unknown must not count, got %v", err)
+	}
+
+	// A held row inside the same scope always counts regardless of age.
+	held, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 5}))
+	if err != nil {
+		t.Fatalf("reserve held: %v", err)
+	}
+	if _, err := f.db.SQL.ExecContext(ctx,
+		`UPDATE reservations SET created_at = $2 WHERE tenant_id = $1::uuid AND (id = $3 OR id LIKE $3 || '/%')`,
+		f.tenant, time.Now().UTC().AddDate(0, -2, 0), held.ID); err != nil {
+		t.Fatalf("backdate held: %v", err)
+	}
+	if _, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 10})); !errors.Is(err, billing.ErrBudgetExceeded) {
+		t.Fatalf("aged held must still count (90+5+10>100), got %v", err)
+	}
+}
+
+func TestPromptBoundPricedOnceAtHigherRate(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.modelPrice(t, "p-in", billing.UnitInput, 10, 1, "USD")
+	f.modelPrice(t, "p-cin", billing.UnitCachedInput, 3, 1, "USD")
+	f.modelPrice(t, "p-out", billing.UnitOutput, 5, 1, "USD")
+	f.budget(t, "bt", billing.BudgetSubjectAPIKey, f.keyID, billing.BudgetKindTokens, 150, "")
+
+	res, err := f.svc.Reserve(ctx, f.principal,
+		f.req(billing.Usage{InputUnits: 100, CachedInputUnits: 100, OutputUnits: 10}))
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	// Bound = 100 prompt tokens at the higher input rate + 10 output:
+	// 100*10 + 10*5 = 1050, never (100*10)+(100*3)+(10*5).
+	if res.LimitAmountMicros != 1050 {
+		t.Fatalf("bound %d, want 1050", res.LimitAmountMicros)
+	}
+	// Token budget counted 110 (100 prompt once + 10 output): 40 headroom.
+	if _, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 41})); !errors.Is(err, billing.ErrBudgetExceeded) {
+		t.Fatalf("110+41 must exceed 150 token budget, got %v", err)
+	}
+	if _, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 40})); err != nil {
+		t.Fatalf("110+40 must fit 150 token budget, got %v", err)
+	}
+	// Settle stays disjoint: real usage reports input minus cached.
+	rec, err := f.svc.Settle(ctx, f.principal, res.ID,
+		billing.Usage{InputUnits: 60, CachedInputUnits: 30, OutputUnits: 5})
+	if err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if rec.AmountMicros != 60*10+30*3+5*5 {
+		t.Fatalf("settled %d, want 715", rec.AmountMicros)
+	}
+}
+
+func TestSettleUnpricedUnitsRecorded(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.flatPrices(t)
+
+	res, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 10}))
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	// Report a unit kind the snapshot never priced: settle must not fail,
+	// units are recorded, only priced kinds charge.
+	rec, err := f.svc.Settle(ctx, f.principal, res.ID, billing.Usage{
+		InputUnits: 8,
+		OtherUnits: map[billing.UnitKind]int64{"images": 2},
+	})
+	if err != nil {
+		t.Fatalf("settle with unpriced kind: %v", err)
+	}
+	if rec.Outcome != billing.OutcomeUnpricedUnits {
+		t.Fatalf("outcome %q, want unpriced_units", rec.Outcome)
+	}
+	if rec.AmountMicros != 8 || rec.Units["images"] != 2 || rec.Units[billing.UnitInput] != 8 {
+		t.Fatalf("unpriced settle record: %+v", rec)
+	}
+}
+
+func TestBudgetTimezoneLiabilityWindow(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.flatPrices(t)
+
+	// A daily budget on Europe/Ljubljana (UTC+1/UTC+2): the liability window
+	// starts at the Ljubljana day boundary, not the UTC one.
+	if err := f.repo.CreateBudget(ctx, f.tenant, "btz", billing.Budget{
+		Subject:           billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: f.keyID},
+		Kind:              billing.BudgetKindAmount,
+		Period:            billing.PeriodDaily,
+		LimitAmountMicros: 100,
+		Currency:          "USD",
+		Timezone:          "Europe/Ljubljana",
+		StartsAt:          time.Now().UTC().Add(-time.Hour * 48),
+	}); err != nil {
+		t.Fatalf("create tz budget: %v", err)
+	}
+	got, err := f.repo.GetBudget(ctx, f.tenant, "btz")
+	if err != nil || got.Timezone != "Europe/Ljubljana" {
+		t.Fatalf("timezone round-trip: %+v err=%v", got, err)
+	}
+
+	loc, err := time.LoadLocation("Europe/Ljubljana")
+	if err != nil {
+		t.Skipf("zoneinfo unavailable: %v", err)
+	}
+	now := time.Now().UTC()
+	localNow := now.In(loc)
+	dayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(),
+		0, 0, 0, 0, loc)
+	if from := billing.LiabilityFrom(got, now); !from.Equal(dayStart) {
+		t.Fatalf("liability from %v, want Ljubljana day start %v", from, dayStart)
+	}
+
+	// Usage settled just before the Ljubljana day start must not consume the
+	// fresh day's budget even though it may share the same UTC day.
+	res, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 90}))
+	if err != nil {
+		t.Fatalf("reserve old: %v", err)
+	}
+	if _, err := f.svc.Settle(ctx, f.principal, res.ID, billing.Usage{InputUnits: 90}); err != nil {
+		t.Fatalf("settle old: %v", err)
+	}
+	if _, err := f.db.SQL.ExecContext(ctx,
+		`UPDATE usage_records SET created_at = $2 WHERE tenant_id = $1::uuid`,
+		f.tenant, dayStart.UTC().Add(-time.Minute)); err != nil {
+		t.Fatalf("backdate usage: %v", err)
+	}
+	if _, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 90})); err != nil {
+		t.Fatalf("new Ljubljana day must admit, got %v", err)
+	}
+
+	// An invalid zone name falls back to UTC.
+	bad := got
+	bad.Timezone = "Not/AZone"
+	utcStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	if from := billing.LiabilityFrom(bad, now); !from.Equal(utcStart) {
+		t.Fatalf("invalid zone must fall back to UTC day start, got %v", from)
 	}
 }

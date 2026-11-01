@@ -87,6 +87,22 @@ const (
 
 var errResponseTooLarge = errors.New("upstream response body exceeds maximum size")
 
+// NotDispatched marks a dispatch failure that provably never placed request
+// bytes on the provider: transports that do not send through the caller's
+// net/http context (FFI, attestation, local validation) wrap pre-send
+// failures in it so the executor can release the reservation instead of
+// retaining unknown liability. It is evidence, never a retry signal.
+type NotDispatched struct{ Err error }
+
+func (e *NotDispatched) Error() string { return e.Err.Error() }
+func (e *NotDispatched) Unwrap() error { return e.Err }
+
+// IsNotDispatched reports whether err is a typed pre-send failure.
+func IsNotDispatched(err error) bool {
+	var nd *NotDispatched
+	return errors.As(err, &nd)
+}
+
 type transportKey struct {
 	origin               string
 	allowPrivate         bool

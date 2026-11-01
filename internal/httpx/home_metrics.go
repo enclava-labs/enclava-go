@@ -8,6 +8,7 @@ package httpx
 import (
 	"context"
 	"log"
+	"sort"
 	"time"
 
 	"enclava-go/internal/auth"
@@ -30,6 +31,7 @@ type BudgetProgress = budgetProgressDTO
 type HomeMetrics struct {
 	Requests30d       int64
 	Spend30d          []MoneyAmount
+	Unsettled30d      []MoneyAmount
 	Series30d         []postgres.DailyUsageRow
 	DocumentTotal     int64
 	ConversationTotal int64
@@ -75,6 +77,29 @@ func (a *App) dashboardHomeMetrics(ctx context.Context, p auth.Principal, caps d
 		for _, t := range totals {
 			m.Requests30d += t.RequestCount
 			m.Spend30d = append(m.Spend30d, MoneyAmount{Currency: t.Currency, AmountMicros: t.AmountMicros})
+		}
+	}
+	// Outstanding liability over the same window: held reservations always
+	// count, unknown count when created inside it — canonical rows only so
+	// api-key attribution never double-counts.
+	unsettled, err := a.billingRepo.ReportUnsettledBySubject(ctx, p.TenantID, since)
+	if err != nil {
+		log.Printf("dashboard home: unsettled liability: %v", err)
+	} else {
+		byCur := map[string]int64{}
+		order := []string{}
+		for _, row := range unsettled {
+			if row.Attributed {
+				continue
+			}
+			if _, seen := byCur[row.Currency]; !seen {
+				order = append(order, row.Currency)
+			}
+			byCur[row.Currency] += row.HeldMicros + row.UnknownMicros
+		}
+		sort.Strings(order)
+		for _, cur := range order {
+			m.Unsettled30d = append(m.Unsettled30d, MoneyAmount{Currency: cur, AmountMicros: byCur[cur]})
 		}
 	}
 

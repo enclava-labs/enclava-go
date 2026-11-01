@@ -31,10 +31,7 @@ func billingSubjectOf(p auth.Principal) billing.Subject {
 // liabilityForBudget returns (units, amountMicros) of held+settled liability
 // inside the budget's liability window.
 func (a *App) liabilityForBudget(ctx context.Context, tenantID string, budget billing.Budget, now time.Time) (int64, int64, error) {
-	from := periodStart(budget.Period, now)
-	if budget.StartsAt.After(from) {
-		from = budget.StartsAt
-	}
+	from := billing.LiabilityFrom(budget, now)
 	rows, err := a.billingRepo.Liabilities(ctx, tenantID, budget.Subject, from)
 	if err != nil {
 		return 0, 0, err
@@ -64,21 +61,6 @@ func checkedBudgetAdd(a, b int64) (int64, bool) {
 		return 0, false
 	}
 	return a + b, true
-}
-
-// periodStart mirrors billing.periodStart for the read path.
-func periodStart(period string, now time.Time) time.Time {
-	switch period {
-	case billing.PeriodDaily:
-		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	case billing.PeriodWeekly:
-		d := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-		return d.AddDate(0, 0, -int((int(now.Weekday())+6)%7))
-	case billing.PeriodMonthly:
-		return time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
-	default:
-		return time.Time{}
-	}
 }
 
 func microsToCents(micro int64) int64 {
@@ -120,6 +102,8 @@ type budgetDTO struct {
 	LimitValue  int64   `json:"limit_value"`
 	Currency    string  `json:"currency,omitempty"`
 	Period      string  `json:"period"`
+	Timezone    string  `json:"timezone"`
+	Status      string  `json:"status"` // scheduled|active|ended|inactive
 	StartsAt    string  `json:"starts_at"`
 	EndsAt      *string `json:"ends_at,omitempty"`
 }
@@ -152,7 +136,9 @@ type budgetView struct {
 	Progress  budgetProgressDTO    `json:"progress"`
 }
 
-func newBudgetDTO(b billing.Budget) budgetDTO {
+// newBudgetDTO projects one row. active is the persisted flag — the billing
+// Budget type never carries it, so callers pass it alongside.
+func newBudgetDTO(b billing.Budget, active bool, now time.Time) budgetDTO {
 	dto := budgetDTO{
 		ID:          b.ID,
 		Name:        b.Name,
@@ -162,6 +148,8 @@ func newBudgetDTO(b billing.Budget) budgetDTO {
 		LimitValue:  b.LimitAmountMicros,
 		Currency:    b.Currency,
 		Period:      b.Period,
+		Timezone:    budgetTimezoneName(b.Timezone),
+		Status:      budgetStatus(b, active, now),
 		StartsAt:    b.StartsAt.UTC().Format(time.RFC3339),
 	}
 	if b.EndsAt != nil {
@@ -169,6 +157,30 @@ func newBudgetDTO(b billing.Budget) budgetDTO {
 		dto.EndsAt = &e
 	}
 	return dto
+}
+
+// budgetTimezoneName normalizes the persisted zone for the wire: "" and any
+// unrecognized name read back as UTC, matching billing.periodStart.
+func budgetTimezoneName(tz string) string {
+	if tz == "" {
+		return "UTC"
+	}
+	return tz
+}
+
+// budgetStatus is the display lifecycle: a deactivated row is inactive;
+// otherwise the window decides ended / scheduled / active at now.
+func budgetStatus(b billing.Budget, active bool, now time.Time) string {
+	if !active {
+		return "inactive"
+	}
+	if b.EndsAt != nil && !now.Before(*b.EndsAt) {
+		return "ended"
+	}
+	if now.Before(b.StartsAt) {
+		return "scheduled"
+	}
+	return "active"
 }
 
 // currencyLiability accumulates one currency's per-state sums.
@@ -186,10 +198,7 @@ type currencyLiability struct {
 // count per-kind units across every row. Overflow clamps at MaxInt64 the
 // way admit's checked sums refuse past it.
 func (a *App) budgetProgress(ctx context.Context, tenantID string, budget billing.Budget, now time.Time) (budgetProgressDTO, []budgetLiabilityRow, error) {
-	from := periodStart(budget.Period, now)
-	if budget.StartsAt.After(from) {
-		from = budget.StartsAt
-	}
+	from := billing.LiabilityFrom(budget, now)
 	rows, err := a.billingRepo.Liabilities(ctx, tenantID, budget.Subject, from)
 	if err != nil {
 		return budgetProgressDTO{}, nil, err
@@ -281,7 +290,8 @@ var budgetSubjectTypes = map[string]bool{
 }
 
 // adminBudgetCreateRequest is the POST body. Dates are RFC3339; ends_at is
-// optional and must be after starts_at.
+// optional and must be after starts_at; timezone is an optional IANA name
+// ("" or "UTC" = UTC) governing the period window boundaries.
 type adminBudgetCreateRequest struct {
 	Name        string  `json:"name"`
 	SubjectType string  `json:"subject_type"`
@@ -290,6 +300,7 @@ type adminBudgetCreateRequest struct {
 	LimitValue  *int64  `json:"limit_value"`
 	Currency    string  `json:"currency"`
 	Period      string  `json:"period"`
+	Timezone    string  `json:"timezone,omitempty"`
 	StartsAt    string  `json:"starts_at"`
 	EndsAt      *string `json:"ends_at"`
 }
@@ -356,6 +367,14 @@ func (a *App) handleAdminBudgetCreate(w http.ResponseWriter, r *http.Request, pr
 			return
 		}
 	}
+	timezone := strings.TrimSpace(req.Timezone)
+	if timezone == "" {
+		timezone = "UTC"
+	}
+	if _, err := time.LoadLocation(timezone); err != nil {
+		WriteOpenAIError(w, http.StatusBadRequest, "timezone must be an IANA time zone name", "invalid_request_error", "invalid_timezone")
+		return
+	}
 	if req.Period != billing.PeriodDaily && req.Period != billing.PeriodWeekly && req.Period != billing.PeriodMonthly {
 		WriteOpenAIError(w, http.StatusBadRequest, "period must be daily, weekly or monthly", "invalid_request_error", "invalid_period")
 		return
@@ -385,6 +404,18 @@ func (a *App) handleAdminBudgetCreate(w http.ResponseWriter, r *http.Request, pr
 		WriteOpenAIError(w, http.StatusBadRequest, "budget subject does not exist in this tenant", "invalid_request_error", "invalid_subject")
 		return
 	}
+	if req.Kind == billing.BudgetKindAmount {
+		ok, err := a.tenantBillsCurrency(r.Context(), principal.TenantID, req.Currency)
+		if err != nil {
+			log.Printf("failed to read tenant price currencies: %v", err)
+			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "budget_currency_check_failed")
+			return
+		}
+		if !ok {
+			WriteOpenAIError(w, http.StatusBadRequest, "currency does not match any currency the tenant's prices bill in", "invalid_request_error", "invalid_currency")
+			return
+		}
+	}
 	budget := billing.Budget{
 		ID:                NewID("budget"),
 		Name:              name,
@@ -393,6 +424,7 @@ func (a *App) handleAdminBudgetCreate(w http.ResponseWriter, r *http.Request, pr
 		Period:            req.Period,
 		LimitAmountMicros: *req.LimitValue,
 		Currency:          req.Currency,
+		Timezone:          timezone,
 		StartsAt:          startsAt,
 		EndsAt:            endsAt,
 	}
@@ -403,10 +435,12 @@ func (a *App) handleAdminBudgetCreate(w http.ResponseWriter, r *http.Request, pr
 	}
 	a.recordBudgetBillingAudit(r.Context(), principal, "budget.created", budget, map[string]any{
 		"limit_value": budget.LimitAmountMicros,
+		"kind":        budget.Kind,
 		"period":      budget.Period,
 		"currency":    budget.Currency,
+		"timezone":    budget.Timezone,
 	})
-	view, err := a.budgetView(r.Context(), principal.TenantID, budget, time.Now().UTC())
+	view, err := a.budgetView(r.Context(), principal.TenantID, budget, true, time.Now().UTC())
 	if err != nil {
 		log.Printf("failed to project budget liability: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "budget_liability_failed")
@@ -421,15 +455,15 @@ func (a *App) handleAdminBudgetList(w http.ResponseWriter, r *http.Request, prin
 		return
 	}
 	now := time.Now().UTC()
-	budgets, err := a.billingRepo.ListAllActiveBudgets(r.Context(), principal.TenantID, now)
+	budgets, err := a.billingRepo.ReportListBudgets(r.Context(), principal.TenantID)
 	if err != nil {
 		log.Printf("failed to list budgets: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "budgets_list_failed")
 		return
 	}
 	views := make([]budgetView, 0, len(budgets))
-	for _, b := range budgets {
-		view, err := a.budgetView(r.Context(), principal.TenantID, b, now)
+	for _, row := range budgets {
+		view, err := a.budgetView(r.Context(), principal.TenantID, row.Budget, row.Active, now)
 		if err != nil {
 			log.Printf("failed to project budget liability: %v", err)
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "budget_liability_failed")
@@ -440,9 +474,14 @@ func (a *App) handleAdminBudgetList(w http.ResponseWriter, r *http.Request, prin
 	WriteJSON(w, http.StatusOK, map[string]any{"budgets": views})
 }
 
+// handleAdminBudgetByID serves PATCH (limit-only edit) and DELETE
+// (deactivate). PATCH is limit-only on purpose: the window, subject, kind
+// and currency are frozen at create so held/settled liability can never be
+// re-scoped. DELETE flips active=false idempotently — admission already
+// ignores inactive budgets — and audits the transition like a limit change.
 func (a *App) handleAdminBudgetByID(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
 	setNoStoreHeaders(w)
-	if r.Method != http.MethodPatch {
+	if r.Method != http.MethodPatch && r.Method != http.MethodDelete {
 		WriteMethodNotAllowed(w)
 		return
 	}
@@ -455,23 +494,56 @@ func (a *App) handleAdminBudgetByID(w http.ResponseWriter, r *http.Request, prin
 		WriteOpenAIError(w, http.StatusBadRequest, "budget id is required", "invalid_request_error", "missing_budget_id")
 		return
 	}
+	// PATCH validates its body before the row fetch — a malformed request is
+	// 400 regardless of whether the id exists.
 	var req adminBudgetPatchRequest
-	if err := DecodeJSON(r, &req); err != nil {
-		WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_body")
-		return
+	if r.Method == http.MethodPatch {
+		if err := DecodeJSON(r, &req); err != nil {
+			WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_body")
+			return
+		}
+		if req.LimitValue == nil {
+			WriteOpenAIError(w, http.StatusBadRequest, "limit_value is required", "invalid_request_error", "invalid_limit_value")
+			return
+		}
+		if *req.LimitValue <= 0 || *req.LimitValue > math.MaxInt64/2 {
+			WriteOpenAIError(w, http.StatusBadRequest, "limit_value must be a positive integer no greater than MaxInt64/2", "invalid_request_error", "invalid_limit_value")
+			return
+		}
 	}
-	if req.LimitValue == nil {
-		WriteOpenAIError(w, http.StatusBadRequest, "limit_value is required", "invalid_request_error", "invalid_limit_value")
-		return
-	}
-	if *req.LimitValue <= 0 || *req.LimitValue > math.MaxInt64/2 {
-		WriteOpenAIError(w, http.StatusBadRequest, "limit_value must be a positive integer no greater than MaxInt64/2", "invalid_request_error", "invalid_limit_value")
-		return
-	}
-	budget, err := a.billingRepo.GetBudget(r.Context(), principal.TenantID, id)
+	row, err := a.billingRepo.ReportGetBudget(r.Context(), principal.TenantID, id)
 	if err != nil {
-		// Unknown and cross-tenant ids are one indistinguishable not-found.
 		WriteOpenAIError(w, http.StatusNotFound, "budget not found", "invalid_request_error", "budget_not_found")
+		return
+	}
+	budget := row.Budget
+	active := row.Active
+
+	if r.Method == http.MethodDelete {
+		deactivated, err := a.billingRepo.ReportDeactivateBudget(r.Context(), principal.TenantID, id)
+		if err != nil {
+			if errors.Is(err, postgres.ErrBudgetNotFound) {
+				WriteOpenAIError(w, http.StatusNotFound, "budget not found", "invalid_request_error", "budget_not_found")
+				return
+			}
+			log.Printf("failed to deactivate budget: %v", err)
+			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "budget_delete_failed")
+			return
+		}
+		if deactivated {
+			active = false
+			a.recordBudgetBillingAudit(r.Context(), principal, "budget.deactivated", budget, map[string]any{
+				"kind":     budget.Kind,
+				"currency": budget.Currency,
+			})
+		}
+		view, verr := a.budgetView(r.Context(), principal.TenantID, budget, active, time.Now().UTC())
+		if verr != nil {
+			log.Printf("failed to project budget liability: %v", verr)
+			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "budget_liability_failed")
+			return
+		}
+		WriteJSON(w, http.StatusOK, view)
 		return
 	}
 	if err := a.billingRepo.UpdateBudgetLimit(r.Context(), principal.TenantID, id, *req.LimitValue); err != nil {
@@ -486,8 +558,10 @@ func (a *App) handleAdminBudgetByID(w http.ResponseWriter, r *http.Request, prin
 	budget.LimitAmountMicros = *req.LimitValue
 	a.recordBudgetBillingAudit(r.Context(), principal, "budget.limit_updated", budget, map[string]any{
 		"limit_value": budget.LimitAmountMicros,
+		"kind":        budget.Kind,
+		"currency":    budget.Currency,
 	})
-	view, err := a.budgetView(r.Context(), principal.TenantID, budget, time.Now().UTC())
+	view, err := a.budgetView(r.Context(), principal.TenantID, budget, active, time.Now().UTC())
 	if err != nil {
 		log.Printf("failed to project budget liability: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "budget_liability_failed")
@@ -497,12 +571,32 @@ func (a *App) handleAdminBudgetByID(w http.ResponseWriter, r *http.Request, prin
 }
 
 // budgetView joins one budget row to its admission-matching projection.
-func (a *App) budgetView(ctx context.Context, tenantID string, b billing.Budget, now time.Time) (budgetView, error) {
+func (a *App) budgetView(ctx context.Context, tenantID string, b billing.Budget, active bool, now time.Time) (budgetView, error) {
 	progress, liability, err := a.budgetProgress(ctx, tenantID, b, now)
 	if err != nil {
 		return budgetView{}, err
 	}
-	return budgetView{Budget: newBudgetDTO(b), Liability: liability, Progress: progress}, nil
+	return budgetView{Budget: newBudgetDTO(b, active, now), Liability: liability, Progress: progress}, nil
+}
+
+// tenantBillsCurrency reports whether an amount budget may bind currency:
+// when the tenant prices nothing yet any valid code binds; once prices
+// exist the budget's currency must be one they actually bill in — a budget
+// bound to an unpriced currency could never admit or refuse a reservation.
+func (a *App) tenantBillsCurrency(ctx context.Context, tenantID, currency string) (bool, error) {
+	currencies, err := a.billingRepo.ReportPriceCurrencies(ctx, tenantID)
+	if err != nil {
+		return false, err
+	}
+	if len(currencies) == 0 {
+		return true, nil
+	}
+	for _, c := range currencies {
+		if c == currency {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // verifyBudgetSubject refuses subjects that do not exist inside the caller's

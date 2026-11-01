@@ -39,6 +39,7 @@
       <div class="row"><span class="kpi-value">{{money .AmountMicros .Currency}}</span><span class="muted">{{.Currency}}</span></div>
       {{if and $.Data.KPIs.Budget (eq $.Data.KPIs.Budget.Progress.Currency .Currency)}}<span class="progress"><i style="width: {{$.Data.KPIs.Budget.Percent}}%"></i></span><span class="muted">of budget</span>{{end}}
       {{else}}<div class="kpi-value">—</div><span class="muted">No spend recorded</span>{{end}}
+      {{range .Data.KPIs.Unsettled}}<div class="muted">+ {{money .AmountMicros .Currency}} {{.Currency}} unsettled</div>{{end}}
     </div>
     <div class="card kpi">
       <div class="kpi-label">Knowledge documents</div>

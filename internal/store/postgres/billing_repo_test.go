@@ -396,3 +396,157 @@ func TestListUsageByTeamAndCredentialAttribution(t *testing.T) {
 		t.Fatalf("subject usage since = (%d, %d, %v), want (9, 90, nil)", units, micros, err)
 	}
 }
+
+func TestLiabilitiesAggregatesAndFoldsPromptKinds(t *testing.T) {
+	db := RequireTestDB(t)
+	repo := NewBillingRepo(db)
+	ctx := context.Background()
+	tenant := seedBillingTenant(t, ctx, db)
+
+	mkRes := func(id, state string, units map[billing.UnitKind]int64, bound int64, dispatched bool, created time.Time) {
+		t.Helper()
+		res := billing.Reservation{
+			TenantID: tenant, ID: id, State: state,
+			Subject:           billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: "k1"},
+			Price:             billing.PriceSnapshot{Currency: "USD", RoundingRule: billing.RoundingCeil},
+			LimitAmountMicros: bound, Currency: "USD", Units: units,
+		}
+		if err := repo.InTx(ctx, func(tx billing.BillingTx) error {
+			if err := tx.InsertReservations(ctx, []billing.Reservation{res}); err != nil {
+				return err
+			}
+			if dispatched {
+				if _, err := tx.MarkDispatched(ctx, tenant, id); err != nil {
+					return err
+				}
+			}
+			if state != billing.ReservationHeld {
+				_, err := tx.Transition(ctx, tenant, id, billing.ReservationHeld, state)
+				return err
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("insert %s: %v", id, err)
+		}
+		if _, err := db.SQL.ExecContext(ctx,
+			`UPDATE reservations SET created_at = $3 WHERE tenant_id = $1::uuid AND (id = $2 OR id LIKE $2 || '/%')`,
+			tenant, id, created); err != nil {
+			t.Fatalf("backdate %s: %v", id, err)
+		}
+	}
+
+	now := time.Now().UTC()
+	from := now.Add(-time.Hour)
+	// Held row with split prompt kinds: folds to input=max(40,60)=60 + output 5.
+	mkRes("res-h", billing.ReservationHeld,
+		map[billing.UnitKind]int64{billing.UnitInput: 40, billing.UnitCachedInput: 60, billing.UnitOutput: 5}, 500, false, now)
+	// Unknown inside the window counts; one created before it does not.
+	mkRes("res-u-in", billing.ReservationUnknown,
+		map[billing.UnitKind]int64{billing.UnitInput: 7}, 70, true, now)
+	mkRes("res-u-old", billing.ReservationUnknown,
+		map[billing.UnitKind]int64{billing.UnitInput: 900}, 9000, true, now.AddDate(0, -2, 0))
+
+	rows, err := repo.Liabilities(ctx, tenant, billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: "k1"}, from)
+	if err != nil {
+		t.Fatalf("liabilities: %v", err)
+	}
+	var held, unknown *billing.LiabilityRow
+	for i := range rows {
+		switch rows[i].State {
+		case billing.ReservationHeld:
+			held = &rows[i]
+		case billing.ReservationUnknown:
+			unknown = &rows[i]
+		}
+	}
+	if held == nil || held.AmountMicros != 500 {
+		t.Fatalf("held row %+v, want amount 500", held)
+	}
+	if held.Units[billing.UnitInput] != 60 || held.Units[billing.UnitOutput] != 5 ||
+		len(held.Units) != 2 {
+		t.Fatalf("held units not folded: %+v", held.Units)
+	}
+	if unknown == nil || unknown.AmountMicros != 70 || unknown.Units[billing.UnitInput] != 7 {
+		t.Fatalf("unknown inside window must count once: %+v", unknown)
+	}
+
+	// Tenant scope sees the canonical row only (attribution ids carry '/').
+	trows, err := repo.Liabilities(ctx, tenant, billing.Subject{Type: billing.BudgetSubjectTenant, ID: tenant}, from)
+	if err != nil {
+		t.Fatalf("tenant liabilities: %v", err)
+	}
+	var tHeld int64
+	for _, r := range trows {
+		if r.State == billing.ReservationHeld {
+			tHeld += r.AmountMicros
+		}
+	}
+	if tHeld != 500 {
+		t.Fatalf("tenant held liability = %d, want 500 (no attribution dup)", tHeld)
+	}
+}
+
+func TestSweepStaleHoldsRepo(t *testing.T) {
+	db := RequireTestDB(t)
+	repo := NewBillingRepo(db)
+	ctx := context.Background()
+	tenant := seedBillingTenant(t, ctx, db)
+
+	insert := func(id string, dispatched bool, created time.Time) {
+		t.Helper()
+		res := billing.Reservation{
+			TenantID: tenant, ID: id, State: billing.ReservationHeld,
+			Subject:  billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: "k"},
+			Price:    billing.PriceSnapshot{Currency: "USD", RoundingRule: billing.RoundingCeil},
+			Currency: "USD", Units: map[billing.UnitKind]int64{billing.UnitInput: 1},
+		}
+		if err := repo.InTx(ctx, func(tx billing.BillingTx) error {
+			if err := tx.InsertReservations(ctx, []billing.Reservation{res}); err != nil {
+				return err
+			}
+			if dispatched {
+				_, err := tx.MarkDispatched(ctx, tenant, id)
+				return err
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("insert %s: %v", id, err)
+		}
+		if _, err := db.SQL.ExecContext(ctx,
+			`UPDATE reservations SET created_at = $3 WHERE tenant_id = $1::uuid AND id = $2`,
+			tenant, id, created); err != nil {
+			t.Fatalf("backdate %s: %v", id, err)
+		}
+	}
+
+	cutoff := time.Now().UTC().Add(-time.Hour)
+	insert("stale-nodisp", false, cutoff.Add(-time.Hour))
+	insert("stale-disp", true, cutoff.Add(-time.Hour))
+	insert("fresh", true, time.Now().UTC())
+
+	released, unknown, err := repo.SweepStaleHolds(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if released != 1 || unknown != 1 {
+		t.Fatalf("released=%d unknown=%d, want 1/1", released, unknown)
+	}
+	state := func(id string) string {
+		var s string
+		if err := db.SQL.QueryRowContext(ctx,
+			`SELECT state FROM reservations WHERE tenant_id = $1::uuid AND id = $2`,
+			tenant, id).Scan(&s); err != nil {
+			t.Fatalf("state %s: %v", id, err)
+		}
+		return s
+	}
+	if s := state("stale-nodisp"); s != billing.ReservationReleased {
+		t.Fatalf("stale undispatched = %s", s)
+	}
+	if s := state("stale-disp"); s != billing.ReservationUnknown {
+		t.Fatalf("stale dispatched = %s", s)
+	}
+	if s := state("fresh"); s != billing.ReservationHeld {
+		t.Fatalf("fresh = %s", s)
+	}
+}

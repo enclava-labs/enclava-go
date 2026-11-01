@@ -297,12 +297,12 @@ func (p *TinfoilProvider) DoResponsesStream(ctx context.Context, method, path st
 func (p *TinfoilProvider) doStream(ctx context.Context, method, path string, body []byte) (io.ReadCloser, error) {
 	_, streamClient, err := p.requestClients()
 	if err != nil {
-		return nil, err
+		return nil, &NotDispatched{Err: err}
 	}
 	requestURL := p.baseURL + path
 	req, err := http.NewRequestWithContext(ctx, method, requestURL, noRetryBody(body))
 	if err != nil {
-		return nil, fmt.Errorf("build stream request: %w", err)
+		return nil, &NotDispatched{Err: fmt.Errorf("build stream request: %w", err)}
 	}
 	req.Header.Set("Authorization", "Bearer "+p.apiKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -324,7 +324,9 @@ func (p *TinfoilProvider) ensureVerified(ctx context.Context) error {
 	isStale := p.verifyMaxAge > 0 && status.Verified && time.Since(status.VerifiedAt) >= p.verifyMaxAge
 	if p.verifyPerCall || !status.Verified || isStale {
 		if _, err := p.VerifyAttestation(ctx); err != nil {
-			return fmt.Errorf("tinfoil attestation required: %w", err)
+			// Attestation gates dispatch: a verification failure means the
+			// request provably never reached the provider.
+			return &NotDispatched{Err: fmt.Errorf("tinfoil attestation required: %w", err)}
 		}
 	}
 	return nil
@@ -333,12 +335,12 @@ func (p *TinfoilProvider) ensureVerified(ctx context.Context) error {
 func (p *TinfoilProvider) doJSON(ctx context.Context, method, path string, body []byte) ([]byte, error) {
 	jsonClient, _, err := p.requestClients()
 	if err != nil {
-		return nil, err
+		return nil, &NotDispatched{Err: err}
 	}
 	requestURL := p.baseURL + path
 	req, err := http.NewRequestWithContext(ctx, method, requestURL, noRetryBody(body))
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, &NotDispatched{Err: fmt.Errorf("build request: %w", err)}
 	}
 	req.Header.Set("Authorization", "Bearer "+p.apiKey)
 	if body != nil {

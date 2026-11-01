@@ -13,6 +13,7 @@ import (
 	"enclava-go/internal/store/postgres"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -101,6 +102,9 @@ func TestAdmissionCapsActiveUntilStreamCloses(t *testing.T) {
 	if err := res.Body.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// Close returns promptly; the background drain still holds the slot
+	// until the body ends — release it so the permit frees.
+	held.unblock()
 	waitActive(t, f.admission, inference.AdmissionExecute, 0)
 }
 
@@ -149,6 +153,11 @@ func TestAdmissionQueuedCallerProceedsOnRelease(t *testing.T) {
 	if err := first.Body.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// The queued caller proceeds only once the drain finishes: unblock
+	// the held body so the permit releases, then serve a self-ending
+	// stream for the second attempt.
+	held.unblock()
+	f.upstream.stream = io.NopCloser(strings.NewReader("data: [DONE]\n\n"))
 	out := <-done
 	if out.err != nil {
 		t.Fatalf("queued request: %v", out.err)
@@ -216,6 +225,8 @@ func TestAdmissionQueuedCancelLeavesNoLeaks(t *testing.T) {
 	if err := first.Body.Close(); err != nil {
 		t.Fatal(err)
 	}
+	held.unblock()
+	f.upstream.stream = io.NopCloser(strings.NewReader("data: [DONE]\n\n"))
 	second, err := f.svc.Execute(f.ctx, f.principal, f.streamRequest())
 	if err != nil {
 		t.Fatalf("post-cancel request should proceed, got %v", err)
@@ -246,12 +257,13 @@ func TestAdmissionAbandonedBodyHoldsThenCloseReleases(t *testing.T) {
 	if err := res.Body.Close(); err != nil {
 		t.Fatal(err)
 	}
+	held.unblock()
 	waitActive(t, f.admission, inference.AdmissionExecute, 0)
 	if n := f.reservationCount(t); n != 1 {
 		t.Fatalf("reservation count: %d", n)
 	}
 	// Early close without terminal usage retains liability, not zero-cost.
-	if st := f.reservationState(t, res.ReservationID); st != billing.ReservationUnknown {
+	if st := f.waitReservationState(t, res.ReservationID, billing.ReservationUnknown); st != billing.ReservationUnknown {
 		t.Fatalf("abandoned stream must retain liability, state=%s", st)
 	}
 }
@@ -294,6 +306,7 @@ func TestAdmissionManageProgressesWhileExecuteSaturated(t *testing.T) {
 	if err := res.Body.Close(); err != nil {
 		t.Fatal(err)
 	}
+	held.unblock()
 	waitActive(t, f.admission, inference.AdmissionExecute, 0)
 }
 
@@ -337,6 +350,7 @@ func TestAdmissionFanOutPoolCannotDeadlockExecute(t *testing.T) {
 	if err := out.Body.Close(); err != nil {
 		t.Fatal(err)
 	}
+	held.unblock()
 	waitActive(t, f.admission, inference.AdmissionFanOut, 0)
 	waitActive(t, f.admission, inference.AdmissionExecute, 0)
 }

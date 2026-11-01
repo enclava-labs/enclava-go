@@ -15,6 +15,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"enclava-go/internal/auth"
@@ -80,9 +81,14 @@ func usageFloat(v any) (float64, bool) {
 	}
 }
 
-// usageFromMap maps one usage object to billing.Usage. Top-level numeric
-// fields that are not part of the disjoint input/output accounting are
-// preserved in OtherUnits so advertised units never settle as free.
+// usageFromMap maps one usage object to billing.Usage: only token counts are
+// units. Cached input is a subset of reported input settled disjointly
+// (InputUnits is input-minus-cached so cached tokens never bill twice);
+// DeepSeek's flat prompt_cache_hit_tokens fills in when no details object
+// carries a cached count. Non-token numerics (cost, *_time) and token
+// breakdowns already inside a priced kind (total, reasoning, cache misses)
+// are ignored; unmapped top-level *_tokens fields become billed OtherUnits
+// rather than settling as free.
 func usageFromMap(u map[string]any) billing.Usage {
 	var out billing.Usage
 
@@ -101,6 +107,9 @@ func usageFromMap(u map[string]any) billing.Usage {
 			cached += usageField(d["cached_tokens"])
 		}
 	}
+	if cached == 0 {
+		cached = usageField(u["prompt_cache_hit_tokens"])
+	}
 	if cached > input {
 		cached = input
 	}
@@ -111,15 +120,15 @@ func usageFromMap(u map[string]any) billing.Usage {
 	consumed := map[string]bool{
 		"input_tokens": true, "prompt_tokens": true,
 		"output_tokens": true, "completion_tokens": true,
-		"total_tokens": true, "cached_tokens": true,
-		// Breakdown of completion/output tokens (OpenAI nests it under
-		// completion_tokens_details; vLLM/SGLang-based providers report it
-		// top level). Already billed as output — counting it again would
-		// double-charge, and leaving it unpriced would strand settlement.
-		"reasoning_tokens": true,
+		"total_tokens": true, "prompt_cache_hit_tokens": true,
+		// Breakdowns already inside a priced kind — reasoning is part of
+		// completion/output, cache misses part of prompt/input. Counting
+		// them again would double-charge; pricing them separately would
+		// strand settlement.
+		"reasoning_tokens": true, "prompt_cache_miss_tokens": true,
 	}
 	for k, v := range u {
-		if consumed[k] || strings.HasSuffix(k, "_details") {
+		if consumed[k] || !strings.HasSuffix(k, "_tokens") {
 			continue
 		}
 		if n := usageField(v); n > 0 {
@@ -160,10 +169,15 @@ type streamResult struct {
 
 // accountingStream wraps one dispatched streaming body: it observes SSE
 // events for the terminal usage record and settles or retains the attempt's
-// liability exactly once — on clean termination, early caller Close or EOF
-// without a terminal event. Cancellation propagates to the upstream body;
-// accounting runs on a detached bounded context so client disconnect cannot
-// strand the settlement write.
+// liability exactly once — on clean termination, caller Close or a failed
+// drain. Caller Close before a terminal event returns promptly while a
+// background drain keeps reading the upstream body (bounded by the
+// transport's own idle/wall limits) until the terminal usage event, so a
+// client disconnect still settles the provider's real token counts; only a
+// failed drain retains unknown liability. Accounting runs on a detached
+// bounded context so client disconnect cannot strand the settlement write.
+// All reads and terminal-state mutation serialize under readMu; Close and
+// finalized are atomic so prompt Close and slow finalization can race.
 type accountingStream struct {
 	body   io.ReadCloser
 	finish func(usage []byte, terminal bool)
@@ -172,6 +186,7 @@ type accountingStream struct {
 	// the terminal classification, alongside finish.
 	outcomeFn func(streamResult)
 
+	readMu         sync.Mutex
 	pending        []byte
 	usageRaw       []byte
 	terminal       bool
@@ -179,6 +194,8 @@ type accountingStream struct {
 	eof            bool
 	readErr        error
 	once           sync.Once
+	finalized      atomic.Bool
+	closed         atomic.Bool
 }
 
 func newAccountingStream(body io.ReadCloser, finish func(usage []byte, terminal bool)) *accountingStream {
@@ -192,6 +209,14 @@ func (s *accountingStream) onOutcome(fn func(streamResult)) {
 }
 
 func (s *accountingStream) Read(p []byte) (int, error) {
+	if s.closed.Load() {
+		return 0, io.EOF
+	}
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	if s.closed.Load() {
+		return 0, io.EOF
+	}
 	n, err := s.body.Read(p)
 	if n > 0 {
 		s.scan(p[:n])
@@ -257,18 +282,19 @@ func (s *accountingStream) observeLine(line []byte) {
 	}
 }
 
-// finalize runs the once-only accounting decision. A terminal event with
-// parseable usage settles under the immutable snapshot; anything else —
-// truncated stream, missing usage, early Close — retains unknown liability.
-// The same once-block derives the endpoint-health classification: caller
-// Close before any upstream end is client cancellation (no observation),
-// a read error carries its error, EOF without a terminal event is a
-// transport-class premature end.
+// finalize runs the once-only accounting decision under readMu. A terminal
+// event with parseable usage settles under the immutable snapshot; anything
+// else — truncated stream, missing usage, failed drain — retains unknown
+// liability. The same once-block derives the endpoint-health
+// classification: caller Close before any upstream end is client
+// cancellation (no observation), a read error carries its error, EOF
+// without a terminal event is a transport-class premature end.
 func (s *accountingStream) finalize() {
 	s.once.Do(func() {
+		s.finalized.Store(true)
 		if s.outcomeFn != nil {
 			res := streamResult{Terminal: s.terminal, UpstreamFailed: s.upstreamFailed, Err: s.readErr}
-			if s.readErr == nil && !s.eof && !s.terminal {
+			if s.closed.Load() && s.readErr == nil && !s.terminal {
 				res.ClientCanceled = true
 			}
 			s.outcomeFn(res)
@@ -277,10 +303,64 @@ func (s *accountingStream) finalize() {
 	})
 }
 
-// Close finalizes accounting exactly once then closes the upstream body.
+// drain keeps reading the upstream body in the background after caller
+// Close, until the terminal usage event or a read failure; the transport's
+// own idle/wall bounds cap it. It owns the body's eventual Close.
+func (s *accountingStream) drain() {
+	buf := make([]byte, 32*1024)
+	for {
+		s.readMu.Lock()
+		switch {
+		case s.finalized.Load():
+			s.readMu.Unlock()
+			_ = s.body.Close()
+			return
+		case s.terminal && s.usageRaw != nil:
+			// The terminal usage event is in hand — settle exactly now,
+			// no need to read the body's remaining bytes.
+			s.finalize()
+			s.readMu.Unlock()
+			_ = s.body.Close()
+			return
+		case s.eof || s.readErr != nil:
+			s.finalize()
+			s.readMu.Unlock()
+			_ = s.body.Close()
+			return
+		}
+		n, err := s.body.Read(buf)
+		if n > 0 {
+			s.scan(buf[:n])
+		}
+		switch {
+		case errors.Is(err, io.EOF):
+			s.eof = true
+			s.finalize()
+			s.readMu.Unlock()
+			_ = s.body.Close()
+			return
+		case err != nil:
+			s.readErr = err
+			s.finalize()
+			s.readMu.Unlock()
+			_ = s.body.Close()
+			return
+		}
+		s.readMu.Unlock()
+	}
+}
+
+// Close returns promptly: a stream that already ended closes its body at
+// once; one still in flight starts the background drain that reads out the
+// terminal usage event and settles exactly, closing the body when done.
 func (s *accountingStream) Close() error {
-	s.finalize()
-	return s.body.Close()
+	if s.closed.CompareAndSwap(false, true) {
+		if s.finalized.Load() {
+			return s.body.Close()
+		}
+		go s.drain()
+	}
+	return nil
 }
 
 // accounting runs fn on a detached, bounded context. Settlement must outlive
@@ -292,8 +372,10 @@ func accounting(ctx context.Context, timeout time.Duration, fn func(context.Cont
 }
 
 // settleReservation applies the once-only outcome for a dispatched attempt:
-// exact usage settles under the immutable snapshot; anything ambiguous keeps
-// unknown liability. A settle failure also retains liability.
+// exact usage settles under the immutable snapshot — retried briefly so a
+// transient store failure does not strand exact accounting — and anything
+// ambiguous keeps unknown liability. An exhausted settle also retains
+// liability.
 func (s *Service) settleReservation(ctx context.Context, p auth.Principal, res billing.Reservation, usage billing.Usage, usageKnown bool) (*billing.UsageRecord, error) {
 	if !usageKnown {
 		err := accounting(ctx, accountingTimeout, func(c context.Context) error {
@@ -304,7 +386,21 @@ func (s *Service) settleReservation(ctx context.Context, p auth.Principal, res b
 	var rec billing.UsageRecord
 	err := accounting(ctx, accountingTimeout, func(c context.Context) error {
 		var serr error
-		rec, serr = s.billing.Settle(c, p, res.ID, usage)
+		for attempt := range 3 {
+			if attempt > 0 {
+				timer := time.NewTimer(200 * time.Millisecond)
+				select {
+				case <-c.Done():
+					timer.Stop()
+					return c.Err()
+				case <-timer.C:
+				}
+			}
+			rec, serr = s.billing.Settle(c, p, res.ID, usage)
+			if serr == nil {
+				return nil
+			}
+		}
 		return serr
 	})
 	if err != nil {

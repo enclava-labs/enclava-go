@@ -74,6 +74,12 @@ type Config struct {
 	InferenceMaxInflight  int   // INFERENCE_MAX_INFLIGHT — /v1 requests executing
 	InferenceMaxHTTPQueue int   // INFERENCE_MAX_HTTP_QUEUE — /v1 callers waiting
 	InferenceMaxBodyBytes int64 // INFERENCE_MAX_BODY_BYTES — in-flight request-body bytes
+	// InferenceDefaultMaxOutputTokens is the generation cap injected into
+	// chat/responses payloads that declare none; the reserved hold can
+	// never exceed what the provider is asked to produce
+	// (INFERENCE_DEFAULT_MAX_OUTPUT_TOKENS, 0 = inject nothing and hold
+	// the operation bound).
+	InferenceDefaultMaxOutputTokens int64
 }
 
 func Load() (Config, error) {
@@ -119,16 +125,17 @@ func Load() (Config, error) {
 		TrustProxyHeaders:       getEnvBool("TRUST_PROXY_HEADERS", false),
 		SessionTenantSlug:       strings.TrimSpace(getEnv("SESSION_TENANT_SLUG", "bootstrap")),
 
-		InferenceMaxActive:    getEnvInt("INFERENCE_MAX_ACTIVE", 32),
-		InferenceMaxQueued:    getEnvInt("INFERENCE_MAX_QUEUED", 128),
-		InferencePerTenant:    getEnvInt("INFERENCE_PER_TENANT", 0),
-		InferenceManageActive: getEnvInt("INFERENCE_MANAGE_ACTIVE", 8),
-		InferenceManageQueued: getEnvInt("INFERENCE_MANAGE_QUEUED", 64),
-		InferenceFanOutActive: getEnvInt("INFERENCE_FANOUT_ACTIVE", 8),
-		InferenceFanOutQueued: getEnvInt("INFERENCE_FANOUT_QUEUED", 256),
-		InferenceMaxInflight:  getEnvInt("INFERENCE_MAX_INFLIGHT", 64),
-		InferenceMaxHTTPQueue: getEnvInt("INFERENCE_MAX_HTTP_QUEUE", 128),
-		InferenceMaxBodyBytes: getEnvInt64("INFERENCE_MAX_BODY_BYTES", 256<<20),
+		InferenceMaxActive:              getEnvInt("INFERENCE_MAX_ACTIVE", 32),
+		InferenceMaxQueued:              getEnvInt("INFERENCE_MAX_QUEUED", 128),
+		InferencePerTenant:              getEnvInt("INFERENCE_PER_TENANT", 0),
+		InferenceManageActive:           getEnvInt("INFERENCE_MANAGE_ACTIVE", 8),
+		InferenceManageQueued:           getEnvInt("INFERENCE_MANAGE_QUEUED", 64),
+		InferenceFanOutActive:           getEnvInt("INFERENCE_FANOUT_ACTIVE", 8),
+		InferenceFanOutQueued:           getEnvInt("INFERENCE_FANOUT_QUEUED", 256),
+		InferenceMaxInflight:            getEnvInt("INFERENCE_MAX_INFLIGHT", 64),
+		InferenceMaxHTTPQueue:           getEnvInt("INFERENCE_MAX_HTTP_QUEUE", 128),
+		InferenceMaxBodyBytes:           getEnvInt64("INFERENCE_MAX_BODY_BYTES", 256<<20),
+		InferenceDefaultMaxOutputTokens: getEnvInt64("INFERENCE_DEFAULT_MAX_OUTPUT_TOKENS", 16384),
 	}
 	if cfg.Provider == "openai" {
 		cfg.Provider = "privatemode"
@@ -146,7 +153,8 @@ func Load() (Config, error) {
 	}
 	if cfg.InferenceMaxQueued < 0 || cfg.InferenceManageQueued < 0 ||
 		cfg.InferenceFanOutQueued < 0 || cfg.InferenceMaxHTTPQueue < 0 ||
-		cfg.InferencePerTenant < 0 || cfg.InferenceMaxBodyBytes < 0 {
+		cfg.InferencePerTenant < 0 || cfg.InferenceMaxBodyBytes < 0 ||
+		cfg.InferenceDefaultMaxOutputTokens < 0 {
 		return Config{}, fmt.Errorf("INFERENCE_* queue/byte/tenant limits must be >= 0")
 	}
 	if cfg.Port <= 0 {

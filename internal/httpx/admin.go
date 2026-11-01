@@ -422,15 +422,86 @@ func (a *App) handleAdminUsageSummary(w http.ResponseWriter, r *http.Request, pr
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "usage_summary_failed")
 		return
 	}
-	var totalUnits int64
-	for _, u := range usage {
-		totalUnits += u.TotalUnits
+	// total_units counts settled usage once: UsageBySubject emits per-key
+	// attribution rows on top of canonical subject rows, so summing them
+	// would count key-admitted usage twice. UsageTotals sums canonical
+	// usage_records only — units (not money) may merge across currencies.
+	totals, err := a.billingRepo.UsageTotals(r.Context(), principal.TenantID, since)
+	if err != nil {
+		log.Printf("failed to fetch usage totals: %v", err)
+		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "usage_summary_failed")
+		return
 	}
+	var totalUnits int64
+	for _, t := range totals {
+		totalUnits += t.TotalUnits
+	}
+	unsettledRows, err := a.billingRepo.ReportUnsettledBySubject(r.Context(), principal.TenantID, since)
+	if err != nil {
+		log.Printf("failed to fetch unsettled liability: %v", err)
+		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "usage_summary_failed")
+		return
+	}
+	unsettled, unsettledTotals := summarizeUnsettled(unsettledRows)
 	WriteJSON(w, http.StatusOK, map[string]any{
-		"usage":       usage,
-		"total_units": totalUnits,
-		"period_days": 30,
+		"usage":            usage,
+		"total_units":      totalUnits,
+		"unsettled":        unsettled,
+		"unsettled_totals": unsettledTotals,
+		"period_days":      30,
 	})
+}
+
+// unsettledSubjectDTO is one per-(subject, currency) liability line.
+type unsettledSubjectDTO struct {
+	SubjectType string `json:"subject_type"`
+	SubjectID   string `json:"subject_id"`
+	Currency    string `json:"currency"`
+	HeldMicros  int64  `json:"held_micros"`
+	// UnknownMicros is the bound of unknown reservations created inside the
+	// window — still outstanding, not yet written off or reconciled.
+	UnknownMicros   int64 `json:"unknown_micros"`
+	UnsettledMicros int64 `json:"unsettled_micros"`
+	Units           int64 `json:"units"`
+}
+
+// summarizeUnsettled folds the repo's per-subject rows into the API shape:
+// one line per (subject, currency) plus the tenant total over canonical rows
+// only (api_key attribution rows carry the same money under the key).
+func summarizeUnsettled(rows []postgres.ReportUnsettledRow) ([]unsettledSubjectDTO, []unsettledSubjectDTO) {
+	subjects := make([]unsettledSubjectDTO, 0, len(rows))
+	totals := map[string]*unsettledSubjectDTO{}
+	order := []string{}
+	for _, row := range rows {
+		dto := unsettledSubjectDTO{
+			SubjectType:     row.SubjectType,
+			SubjectID:       row.SubjectID,
+			Currency:        row.Currency,
+			HeldMicros:      row.HeldMicros,
+			UnknownMicros:   row.UnknownMicros,
+			UnsettledMicros: row.HeldMicros + row.UnknownMicros,
+			Units:           row.Units,
+		}
+		subjects = append(subjects, dto)
+		if row.Attributed {
+			continue
+		}
+		total := totals[row.Currency]
+		if total == nil {
+			total = &unsettledSubjectDTO{SubjectType: "tenant", Currency: row.Currency}
+			totals[row.Currency] = total
+			order = append(order, row.Currency)
+		}
+		total.HeldMicros += row.HeldMicros
+		total.UnknownMicros += row.UnknownMicros
+		total.UnsettledMicros += dto.UnsettledMicros
+		total.Units += row.Units
+	}
+	out := make([]unsettledSubjectDTO, 0, len(order))
+	for _, c := range order {
+		out = append(out, *totals[c])
+	}
+	return subjects, out
 }
 
 func setNoStoreHeaders(w http.ResponseWriter) {
@@ -480,6 +551,15 @@ func sanitizeAdminAPIKeyRequest(req *adminAPIKeyCreateRequest, requireName bool)
 	}
 	if req.BudgetLimitCents != nil && *req.BudgetLimitCents < 0 {
 		return errors.New("budget_limit_cents must be zero or greater")
+	}
+	// A positive legacy limit is no longer silently dropped: per-key budgets
+	// live in the billing budgets API, so refuse with the pointer instead of
+	// accepting a cap nothing would enforce.
+	if req.BudgetLimitTokens != nil && *req.BudgetLimitTokens > 0 {
+		return errors.New("budget_limit_tokens is no longer supported; create a budget via /api/v1/admin/budgets")
+	}
+	if req.BudgetLimitCents != nil && *req.BudgetLimitCents > 0 {
+		return errors.New("budget_limit_cents is no longer supported; create a budget via /api/v1/admin/budgets")
 	}
 	if req.BudgetPeriod != "" && req.BudgetPeriod != "total" && req.BudgetPeriod != "monthly" {
 		return errors.New("budget_period must be empty, 'total', or 'monthly'")

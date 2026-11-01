@@ -74,23 +74,30 @@ func (a *App) usageConfigured(w http.ResponseWriter) bool {
 
 // --- overview ---------------------------------------------------------------
 
+// usageGroupRow is one spend-table line. Unsettled carries the per-currency
+// held+unknown liability for rows whose subject key is known (per-subject
+// and per-key tables); model/team rows leave it empty.
 type usageGroupRow struct {
 	Label, Sub      string
 	Requests, Units int64
 	Spend           string
+	Unsettled       []MoneyAmount
 }
 
 type usageOverviewData struct {
-	Days      int
-	Requests  int64
-	Tokens    int64
-	Spend     string // primary currency via the shared money formatter
-	SpendFoot string // remaining currencies, "+ €… + £…", "" when single
-	Daily     []dashboardBar
-	ByModel   []usageGroupRow
-	ByTeam    []usageGroupRow
-	ByKey     []usageGroupRow
-	Empty     dashboardEmpty
+	Days          int
+	Requests      int64
+	Tokens        int64
+	Spend         string // primary currency via the shared money formatter
+	SpendFoot     string // remaining currencies, "+ €… + £…", "" when single
+	Unsettled     string // outstanding liability, primary currency
+	UnsettledFoot string // remaining currencies
+	Daily         []dashboardBar
+	ByModel       []usageGroupRow
+	ByTeam        []usageGroupRow
+	BySubject     []usageGroupRow
+	ByKey         []usageGroupRow
+	Empty         dashboardEmpty
 }
 
 // usageRangeDays accepts exactly 7/30/90; anything else is the 30 default.
@@ -211,53 +218,139 @@ func (a *App) usageOverview(ctx context.Context, tenantID string, days int) (usa
 	if err != nil {
 		return out, err
 	}
-	out.ByModel = usageSpendRows(modelRows, nil)
+	out.ByModel = usageSpendRows(modelRows, nil, nil)
 
 	teamRows, err := a.billingRepo.ListUsageByTeam(ctx, tenantID, since)
 	if err != nil {
 		return out, err
 	}
-	out.ByTeam = usageSpendRows(teamRows, nil)
+	out.ByTeam = usageSpendRows(teamRows, nil, nil)
 
 	subjectRows, err := a.billingRepo.UsageBySubject(ctx, tenantID, since)
 	if err != nil {
 		return out, err
 	}
-	out.ByKey = usageSpendRows(subjectRows, func(g postgres.UsageGroupSum) (string, string, bool) {
+	// Outstanding (held+unknown) liability, same window rule as admission:
+	// held always, unknown created inside the window. Canonical rows give
+	// per-subject and tenant totals; api_key attribution rows give per-key.
+	unsettledRows, err := a.billingRepo.ReportUnsettledBySubject(ctx, tenantID, since)
+	if err != nil {
+		return out, err
+	}
+	canonical := unsettledAmounts(unsettledRows, false)
+	perKey := unsettledAmounts(unsettledRows, true)
+	{
+		// Tenant totals per currency — canonical rows only, so key-attributed
+		// money never counts twice. Largest currency leads, code order ties.
+		totals := map[string]int64{}
+		currencies := []string{}
+		for key, amounts := range canonical {
+			cur := amounts[0].Currency
+			if _, seen := totals[cur]; !seen {
+				currencies = append(currencies, cur)
+			}
+			totals[cur] += sumAmounts(amounts)
+			_ = key
+		}
+		sort.Strings(currencies)
+		primary := ""
+		for _, cur := range currencies {
+			if primary == "" || totals[cur] > totals[primary] {
+				primary = cur
+			}
+		}
+		var extras []string
+		for _, cur := range currencies {
+			if cur == primary {
+				out.Unsettled = money(totals[cur], cur)
+			} else {
+				extras = append(extras, money(totals[cur], cur))
+			}
+		}
+		out.UnsettledFoot = strings.Join(extras, " + ")
+	}
+
+	out.BySubject = usageSpendRows(subjectRows, func(g postgres.UsageGroupSum) (string, string, string, bool) {
+		if g.SubjectType == billing.BudgetSubjectAPIKey {
+			return "", "", "", false
+		}
+		key := g.SubjectType + "\x00" + g.SubjectID
+		label := labels[key]
+		if label == "" {
+			label = g.SubjectID
+		}
+		return label, term(g.SubjectType), key, true
+	}, canonical)
+
+	out.ByKey = usageSpendRows(subjectRows, func(g postgres.UsageGroupSum) (string, string, string, bool) {
 		if g.SubjectType != billing.BudgetSubjectAPIKey {
-			return "", "", false
+			return "", "", "", false
 		}
 		label := labels["api_key\x00"+g.SubjectID]
 		if label == "" {
 			label = "API key " + g.SubjectID
 		}
-		return label, g.SubjectID, true
-	})
+		return label, g.SubjectID, "api_key\x00" + g.SubjectID, true
+	}, perKey)
 	return out, nil
 }
 
+func sumAmounts(amounts []MoneyAmount) int64 {
+	var n int64
+	for _, a := range amounts {
+		n += a.AmountMicros
+	}
+	return n
+}
+
+// unsettledAmounts groups unsettled rows into a subject-keyed per-currency
+// lookup; attributed selects the api_key attribution arm, false the
+// canonical billing-subject arm.
+func unsettledAmounts(rows []postgres.ReportUnsettledRow, attributed bool) map[string][]MoneyAmount {
+	out := map[string][]MoneyAmount{}
+	for _, row := range rows {
+		if row.Attributed != attributed {
+			continue
+		}
+		key := row.SubjectType + "\x00" + row.SubjectID
+		out[key] = append(out[key], MoneyAmount{
+			Currency:     row.Currency,
+			AmountMicros: row.HeldMicros + row.UnknownMicros,
+		})
+	}
+	return out
+}
+
 // usageSpendRows maps one UsageGroupSum per row — mixed currencies each keep
-// their own row, never merged — sorted by request count desc.
-func usageSpendRows(rows []postgres.UsageGroupSum, label func(postgres.UsageGroupSum) (label, sub string, keep bool)) []usageGroupRow {
+// their own row, never merged — sorted by request count desc. The label
+// callback's key joins the row to its unsettled per-currency liability.
+func usageSpendRows(rows []postgres.UsageGroupSum, label func(postgres.UsageGroupSum) (label, sub, key string, keep bool), unsettled map[string][]MoneyAmount) []usageGroupRow {
 	out := make([]usageGroupRow, 0, len(rows))
 	for _, g := range rows {
-		rowLabel, sub := g.Key, ""
+		rowLabel, sub, key := g.Key, "", ""
 		if label != nil {
 			var keep bool
-			if rowLabel, sub, keep = label(g); !keep {
+			if rowLabel, sub, key, keep = label(g); !keep {
 				continue
 			}
 		}
-		out = append(out, usageGroupRow{
+		row := usageGroupRow{
 			Label: orDash(rowLabel), Sub: sub,
 			Requests: g.RequestCount, Units: g.TotalUnits,
 			Spend: money(g.AmountMicros, g.Currency),
-		})
+		}
+		if key != "" {
+			for _, amt := range unsettled[key] {
+				if amt.Currency == g.Currency {
+					row.Unsettled = append(row.Unsettled, amt)
+				}
+			}
+		}
+		out = append(out, row)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Requests > out[j].Requests })
 	return out
 }
-
 func orDash(s string) string {
 	if strings.TrimSpace(s) == "" {
 		return "—"
@@ -316,6 +409,8 @@ type usageBudgetRow struct {
 	SubjectID        string
 	SubjectLabel     string
 	Kind, Period     string
+	Timezone         string
+	Status           string // scheduled|active|ended|inactive
 	LimitDisplay     string
 	CountedDisplay   string
 	Unlimited        bool
@@ -408,13 +503,14 @@ func usageBudgetsView(tenantID string, rows []usageBudgetRow, caps dashboardCaps
 // projection; per-currency liability rows are informational.
 func (a *App) usageBudgetRows(ctx context.Context, tenantID string) ([]usageBudgetRow, error) {
 	now := time.Now().UTC()
-	budgets, err := a.billingRepo.ListAllActiveBudgets(ctx, tenantID, now)
+	budgets, err := a.billingRepo.ReportListBudgets(ctx, tenantID)
 	if err != nil {
 		return nil, err
 	}
 	labels := a.usageSubjectLabels(ctx, tenantID)
 	rows := make([]usageBudgetRow, 0, len(budgets))
-	for _, b := range budgets {
+	for _, rb := range budgets {
+		b := rb.Budget
 		progress, liability, err := a.budgetProgress(ctx, tenantID, b, now)
 		if err != nil {
 			return nil, err
@@ -424,6 +520,8 @@ func (a *App) usageBudgetRows(ctx context.Context, tenantID string) ([]usageBudg
 			SubjectType: b.Subject.Type, SubjectID: b.Subject.ID,
 			SubjectLabel: subjectLabel(labels, b.Subject),
 			Kind:         b.Kind, Period: b.Period,
+			Timezone: budgetTimezoneName(b.Timezone),
+			Status:   budgetStatus(b, rb.Active, now),
 			StartsAt: b.StartsAt, EndsAt: b.EndsAt,
 		}
 		if progress.LimitValue <= 0 {
@@ -747,12 +845,16 @@ func (a *App) usageAuditData(ctx context.Context, tenantID string, f usageAuditF
 	kinds := map[string]bool{}
 	for _, row := range billingRows {
 		kinds[row.Action] = true
+		// Budget events record kind+currency in their detail, so an
+		// amount-budget limit renders as money in its own currency and a
+		// token budget as counted units — never bare numbers.
+		currency, _ := row.Detail["currency"].(string)
 		rows = append(rows, usageAuditRow{
 			Time: row.CreatedAt, Kind: row.Action,
 			ActorType: row.ActorType, Actor: row.ActorID,
 			SubjectType: row.SubjectType, SubjectID: row.SubjectID,
 			SubjectLabel: subjectLabel(labels, billing.Subject{Type: row.SubjectType, ID: row.SubjectID}),
-			Amount:       usageAuditAmount(row.Detail, ""),
+			Amount:       usageAuditAmount(row.Detail, currency),
 		})
 	}
 	for _, row := range priceRows {

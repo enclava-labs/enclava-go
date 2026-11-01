@@ -7,9 +7,11 @@ package inference_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -48,11 +50,19 @@ type fakeUpstream struct {
 	lastBody []byte
 	lastPath string
 	calls    int32
+	// onChat intercepts CreateChatCompletion mid-dispatch — tests use it to
+	// cancel the caller's context or probe the dispatch context.
+	onChat func(ctx context.Context) error
 }
 
 func (f *fakeUpstream) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
 	atomic.AddInt32(&f.calls, 1)
 	f.lastBody = body
+	if f.onChat != nil {
+		if err := f.onChat(ctx); err != nil {
+			return nil, err
+		}
+	}
 	if f.visionErr != nil && bytes.Contains(body, []byte("image_url")) {
 		return nil, f.visionErr
 	}
@@ -263,6 +273,39 @@ func (f *fx) reservationState(t *testing.T, reservationID string) string {
 		t.Fatalf("reservation %s: %v", reservationID, err)
 	}
 	return state
+}
+
+// waitReservationState polls the canonical row until it reaches want —
+// stream accounting may still be draining after Body.Close returns.
+func (f *fx) waitReservationState(t *testing.T, reservationID, want string) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var state string
+		if err := f.db.SQL.QueryRowContext(f.ctx,
+			`SELECT state FROM reservations WHERE tenant_id = $1 AND id = $2`,
+			f.tenant, reservationID).Scan(&state); err == nil && state == want {
+			return state
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return f.reservationState(t, reservationID)
+}
+
+// reservationUnits reads the held per-kind unit bound of the canonical row.
+func (f *fx) reservationUnits(t *testing.T, reservationID string) map[string]int64 {
+	t.Helper()
+	var raw []byte
+	if err := f.db.SQL.QueryRowContext(f.ctx,
+		`SELECT reserved_units FROM reservations WHERE tenant_id = $1 AND id = $2`,
+		f.tenant, reservationID).Scan(&raw); err != nil {
+		t.Fatalf("reservation units: %v", err)
+	}
+	var units map[string]int64
+	if err := json.Unmarshal(raw, &units); err != nil {
+		t.Fatalf("decode units: %v", err)
+	}
+	return units
 }
 
 func (f *fx) reservationCount(t *testing.T) int {
@@ -476,14 +519,10 @@ func TestNeverDispatchedFailureReleases(t *testing.T) {
 	if err == nil {
 		t.Fatal("transport build failure must surface")
 	}
-	var state string
-	if qerr := f.db.SQL.QueryRowContext(f.ctx,
-		`SELECT state FROM reservations WHERE tenant_id = $1 LIMIT 1`,
-		f.tenant).Scan(&state); qerr != nil {
-		t.Fatal(qerr)
-	}
-	if state != billing.ReservationReleased {
-		t.Fatalf("never-dispatched hold must release, state=%s", state)
+	// The transport resolves before reserving now: a build failure leaves
+	// no reservation at all.
+	if n := f.reservationCount(t); n != 0 {
+		t.Fatalf("transport build failure left %d reservations", n)
 	}
 }
 
@@ -540,13 +579,14 @@ func TestStreamEarlyCloseRetainsLiability(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	// Caller abandons mid-stream: Close must retain unknown liability.
+	// Caller abandons mid-stream: Close returns promptly while the drain
+	// keeps reading; this body ends without a terminal event so liability
+	// stays unknown once the drain finishes.
 	if err := res.Body.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if f.reservationState(t, res.ReservationID) != billing.ReservationUnknown {
-		t.Fatalf("cancelled stream must retain liability: %s",
-			f.reservationState(t, res.ReservationID))
+	if got := f.waitReservationState(t, res.ReservationID, billing.ReservationUnknown); got != billing.ReservationUnknown {
+		t.Fatalf("cancelled stream must retain liability: %s", got)
 	}
 }
 
@@ -730,8 +770,8 @@ func TestConfidentialEndpointVerifiesBeforeDispatch(t *testing.T) {
 	if got.AssuranceVerifiedAt == nil {
 		t.Fatal("verification timestamp not persisted")
 	}
-
-	// A failed attestation retains the reservation as never-dispatched.
+	// A failed attestation blocks dispatch before any hold exists: the
+	// transport is resolved (and attests) before reserving.
 	att.verifyErr = errors.New("attestation failed")
 	// Rebuild signature so the transport cache misses and re-verifies.
 	e2 := got
@@ -739,17 +779,12 @@ func TestConfidentialEndpointVerifiesBeforeDispatch(t *testing.T) {
 	if err := f.endpoint.Update(f.ctx, e2); err != nil {
 		t.Fatal(err)
 	}
+	before := f.reservationCount(t)
 	if _, err := svc.Execute(f.ctx, f.principal, req); err == nil {
 		t.Fatal("failed attestation must block dispatch")
 	}
-	var state string
-	if qerr := f.db.SQL.QueryRowContext(f.ctx,
-		`SELECT state FROM reservations WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1`,
-		f.tenant).Scan(&state); qerr != nil {
-		t.Fatal(qerr)
-	}
-	if state != billing.ReservationReleased {
-		t.Fatalf("unverified attempt must release, got %s", state)
+	if n := f.reservationCount(t); n != before {
+		t.Fatalf("attestation failure created %d reservations", n-before)
 	}
 	if atomic.LoadInt32(&att.calls) != 1 {
 		t.Fatalf("attestation failure reached transport calls=%d", att.calls)
@@ -1447,5 +1482,353 @@ func TestTwoKeysOneOwnerBillIndependently(t *testing.T) {
 	}
 	if k1Settled != 18 {
 		t.Fatalf("key1 settled liability = %d, want 18", k1Settled)
+	}
+}
+
+// --- accounting hardening: never-sent release, exact disconnect accounting,
+// output-bound sizing -----------------------------------------------------
+
+// TestConnectionRefusedReleasesHold drives the real net/http transport at a
+// dead port: no request bytes can have left, so the held reservation must
+// release — not park as unknown or consume budget.
+func TestConnectionRefusedReleasesHold(t *testing.T) {
+	f := newFx(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := "http://" + ln.Addr().String()
+	_ = ln.Close() // port is now guaranteed refused
+
+	e := inference.Endpoint{
+		ID: "ep-dead", TenantID: f.tenant, Protocol: "openai_compatible",
+		BaseOrigin:        dead,
+		Capabilities:      []string{inference.CapabilityChat, "model:gpt-fast=gpt-4o-mini"},
+		AuthorizedPrivate: true, Enabled: true,
+	}
+	if err := f.endpoint.Create(f.ctx, e); err != nil {
+		t.Fatalf("create endpoint: %v", err)
+	}
+	f.priceFor(t, "ep-dead", inference.CapabilityChat, billing.UnitInput, 1, 1)
+	f.priceFor(t, "ep-dead", inference.CapabilityChat, billing.UnitOutput, 1, 1)
+
+	svc, err := inference.NewService(inference.Deps{
+		Endpoints: f.endpoint, Sources: f.sources,
+		Authorizer: source.NewAuthorizer(f.sources, time.Hour),
+		Billing:    f.billing, Artifacts: f.artifact,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+
+	req := f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`)
+	req.EndpointID = "ep-dead"
+	if _, err := svc.Execute(f.ctx, f.principal, req); err == nil {
+		t.Fatal("connection refused must surface")
+	}
+	var state string
+	if qerr := f.db.SQL.QueryRowContext(f.ctx,
+		`SELECT state FROM reservations WHERE tenant_id = $1 LIMIT 1`,
+		f.tenant).Scan(&state); qerr != nil {
+		t.Fatal(qerr)
+	}
+	if state != billing.ReservationReleased {
+		t.Fatalf("never-sent hold must release, state=%s", state)
+	}
+}
+
+// A streamed definitive upstream error settles exactly like the non-stream
+// branch — the provider answered, so the reservation is settled evidence,
+// never unknown liability.
+func TestStreamOpenUpstreamErrorSettles(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+	f.upstream.streamErr = &llm.UpstreamError{StatusCode: 429, Body: []byte(`{"error":{"message":"rate limited"}}`)}
+
+	req := f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`)
+	req.Stream = true
+	_, err := f.svc.Execute(f.ctx, f.principal, req)
+	var ue *llm.UpstreamError
+	if !errors.As(err, &ue) || ue.StatusCode != 429 {
+		t.Fatalf("upstream 429 must surface, got %v", err)
+	}
+	var state string
+	if qerr := f.db.SQL.QueryRowContext(f.ctx,
+		`SELECT state FROM reservations WHERE tenant_id = $1 LIMIT 1`,
+		f.tenant).Scan(&state); qerr != nil {
+		t.Fatal(qerr)
+	}
+	if state != billing.ReservationSettled {
+		t.Fatalf("streamed upstream error must settle, state=%s", state)
+	}
+	var n int
+	if qerr := f.db.SQL.QueryRowContext(f.ctx,
+		`SELECT count(*) FROM usage_records WHERE tenant_id = $1`, f.tenant).Scan(&n); qerr != nil || n != 1 {
+		t.Fatalf("settlement records = %d (err=%v), want 1", n, qerr)
+	}
+}
+
+// failingDispatchBilling fails MarkDispatched; the hold must release via
+// ReleaseUndispatched — never park as held.
+type failingDispatchBilling struct{ inference.Billing }
+
+func (b *failingDispatchBilling) MarkDispatched(ctx context.Context, p auth.Principal, reservationID string) error {
+	return errors.New("dispatch store unavailable")
+}
+
+func TestMarkDispatchedFailureReleases(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+	f.billingOverride = &failingDispatchBilling{Billing: f.billing}
+	f.build(t)
+
+	_, err := f.svc.Execute(f.ctx, f.principal,
+		f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err == nil {
+		t.Fatal("mark-dispatched failure must surface")
+	}
+	if f.upstream.calls != 0 {
+		t.Fatal("failed dispatch mark reached the transport")
+	}
+	var state string
+	if qerr := f.db.SQL.QueryRowContext(f.ctx,
+		`SELECT state FROM reservations WHERE tenant_id = $1 LIMIT 1`,
+		f.tenant).Scan(&state); qerr != nil {
+		t.Fatal(qerr)
+	}
+	if state != billing.ReservationReleased {
+		t.Fatalf("undispatched hold must release, state=%s", state)
+	}
+}
+
+// Client cancellation mid-dispatch must not cancel the upstream call: the
+// provider may still be executing, and the response carries the exact token
+// counts the settlement needs.
+func TestClientCancelNonStreamStillSettles(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+
+	callCtx, cancel := context.WithCancel(f.ctx)
+	f.upstream.onChat = func(ctx context.Context) error {
+		cancel()
+		if err := ctx.Err(); err != nil {
+			return err // the dispatch context must outlive the caller's
+		}
+		return nil
+	}
+
+	res, err := f.svc.Execute(callCtx, f.principal,
+		f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("cancelled client context must not abort dispatch: %v", err)
+	}
+	defer res.Body.Close()
+	if res.Usage == nil || res.Usage.AmountMicros != 18 {
+		t.Fatalf("cancelled client lost exact usage: %+v", res.Usage)
+	}
+	if f.reservationState(t, res.ReservationID) != billing.ReservationSettled {
+		t.Fatal("cancelled client's attempt must settle")
+	}
+}
+
+// A client disconnect mid-stream drains the upstream body to its terminal
+// usage event and settles the provider's real counts — Close returns
+// promptly, the permit releases when the drain ends.
+func TestClientDisconnectStreamSettles(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+	f.upstream.stream = io.NopCloser(strings.NewReader(
+		"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+			"data: {\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":7}}\n\n" +
+			"data: [DONE]\n\n"))
+
+	req := f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`)
+	req.Stream = true
+	res, err := f.svc.Execute(f.ctx, f.principal, req)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	buf := make([]byte, 32)
+	if _, err := res.Body.Read(buf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if err := res.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.waitReservationState(t, res.ReservationID, billing.ReservationSettled); got != billing.ReservationSettled {
+		t.Fatalf("disconnected stream must settle after drain: %s", got)
+	}
+	var amount int64
+	if qerr := f.db.SQL.QueryRowContext(f.ctx,
+		`SELECT amount_micros FROM usage_records WHERE tenant_id = $1 AND reservation_id = $2`,
+		f.tenant, res.ReservationID).Scan(&amount); qerr != nil {
+		t.Fatal(qerr)
+	}
+	if amount != 20+2*7 {
+		t.Fatalf("drained settlement amount=%d, want 34", amount)
+	}
+}
+
+// flakySettleBilling fails the first n Settle calls; the executor must retry
+// within the accounting window instead of parking the reservation unknown.
+type flakySettleBilling struct {
+	inference.Billing
+	calls int32
+}
+
+func (b *flakySettleBilling) Settle(ctx context.Context, p auth.Principal, reservationID string, actual billing.Usage) (billing.UsageRecord, error) {
+	if atomic.AddInt32(&b.calls, 1) < 3 {
+		return billing.UsageRecord{}, errors.New("transient settlement failure")
+	}
+	return b.Billing.Settle(ctx, p, reservationID, actual)
+}
+
+func TestSettleRetryRecoversExactAccounting(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+	flaky := &flakySettleBilling{Billing: f.billing}
+	f.billingOverride = flaky
+	f.build(t)
+
+	res, err := f.svc.Execute(f.ctx, f.principal,
+		f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	defer res.Body.Close()
+	if res.SettlementError != nil {
+		t.Fatalf("transient settle failures must retry, got %v", res.SettlementError)
+	}
+	if atomic.LoadInt32(&flaky.calls) != 3 {
+		t.Fatalf("settle calls = %d, want 3", flaky.calls)
+	}
+	if res.Usage == nil || res.Usage.AmountMicros != 18 {
+		t.Fatalf("retried settlement wrong: %+v", res.Usage)
+	}
+	if f.reservationState(t, res.ReservationID) != billing.ReservationSettled {
+		t.Fatal("reservation not settled")
+	}
+}
+
+// The executor owns the output bound: the payload's declared generation cap
+// times n sizes the hold, the configured default is injected upstream when
+// absent, and requests above the operation bound refuse 4xx.
+func TestOutputBoundDerivedFromPayload(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+
+	// Declared cap times n sizes the hold exactly.
+	res, err := f.svc.Execute(f.ctx, f.principal,
+		f.chatRequest(`{"messages":[{"role":"user","content":"hi"}],"max_tokens":100,"n":3}`))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	res.Body.Close()
+	units := f.reservationUnits(t, res.ReservationID)
+	if units["output"] != 300 {
+		t.Fatalf("held output = %v, want 300 (100×3)", units["output"])
+	}
+
+	// An absent cap injects the configured default into the upstream body
+	// and holds exactly that.
+	res2, err := f.svc.Execute(f.ctx, f.principal,
+		f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	res2.Body.Close()
+	units = f.reservationUnits(t, res2.ReservationID)
+	if units["output"] != 16384 {
+		t.Fatalf("held output = %v, want injected default 16384", units["output"])
+	}
+	var sent map[string]any
+	if err := json.Unmarshal(f.upstream.lastBody, &sent); err != nil {
+		t.Fatal(err)
+	}
+	if sent["max_tokens"] != float64(16384) {
+		t.Fatalf("upstream payload missing injected cap: %s", f.upstream.lastBody)
+	}
+
+	// Above the operation bound refuses — the request can never dispatch.
+	calls := atomic.LoadInt32(&f.upstream.calls)
+	_, err = f.svc.Execute(f.ctx, f.principal,
+		f.chatRequest(`{"messages":[{"role":"user","content":"hi"}],"max_tokens":200000}`))
+	if !errors.Is(err, inference.ErrUnbounded) {
+		t.Fatalf("over-bound request must refuse, got %v", err)
+	}
+	if atomic.LoadInt32(&f.upstream.calls) != calls {
+		t.Fatal("over-bound request dispatched")
+	}
+
+	// A zero configured default injects nothing and holds the operation bound.
+	svc, err := inference.NewService(inference.Deps{
+		Endpoints: f.endpoint, Sources: f.sources,
+		Authorizer: source.NewAuthorizer(f.sources, time.Hour),
+		Billing:    f.billing, Artifacts: f.artifact,
+	}, inference.WithTransportFactory(
+		func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {
+			return f.upstream, nil
+		}), inference.WithDefaultMaxOutputTokens(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res3, err := svc.Execute(f.ctx, f.principal,
+		f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	res3.Body.Close()
+	units = f.reservationUnits(t, res3.ReservationID)
+	if units["output"] != 1<<17 {
+		t.Fatalf("zero-default hold = %v, want operation bound %d", units["output"], 1<<17)
+	}
+	var sent3 map[string]any
+	if err := json.Unmarshal(f.upstream.lastBody, &sent3); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := sent3["max_tokens"]; present {
+		t.Fatalf("zero default must inject nothing: %s", f.upstream.lastBody)
+	}
+}
+
+// noStreamUpstream reports itself as incapable of streamed dispatch.
+type noStreamUpstream struct{ fakeUpstream }
+
+func (u *noStreamUpstream) SupportsStream(string) bool { return false }
+
+// Unsupported stream/capability combinations refuse before a reservation
+// exists — the hold can never strand on a transport that cannot serve it.
+func TestUnsupportedStreamRefusedBeforeReserve(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+	up := &noStreamUpstream{}
+	svc, err := inference.NewService(inference.Deps{
+		Endpoints: f.endpoint, Sources: f.sources,
+		Authorizer: source.NewAuthorizer(f.sources, time.Hour),
+		Billing:    f.billing, Artifacts: f.artifact,
+	}, inference.WithTransportFactory(
+		func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {
+			return up, nil
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`)
+	req.Stream = true
+	_, err = svc.Execute(f.ctx, f.principal, req)
+	if !errors.Is(err, inference.ErrUnsupportedCapability) {
+		t.Fatalf("unsupported stream must refuse 4xx, got %v", err)
+	}
+	if n := f.reservationCount(t); n != 0 {
+		t.Fatalf("unsupported stream left %d reservations", n)
 	}
 }

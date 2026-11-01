@@ -337,6 +337,101 @@ func effectiveCapability(capability string, info payloadInfo) (string, error) {
 	return capability, nil
 }
 
+// resolveOutputEstimate derives the attempt's output bound from the payload
+// — the executor owns it; caller-provided Estimate.OutputUnits is ignored.
+// Chat/vision payloads declare max_completion_tokens or max_tokens, times n
+// (default 1); Responses create declares max_output_tokens; non-creating
+// operations (embeddings, input_tokens) generate nothing and bound zero.
+// An absent generation cap is injected into the payload at the configured
+// default (per choice, so default×n never exceeds the operation bound) and
+// the provider never produces more than the hold; a configured default of
+// zero injects nothing and holds the operation bound. Compact holds the
+// bound unless the caller declares max_output_tokens: the compaction
+// endpoint is not known to accept the field, so nothing is injected there.
+// Requested×n above the operation bound is a 4xx refusal — such a request
+// can never dispatch.
+func (s *Service) resolveOutputEstimate(capability string, req Request, root map[string]any) (int64, error) {
+	bound, ok := boundFor(capability)
+	if !ok {
+		return 0, ErrUnsupportedCapability
+	}
+	var keys []string
+	n := int64(1)
+	switch capability {
+	case CapabilityChat, CapabilityVision:
+		keys = []string{"max_completion_tokens", "max_tokens"}
+		n = payloadN(root)
+	case CapabilityResponses:
+		_, path := responsesTarget(capability, req)
+		if path != "/responses" {
+			return 0, nil
+		}
+		keys = []string{"max_output_tokens"}
+	case CapabilityCompact:
+		keys = []string{"max_output_tokens"}
+	default:
+		return 0, nil
+	}
+	var requested int64
+	found := false
+	for _, key := range keys {
+		if v, present := root[key]; present {
+			n64, ok := payloadInt(v)
+			if !ok || n64 < 0 {
+				return 0, fmt.Errorf("%w: %s must be a non-negative integer", ErrUnbounded, key)
+			}
+			requested = n64
+			found = true
+			break
+		}
+	}
+	if !found {
+		if s.defaultMaxOutput <= 0 || capability == CapabilityCompact {
+			return bound.OutputUnits, nil
+		}
+		// The injected cap bounds upstream generation to exactly the hold;
+		// the payload field is the provider's own generation knob.
+		perChoice := min(s.defaultMaxOutput, bound.OutputUnits/n)
+		if perChoice == 0 {
+			return 0, fmt.Errorf("%w: n exceeds the operation output bound", ErrUnbounded)
+		}
+		root[keys[len(keys)-1]] = perChoice
+		return perChoice * n, nil
+	}
+	if requested > bound.OutputUnits/n || requested*n > bound.OutputUnits {
+		return 0, fmt.Errorf("%w: requested output units exceed the operation bound", ErrUnbounded)
+	}
+	return requested * n, nil
+}
+
+// payloadN reads the optional n multiplier; absent or malformed values hold
+// as one — the provider rejects malformed fields itself.
+func payloadN(root map[string]any) int64 {
+	if n, ok := payloadInt(root["n"]); ok && n > 0 {
+		return n
+	}
+	return 1
+}
+
+// payloadInt accepts a non-negative integral JSON value.
+func payloadInt(v any) (int64, bool) {
+	switch n := v.(type) {
+	case json.Number:
+		f, err := n.Float64()
+		if err != nil || f != math.Trunc(f) {
+			return 0, false
+		}
+		return int64(f), true
+	case float64:
+		if n != math.Trunc(n) {
+			return 0, false
+		}
+		return int64(n), true
+	default:
+		return 0, false
+	}
+}
+
 // marshalPayload produces the dispatched body: the endpoint-bound upstream
 // model replaces any client-supplied value, the stream flag reflects the
 // request and streaming chat bodies carry stream_options.include_usage so
@@ -620,12 +715,12 @@ func modelAliasOf(capability string) (string, bool) {
 	return alias, alias != ""
 }
 
-// requiredUnits is the priced unit set a capability's dispatch may demand —
+// RequiredUnits is the priced unit set a capability's dispatch may demand —
 // the exact bound set checkEstimate validates caller estimates against.
 // cached_input is always included where the bound carries it: Execute raises
 // every estimate's cached-input bound to input, so an endpoint that cannot
 // price cached input is not routable for the operation.
-func requiredUnits(capability string) []billing.UnitKind {
+func RequiredUnits(capability string) []billing.UnitKind {
 	bound, ok := boundFor(capability)
 	if !ok {
 		return nil
@@ -693,7 +788,7 @@ func priceCurrencyMismatch(prices []billing.Price, kinds []billing.UnitKind) err
 // Returns the missing units of the last evaluated (model) set — empty means
 // completely priced.
 func (s *Service) PriceCoverage(ctx context.Context, tenantID, endpointID, modelAlias, capability string, now time.Time) ([]billing.UnitKind, error) {
-	kinds := requiredUnits(capability)
+	kinds := RequiredUnits(capability)
 	if len(kinds) == 0 {
 		return nil, ErrUnsupportedCapability
 	}

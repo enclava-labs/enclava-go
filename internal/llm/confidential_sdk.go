@@ -100,6 +100,13 @@ func (p *ConfidentialSDK) Supports(capability string) bool {
 		capability == "embeddings" || capability == "responses" || capability == "responses/compact"
 }
 
+// SupportsStream narrows Supports for streamed dispatch: the SDK streams
+// chat/vision completions only — streamed Responses has no FFI path, so the
+// executor refuses it before reserving instead of failing post-dispatch.
+func (p *ConfidentialSDK) SupportsStream(capability string) bool {
+	return capability == "chat/completions" || capability == "vision"
+}
+
 func (p *ConfidentialSDK) VerifyAttestation(ctx context.Context) (AttestationStatus, error) {
 	timeout := time.Duration(0)
 	if deadline, ok := ctx.Deadline(); ok {
@@ -136,17 +143,18 @@ func (p *ConfidentialSDK) CreateEmbeddings(ctx context.Context, body []byte) ([]
 }
 
 // execute runs one blocking SDK operation under the caller's deadline and
-// enforces the verified-verdict contract on its result.
+// enforces the verified-verdict contract on its result. Failures before the
+// FFI call (decode, expired deadline) are typed NotDispatched.
 func (p *ConfidentialSDK) execute(ctx context.Context, body []byte, call func(any, time.Duration) (map[string]any, error)) ([]byte, error) {
 	var req any
 	if err := json.Unmarshal(body, &req); err != nil {
-		return nil, err
+		return nil, &NotDispatched{Err: err}
 	}
 	timeout := time.Duration(0)
 	if deadline, ok := ctx.Deadline(); ok {
 		timeout = time.Until(deadline)
 		if timeout <= 0 {
-			return nil, ctx.Err()
+			return nil, &NotDispatched{Err: ctx.Err()}
 		}
 	}
 	result, err := call(req, timeout)
@@ -170,13 +178,19 @@ func (p *ConfidentialSDK) execute(ctx context.Context, body []byte, call func(an
 }
 
 // sdkOperationError maps an SDK failure onto the executor's accounting
-// contract: only a definitive provider rejection is an UpstreamError (settled
-// with its reported usage). Never-dispatched and unknown outcomes stay plain
-// errors so the executor retains liability instead of settling them as free.
+// contract: a definitive provider rejection is an UpstreamError (settled
+// with its reported usage), a typed never-dispatched failure releases the
+// hold, and unknown outcomes stay plain errors so liability is retained.
 func sdkOperationError(err error) error {
 	var sdkErr *ci.Error
-	if errors.As(err, &sdkErr) && sdkErr.Dispatch == ci.DispatchRejected && sdkErr.HTTPStatus > 0 {
+	if !errors.As(err, &sdkErr) {
+		return fmt.Errorf("confidential SDK: %w", err)
+	}
+	if sdkErr.Dispatch == ci.DispatchRejected && sdkErr.HTTPStatus > 0 {
 		return &UpstreamError{StatusCode: sdkErr.HTTPStatus, Message: sdkErr.Message}
+	}
+	if sdkErr.Dispatch == ci.DispatchNotDispatched || sdkErr.Status == ci.StatusInvalidArgument {
+		return &NotDispatched{Err: fmt.Errorf("confidential SDK: %w", err)}
 	}
 	return fmt.Errorf("confidential SDK: %w", err)
 }
@@ -184,10 +198,10 @@ func sdkOperationError(err error) error {
 func (p *ConfidentialSDK) CreateChatCompletionStream(ctx context.Context, body []byte) (io.ReadCloser, error) {
 	var req any
 	if err := json.Unmarshal(body, &req); err != nil {
-		return nil, err
+		return nil, &NotDispatched{Err: err}
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, &NotDispatched{Err: err}
 	}
 	stream, err := p.client.StartStream(req)
 	if err != nil {
@@ -369,13 +383,13 @@ func (p *ConfidentialSDK) DoResponsesRequest(ctx context.Context, method, path s
 	}
 	req, err := responseManageRequest(method, path, body, p.provider)
 	if err != nil {
-		return nil, err
+		return nil, &NotDispatched{Err: err}
 	}
 	timeout := time.Duration(0)
 	if deadline, ok := ctx.Deadline(); ok {
 		timeout = time.Until(deadline)
 		if timeout <= 0 {
-			return nil, ctx.Err()
+			return nil, &NotDispatched{Err: ctx.Err()}
 		}
 	}
 	result, err := p.client.ResponseManage(req, timeout)
