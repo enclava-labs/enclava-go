@@ -290,6 +290,20 @@ func htmlBlocks(text string) []parseBlock {
 	var active *parseBlock
 	var body strings.Builder
 	blocked := ""
+	// closeActive ends the open block at end. Whitespace-only blocks (the
+	// empty <p> spacers e-book converters emit) are dropped rather than
+	// failing the whole member back to raw markup.
+	closeActive := func(end int) {
+		if active == nil {
+			return
+		}
+		active.end = end
+		active.text = strings.TrimSpace(body.String())
+		if active.text != "" {
+			out = append(out, *active)
+		}
+		active = nil
+	}
 	for {
 		kind := z.Next()
 		raw := z.Raw()
@@ -309,7 +323,9 @@ func htmlBlocks(text string) []parseBlock {
 		}
 		switch kind {
 		case htmltoken.ErrorToken:
-			if z.Err() == io.EOF && active == nil {
+			if z.Err() == io.EOF && implicitlyClosed(active) {
+				// HTML may omit the final </p> or </li>.
+				closeActive(offset)
 				return out
 			}
 			return nil
@@ -336,9 +352,12 @@ func htmlBlocks(text string) []parseBlock {
 				blockKind = "code"
 			}
 			if blockKind != "" {
-				if active != nil {
+				if !implicitlyClosed(active) {
 					return nil
 				}
+				// A new block closes an open <p> or <li>, whose end tags
+				// HTML lets authors omit.
+				closeActive(offset)
 				body.Reset()
 				active = &parseBlock{kind: blockKind, level: level, start: offset}
 			}
@@ -353,16 +372,45 @@ func htmlBlocks(text string) []parseBlock {
 				(active.kind == "paragraph" && name == "p") || (active.kind == "list_item" && name == "li") ||
 				(active.kind == "code" && name == "pre"))
 			if matches {
-				active.end = end
-				active.text = strings.TrimSpace(body.String())
-				if active.text == "" {
-					return nil
-				}
-				out = append(out, *active)
-				active = nil
+				closeActive(end)
 			}
 		}
 		offset = end
+	}
+}
+
+// implicitlyClosed reports whether the open block may end without its end
+// tag: <p> and <li> (HTML makes those optional); an unterminated heading or
+// <pre> is malformed and keeps the plain-text fallback.
+func implicitlyClosed(active *parseBlock) bool {
+	return active == nil || active.kind == "paragraph" || active.kind == "list_item"
+}
+
+// htmlText is a markup member's tag-stripped body text — the EPUB fallback
+// for members with no paragraph structure, so markup is never indexed.
+func htmlText(text string) string {
+	z := htmltoken.NewTokenizer(strings.NewReader(text))
+	var b strings.Builder
+	skip := ""
+	for {
+		switch z.Next() {
+		case htmltoken.ErrorToken:
+			return b.String()
+		case htmltoken.StartTagToken:
+			tag, _ := z.TagName()
+			if name := strings.ToLower(string(tag)); skip == "" && (name == "head" || name == "script" || name == "style") {
+				skip = name
+			}
+		case htmltoken.EndTagToken:
+			if tag, _ := z.TagName(); strings.EqualFold(string(tag), skip) {
+				skip = ""
+			}
+		case htmltoken.TextToken:
+			if skip == "" {
+				b.Write(z.Text())
+				b.WriteString("\n\n")
+			}
+		}
 	}
 }
 
@@ -644,7 +692,7 @@ func epubBlocks(data []byte) ([]parseBlock, error) {
 		}
 		part := htmlBlocks(string(raw))
 		if part == nil {
-			part = plainBlocks(string(raw))
+			part = plainBlocks(htmlText(string(raw)))
 		}
 		for i := range part {
 			if part[i].locator.Section == "" {

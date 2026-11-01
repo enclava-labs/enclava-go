@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -179,6 +180,37 @@ func TestEPUBMalformedAndFallbackOrder(t *testing.T) {
 	}
 	if blocks[0].text != "A" || blocks[1].text != "B" {
 		t.Fatalf("fallback order lost: %#v", blocks)
+	}
+}
+
+// TestEPUBConverterMarkupNeverIndexed: calibre/pdftohtml output (XML
+// declaration, head metadata, empty spacer paragraphs, an unclosed final
+// <p>, a div-only cover page) parses to its text — an empty <p> used to fail
+// the whole member back to raw markup, which was then chunked and embedded.
+func TestEPUBConverterMarkupNeverIndexed(t *testing.T) {
+	data := writeZip(t, map[string]string{
+		"META-INF/container.xml": `<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>`,
+		"content.opf":            `<package xmlns="http://www.idpf.org/2007/opf" version="2.0"><manifest><item id="t" href="titlepage.xhtml" media-type="application/xhtml+xml"/><item id="s" href="index_split_000.html" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="t"/><itemref idref="s"/></spine></package>`,
+		"titlepage.xhtml":        `<?xml version='1.0' encoding='utf-8'?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Cover</title></head><body><div class="cover"><img src="cover.jpeg" alt=""/></div><div>A novel by Charles Stross</div></body></html>`,
+		"index_split_000.html": `<?xml version='1.0' encoding='utf-8'?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Microsoft Word - Accelerando.rtf</title><meta name="generator" content="pdftohtml 0.36"/><link href="stylesheet.css" rel="stylesheet" type="text/css"/></head>
+<body class="calibre"><p class="calibre1">Chapter 1: Lobsters </p><p class="calibre1"> </p>
+<p class="calibre1">Manfred's on the road again, making strangers rich. </p><p class="calibre1">It's a hot summer Tuesday</body></html>`,
+	})
+	blocks, err := epubBlocks(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var texts []string
+	for _, b := range blocks {
+		if strings.ContainsAny(b.text, "<>") || strings.Contains(b.text, "calibre") || strings.Contains(b.text, "pdftohtml") {
+			t.Fatalf("markup indexed as text: %q", b.text)
+		}
+		texts = append(texts, b.text)
+	}
+	want := []string{"A novel by Charles Stross", "Chapter 1: Lobsters", "Manfred's on the road again, making strangers rich.", "It's a hot summer Tuesday"}
+	if strings.Join(texts, "|") != strings.Join(want, "|") {
+		t.Fatalf("blocks = %q, want %q", texts, want)
 	}
 }
 

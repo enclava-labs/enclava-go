@@ -99,6 +99,12 @@ func (c *QdrantClient) EnsureCollection(ctx context.Context, collection string, 
 	return nil
 }
 
+// qdrantUpsertBatch bounds one upsert request: Qdrant refuses JSON bodies
+// over 32 MiB by default and a 2560-dimension point serializes to ~58 KB, so
+// a book-sized document (1,247 points ≈ 72 MB) must be split. Upserts are
+// idempotent by point id, so a failed batch is safely retried whole.
+const qdrantUpsertBatch = 128
+
 func (c *QdrantClient) UpsertPoints(ctx context.Context, collection string, points []QdrantPoint) error {
 	hasSparse, namedDense, err := c.collectionVectors(ctx, collection)
 	if err != nil {
@@ -120,16 +126,18 @@ func (c *QdrantClient) UpsertPoints(ctx context.Context, collection string, poin
 		}
 		wirePoints = append(wirePoints, map[string]any{"id": point.ID, "vector": vectors, "payload": point.Payload})
 	}
-	body, err := json.Marshal(map[string]any{"points": wirePoints})
-	if err != nil {
-		return err
-	}
-	status, resp, err := c.do(ctx, http.MethodPut, "/collections/"+url.PathEscape(collection)+"/points?wait=true", body)
-	if err != nil {
-		return err
-	}
-	if status >= 300 {
-		return fmt.Errorf("qdrant upsert failed: status=%d body=%s", status, string(resp))
+	for start := 0; start < len(wirePoints); start += qdrantUpsertBatch {
+		body, err := json.Marshal(map[string]any{"points": wirePoints[start:min(start+qdrantUpsertBatch, len(wirePoints))]})
+		if err != nil {
+			return err
+		}
+		status, resp, err := c.do(ctx, http.MethodPut, "/collections/"+url.PathEscape(collection)+"/points?wait=true", body)
+		if err != nil {
+			return err
+		}
+		if status >= 300 {
+			return fmt.Errorf("qdrant upsert failed: status=%d body=%s", status, string(resp))
+		}
 	}
 	return nil
 }

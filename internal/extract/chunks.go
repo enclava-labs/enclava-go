@@ -43,7 +43,7 @@ func Chunk(document source.Document, profile source.ChunkProfile) ([]source.Chun
 		chunks = append(chunks, current)
 		current = source.Chunk{ObjectRef: document.Ref, ProfileID: profile.ID}
 	}
-	for _, group := range boundaryGroups(document.Blocks, profile.BoundaryStrategy) {
+	for _, group := range boundaryGroups(document.Blocks, profile.BoundaryStrategy, profile.SizeCodePoints) {
 		if profile.TableHandling == "skip" {
 			filtered := group[:0]
 			for _, block := range group {
@@ -122,14 +122,16 @@ func Chunk(document source.Document, profile source.ChunkProfile) ([]source.Chun
 	return chunks, nil
 }
 
-func boundaryGroups(blocks []source.Block, strategy string) [][]source.Block {
+func boundaryGroups(blocks []source.Block, strategy string, size int) [][]source.Block {
 	var groups [][]source.Block
 	var current []source.Block
+	packed := 0 // code points in current, counting the "\n" joins
 	emit := func() {
 		if len(current) > 0 {
 			groups = append(groups, current)
 			current = nil
 		}
+		packed = 0
 	}
 	for _, block := range blocks {
 		switch strategy {
@@ -176,6 +178,25 @@ func boundaryGroups(blocks []source.Block, strategy string) [][]source.Block {
 			if len(current) > 0 && (current[0].Kind != "code" || current[0].ParentID != block.ParentID) {
 				emit()
 			}
+			current = append(current, block)
+		case "fixed":
+			// Fixed-size windows pack consecutive blocks up to the size, so
+			// short blocks (a converted e-book's one-line paragraphs) never
+			// become one-line chunks. Tables and blocks at or over the size
+			// stand alone; Chunk splits the oversized ones.
+			n := utf8.RuneCountInString(block.Text)
+			if isTableBlock(block) || n >= size {
+				emit()
+				groups = append(groups, []source.Block{block})
+				continue
+			}
+			if len(current) > 0 && packed+1+n > size {
+				emit()
+			}
+			if len(current) > 0 {
+				packed++
+			}
+			packed += n
 			current = append(current, block)
 		default:
 			emit()

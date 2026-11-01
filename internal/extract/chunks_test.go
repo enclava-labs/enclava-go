@@ -132,6 +132,40 @@ func TestChunkTableRowWiseKeepsRowsTogether(t *testing.T) {
 	}
 }
 
+// TestChunkFixedPacksShortBlocksUpToSize: a converted e-book with one line
+// per paragraph must chunk into size-bounded windows of consecutive lines —
+// one chunk per line made every chunk a sentence fragment.
+func TestChunkFixedPacksShortBlocksUpToSize(t *testing.T) {
+	ref := source.ObjectRef{TenantID: "tenant", ObjectID: "book", ObservedSeq: 1}
+	lines := []string{"Manfred's on the road again,", "making strangers rich.", "It's a hot summer Tuesday,", "and he's standing in the plaza.", strings.Repeat("x", 70)}
+	var blocks []source.Block
+	offset := 0
+	for i, line := range lines {
+		blocks = append(blocks, source.Block{ID: string(rune('a' + i)), Ordinal: i, Kind: "paragraph", Text: line, ByteStart: offset, ByteEnd: offset + len(line)})
+		offset += len(line) + 1
+	}
+	profile := source.ChunkProfile{ID: "cpv", ProfileID: "fixed", Version: 1, SizeCodePoints: 60, BoundaryStrategy: "fixed", TableHandling: "row-wise"}
+	chunks, err := Chunk(source.Document{Ref: ref, Blocks: blocks}, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var texts []string
+	for _, c := range chunks {
+		if utf8.RuneCountInString(c.Text) > 60 {
+			t.Fatalf("chunk over size: %q", c.Text)
+		}
+		texts = append(texts, c.Text)
+	}
+	want := []string{
+		"Manfred's on the road again,\nmaking strangers rich.",
+		"It's a hot summer Tuesday,\nand he's standing in the plaza.",
+		strings.Repeat("x", 60), strings.Repeat("x", 10),
+	}
+	if !reflect.DeepEqual(texts, want) {
+		t.Fatalf("fixed chunks = %q, want %q", texts, want)
+	}
+}
+
 func TestChunkBoundaryStrategyControlsGrouping(t *testing.T) {
 	ref := source.ObjectRef{TenantID: "tenant", ObjectID: "doc", ObservedSeq: 1}
 	doc := source.Document{Ref: ref, Blocks: []source.Block{

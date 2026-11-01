@@ -22,9 +22,9 @@ invoice_number, invoice_date, due_date, service_provider, buyer, subtotal, tax_a
 				"type":     "object",
 				"required": []any{"invoice_number", "total_amount"},
 				"properties": map[string]any{
-					"invoice_number":   map[string]any{"type": "string"},
-					"invoice_date":     map[string]any{"type": "string"},
-					"due_date":         map[string]any{"type": "string"},
+					"invoice_number": map[string]any{"type": "string"},
+					"invoice_date":   map[string]any{"type": "string"},
+					"due_date":       map[string]any{"type": "string"},
 					// Party names are strings in the prompt's field list —
 					// a bare {"type":"object"} here flags every model's
 					// natural output as invalid.

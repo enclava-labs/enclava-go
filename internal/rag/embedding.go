@@ -23,9 +23,13 @@ func tokenEstimate(text string) int {
 // maxEmbeddingInputs caps batch size by item count; maxEmbeddingBatchUnits
 // caps the summed estimate so one batch always sits inside the routed
 // embeddings operation bound — a route-level limit is enforced by the
-// executor, never assumed from a fixed item count.
+// executor, never assumed from a fixed item count. The item cap also bounds
+// the provider's JSON response, which grows with inputs × dimensions
+// (~21 bytes per float, measured on vLLM): 64 keeps vectors up to ~6000
+// dimensions under the 8 MiB provider response limit — 2048 overflowed it
+// for a 2560-dimension model on any document past ~150 chunks.
 const (
-	maxEmbeddingInputs     = 2048
+	maxEmbeddingInputs     = 64
 	maxEmbeddingBatchUnits = 1 << 20
 )
 
