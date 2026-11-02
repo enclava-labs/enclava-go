@@ -6,6 +6,7 @@
 package inference_test
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"enclava-go/internal/billing"
 	"enclava-go/internal/inference"
+	"enclava-go/internal/llm"
 	"enclava-go/internal/source"
 )
 
@@ -410,5 +412,126 @@ func TestModelFieldReplacedNotRespected(t *testing.T) {
 	if !strings.Contains(string(f.upstream.lastBody), `"model":"gpt-4o-mini"`) ||
 		strings.Contains(string(f.upstream.lastBody), "gpt-admin-secret") {
 		t.Fatalf("client model leaked upstream: %s", f.upstream.lastBody)
+	}
+}
+
+// An uncapped chat request gets the injected default under the field the
+// routed model actually accepts: OpenAI reasoning models reject max_tokens
+// outright, so the cap goes in max_completion_tokens; OpenAI-compatible
+// endpoints keep max_tokens.
+func TestInjectedCapUsesRoutedModelField(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t, "model:o3-reason=o3")
+	f.flatPrices(t)
+
+	req := f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`)
+	req.Model = "o3-reason"
+	res, err := f.svc.Execute(f.ctx, f.principal, req)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	_ = res.Body.Close()
+	var sent map[string]any
+	if err := json.Unmarshal(f.upstream.lastBody, &sent); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := sent["max_tokens"]; present {
+		t.Fatalf("o-series model received rejected max_tokens: %s", f.upstream.lastBody)
+	}
+	if sent["max_completion_tokens"] != float64(16384) {
+		t.Fatalf("injected cap = %v, want 16384: %s", sent["max_completion_tokens"], f.upstream.lastBody)
+	}
+
+	// Ordinary OpenAI-compatible models keep the legacy field.
+	res2, err := f.svc.Execute(f.ctx, f.principal,
+		f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	_ = res2.Body.Close()
+	var sent2 map[string]any
+	if err := json.Unmarshal(f.upstream.lastBody, &sent2); err != nil {
+		t.Fatal(err)
+	}
+	if sent2["max_tokens"] != float64(16384) {
+		t.Fatalf("compat endpoint lost max_tokens: %s", f.upstream.lastBody)
+	}
+}
+
+// Nullable OpenAI fields count as absent: a null cap falls through to the
+// next supplied cap or the injected default rather than refusing.
+func TestNullGenerationCapsTreatedAsAbsent(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+
+	res, err := f.svc.Execute(f.ctx, f.principal,
+		f.chatRequest(`{"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":null,"max_tokens":64}`))
+	if err != nil {
+		t.Fatalf("null+declared cap must execute: %v", err)
+	}
+	_ = res.Body.Close()
+	if units := f.reservationUnits(t, res.ReservationID); units["output"] != 64 {
+		t.Fatalf("held output = %v, want 64 from the non-null cap", units["output"])
+	}
+
+	res2, err := f.svc.Execute(f.ctx, f.principal,
+		f.chatRequest(`{"messages":[{"role":"user","content":"hi"}],"max_tokens":null}`))
+	if err != nil {
+		t.Fatalf("null cap must execute: %v", err)
+	}
+	_ = res2.Body.Close()
+	var sent map[string]any
+	if err := json.Unmarshal(f.upstream.lastBody, &sent); err != nil {
+		t.Fatal(err)
+	}
+	if sent["max_tokens"] != float64(16384) {
+		t.Fatalf("null cap did not fall back to the injected default: %s", f.upstream.lastBody)
+	}
+}
+
+// The injected default respects the routed model's catalog limits: an
+// 8k-window model never receives a 16k default, while a caller-declared
+// cap stays within the operation bound untouched.
+func TestInjectedDefaultClampedToModelLimits(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+	f.upstream.models = []llm.Model{{ID: "gpt-4o-mini", ContextLength: 8192}}
+
+	// The dispatch path never fetches catalog metadata: warm the shared
+	// per-endpoint cache the clamp reads through the same lookup
+	// ModelContextLength uses.
+	if _, err := f.svc.ModelContextLength(f.ctx, f.principal, "gpt-fast", ""); err != nil {
+		t.Fatalf("warm model context: %v", err)
+	}
+	res, err := f.svc.Execute(f.ctx, f.principal,
+		f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	_ = res.Body.Close()
+	// chatRequest estimates 100 input units: 8192-window minus prompt.
+	var sent map[string]any
+	if err := json.Unmarshal(f.upstream.lastBody, &sent); err != nil {
+		t.Fatal(err)
+	}
+	if sent["max_tokens"] != float64(8092) {
+		t.Fatalf("injected cap = %v, want 8092 (8192-100): %s", sent["max_tokens"], f.upstream.lastBody)
+	}
+
+	// Declared caps are never rewritten — only the injection clamps.
+	res2, err := f.svc.Execute(f.ctx, f.principal,
+		f.chatRequest(`{"messages":[{"role":"user","content":"hi"}],"max_tokens":8192}`))
+	if err != nil {
+		t.Fatalf("declared cap must pass through: %v", err)
+	}
+	_ = res2.Body.Close()
+	var sent2 map[string]any
+	if err := json.Unmarshal(f.upstream.lastBody, &sent2); err != nil {
+		t.Fatal(err)
+	}
+	if sent2["max_tokens"] != float64(8192) {
+		t.Fatalf("declared cap was rewritten: %s", f.upstream.lastBody)
 	}
 }

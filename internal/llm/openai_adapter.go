@@ -172,11 +172,15 @@ func (a *OpenAICompatibleAdapter) doStream(ctx context.Context, method, path str
 	if err != nil {
 		return nil, fmt.Errorf("upstream chat stream request failed: %w", err)
 	}
+	stream := newBoundedStreamBody(resp.Body, a.streamIdle, a.streamWall)
 	if resp.StatusCode >= 300 {
-		upstreamBody, _ := readBoundedBody(resp.Body, maxErrorBodyBytes)
+		// The error body rides the same bounded reader: an upstream that
+		// ships headers then stalls the body is cut by the idle limit and
+		// by caller cancellation instead of pinning the opener.
+		upstreamBody, _ := readBoundedBody(stream, maxErrorBodyBytes)
 		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: upstreamBody, Message: upstreamErrorMessage(upstreamBody)}
 	}
-	return newBoundedStreamBody(resp.Body, a.streamIdle, a.streamWall), nil
+	return stream, nil
 }
 
 func (a *OpenAICompatibleAdapter) doJSON(ctx context.Context, method, path string, body []byte) ([]byte, error) {

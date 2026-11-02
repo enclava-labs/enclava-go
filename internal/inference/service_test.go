@@ -53,6 +53,9 @@ type fakeUpstream struct {
 	// onChat intercepts CreateChatCompletion mid-dispatch — tests use it to
 	// cancel the caller's context or probe the dispatch context.
 	onChat func(ctx context.Context) error
+	// onStream intercepts CreateChatCompletionStream mid-open — tests use
+	// it to hold the open and probe the open-phase context.
+	onStream func(ctx context.Context) error
 }
 
 func (f *fakeUpstream) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
@@ -72,6 +75,11 @@ func (f *fakeUpstream) CreateChatCompletion(ctx context.Context, body []byte) ([
 func (f *fakeUpstream) CreateChatCompletionStream(ctx context.Context, body []byte) (io.ReadCloser, error) {
 	atomic.AddInt32(&f.calls, 1)
 	f.lastBody = body
+	if f.onStream != nil {
+		if err := f.onStream(ctx); err != nil {
+			return nil, err
+		}
+	}
 	if f.streamErr != nil {
 		return nil, f.streamErr
 	}
@@ -1678,6 +1686,41 @@ func TestClientDisconnectStreamSettles(t *testing.T) {
 	if amount != 20+2*7 {
 		t.Fatalf("drained settlement amount=%d, want 34", amount)
 	}
+}
+
+// Client cancellation DURING stream open aborts the open — the detached
+// lifetime belongs to an opened body, not a wedged one. The hang is modeled
+// as a transport whose open blocks on the dispatch context; upstream a
+// non-2xx body that never finishes produces the same wedge (adapter-bound).
+func TestClientCancelDuringStreamOpenReleases(t *testing.T) {
+	f := admissionFx(t, inference.AdmissionConfig{
+		Execute: inference.ClassLimit{MaxActive: 1, MaxQueued: 0},
+	})
+
+	callCtx, cancel := context.WithCancel(f.ctx)
+	defer cancel()
+	f.upstream.onStream = func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.svc.Execute(callCtx, f.principal, f.streamRequest())
+		done <- err
+	}()
+	waitActive(t, f.admission, inference.AdmissionExecute, 1)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled stream open error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream open ignored caller cancellation")
+	}
+	waitActive(t, f.admission, inference.AdmissionExecute, 0)
 }
 
 // flakySettleBilling fails the first n Settle calls; the executor must retry

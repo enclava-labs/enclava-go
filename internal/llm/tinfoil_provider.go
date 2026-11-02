@@ -312,11 +312,12 @@ func (p *TinfoilProvider) doStream(ctx context.Context, method, path string, bod
 	if err != nil {
 		return nil, fmt.Errorf("upstream chat stream request failed: %w", err)
 	}
+	stream := newBoundedStreamBody(resp.Body, p.streamIdle, p.streamWall)
 	if resp.StatusCode >= 300 {
-		upstreamBody, _ := readBoundedBody(resp.Body, maxErrorBodyBytes)
+		upstreamBody, _ := readBoundedBody(stream, maxErrorBodyBytes)
 		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: upstreamBody}
 	}
-	return newBoundedStreamBody(resp.Body, p.streamIdle, p.streamWall), nil
+	return stream, nil
 }
 
 func (p *TinfoilProvider) ensureVerified(ctx context.Context) error {

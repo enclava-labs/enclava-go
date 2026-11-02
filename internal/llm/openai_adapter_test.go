@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -192,5 +193,44 @@ func TestAdapterStreamIdleLimit(t *testing.T) {
 	_, err = stream.Read(buf)
 	if err == nil {
 		t.Fatal("expected idle timeout to terminate the silent stream")
+	}
+}
+
+// A non-2xx response whose headers arrive but whose body never terminates
+// must be cut by the same stream limits a live stream gets — the error-body
+// read rides the bounded reader, so a stalling upstream cannot pin the
+// opener past the idle limit or a caller cancellation.
+func TestAdapterStreamErrorBodyHonorsLimits(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	adapter := NewOpenAICompatibleAdapter(server.URL, "k", 5*time.Second).
+		WithAllowPrivateEndpoint().
+		WithStreamLimits(150*time.Millisecond, 0)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := adapter.CreateChatCompletionStream(ctx, []byte(`{"stream":true}`))
+		done <- err
+	}()
+	var upstreamErr *UpstreamError
+	select {
+	case err := <-done:
+		if !errors.As(err, &upstreamErr) || upstreamErr.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("error = %v, want UpstreamError 429", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("stalled 429 body was not bounded by the idle limit")
 	}
 }

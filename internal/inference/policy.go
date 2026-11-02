@@ -342,15 +342,21 @@ func effectiveCapability(capability string, info payloadInfo) (string, error) {
 // Chat/vision payloads declare max_completion_tokens or max_tokens, times n
 // (default 1); Responses create declares max_output_tokens; non-creating
 // operations (embeddings, input_tokens) generate nothing and bound zero.
+// A null cap counts as absent, matching the nullable OpenAI contract, and
+// the next supplied cap or the default wins.
 // An absent generation cap is injected into the payload at the configured
 // default (per choice, so default×n never exceeds the operation bound) and
 // the provider never produces more than the hold; a configured default of
-// zero injects nothing and holds the operation bound. Compact holds the
-// bound unless the caller declares max_output_tokens: the compaction
-// endpoint is not known to accept the field, so nothing is injected there.
+// zero injects nothing and holds the operation bound. The injected default
+// is further clamped to the routed model's catalog limits — its declared
+// generation ceiling and its context window minus the reserved prompt
+// estimate — but only when the per-endpoint cache already holds them;
+// the request path never fetches model metadata. Compact holds the bound
+// unless the caller declares max_output_tokens: the compaction endpoint
+// is not known to accept the field, so nothing is injected there.
 // Requested×n above the operation bound is a 4xx refusal — such a request
 // can never dispatch.
-func (s *Service) resolveOutputEstimate(capability string, req Request, root map[string]any) (int64, error) {
+func (s *Service) resolveOutputEstimate(capability string, req Request, root map[string]any, endpoint Endpoint, upstreamModel string) (int64, error) {
 	bound, ok := boundFor(capability)
 	if !ok {
 		return 0, ErrUnsupportedCapability
@@ -375,15 +381,25 @@ func (s *Service) resolveOutputEstimate(capability string, req Request, root map
 	var requested int64
 	found := false
 	for _, key := range keys {
-		if v, present := root[key]; present {
-			n64, ok := payloadInt(v)
-			if !ok || n64 < 0 {
-				return 0, fmt.Errorf("%w: %s must be a non-negative integer", ErrUnbounded, key)
-			}
-			requested = n64
-			found = true
-			break
+		v, present := root[key]
+		if !present {
+			continue
 		}
+		if v == nil {
+			// Nullable in the OpenAI contract: a null cap is absent, not
+			// malformed — drop it so the next key or the injected default
+			// applies and the null never reaches a provider that would
+			// reject the parameter's presence.
+			delete(root, key)
+			continue
+		}
+		n64, ok := payloadInt(v)
+		if !ok || n64 < 0 {
+			return 0, fmt.Errorf("%w: %s must be a non-negative integer", ErrUnbounded, key)
+		}
+		requested = n64
+		found = true
+		break
 	}
 	if !found {
 		if s.defaultMaxOutput <= 0 || capability == CapabilityCompact {
@@ -395,13 +411,43 @@ func (s *Service) resolveOutputEstimate(capability string, req Request, root map
 		if perChoice == 0 {
 			return 0, fmt.Errorf("%w: n exceeds the operation output bound", ErrUnbounded)
 		}
-		root[keys[len(keys)-1]] = perChoice
+		// Clamp the injected default to the routed model's catalog limits
+		// — its declared generation ceiling and its context window minus
+		// the reserved prompt estimate — but only when the per-endpoint
+		// cache already holds them: the dispatch path must never build a
+		// transport or call upstream to learn limits, so a cold cache
+		// clamps nothing.
+		if limits, ok := s.modelLimitsCached(endpoint, upstreamModel); ok {
+			if limits.maxOutput > 0 && limits.maxOutput < perChoice {
+				perChoice = limits.maxOutput
+			}
+			if headroom := limits.contextLength - req.Estimate.InputUnits; headroom > 0 && headroom < perChoice {
+				perChoice = headroom
+			}
+		}
+		key := keys[len(keys)-1]
+		if requiresCompletionTokens(upstreamModel) {
+			// OpenAI reasoning models reject max_tokens outright; no
+			// catalog capability bit exposes the restriction.
+			key = "max_completion_tokens"
+		}
+		root[key] = perChoice
 		return perChoice * n, nil
 	}
 	if requested > bound.OutputUnits/n || requested*n > bound.OutputUnits {
 		return 0, fmt.Errorf("%w: requested output units exceed the operation bound", ErrUnbounded)
 	}
 	return requested * n, nil
+}
+
+// requiresCompletionTokens reports whether the upstream model accepts only
+// max_completion_tokens: OpenAI's reasoning models (o-series, gpt-5 family)
+// reject the legacy max_tokens field. No endpoint or catalog signal exposes
+// the restriction, so the documented family prefixes are the check —
+// unknown models keep the legacy field OpenAI-compatible servers accept.
+func requiresCompletionTokens(upstreamModel string) bool {
+	id := strings.ToLower(upstreamModel)
+	return strings.HasPrefix(id, "gpt-5") || len(id) >= 2 && id[0] == 'o' && id[1] >= '0' && id[1] <= '9'
 }
 
 // payloadN reads the optional n multiplier; absent or malformed values hold

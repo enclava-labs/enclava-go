@@ -152,8 +152,10 @@ func WithAttemptTimeout(d time.Duration) Option {
 }
 
 // WithDefaultMaxOutputTokens sets the output bound injected into payloads
-// that declare none (chat: max_tokens, responses: max_output_tokens). Zero
-// disables injection — those attempts hold the operation bound.
+// that declare none (chat: max_tokens, or max_completion_tokens for models
+// that reject the legacy field; responses: max_output_tokens), clamped to
+// the routed model's catalog limits when reported. Zero disables injection
+// — those attempts hold the operation bound.
 func WithDefaultMaxOutputTokens(n int64) Option {
 	return func(s *Service) { s.defaultMaxOutput = n }
 }
@@ -249,20 +251,6 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 	if req.Estimate.CachedInputUnits < req.Estimate.InputUnits {
 		req.Estimate.CachedInputUnits = req.Estimate.InputUnits
 	}
-	// The output bound is owned here, never by callers: the payload's
-	// declared generation cap (times n) sizes the hold, the configured
-	// default is injected upstream when absent, and the operation bound
-	// holds as the last resort. A request declaring more than the bound
-	// refuses 4xx — it can never dispatch.
-	outUnits, err := s.resolveOutputEstimate(capability, req, info.root)
-	if err != nil {
-		return nil, err
-	}
-	req.Estimate.OutputUnits = outUnits
-	if err := checkEstimate(capability, req.Estimate); err != nil {
-		return nil, err
-	}
-
 	endpoint, err := s.route(ctx, p, req, capability)
 	if err != nil {
 		return nil, err
@@ -272,6 +260,21 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 		return nil, err
 	}
 	upstreamModel := decision.UpstreamModel
+
+	// The output bound is owned here, never by callers: the payload's
+	// declared generation cap (times n) sizes the hold, the configured
+	// default is injected upstream when absent, and the operation bound
+	// holds as the last resort. A request declaring more than the bound
+	// refuses 4xx — it can never dispatch. Injection runs after routing so
+	// the default can use the routed model's cached catalog limits.
+	outUnits, err := s.resolveOutputEstimate(capability, req, info.root, endpoint, upstreamModel)
+	if err != nil {
+		return nil, err
+	}
+	req.Estimate.OutputUnits = outUnits
+	if err := checkEstimate(capability, req.Estimate); err != nil {
+		return nil, err
+	}
 
 	// Admit before resolving the transport or reserving: queued attempts
 	// never hold a budget hold, and cold transport construction (including
@@ -329,9 +332,12 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 	// permanently consuming budget. The upstream call runs detached from the
 	// caller: a client disconnect must not abort it (the provider may still
 	// be executing), so the exact token counts can still be settled — for
-	// streams the accounting body drains to the terminal usage event.
+	// streams the accounting body drains to the terminal usage event. The
+	// stream open is the exception: it stays on the caller's context so a
+	// wedged open or a never-ending error body dies with the request instead
+	// of pinning the slot; dispatchStream detaches only the opened body.
 	obs := &sendObserver{}
-	tctx := httptrace.WithClientTrace(context.WithoutCancel(ctx), &httptrace.ClientTrace{
+	trace := &httptrace.ClientTrace{
 		GetConn:           func(string) { obs.any.Store(true) },
 		GotConn:           func(httptrace.GotConnInfo) { obs.any.Store(true) },
 		DNSStart:          func(httptrace.DNSStartInfo) { obs.any.Store(true) },
@@ -345,12 +351,13 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 			}
 		},
 		GotFirstResponseByte: func() { obs.sent.Store(true); obs.any.Store(true) },
-	})
+	}
+	tctx := httptrace.WithClientTrace(context.WithoutCancel(ctx), trace)
 
 	if req.Stream {
 		// Streams bound their own lifetime via idle/wall limits on the body;
 		// the attempt timeout would kill valid held streams on return.
-		raw, err := s.dispatchStream(tctx, up, capability, req, body)
+		raw, err := s.dispatchStream(httptrace.WithClientTrace(ctx, trace), up, capability, req, body)
 		if err != nil {
 			permit.Release()
 			s.observeDispatchFailure(endpoint, err)
@@ -665,20 +672,42 @@ func (s *Service) dispatch(ctx context.Context, up Upstream, capability string, 
 	}
 }
 
-// dispatchStream opens the streaming variant of the bounded request.
+// dispatchStream opens the streaming variant of the bounded request. The
+// request itself runs on a detached context — an opened body must outlive a
+// client disconnect so accounting can drain its terminal usage — while the
+// open phase alone watches the caller: a hung open or a non-2xx body the
+// upstream never finishes dies with the request instead of pinning the
+// admission slot forever. The cancel stays bound to the returned body.
 func (s *Service) dispatchStream(ctx context.Context, up Upstream, capability string, req Request, body []byte) (io.ReadCloser, error) {
 	if unsupported, ok := up.(interface{ Supports(string) bool }); ok && !unsupported.Supports(capability) {
 		return nil, ErrUnsupportedCapability
 	}
+	openCtx, openCancel := context.WithCancel(context.WithoutCancel(ctx))
+	stopOpenWatch := context.AfterFunc(ctx, openCancel)
+	var raw io.ReadCloser
+	var err error
 	switch capability {
 	case CapabilityChat, CapabilityVision:
-		return up.CreateChatCompletionStream(ctx, body)
+		raw, err = up.CreateChatCompletionStream(openCtx, body)
 	case CapabilityResponses, CapabilityCompact:
 		method, path := responsesTarget(capability, req)
-		return up.DoResponsesStream(ctx, method, path, body)
+		raw, err = up.DoResponsesStream(openCtx, method, path, body)
 	default:
-		return nil, ErrUnsupportedCapability
+		err = ErrUnsupportedCapability
 	}
+	if err != nil {
+		stopOpenWatch()
+		openCancel()
+		return nil, err
+	}
+	if !stopOpenWatch() {
+		// The caller cancelled mid-open: the opened body already carries
+		// the cancelled context, so it cannot serve a stream.
+		_ = raw.Close()
+		openCancel()
+		return nil, ctx.Err()
+	}
+	return &cancelOnClose{ReadCloser: raw, done: openCancel}, nil
 }
 
 // responsesTarget resolves the bounded Responses operation path.
