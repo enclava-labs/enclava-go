@@ -142,8 +142,10 @@ type fx struct {
 	factoryErr    error
 	conversations inference.ConversationStore
 	// billingOverride swaps the executor's billing seam (tests exercising
-	// accounting failure); nil uses f.billing.
 	billingOverride inference.Billing
+	// transportHook runs inside the transport factory before the fake is
+	// returned — tests use it to gate concurrent construction.
+	transportHook func()
 }
 
 func newFx(t *testing.T) *fx {
@@ -192,6 +194,9 @@ func (f *fx) build(t *testing.T) {
 		Conversations: f.conversations,
 	}, inference.WithTransportFactory(
 		func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {
+			if f.transportHook != nil {
+				f.transportHook()
+			}
 			if f.factoryErr != nil {
 				return nil, f.factoryErr
 			}

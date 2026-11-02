@@ -15,6 +15,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -376,5 +377,89 @@ func TestAdmissionPerTenantSublimit(t *testing.T) {
 	_, err = f.svc.Execute(f.ctx, f.principal, f.streamRequest())
 	if !errors.Is(err, inference.ErrOverloaded) {
 		t.Fatalf("per-tenant sublimit should reject, got %v", err)
+	}
+}
+
+// Transport construction (attestation on cold endpoints) is billed against
+// the execute permit: an in-flight build keeps a second request out of the
+// factory entirely — admission must never report free capacity while a
+// transport is being resolved.
+func TestAdmissionBoundsTransportConstruction(t *testing.T) {
+	f := admissionFx(t, inference.AdmissionConfig{
+		Execute: inference.ClassLimit{MaxActive: 1, MaxQueued: 0},
+		Manage:  inference.ClassLimit{MaxActive: 1, MaxQueued: 0},
+		FanOut:  inference.ClassLimit{MaxActive: 1, MaxQueued: 0},
+	})
+	var calls atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	f.transportHook = func() {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+	}
+
+	type outcome struct {
+		res *inference.Result
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := f.svc.Execute(f.ctx, f.principal, f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+		done <- outcome{res, err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first request never reached transport construction")
+	}
+
+	_, err := f.svc.Execute(f.ctx, f.principal, f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if !errors.Is(err, inference.ErrOverloaded) {
+		t.Fatalf("expected ErrOverloaded, got %v", err)
+	}
+	close(release)
+	out := <-done
+	if out.err != nil {
+		t.Fatalf("first request: %v", out.err)
+	}
+	if err := out.res.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("rejected request reached transport construction: %d builds", n)
+	}
+	if n := f.reservationCount(t); n != 1 {
+		t.Fatalf("rejected request must not reserve: %d reservations", n)
+	}
+	waitActive(t, f.admission, inference.AdmissionExecute, 0)
+}
+
+// A failed transport build must hand its permit back: the next request
+// proceeds and no reservation exists for the attempt that never reached
+// dispatch.
+func TestAdmissionTransportFailureReleasesPermit(t *testing.T) {
+	f := admissionFx(t, inference.AdmissionConfig{
+		Execute: inference.ClassLimit{MaxActive: 1, MaxQueued: 0},
+		Manage:  inference.ClassLimit{MaxActive: 1, MaxQueued: 0},
+		FanOut:  inference.ClassLimit{MaxActive: 1, MaxQueued: 0},
+	})
+	f.factoryErr = errors.New("attestation failed")
+	if _, err := f.svc.Execute(f.ctx, f.principal, f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`)); err == nil {
+		t.Fatal("failed transport must error")
+	}
+	waitActive(t, f.admission, inference.AdmissionExecute, 0)
+
+	f.factoryErr = nil
+	res, err := f.svc.Execute(f.ctx, f.principal, f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("execute after failed transport: %v", err)
+	}
+	if err := res.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.reservationCount(t); n != 1 {
+		t.Fatalf("failed transport must not reserve: %d reservations", n)
 	}
 }

@@ -273,22 +273,9 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 	}
 	upstreamModel := decision.UpstreamModel
 
-	// The transport is resolved before reserving so unsupported
-	// capability/stream combinations refuse cleanly — a reservation must
-	// never exist for an attempt this transport cannot dispatch.
-	up, err := s.transportFor(ctx, endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("transport for endpoint: %w", err)
-	}
-	if err := dispatchSupports(up, capability, req.Stream); err != nil {
-		return nil, err
-	}
-	body, err := marshalPayload(info.root, upstreamModel, req)
-	if err != nil {
-		return nil, err
-	}
-
-	// Admit before reserving: queued attempts never hold a budget hold.
+	// Admit before resolving the transport or reserving: queued attempts
+	// never hold a budget hold, and cold transport construction (including
+	// attestation) counts against the same active bound as dispatch.
 	// Job-originated (internal fan-out) work draws from its own pool so a
 	// nested or background model call can never deadlock an outer permit
 	// held by the request pool.
@@ -298,6 +285,24 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 	}
 	permit, err := s.admission.Acquire(ctx, class, p.TenantID)
 	if err != nil {
+		return nil, err
+	}
+
+	// The transport is resolved before reserving so unsupported
+	// capability/stream combinations refuse cleanly — a reservation must
+	// never exist for an attempt this transport cannot dispatch.
+	up, err := s.transportFor(ctx, endpoint)
+	if err != nil {
+		permit.Release()
+		return nil, fmt.Errorf("transport for endpoint: %w", err)
+	}
+	if err := dispatchSupports(up, capability, req.Stream); err != nil {
+		permit.Release()
+		return nil, err
+	}
+	body, err := marshalPayload(info.root, upstreamModel, req)
+	if err != nil {
+		permit.Release()
 		return nil, err
 	}
 
