@@ -20,7 +20,7 @@
   // the zone's UTC offset at the candidate instant (DST-correct) via Intl.
   function zoneOffsetMs(tz, ms) {
     const parts = new Intl.DateTimeFormat('en-US', {
-      timeZone: tz, hour12: false,
+      timeZone: tz, hourCycle: 'h23', // never "24" for midnight
       year: 'numeric', month: '2-digit', day: '2-digit',
       hour: '2-digit', minute: '2-digit', second: '2-digit',
     }).formatToParts(new Date(ms));
