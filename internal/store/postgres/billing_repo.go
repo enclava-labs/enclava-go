@@ -471,12 +471,13 @@ func (t billingTx) Transition(ctx context.Context, tenantID, id, from, to string
 	return n, nil
 }
 
-// MarkDispatched stamps dispatched_at on rows not yet dispatched.
+// MarkDispatched stamps dispatched_at on held rows not yet dispatched; the
+// state guard refuses rows a sweep already released or moved to unknown.
 func (t billingTx) MarkDispatched(ctx context.Context, tenantID, id string) (int64, error) {
 	res, err := t.tx.ExecContext(ctx, `
 		UPDATE reservations SET dispatched_at = now()
 		WHERE tenant_id = $1::uuid AND (id = $2 OR id LIKE $2 || '/%')
-		  AND dispatched_at IS NULL`, tenantID, id)
+		  AND state = 'held' AND dispatched_at IS NULL`, tenantID, id)
 	if err != nil {
 		return 0, fmt.Errorf("mark dispatched: %w", err)
 	}

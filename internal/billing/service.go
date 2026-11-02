@@ -238,14 +238,20 @@ func (s *Service) MarkUnknown(ctx context.Context, p auth.Principal, reservation
 }
 
 // MarkDispatched records that the reservation's upstream attempt was
-// dispatched; ReleaseUndispatched refuses it afterwards.
+// dispatched; ReleaseUndispatched refuses it afterwards. The reservation
+// must still be held — a worker resuming after a hold sweep must not send
+// provider bytes against a released liability.
 func (s *Service) MarkDispatched(ctx context.Context, p auth.Principal, reservationID string) error {
 	return s.repo.InTx(ctx, func(tx BillingTx) error {
-		// Existence check first so a second MarkDispatched is a no-op.
-		if _, err := tx.GetReservationForUpdate(ctx, p.TenantID, reservationID); err != nil {
+		res, err := tx.GetReservationForUpdate(ctx, p.TenantID, reservationID)
+		if err != nil {
 			return err
 		}
-		_, err := tx.MarkDispatched(ctx, p.TenantID, reservationID)
+		// A second MarkDispatched on a held row is a no-op success.
+		if res.State != ReservationHeld {
+			return fmt.Errorf("%w: %s is %s", ErrReservationState, reservationID, res.State)
+		}
+		_, err = tx.MarkDispatched(ctx, p.TenantID, reservationID)
 		return err
 	})
 }

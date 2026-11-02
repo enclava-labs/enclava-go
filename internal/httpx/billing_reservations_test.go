@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -194,5 +195,74 @@ func TestAdminReservationsCrossTenantHidden(t *testing.T) {
 		strings.NewReader(`{"input_tokens":1,"cached_input_tokens":0,"output_tokens":0}`))
 	if rec := doBudgetHandler(foreignDB.app.handleAdminReservationByID, foreign, resolve); rec.Code != http.StatusNotFound {
 		t.Fatalf("cross-tenant resolve = %d, want 404", rec.Code)
+	}
+}
+
+func TestAdminReservationsListPaginatesCursor(t *testing.T) {
+	f := newReservationFixture(t)
+	admin := f.adminPrincipal()
+	ctx := context.Background()
+
+	// Seed more outstanding rows than the fixed page cap in one bulk insert;
+	// the shared created_at exercises the id-DESC keyset tiebreak.
+	const seeded = reservationsListCap + 3
+	if _, err := f.db.SQL.ExecContext(ctx, `
+		INSERT INTO reservations
+			(tenant_id, id, subject_type, subject_id, price_snapshot,
+			 reserved_units, limit_amount_micros, currency, state, capability, model)
+		SELECT $1::uuid, 'res_page_' || g, 'api_key', 'k-page',
+		       '{"rates":[],"currency":"USD","rounding_rule":"ceil"}'::jsonb,
+		       '{"input":1}'::jsonb, 1, 'USD', 'unknown', 'chat', 'm'
+		FROM generate_series(1, $2) g`, f.tenant, seeded); err != nil {
+		t.Fatalf("bulk seed reservations: %v", err)
+	}
+
+	type listBody struct {
+		Reservations []struct {
+			ID string `json:"id"`
+		} `json:"reservations"`
+		NextCursor string `json:"next_cursor"`
+	}
+	get := func(query string) listBody {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/reservations?state=unknown"+query, nil)
+		rec := doBudgetHandler(f.app.handleAdminReservations, admin, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("list %s = %d: %s", query, rec.Code, rec.Body.String())
+		}
+		var body listBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode page: %v", err)
+		}
+		return body
+	}
+
+	first := get("")
+	if len(first.Reservations) != reservationsListCap || first.NextCursor == "" {
+		t.Fatalf("page 1 = %d rows cursor %q, want a capped page with next_cursor",
+			len(first.Reservations), first.NextCursor)
+	}
+	second := get("&cursor=" + url.QueryEscape(first.NextCursor))
+	if len(second.Reservations) != seeded-reservationsListCap || second.NextCursor != "" {
+		t.Fatalf("page 2 = %d rows cursor %q, want the remainder with no next_cursor",
+			len(second.Reservations), second.NextCursor)
+	}
+	seen := map[string]bool{}
+	for _, page := range []listBody{first, second} {
+		for _, row := range page.Reservations {
+			if seen[row.ID] {
+				t.Fatalf("row repeated across pages: %s", row.ID)
+			}
+			seen[row.ID] = true
+		}
+	}
+	if len(seen) != seeded {
+		t.Fatalf("pages covered %d rows, want all %d", len(seen), seeded)
+	}
+
+	// A malformed cursor is a 400, never an ignored parameter.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/reservations?state=unknown&cursor=not-a-cursor", nil)
+	if rec := doBudgetHandler(f.app.handleAdminReservations, admin, req); rec.Code != http.StatusBadRequest {
+		t.Fatalf("malformed cursor = %d, want 400: %s", rec.Code, rec.Body.String())
 	}
 }

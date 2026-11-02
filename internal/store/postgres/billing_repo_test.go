@@ -470,8 +470,19 @@ func TestLiabilitiesAggregatesAndFoldsPromptKinds(t *testing.T) {
 		t.Fatalf("unknown inside window must count once: %+v", unknown)
 	}
 
-	// Tenant scope sees the canonical row only (attribution ids carry '/').
+	// The admin unsettled report must fold the same way: the held dual-key
+	// row contributes max(40,60)+5 plus the in-window unknown's 7 — never
+	// the raw 40+60+5+7.
+	report, err := repo.ReportUnsettledBySubject(ctx, tenant, from)
+	if err != nil {
+		t.Fatalf("unsettled report: %v", err)
+	}
+	if len(report) != 1 || report[0].Units != 72 || report[0].HeldMicros != 500 || report[0].UnknownMicros != 70 {
+		t.Fatalf("unsettled report row = %+v, want folded units 72 over held 500/unknown 70", report)
+	}
+
 	trows, err := repo.Liabilities(ctx, tenant, billing.Subject{Type: billing.BudgetSubjectTenant, ID: tenant}, from)
+	// Tenant scope sees the canonical row only (attribution ids carry '/').
 	if err != nil {
 		t.Fatalf("tenant liabilities: %v", err)
 	}

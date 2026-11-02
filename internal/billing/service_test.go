@@ -588,6 +588,48 @@ func TestSweepStaleHolds(t *testing.T) {
 	}
 }
 
+func TestMarkDispatchedAfterSweepRefused(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.flatPrices(t)
+
+	stale, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 10}))
+	if err != nil {
+		t.Fatalf("reserve stale: %v", err)
+	}
+	cutoff := time.Now().UTC().Add(-time.Hour)
+	if _, err := f.db.SQL.ExecContext(ctx,
+		`UPDATE reservations SET created_at = $2 WHERE tenant_id = $1::uuid AND (id = $3 OR id LIKE $3 || '/%')`,
+		f.tenant, cutoff.Add(-time.Hour), stale.ID); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	if released, _, err := f.svc.SweepStaleHolds(ctx, cutoff); err != nil || released != 2 {
+		t.Fatalf("sweep released=%d err=%v", released, err)
+	}
+
+	// A worker resuming after the sweep must not dispatch: released liability
+	// would mean provider cost with nothing enforceable to settle.
+	if err := f.svc.MarkDispatched(ctx, f.principal, stale.ID); !errors.Is(err, billing.ErrReservationState) {
+		t.Fatalf("dispatch after sweep must fail, got %v", err)
+	}
+	got, err := f.svc.GetReservation(ctx, f.principal, stale.ID)
+	if err != nil || got.State != billing.ReservationReleased || got.DispatchedAt != nil {
+		t.Fatalf("reservation must stay released/undispatched, got %+v err=%v", got, err)
+	}
+
+	// Idempotency: double MarkDispatched on a held reservation succeeds.
+	held, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 10}))
+	if err != nil {
+		t.Fatalf("reserve held: %v", err)
+	}
+	if err := f.svc.MarkDispatched(ctx, f.principal, held.ID); err != nil {
+		t.Fatalf("first dispatch: %v", err)
+	}
+	if err := f.svc.MarkDispatched(ctx, f.principal, held.ID); err != nil {
+		t.Fatalf("second dispatch must be a no-op, got %v", err)
+	}
+}
+
 func TestLiabilityWindowDropsStaleUnknown(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()

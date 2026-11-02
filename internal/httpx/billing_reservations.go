@@ -19,7 +19,8 @@ import (
 	"enclava-go/internal/store/postgres"
 )
 
-// reservationsListCap bounds the reconciliation list — newest rows first.
+// reservationsListCap bounds one page of the reconciliation list — newest
+// rows first, continued via the opaque `cursor` query param.
 const reservationsListCap = 500
 
 // adminReservationDTO is the wire shape of one canonical reservation row.
@@ -61,8 +62,13 @@ func (a *App) handleAdminReservations(w http.ResponseWriter, r *http.Request, pr
 		WriteOpenAIError(w, http.StatusBadRequest, "state must be 'held' or 'unknown'", "invalid_request_error", "invalid_state")
 		return
 	}
-	rows, err := a.billingRepo.ReportListReservations(r.Context(), principal.TenantID, state, reservationsListCap)
+	rows, next, err := a.billingRepo.ReportListReservations(r.Context(), principal.TenantID, state, reservationsListCap,
+		r.URL.Query().Get("cursor"))
 	if err != nil {
+		if errors.Is(err, postgres.ErrInvalidCursor) {
+			WriteOpenAIError(w, http.StatusBadRequest, "invalid cursor", "invalid_request_error", "invalid_cursor")
+			return
+		}
 		log.Printf("failed to list reservations: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "reservations_list_failed")
 		return
@@ -77,7 +83,7 @@ func (a *App) handleAdminReservations(w http.ResponseWriter, r *http.Request, pr
 		}
 		out = append(out, dto)
 	}
-	WriteJSON(w, http.StatusOK, map[string]any{"reservations": out})
+	WriteJSON(w, http.StatusOK, map[string]any{"reservations": out, "next_cursor": next})
 }
 
 func adminReservationDTOFor(row postgres.ReportReservationRow) (adminReservationDTO, error) {
