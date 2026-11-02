@@ -76,8 +76,35 @@ and chunk problems are persisted per generation and returned on
 `documents[].warnings`: non-UTF-8 input decoded as windows-1252 or UTF-16,
 XLSX sheets over the cell cap, CSV/XLSX header rows leading each table
 chunk, and `truncated:` markers when a document exceeds the 4,096-chunk cap
-(only the first 4,096 chunks are indexed). Vector search results are
-re-authorized against current source ACLs before they are returned.
+(only the first 4,096 chunks are indexed).
+
+Search prefilters indexed points by their `acl` access tokens and `published`
+flag, rather than enumerating every published document. Caller tokens cover
+the actor, delegated actor, tenant-wide access, mapped source identities and
+source groups from a complete membership snapshot. Every hit is re-authorized
+against PostgreSQL for the object, version, document status and current
+published generation before results, evidence, locations or facets are
+produced, so revocations and temporary connection disablement take effect
+immediately. Each index fetches up to four times the per-index result limit,
+capped at 200 points per round, for at most three rounds (the initial round
+and two extra rounds); fewer results can be returned when post-checks discard
+hits.
+
+`POST /api/v1/rag/search` has no per-collection or aggregate 2,000-document
+bound. It returns `search_scope_too_large` when more than 20 distinct
+collections are requested, or when no selection is supplied and more than
+20 collections are readable.
+
+Access tokens are written at embedding and refreshed before publication.
+Complete grants snapshots re-project connector objects with revision fencing.
+The durable `rag.access_backfill` job backfills older points, triggered at
+startup and periodically; points without the projection remain searchable
+through the authoritative post-check. Temporary connection disablement is
+enforced by that post-check, not by the tokens.
+
+Query embedding and rewrite send only the query to their models. Section
+selection sends the source references of its candidate results with the model
+call, so input restrictions apply.
 
 A collection embeds with the deployment default (`DEFAULT_EMBEDDING_MODEL`,
 `DEFAULT_EMBEDDING_DIMENSIONS`) unless the create body sets
@@ -87,8 +114,10 @@ Matryoshka-trained models such as Qwen3-Embedding). A shortened size is
 checked with one test embedding at create time (400 if the model can't
 produce it). Changing either with `PUT` is checked the same way, then every
 document re-embeds into a new index in the background; search keeps reading
-each document from its previous index until it is done, and the old index is
-dropped once no document uses it.
+each document from its previous index until it is done. Per-index rankings
+are fused using plain (unweighted) reciprocal rank fusion; a binding whose
+model the caller cannot use is skipped (if no binding can be searched, the
+search fails). The old index is dropped once no document uses it.
 
 `query_prefix` and `passage_prefix` (create and `PUT`, returned in
 collection responses) control the strings prepended to queries and chunks
