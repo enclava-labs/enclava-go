@@ -37,7 +37,7 @@ func TestDiscoverListsModelsSortedAndClassifiesProbes(t *testing.T) {
 		inference.CapabilityVision:     "no",
 		inference.CapabilityCompact:    "no",
 
-		inference.CapabilityMCP:        "unknown",
+		inference.CapabilityMCP: "unknown",
 	}
 	if !reflect.DeepEqual(report.Capabilities, want) {
 		t.Fatalf("capabilities = %v", report.Capabilities)
