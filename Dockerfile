@@ -9,7 +9,7 @@ WORKDIR /src
 # container builds resolve the same module revision.
 RUN apk add --no-cache git ca-certificates \
 	&& git clone --quiet https://github.com/enclava-labs/confidential-inference-sdk /enclava-proxy-sdk/confidential-inference-sdk \
-	&& git -C /enclava-proxy-sdk/confidential-inference-sdk checkout --quiet cfcaae5c337a7bfdeef85ed7e060f4ea21fe5117
+	&& git -C /enclava-proxy-sdk/confidential-inference-sdk checkout --quiet adcb08cee700fe9f18ac1954cc146b98295e2008
 
 COPY go.mod go.sum ./
 RUN go mod download

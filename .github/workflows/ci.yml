@@ -41,7 +41,7 @@ jobs:
         run: |
           git clone --quiet https://github.com/enclava-labs/confidential-inference-sdk ../enclava-proxy-sdk/confidential-inference-sdk
           # Keep this pin in sync with the Dockerfile.
-          git -C ../enclava-proxy-sdk/confidential-inference-sdk checkout --quiet cfcaae5c337a7bfdeef85ed7e060f4ea21fe5117
+          git -C ../enclava-proxy-sdk/confidential-inference-sdk checkout --quiet adcb08cee700fe9f18ac1954cc146b98295e2008
       - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           go-version-file: go.mod
