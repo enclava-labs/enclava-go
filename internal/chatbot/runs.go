@@ -958,20 +958,47 @@ func truncateRunText(text string, limit int, marker string) string {
 
 func fitRunContext(payload map[string]any, messages []map[string]any, historyStart int, historyCount *int, budget int) ([]byte, []map[string]any, error) {
 	const marker = "[truncated to fit context]"
-	for {
-		payload["messages"] = messages
-		body, err := json.Marshal(payload)
+	// Marshal each message once and keep its encoded size, so the retained
+	// history suffix is priced without re-marshaling the whole payload for
+	// every dropped message; only the final marshal serializes again.
+	payload["messages"] = []map[string]any{}
+	base, err := json.Marshal(payload)
+	if err != nil {
+		return nil, messages, err
+	}
+	fixed := len(base) - len("[]")
+	sizes := make([]int, len(messages))
+	encoded := 0
+	for i, message := range messages {
+		raw, err := json.Marshal(message)
 		if err != nil {
 			return nil, messages, err
 		}
-		if len(body) <= budget {
-			return body, messages, nil
+		sizes[i] = len(raw)
+		encoded += len(raw)
+	}
+	bodySize := fixed + 2 + encoded
+	if len(messages) > 0 {
+		bodySize += len(messages) - 1
+	}
+	if messages == nil {
+		bodySize += len("null") - len("[]")
+	}
+	removed := 0
+	for removed < *historyCount && historyStart+removed < len(messages) && bodySize > budget {
+		bodySize -= sizes[historyStart+removed] + 1
+		removed++
+	}
+	if removed > 0 {
+		if removed == len(messages) {
+			// "[x]" -> "[]" drops one fewer byte than element-plus-separator.
+			bodySize++
 		}
-		if *historyCount > 0 {
-			messages = append(messages[:historyStart], messages[historyStart+1:]...)
-			*historyCount--
-			continue
-		}
+		messages = append(messages[:historyStart], messages[historyStart+removed:]...)
+		sizes = append(sizes[:historyStart], sizes[historyStart+removed:]...)
+		*historyCount -= removed
+	}
+	for bodySize > budget {
 		largest, size := -1, len(marker)
 		for i, message := range messages {
 			if message["role"] != "tool" {
@@ -996,5 +1023,20 @@ func fitRunContext(payload map[string]any, messages []map[string]any, historySta
 		} else {
 			messages[largest]["content"] = truncateRunText(text+marker, limit, marker)
 		}
+		raw, err := json.Marshal(messages[largest])
+		if err != nil {
+			return nil, messages, err
+		}
+		bodySize += len(raw) - sizes[largest]
+		sizes[largest] = len(raw)
 	}
+	payload["messages"] = messages
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, messages, err
+	}
+	if len(body) > budget {
+		return nil, messages, fmt.Errorf("run context size accounting mismatch: %d > %d", len(body), budget)
+	}
+	return body, messages, nil
 }

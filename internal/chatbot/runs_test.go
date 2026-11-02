@@ -114,6 +114,56 @@ func TestFitRunContextTrimsHistoryThenTools(t *testing.T) {
 	}
 }
 
+type marshalCounter struct {
+	calls *int
+	n     int
+}
+
+func (c marshalCounter) MarshalJSON() ([]byte, error) {
+	*c.calls++
+	return json.Marshal(map[string]int{"n": c.n})
+}
+
+func TestFitRunContextTrimsHistoryLinearly(t *testing.T) {
+	const historyLen = 500
+	messages := make([]map[string]any, 0, 1+historyLen+1)
+	messages = append(messages, map[string]any{"role": "system", "content": "system"})
+	calls := new(int)
+	for i := range historyLen {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		messages = append(messages, map[string]any{"role": role, "content": marshalCounter{calls, i}})
+	}
+	messages = append(messages, map[string]any{"role": "user", "content": "current"})
+	payload := map[string]any{"model": "test"}
+	payload["messages"] = append(append([]map[string]any{}, messages[:1]...), messages[historyLen/2+1:]...)
+	kept, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget := len(kept)
+	history := historyLen
+	*calls = 0
+	body, fitted, err := fitRunContext(payload, messages, 1, &history, budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if history != historyLen/2 || len(fitted) != len(messages)-historyLen/2 || len(body) > budget {
+		t.Fatalf("body=%d history=%d messages=%d", len(body), history, len(fitted))
+	}
+	if string(body) != string(kept) {
+		t.Fatal("fitted payload differs from expected history suffix")
+	}
+	if fitted[1]["content"].(marshalCounter).n != historyLen/2 {
+		t.Fatalf("oldest retained history = %#v, want index %d", fitted[1]["content"], historyLen/2)
+	}
+	if *calls > 2*len(messages) {
+		t.Fatalf("message marshals %d is not linear for %d messages", *calls, len(messages))
+	}
+}
+
 func TestTruncateToolOutputKeepsMarkerAndUTF8(t *testing.T) {
 	text := strings.Repeat("é", maxBuiltinOutputBytes)
 	got := truncateRunText(text, maxBuiltinOutputBytes, "[truncated]")
