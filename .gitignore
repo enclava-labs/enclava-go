@@ -6,6 +6,9 @@
 *.db-shm
 *.db-wal
 
+# runtime data (ENCLAVA_DATA_DIR default: artifacts, scratch)
+/data/
+
 # environment / secrets
 .env
 .env.local
