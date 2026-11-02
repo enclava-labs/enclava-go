@@ -131,10 +131,10 @@ func (r *RAGRepo) InsertCollection(ctx context.Context, c rag.Collection) error 
 		INSERT INTO knowledge_collections
 		    (tenant_id, id, name, description, embedding_model, embedding_dimensions,
 		     qdrant_collection, chunk_profile_version_id, audience, metadata,
-		     owner_actor_id, is_active, embed_titles)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12, $13)`,
+		     owner_actor_id, is_active, embed_titles, query_prefix, passage_prefix)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12, $13, $14, $15)`,
 		c.TenantID, c.ID, c.Name, c.Description, c.EmbeddingModel, c.EmbeddingDimensions,
-		c.QdrantCollection, profileVersionID, aud, metaBytes, nullableText(c.OwnerActorID), c.IsActive, c.EmbedTitles)
+		c.QdrantCollection, profileVersionID, aud, metaBytes, nullableText(c.OwnerActorID), c.IsActive, c.EmbedTitles, c.QueryPrefix, c.PassagePrefix)
 	if err != nil {
 		return fmt.Errorf("insert collection: %w", err)
 	}
@@ -146,10 +146,11 @@ func scanCollection(scanner interface {
 }) (rag.Collection, error) {
 	var c rag.Collection
 	var desc, qdrant, owner, profile sql.NullString
-	var audience, meta, retired []byte
+	var audience, meta, retired, retiredSince []byte
 	var createdAt time.Time
 	err := scanner.Scan(&c.TenantID, &c.ID, &c.Name, &desc, &c.EmbeddingModel, &c.EmbeddingDimensions,
-		&qdrant, &audience, &meta, &owner, &c.IsActive, &createdAt, &profile, &retired, &c.EmbedTitles)
+		&qdrant, &audience, &meta, &owner, &c.IsActive, &createdAt, &profile, &retired, &c.EmbedTitles,
+		&c.QueryPrefix, &c.PassagePrefix, &retiredSince)
 	if err != nil {
 		return rag.Collection{}, err
 	}
@@ -159,6 +160,9 @@ func scanCollection(scanner interface {
 	c.OwnerActorID = owner.String
 	c.Audience = scanJSONList(audience)
 	c.RetiredQdrantCollections = scanJSONList(retired)
+	if err := json.Unmarshal(retiredSince, &c.RetiredIndexSince); err != nil {
+		return rag.Collection{}, fmt.Errorf("decode retired index timestamps: %w", err)
+	}
 	c.CreatedAt = createdAt
 	c.UpdatedAt = createdAt
 	var metaMap map[string]any
@@ -189,7 +193,8 @@ func scanCollection(scanner interface {
 const collectionSelect = `
 	SELECT tenant_id::text, id, name, description, embedding_model, embedding_dimensions,
 	       qdrant_collection, audience, metadata, owner_actor_id, is_active, created_at,
-	       COALESCE(chunk_profile_version_id, ''), retired_qdrant_collections, embed_titles
+	       COALESCE(chunk_profile_version_id, ''), retired_qdrant_collections, embed_titles,
+	       query_prefix, passage_prefix, retired_index_since
 	FROM knowledge_collections`
 
 func (r *RAGRepo) GetCollection(ctx context.Context, tenantID, id string) (rag.Collection, error) {
@@ -238,31 +243,43 @@ func (r *RAGRepo) UpdateCollection(ctx context.Context, c rag.Collection) error 
 	if err != nil {
 		return fmt.Errorf("marshal collection audience: %w", err)
 	}
-	// Moving to another index lists the old one as retired (SET expressions
-	// read the pre-update row) and un-retires the new one, in one statement.
-	res, err := r.db.SQL.ExecContext(ctx, `
-		UPDATE knowledge_collections SET name = $3, description = $4, embedding_model = $5,
-		       audience = $6::jsonb, metadata = $7::jsonb, is_active = $8,
-		       chunk_profile_version_id = $9, embedding_dimensions = $10, embed_titles = $12,
-		       retired_qdrant_collections = CASE WHEN qdrant_collection = $11 THEN retired_qdrant_collections
-		           ELSE ((retired_qdrant_collections - $11::text) - qdrant_collection) || to_jsonb(qdrant_collection) END,
-		       qdrant_collection = $11
-		WHERE tenant_id = $1 AND id = $2`,
-		c.TenantID, c.ID, c.Name, c.Description, c.EmbeddingModel, aud, metaBytes,
-		c.IsActive, nullableText(c.ChunkProfileVersionID), c.EmbeddingDimensions, c.QdrantCollection, c.EmbedTitles)
-	if err != nil {
-		return fmt.Errorf("update collection: %w", err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return source.ErrDenied
-	}
-	return nil
+	// SET expressions read the old index, so retirement and reactivation are atomic.
+	return WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE knowledge_collections SET name = $3, description = $4, embedding_model = $5,
+			       audience = $6::jsonb, metadata = $7::jsonb, is_active = $8,
+			       chunk_profile_version_id = $9, embedding_dimensions = $10, embed_titles = $12,
+			       query_prefix = $13, passage_prefix = $14,
+			       retired_qdrant_collections = CASE WHEN qdrant_collection = $11 THEN retired_qdrant_collections
+			           ELSE ((retired_qdrant_collections - $11::text) - qdrant_collection) || to_jsonb(qdrant_collection) END,
+			       retired_index_since = CASE WHEN qdrant_collection = $11 THEN retired_index_since
+			           ELSE (retired_index_since - $11::text) || jsonb_build_object(qdrant_collection, now()) END,
+			       qdrant_collection = $11
+			WHERE tenant_id = $1 AND id = $2`,
+			c.TenantID, c.ID, c.Name, c.Description, c.EmbeddingModel, aud, metaBytes,
+			c.IsActive, nullableText(c.ChunkProfileVersionID), c.EmbeddingDimensions, c.QdrantCollection, c.EmbedTitles, c.QueryPrefix, c.PassagePrefix)
+		if err != nil {
+			return fmt.Errorf("update collection: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return source.ErrDenied
+		}
+		_, err = tx.ExecContext(ctx, `
+			UPDATE index_generations SET query_prefix=$3
+			WHERE tenant_id=$1 AND collection_id=$2 AND qdrant_collection=$4`,
+			c.TenantID, c.ID, c.QueryPrefix, c.QdrantCollection)
+		if err != nil {
+			return fmt.Errorf("update generation query prefix: %w", err)
+		}
+		return nil
+	})
 }
 
 // ForgetRetiredIndex drops one dropped index from the collection's retired list.
 func (r *RAGRepo) ForgetRetiredIndex(ctx context.Context, tenantID, collectionID, name string) error {
 	if _, err := r.db.SQL.ExecContext(ctx, `
-		UPDATE knowledge_collections SET retired_qdrant_collections = retired_qdrant_collections - $3::text
+		UPDATE knowledge_collections SET retired_qdrant_collections = retired_qdrant_collections - $3::text,
+		    retired_index_since = retired_index_since - $3::text
 		WHERE tenant_id = $1 AND id = $2`, tenantID, collectionID, name); err != nil {
 		return fmt.Errorf("forget retired index: %w", err)
 	}
@@ -315,7 +332,7 @@ func (r *RAGRepo) DocumentsToReembed(ctx context.Context, tenantID string, c rag
 		  AND g.object_version_id=v.id AND g.state='published'
 		WHERE ci.tenant_id=$1 AND ci.collection_id=$2 AND ci.removed_at IS NULL
 		  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL
-		  AND g.qdrant_collection <> '' AND (g.qdrant_collection <> $3 OR g.embed_titles <> $4)
+		  AND g.qdrant_collection <> '' AND (g.qdrant_collection <> $3 OR g.embed_titles <> $4 OR g.passage_prefix <> $5)
 		  AND NOT EXISTS (
 		    SELECT 1 FROM index_generations n
 		    JOIN jobs j ON j.tenant_id=n.tenant_id AND j.input_ref=n.object_version_id
@@ -324,7 +341,7 @@ func (r *RAGRepo) DocumentsToReembed(ctx context.Context, tenantID string, c rag
 		    WHERE n.tenant_id=g.tenant_id AND n.collection_id=g.collection_id
 		      AND n.object_version_id=g.object_version_id AND n.generation > g.generation
 		      AND n.state='staging')
-		ORDER BY o.id`, tenantID, c.ID, c.QdrantCollection, c.EmbedTitles)
+		ORDER BY o.id`, tenantID, c.ID, c.QdrantCollection, c.EmbedTitles, c.PassagePrefix)
 	if err != nil {
 		return nil, fmt.Errorf("list documents to re-embed: %w", err)
 	}
@@ -338,6 +355,69 @@ func (r *RAGRepo) DocumentsToReembed(ctx context.Context, tenantID string, c rag
 		docs = append(docs, d)
 	}
 	return docs, rows.Err()
+}
+
+// PendingReembed answers whether any enqueue candidate exists, stopping at the first row.
+func (r *RAGRepo) PendingReembed(ctx context.Context, tenantID string, c rag.Collection) (bool, error) {
+	var pending bool
+	if err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM collection_items ci
+			JOIN source_objects o ON o.tenant_id=ci.tenant_id AND o.id=ci.object_id
+			JOIN source_object_versions v ON v.tenant_id=o.tenant_id AND v.object_id=o.id AND v.observed_seq=o.observed_seq
+			JOIN index_generations g ON g.tenant_id=ci.tenant_id AND g.collection_id=ci.collection_id
+			  AND g.object_version_id=v.id AND g.state='published'
+			WHERE ci.tenant_id=$1 AND ci.collection_id=$2 AND ci.removed_at IS NULL
+			  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL
+			  AND g.qdrant_collection <> '' AND (g.qdrant_collection <> $3 OR g.embed_titles <> $4 OR g.passage_prefix <> $5)
+			  AND NOT EXISTS (
+			    SELECT 1 FROM index_generations n
+			    JOIN jobs j ON j.tenant_id=n.tenant_id AND j.input_ref=n.object_version_id
+			      AND j.operation='`+rag.OperationEmbed+`' AND j.policy->>'collection_id'=n.collection_id
+			      AND j.policy->>'generation'=n.generation::text AND j.status IN ('queued', 'running')
+			    WHERE n.tenant_id=g.tenant_id AND n.collection_id=g.collection_id
+			      AND n.object_version_id=g.object_version_id AND n.generation > g.generation
+			      AND n.state='staging'))`,
+		tenantID, c.ID, c.QdrantCollection, c.EmbedTitles, c.PassagePrefix).Scan(&pending); err != nil {
+		return false, fmt.Errorf("check pending re-embedding: %w", err)
+	}
+	return pending, nil
+}
+
+// ReembedProgressDocuments includes in-flight attempts so progress remains stable.
+func (r *RAGRepo) ReembedProgressDocuments(ctx context.Context, tenantID string, c rag.Collection) (pending []rag.Document, total []rag.Document, err error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `
+		SELECT o.id, COALESCE(v.id, ''), COALESCE(v.observed_seq, 0), EXISTS (
+			SELECT 1 FROM index_generations g
+			WHERE g.tenant_id=ci.tenant_id AND g.collection_id=ci.collection_id
+			  AND g.object_version_id=v.id AND g.state='published' AND g.qdrant_collection <> ''
+			  AND (g.qdrant_collection <> $3 OR g.embed_titles <> $4 OR g.passage_prefix <> $5))
+		FROM collection_items ci
+		JOIN source_objects o ON o.tenant_id=ci.tenant_id AND o.id=ci.object_id
+		LEFT JOIN source_object_versions v ON v.tenant_id=o.tenant_id AND v.object_id=o.id AND v.observed_seq=o.observed_seq
+		WHERE ci.tenant_id=$1 AND ci.collection_id=$2 AND ci.removed_at IS NULL
+		  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL
+		ORDER BY o.id`, tenantID, c.ID, c.QdrantCollection, c.EmbedTitles, c.PassagePrefix)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list re-embedding progress: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		d := rag.Document{TenantID: tenantID, CollectionID: c.ID}
+		var needsReembed bool
+		if err := rows.Scan(&d.ID, &d.ObjectVersionID, &d.ObservedSeq, &needsReembed); err != nil {
+			return nil, nil, fmt.Errorf("scan re-embedding progress: %w", err)
+		}
+		total = append(total, d)
+		if needsReembed {
+			pending = append(pending, d)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterate re-embedding progress: %w", err)
+	}
+	return pending, total, nil
 }
 
 func (r *RAGRepo) DeleteCollection(ctx context.Context, tenantID, id string) error {
@@ -463,7 +543,7 @@ const documentSelect = `
 	),
 	latest_gen AS (
 		SELECT DISTINCT ON (collection_id, object_version_id)
-		       collection_id, object_version_id, generation, state
+		       collection_id, object_version_id, generation, state, warnings
 		FROM index_generations
 		WHERE tenant_id = $1
 		ORDER BY collection_id, object_version_id, generation DESC
@@ -477,7 +557,7 @@ const documentSelect = `
 	       (SELECT COUNT(*) FROM chunks k
 	        WHERE k.tenant_id = $1 AND k.object_version_id = lv.id
 	          AND k.collection_id = ci.collection_id AND k.generation = lg.generation),
-	       j.error->>'message'
+	       j.error->>'message', COALESCE(lg.warnings, '[]'::jsonb)
 	FROM source_objects o
 	JOIN collection_items ci ON ci.tenant_id = o.tenant_id AND ci.object_id = o.id
 	LEFT JOIN latest_version lv ON lv.object_id = o.id
@@ -522,10 +602,11 @@ func scanDocument(scanner interface {
 	var firstSeen, lastSeen time.Time
 	var chunkCount int64
 	var errorMessage sql.NullString
+	var warnings []byte
 	err := scanner.Scan(&d.ID, &d.CollectionID, &d.SourceType, &nativeID, &seq,
 		&verID, &verSeq, &artifactRef, &sha, &byteSize,
 		&mime, &filename, &provenance,
-		&state, &gone, &firstSeen, &lastSeen, &chunkCount, &errorMessage)
+		&state, &gone, &firstSeen, &lastSeen, &chunkCount, &errorMessage, &warnings)
 	if err != nil {
 		return rag.Document{}, err
 	}
@@ -547,6 +628,9 @@ func scanDocument(scanner interface {
 		d.Metadata = map[string]any{}
 		d.QdrantPointCount = 0
 		return d, nil
+	}
+	if err := json.Unmarshal(warnings, &d.Warnings); err != nil {
+		return rag.Document{}, fmt.Errorf("decode generation warnings: %w", err)
 	}
 	if errorMessage.Valid && errorMessage.String != "" {
 		// The generation's durable embed/ingest job failed: carry the job's
@@ -897,22 +981,75 @@ func (r *RAGRepo) ReplaceVersionChunksAndStage(ctx context.Context, tenantID, co
 	})
 }
 
-// BindGeneration records the index a staged generation is about to be
-// written to — before any point exists, so cleanup always finds them.
-func (r *RAGRepo) BindGeneration(ctx context.Context, tenantID, versionID string, generation int64, c rag.Collection) error {
-	res, err := r.db.SQL.ExecContext(ctx, `
-		UPDATE index_generations SET qdrant_collection = $5, embedding_model = $6, embedding_dimensions = $7,
-		       embed_titles = $8
-		WHERE tenant_id = $1 AND collection_id = $2 AND object_version_id = $3 AND generation = $4
-		  AND state = 'staging'`,
-		tenantID, c.ID, versionID, generation, c.QdrantCollection, c.EmbeddingModel, c.EmbeddingDimensions, c.EmbedTitles)
+func (r *RAGRepo) SetGenerationWarnings(ctx context.Context, tenantID, collectionID, versionID string, generation int64, warnings []string) error {
+	if warnings == nil {
+		warnings = []string{}
+	}
+	data, err := json.Marshal(warnings)
 	if err != nil {
-		return fmt.Errorf("bind generation index: %w", err)
+		return fmt.Errorf("marshal generation warnings: %w", err)
+	}
+	res, err := r.db.SQL.ExecContext(ctx, `
+		UPDATE index_generations SET warnings=$5::jsonb
+		WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3 AND generation=$4 AND state='staging'`,
+		tenantID, collectionID, versionID, generation, data)
+	if err != nil {
+		return fmt.Errorf("set generation warnings: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return fmt.Errorf("generation %d: %w", generation, rag.ErrGenerationSuperseded)
 	}
 	return nil
+}
+
+func (r *RAGRepo) LatestReusableGeneration(ctx context.Context, tenantID, collectionID, versionID, profileVersionID string) (int64, []string, error) {
+	var generation int64
+	var data []byte
+	err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT generation, warnings FROM index_generations
+		WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3
+		  AND chunk_profile_version_id=$4 AND state='published'
+		ORDER BY generation DESC LIMIT 1`, tenantID, collectionID, versionID, profileVersionID).Scan(&generation, &data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil, nil
+	}
+	if err != nil {
+		return 0, nil, fmt.Errorf("find reusable generation: %w", err)
+	}
+	var warnings []string
+	if err := json.Unmarshal(data, &warnings); err != nil {
+		return 0, nil, fmt.Errorf("decode reusable generation warnings: %w", err)
+	}
+	return generation, warnings, nil
+}
+
+// BindGeneration records the index a staged generation is about to be
+// written to — before any point exists, so cleanup always finds them.
+func (r *RAGRepo) BindGeneration(ctx context.Context, tenantID, versionID string, generation int64, c rag.Collection) error {
+	return WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
+		var currentIndex, currentQueryPrefix string
+		if err := tx.QueryRowContext(ctx, `
+			SELECT qdrant_collection, query_prefix FROM knowledge_collections
+			WHERE tenant_id=$1 AND id=$2 FOR SHARE`, tenantID, c.ID).Scan(&currentIndex, &currentQueryPrefix); err != nil {
+			return fmt.Errorf("read generation collection: %w", err)
+		}
+		if currentIndex == c.QdrantCollection {
+			c.QueryPrefix = currentQueryPrefix
+		}
+		res, err := tx.ExecContext(ctx, `
+			UPDATE index_generations SET qdrant_collection = $5, embedding_model = $6, embedding_dimensions = $7,
+			       embed_titles = $8, query_prefix = $9, passage_prefix = $10
+			WHERE tenant_id = $1 AND collection_id = $2 AND object_version_id = $3 AND generation = $4
+			  AND state = 'staging'`,
+			tenantID, c.ID, versionID, generation, c.QdrantCollection, c.EmbeddingModel, c.EmbeddingDimensions, c.EmbedTitles, c.QueryPrefix, c.PassagePrefix)
+		if err != nil {
+			return fmt.Errorf("bind generation index: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return fmt.Errorf("generation %d: %w", generation, rag.ErrGenerationSuperseded)
+		}
+		return nil
+	})
 }
 
 // PublishGenerationFenced makes a staged generation the document's live one.
@@ -1251,6 +1388,8 @@ const listPublishedGenerationsQuery = `
 	SELECT g.collection_id, COALESCE(NULLIF(g.qdrant_collection, ''), c.qdrant_collection),
 	       CASE WHEN g.qdrant_collection = '' THEN c.embedding_model ELSE g.embedding_model END,
 	       CASE WHEN g.qdrant_collection = '' THEN c.embedding_dimensions ELSE g.embedding_dimensions END,
+	       CASE WHEN g.qdrant_collection = '' THEN c.query_prefix ELSE g.query_prefix END,
+	       CASE WHEN g.qdrant_collection = '' THEN c.passage_prefix ELSE g.passage_prefix END,
 	       o.id, g.object_version_id, g.generation, g.state, false
 	FROM index_generations g
 	JOIN source_object_versions v ON v.tenant_id=g.tenant_id AND v.id=g.object_version_id
@@ -1263,7 +1402,7 @@ func scanPublishedGenerations(rows *sql.Rows) ([]rag.IndexGeneration, error) {
 	for rows.Next() {
 		var generation rag.IndexGeneration
 		if err := rows.Scan(&generation.CollectionID, &generation.QdrantCollection, &generation.EmbeddingModel, &generation.EmbeddingDimensions,
-			&generation.ObjectID, &generation.ObjectVersionID, &generation.Generation, &generation.State, &generation.Tombstoned); err != nil {
+			&generation.QueryPrefix, &generation.PassagePrefix, &generation.ObjectID, &generation.ObjectVersionID, &generation.Generation, &generation.State, &generation.Tombstoned); err != nil {
 			return nil, fmt.Errorf("scan published generation: %w", err)
 		}
 		result = append(result, generation)

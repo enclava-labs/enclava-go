@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -33,6 +34,65 @@ func TestRenderInjectsPromptVariables(t *testing.T) {
 	}
 	if rendered.UserPrompt != "Question: Where is the citadel?" {
 		t.Fatalf("unexpected user prompt: %q", rendered.UserPrompt)
+	}
+}
+
+func TestDefaultTemplatePlacesContextBeforeQuestion(t *testing.T) {
+	template := prompts.DefaultTemplates()[0]
+	rendered, err := prompts.Render(template, prompts.RenderInput{UserInput: "question", RAGContext: "retrieved passage"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rendered.SystemPrompt, "retrieved passage") || rendered.UserPrompt != "Context:\nretrieved passage\n\nquestion" {
+		t.Fatalf("unexpected rendered prompt: %#v", rendered)
+	}
+	rendered, err = prompts.Render(template, prompts.RenderInput{UserInput: "question"})
+	if err != nil || rendered.UserPrompt != "question" {
+		t.Fatalf("empty context: %#v, %v", rendered, err)
+	}
+}
+
+func TestDefaultTemplateMigrationPreservesCustomizations(t *testing.T) {
+	db := testdb.New(t)
+	ctx := context.Background()
+	original := testdb.SeedTenant(t, db, "prompt-migration-original")
+	custom := testdb.SeedTenant(t, db, "prompt-migration-custom")
+	oldSystem := "You are a concise, accurate assistant. Use the provided context when it is relevant. If the context is insufficient, answer from general knowledge and say when you are uncertain.\n\n{{.rag_context}}"
+	for _, tenant := range []string{original, custom} {
+		user := "{{.user_input}}"
+		if tenant == custom {
+			user = "Custom: {{.user_input}}"
+		}
+		_, err := db.SQL.ExecContext(ctx, `INSERT INTO prompt_templates (tenant_id, id, name, system_prompt, user_prompt) VALUES ($1, $2, $3, $4, $5)`,
+			tenant, prompts.DefaultTemplateID, "Default", oldSystem, user)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	migration, err := os.ReadFile("../store/postgres/migrations/039_chat_context_and_reservation.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.SplitN(string(migration), ";", 2)
+	if len(parts) != 2 {
+		t.Fatal("migration missing template update")
+	}
+	if _, err := db.SQL.ExecContext(ctx, parts[1]); err != nil {
+		t.Fatal(err)
+	}
+	for _, tenant := range []string{original, custom} {
+		var system, user string
+		if err := db.SQL.QueryRowContext(ctx, `SELECT system_prompt, user_prompt FROM prompt_templates WHERE tenant_id = $1 AND id = $2`, tenant, prompts.DefaultTemplateID).Scan(&system, &user); err != nil {
+			t.Fatal(err)
+		}
+		if tenant == original {
+			want := prompts.DefaultTemplates()[0]
+			if system != want.SystemPrompt || user != want.UserPrompt {
+				t.Fatalf("default not migrated: %q %q", system, user)
+			}
+		} else if system != oldSystem || user != "Custom: {{.user_input}}" {
+			t.Fatalf("customized template changed: %q %q", system, user)
+		}
 	}
 }
 

@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: enclava
+          POSTGRES_PASSWORD: enclava
+          POSTGRES_DB: enclava
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U enclava -d enclava"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      qdrant:
+        image: qdrant/qdrant:v1.15.5
+        ports:
+          - 6333:6333
+    env:
+      ENCLAVA_TEST_DATABASE_URL: postgres://enclava:enclava@127.0.0.1:5432/enclava?sslmode=disable
+      QDRANT_INTEGRATION_URL: http://127.0.0.1:6333
+      ENCLAVA_TEST_QDRANT_URL: http://127.0.0.1:6333
+      # ENCLAVA_NATIVE_INTEGRATION is unset because hosted runners restrict bwrap user namespaces.
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check out confidential inference SDK
+        run: |
+          git clone --quiet https://github.com/enclava-labs/confidential-inference-sdk ../enclava-proxy-sdk/confidential-inference-sdk
+          # Keep this pin in sync with the Dockerfile.
+          git -C ../enclava-proxy-sdk/confidential-inference-sdk checkout --quiet cfcaae5c337a7bfdeef85ed7e060f4ea21fe5117
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+      - name: Install native processors
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils tesseract-ocr bubblewrap ripgrep
+      - name: Wait for Qdrant
+        run: |
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:6333/readyz > /dev/null; then exit 0; fi
+            sleep 2
+          done
+          echo "Qdrant did not become ready" >&2
+          exit 1
+      - name: Check formatting
+        run: make fmt-check
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -count=1 -skip '^(TestOpenAISDKCompatibility|TestExecuteConfidentialSDK.*)$' ./...
+      - name: Entrypoint smoke test
+        run: ./scripts/entrypoint_smoke.sh
+      - name: Lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+          # Legacy findings are tracked separately; new code must be clean.
+          only-new-issues: true
+          args: ./...

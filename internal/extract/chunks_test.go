@@ -10,6 +10,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"enclava-go/internal/artifacts"
 	"enclava-go/internal/source"
 )
 
@@ -129,6 +130,40 @@ func TestChunkTableRowWiseKeepsRowsTogether(t *testing.T) {
 	}
 	if len(chunks) != 2 || chunks[0].Text != "h\nr1\n" || chunks[1].Text != "h\nr2" {
 		t.Fatalf("table rows should remain intact with header context: %#v", chunks)
+	}
+}
+
+func TestCSVHeaderChunksAndCap(t *testing.T) {
+	input := "name,value\n" + strings.Repeat("alice,42\n", 1000)
+	parsed, err := csvBlocks([]byte(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := source.ObjectRef{TenantID: "tenant", ObjectID: "csv", ObservedSeq: 1}
+	doc := makeDocument(ref, artifacts.Ref{SHA256: "csv"}, parsed)
+	profile := source.ChunkProfile{ID: "cpv", ProfileID: "csv", Version: 1, SizeCodePoints: 100, BoundaryStrategy: "fixed", TableHandling: "atomic"}
+	chunks, err := Chunk(doc, profile)
+	if err != nil || len(chunks) >= 200 {
+		t.Fatalf("packed chunks = %d, %v", len(chunks), err)
+	}
+	for _, chunk := range chunks {
+		if !strings.HasPrefix(chunk.Text, "name\tvalue\n") || len(chunk.Spans) < 2 || chunk.Spans[0].BlockID != doc.Blocks[0].ID || chunk.Spans[0].ByteEnd != len(doc.Blocks[0].Text) {
+			t.Fatalf("missing header context: %#v", chunk)
+		}
+	}
+	profile.TableHandling = "row-wise"
+	chunks, err = Chunk(doc, profile)
+	if err != nil || len(chunks) != 1000 || chunks[0].Text != "name\tvalue\nalice\t42" {
+		t.Fatalf("row-wise chunks = %d, %v", len(chunks), err)
+	}
+	parsed, err = csvBlocks([]byte("h\n" + strings.Repeat("r\n", MaxChunksPerDocument+1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc = makeDocument(ref, artifacts.Ref{SHA256: "cap"}, parsed)
+	chunks, err = Chunk(doc, profile)
+	if err != nil || len(chunks) != MaxChunksPerDocument || !strings.HasPrefix(chunks[len(chunks)-1].Warnings[0], "truncated:") {
+		t.Fatalf("chunk cap = %d, %v", len(chunks), err)
 	}
 }
 

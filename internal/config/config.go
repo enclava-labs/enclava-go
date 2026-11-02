@@ -39,6 +39,12 @@ type Config struct {
 	// default model get unless they choose one; 0 = the model's full output.
 	DefaultEmbeddingDimensions int
 	ConnectorSyncInterval      time.Duration
+	SourceAccessMaxStale       time.Duration
+	JobTimeout                 time.Duration
+	UtilityModel               string
+	IndexRetirementSoak        time.Duration
+	MetricsToken               string
+	MetricsAuthDisabled        bool
 	TinfoilAPIKey              string
 	TinfoilEnclave             string
 	TinfoilRepo                string
@@ -115,6 +121,12 @@ func Load() (Config, error) {
 		QdrantURL:               strings.TrimSpace(getEnv("QDRANT_URL", "http://localhost:6333")),
 		DefaultEmbeddingModel:   strings.TrimSpace(getEnv("DEFAULT_EMBEDDING_MODEL", "qwen3-embedding-4b")),
 		ConnectorSyncInterval:   getEnvDuration("CONNECTOR_SYNC_INTERVAL", 0),
+		SourceAccessMaxStale:    168 * time.Hour,
+		JobTimeout:              2 * time.Hour,
+		UtilityModel:            strings.TrimSpace(getEnv("UTILITY_MODEL", "")),
+		IndexRetirementSoak:     24 * time.Hour,
+		MetricsToken:            getEnv("METRICS_TOKEN", ""),
+		MetricsAuthDisabled:     getEnvBool("METRICS_AUTH_DISABLED", false),
 		TinfoilAPIKey:           getEnv("TINFOIL_API_KEY", ""),
 		TinfoilEnclave:          getEnv("TINFOIL_ENCLAVE", ""),
 		TinfoilRepo:             getEnv("TINFOIL_REPO", ""),
@@ -139,6 +151,24 @@ func Load() (Config, error) {
 		InferenceMaxHTTPQueue:           getEnvInt("INFERENCE_MAX_HTTP_QUEUE", 128),
 		InferenceMaxBodyBytes:           getEnvInt64("INFERENCE_MAX_BODY_BYTES", 256<<20),
 		InferenceDefaultMaxOutputTokens: getEnvInt64("INFERENCE_DEFAULT_MAX_OUTPUT_TOKENS", 16384),
+	}
+	for name, target := range map[string]*time.Duration{
+		"SOURCE_ACCESS_MAX_STALE": &cfg.SourceAccessMaxStale,
+		"JOB_TIMEOUT":             &cfg.JobTimeout,
+		"INDEX_RETIREMENT_SOAK":   &cfg.IndexRetirementSoak,
+	} {
+		if raw := os.Getenv(name); raw != "" {
+			value, err := time.ParseDuration(raw)
+			if err != nil || value < 0 {
+				return Config{}, fmt.Errorf("%s must be a non-negative duration", name)
+			}
+			*target = value
+		}
+	}
+	if raw := os.Getenv("METRICS_AUTH_DISABLED"); raw != "" {
+		if _, err := strconv.ParseBool(raw); err != nil {
+			return Config{}, fmt.Errorf("METRICS_AUTH_DISABLED must be a boolean")
+		}
 	}
 	if cfg.Provider == "openai" {
 		cfg.Provider = "privatemode"

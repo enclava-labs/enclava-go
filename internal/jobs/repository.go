@@ -38,6 +38,12 @@ type ClaimedJob struct {
 	AttemptID string
 }
 
+type JobCount struct {
+	Operation string
+	Status    string
+	Count     int64
+}
+
 // JobsRepository is the durable boundary for jobs.Service (JOB-01/JOB-02).
 // Every transition that publishes worker output is fenced by
 // (owner, fence_token): a stale worker's writes are no-ops surfaced as

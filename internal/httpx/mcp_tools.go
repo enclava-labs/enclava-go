@@ -149,6 +149,7 @@ func (a *App) handleMCPServers(w http.ResponseWriter, r *http.Request, p auth.Pr
 			WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_mcp_server")
 			return
 		}
+		a.recordSecurityAudit(r, p, "mcp.server.created", "mcp.server", server.ID, "success")
 		WriteJSON(w, http.StatusCreated, mcpServerJSON(server))
 	default:
 		WriteMethodNotAllowed(w)
@@ -187,12 +188,14 @@ func (a *App) handleMCPServerByID(w http.ResponseWriter, r *http.Request, p auth
 				WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_mcp_server")
 				return
 			}
+			a.recordSecurityAudit(r, p, "mcp.server.updated", "mcp.server", serverID, "success")
 			WriteJSON(w, http.StatusOK, mcpServerJSON(server))
 		case http.MethodDelete:
 			if err := a.mcpRepo.DeleteServer(r.Context(), p.TenantID, serverID); err != nil {
 				http.NotFound(w, r)
 				return
 			}
+			a.recordSecurityAudit(r, p, "mcp.server.deleted", "mcp.server", serverID, "success")
 			WriteJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": serverID})
 		default:
 			WriteMethodNotAllowed(w)
@@ -252,6 +255,7 @@ func (a *App) handleMCPServerByID(w http.ResponseWriter, r *http.Request, p auth
 				WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "mcp_revoke_failed")
 				return
 			}
+			a.recordSecurityAudit(r, p, "mcp.tool.revoked", "mcp.tool", serverID+"/"+toolID, "success")
 			WriteJSON(w, http.StatusOK, map[string]any{"revoked": true, "tool_id": toolID})
 		case http.MethodPut:
 			// Approval never rediscovers: it installs the persisted schemas
@@ -288,6 +292,7 @@ func (a *App) handleMCPServerByID(w http.ResponseWriter, r *http.Request, p auth
 				WriteOpenAIError(w, http.StatusBadRequest, "invalid MCP approval", "invalid_request_error", "invalid_mcp_approval")
 				return
 			}
+			a.recordSecurityAudit(r, p, "mcp.tool.approved", "mcp.tool", serverID+"/"+toolID, "success")
 			WriteJSON(w, http.StatusOK, map[string]any{"approved": true, "server_id": serverID, "tool_id": toolID, "model_name": approval.ModelName, "schema_version": approval.SchemaVersion})
 		default:
 			WriteMethodNotAllowed(w)

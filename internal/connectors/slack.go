@@ -80,11 +80,24 @@ func (a slackAdapter) Content(ctx context.Context, conn source.Connection, curso
 	if err := a.call(ctx, conn, "conversations.history", q, &data); err != nil {
 		return ContentPage{}, err
 	}
+	var info struct {
+		Channel struct {
+			Name string `json:"name"`
+		} `json:"channel"`
+	}
+	if len(data.Messages) > 0 {
+		if err := a.call(ctx, conn, "conversations.info", url.Values{"channel": {channel}}, &info); err != nil {
+			if ctx.Err() != nil {
+				return ContentPage{}, ctx.Err()
+			}
+			info.Channel.Name = ""
+		}
+	}
 	page := ContentPage{Completeness: CompletenessComplete}
 	// Only explicitly requested whole-channel reconciliations can authorize absence sweeps.
 	page.Snapshot = strings.EqualFold(stringFromAny(conn.Config["reconcile"]), "true")
 	for _, msg := range data.Messages {
-		item, err := a.messageItem(ctx, conn, channel, msg)
+		item, err := a.messageItem(ctx, conn, channel, info.Channel.Name, msg)
 		if err != nil {
 			return ContentPage{}, err
 		}
@@ -95,7 +108,8 @@ func (a slackAdapter) Content(ctx context.Context, conn source.Connection, curso
 				return ContentPage{}, err
 			}
 			for _, reply := range replies {
-				item, err := a.messageItem(ctx, conn, channel, reply)
+				reply.ThreadTS = msg.TS
+				item, err := a.messageItem(ctx, conn, channel, info.Channel.Name, reply)
 				if err != nil {
 					return ContentPage{}, err
 				}
@@ -176,7 +190,7 @@ type slackMessage struct {
 	} `json:"files"`
 }
 
-func (a slackAdapter) messageItem(ctx context.Context, conn source.Connection, channel string, msg slackMessage) (ContentItem, error) {
+func (a slackAdapter) messageItem(ctx context.Context, conn source.Connection, channel, title string, msg slackMessage) (ContentItem, error) {
 	if msg.TS == "" {
 		return ContentItem{}, errors.New("slack message omitted ts")
 	}
@@ -188,12 +202,12 @@ func (a slackAdapter) messageItem(ctx context.Context, conn source.Connection, c
 		return ContentItem{}, err
 	}
 	created := slackTimestamp(msg.TS)
-	parent := msg.ThreadTS
-	if parent != "" {
-		parent = "slack:" + channel + ":" + parent
+	parent, parentKind := "slack:"+channel, "channel"
+	if msg.ThreadTS != "" && msg.ThreadTS != msg.TS {
+		parent, parentKind = "slack:"+channel+":"+msg.ThreadTS, "message"
 	}
-	return ContentItem{NativeID: "slack:" + channel + ":" + msg.TS, ParentNativeID: parent,
-		Kind: "message", NativeRevision: msg.TS, Filename: "slack-" + channel + "-" + msg.TS + ".txt", MIMEType: "text/plain",
+	return ContentItem{NativeID: "slack:" + channel + ":" + msg.TS, ParentNativeID: parent, ParentKind: parentKind,
+		Kind: "message", NativeRevision: msg.TS, Title: title, Filename: "slack-" + channel + "-" + msg.TS + ".txt", MIMEType: "text/plain",
 		Text: "[" + msg.TS + " " + msg.User + "] " + msg.Text, URL: permalink.Permalink, CreatedAt: created}, nil
 }
 
@@ -247,7 +261,7 @@ func (a slackAdapter) fileItem(ctx context.Context, conn source.Connection, id s
 		return nil, errors.New("slack files.info omitted file id")
 	}
 	name := firstNonEmpty(f.Name, f.Title, f.ID)
-	return &ContentItem{NativeID: "slack:file:" + f.ID, Kind: "file", NativeRevision: f.ID, Filename: name, MIMEType: f.Mimetype, URL: f.Permalink}, nil
+	return &ContentItem{NativeID: "slack:file:" + f.ID, Kind: "file", NativeRevision: f.ID, Title: f.Name, Filename: name, MIMEType: f.Mimetype, URL: f.Permalink}, nil
 }
 
 func (a slackAdapter) Access(ctx context.Context, conn source.Connection, cursor Cursor, limit int) (AccessPage, error) {
@@ -279,7 +293,7 @@ func (a slackAdapter) Access(ctx context.Context, conn source.Connection, cursor
 			return page, err
 		}
 		for _, uid := range data.Members {
-			page.Grants = append(page.Grants, AccessGrant{NativeObjectID: "slack:" + channel, NativeObjectKind: "channel", NativePrincipalID: uid, NativeGroupID: channel, Scope: "read", Effect: "allow", Inherited: true})
+			page.Grants = append(page.Grants, AccessGrant{NativeObjectID: "slack:" + channel, NativeObjectKind: "channel", NativePrincipalID: uid, NativeGroupID: channel, Scope: "read", Effect: "allow"})
 		}
 		state.Members = data.Metadata.NextCursor
 		state.MembersDone = state.Members == ""

@@ -31,10 +31,13 @@ type Collection struct {
 	QdrantCollection      string `json:"qdrant_collection"`
 	// RetiredQdrantCollections are indexes the collection switched away
 	// from; documents not yet re-embedded are still searched there.
-	RetiredQdrantCollections []string `json:"-"`
-	EmbeddingProvider        string   `json:"embedding_provider,omitempty"`
-	EmbeddingModel           string   `json:"embedding_model"`
-	EmbeddingDimensions      int      `json:"embedding_dimensions"` // 0 = the model's full output
+	RetiredQdrantCollections []string             `json:"-"`
+	RetiredIndexSince        map[string]time.Time `json:"-"`
+	EmbeddingProvider        string               `json:"embedding_provider,omitempty"`
+	EmbeddingModel           string               `json:"embedding_model"`
+	QueryPrefix              string               `json:"query_prefix"`
+	PassagePrefix            string               `json:"passage_prefix"`
+	EmbeddingDimensions      int                  `json:"embedding_dimensions"` // 0 = the model's full output
 	// EmbedTitles prefixes each chunk with its document's name before
 	// embedding: better across many documents, worse inside a single one.
 	EmbedTitles  bool           `json:"embed_titles"`
@@ -67,6 +70,7 @@ type Document struct {
 	Metadata         map[string]any `json:"metadata,omitempty"`
 	QdrantPointCount int            `json:"qdrant_point_count"`
 	ErrorMessage     string         `json:"error_message,omitempty"`
+	Warnings         []string       `json:"warnings,omitempty"`
 	CreatedAt        time.Time      `json:"created_at"`
 	UpdatedAt        time.Time      `json:"updated_at"`
 	ProcessedAt      *time.Time     `json:"processed_at,omitempty"`
@@ -101,6 +105,8 @@ type IndexGeneration struct {
 	QdrantCollection    string
 	EmbeddingModel      string
 	EmbeddingDimensions int
+	QueryPrefix         string
+	PassagePrefix       string
 	ObjectID            string
 	ObjectVersionID     string
 	Generation          int64
@@ -129,6 +135,8 @@ type CreateCollectionInput struct {
 	Description           string         `json:"description,omitempty"`
 	EmbeddingModel        string         `json:"embedding_model,omitempty"`
 	EmbeddingDimensions   *int           `json:"embedding_dimensions,omitempty"`
+	QueryPrefix           *string        `json:"query_prefix,omitempty"`
+	PassagePrefix         *string        `json:"passage_prefix,omitempty"`
 	EmbedTitles           *bool          `json:"embed_titles,omitempty"` // default true
 	ChunkProfileVersionID *string        `json:"chunk_profile_version_id,omitempty"`
 	ChunkSize             int            `json:"chunk_size,omitempty"`
@@ -142,6 +150,8 @@ type UpdateCollectionInput struct {
 	Description           *string        `json:"description,omitempty"`
 	EmbeddingModel        *string        `json:"embedding_model,omitempty"`
 	EmbeddingDimensions   *int           `json:"embedding_dimensions,omitempty"`
+	QueryPrefix           *string        `json:"query_prefix,omitempty"`
+	PassagePrefix         *string        `json:"passage_prefix,omitempty"`
 	EmbedTitles           *bool          `json:"embed_titles,omitempty"`
 	ChunkProfileVersionID *string        `json:"chunk_profile_version_id,omitempty"`
 	ChunkSize             *int           `json:"chunk_size,omitempty"`

@@ -97,7 +97,7 @@ func (f *fixture) grant(objID, kind, subjectID, effect string, rev int64) {
 	var userID, groupID any
 	if kind == source.GrantSubjectGroup {
 		groupID = subjectID
-	} else {
+	} else if kind == source.GrantSubjectUser {
 		userID = subjectID
 	}
 	if _, err := f.db.SQL.ExecContext(f.ctx, `
@@ -204,6 +204,114 @@ func TestSourceACLAllow(t *testing.T) {
 	if err := a.CanRead(f.ctx, f.principal("alice"), obj, source.ReadOptions{}); err != nil {
 		t.Fatalf("group allow must read: %v", err)
 	}
+}
+
+func TestSourceACLAncestorGrants(t *testing.T) {
+	f := newFixture(t)
+	f.conn("conn_a", "active")
+	root := f.obj("root", "conn_a", source.AuthorizationSourceACL)
+	parent := f.obj("parent", "conn_a", source.AuthorizationSourceACL)
+	child := f.obj("child", "conn_a", source.AuthorizationSourceACL)
+	for _, edge := range [][2]string{{parent.ID, root.ID}, {child.ID, parent.ID}} {
+		if _, err := f.db.SQL.ExecContext(f.ctx,
+			`UPDATE source_objects SET parent_object_id = $3 WHERE tenant_id = $1 AND id = $2`,
+			f.tenant, edge[0], edge[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.identity("sid_alice", "alice-gh", "alice")
+	f.completeSnapshot(source.SnapshotMembership, 1, 0)
+	f.completeSnapshot(source.SnapshotGrants, 1, 0)
+	f.grant(root.ID, source.GrantSubjectUser, "sid_alice", source.GrantEffectAllow, 1)
+	a := source.NewAuthorizer(f.repo, time.Hour)
+	if err := a.CanRead(f.ctx, f.principal("alice"), child, source.ReadOptions{}); err != nil {
+		t.Fatalf("ancestor allow must apply: %v", err)
+	}
+	f.grant(parent.ID, source.GrantSubjectUser, "sid_alice", source.GrantEffectDeny, 1)
+	mustDeny(t, a.CanRead(f.ctx, f.principal("alice"), child, source.ReadOptions{}))
+	f.grant(child.ID, source.GrantSubjectUser, "sid_alice", source.GrantEffectAllow, 1)
+	mustDeny(t, a.CanRead(f.ctx, f.principal("alice"), child, source.ReadOptions{}))
+	if err := f.repo.TombstoneObject(f.ctx, f.tenant, parent.ID); err != nil {
+		t.Fatal(err)
+	}
+	mustDeny(t, a.CanRead(f.ctx, f.principal("alice"), child, source.ReadOptions{}))
+}
+
+func TestSourceACLAncestorChainBounds(t *testing.T) {
+	f := newFixture(t)
+	f.conn("conn_a", "active")
+	f.identity("sid_alice", "alice-gh", "alice")
+	f.completeSnapshot(source.SnapshotMembership, 1, 0)
+	f.completeSnapshot(source.SnapshotGrants, 1, 0)
+	objects := make([]source.Object, 10)
+	var previous source.Object
+	for i := range objects {
+		objects[i] = f.obj(fmt.Sprintf("node_%d", i), "conn_a", source.AuthorizationSourceACL)
+		if i > 0 {
+			if _, err := f.db.SQL.ExecContext(f.ctx,
+				`UPDATE source_objects SET parent_object_id = $3 WHERE tenant_id = $1 AND id = $2`,
+				f.tenant, objects[i].ID, previous.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		previous = objects[i]
+	}
+	f.grant(objects[0].ID, source.GrantSubjectUser, "sid_alice", source.GrantEffectAllow, 1)
+	a := source.NewAuthorizer(f.repo, time.Hour)
+	if err := a.CanRead(f.ctx, f.principal("alice"), objects[8], source.ReadOptions{}); err != nil {
+		t.Fatalf("eight ancestor edges must be accepted: %v", err)
+	}
+	mustDeny(t, a.CanRead(f.ctx, f.principal("alice"), objects[9], source.ReadOptions{}))
+	if _, err := f.db.SQL.ExecContext(f.ctx,
+		`UPDATE source_objects SET parent_object_id = $3 WHERE tenant_id = $1 AND id = $2`,
+		f.tenant, objects[0].ID, objects[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	mustDeny(t, a.CanRead(f.ctx, f.principal("alice"), objects[1], source.ReadOptions{}))
+}
+
+func TestSourceACLMembershipNeededForGroups(t *testing.T) {
+	f := newFixture(t)
+	f.conn("conn_a", "active")
+	obj := f.obj("obj_acl", "conn_a", source.AuthorizationSourceACL)
+	f.identity("sid_alice", "alice-gh", "alice")
+	f.group("grp_devs", "devs")
+	f.completeSnapshot(source.SnapshotGrants, 1, 0)
+	f.grant(obj.ID, source.GrantSubjectUser, "sid_alice", source.GrantEffectAllow, 1)
+	a := source.NewAuthorizer(f.repo, time.Hour)
+	p := f.principal("alice")
+	if err := a.CanRead(f.ctx, p, obj, source.ReadOptions{}); err != nil {
+		t.Fatalf("direct grant without membership snapshot: %v", err)
+	}
+	f.grant(obj.ID, source.GrantSubjectGroup, "grp_devs", source.GrantEffectAllow, 1)
+	if err := a.CanRead(f.ctx, p, obj, source.ReadOptions{}); err != nil {
+		t.Fatalf("unknown group allow must not invalidate direct grant: %v", err)
+	}
+	f.grant(obj.ID, source.GrantSubjectGroup, "grp_devs", source.GrantEffectDeny, 1)
+	mustDeny(t, a.CanRead(f.ctx, p, obj, source.ReadOptions{}))
+	f.completeSnapshot(source.SnapshotMembership, 1, 3*time.Hour)
+	mustDeny(t, a.CanRead(f.ctx, p, obj, source.ReadOptions{}))
+	f.completeSnapshot(source.SnapshotMembership, 2, 0)
+	if err := a.CanRead(f.ctx, p, obj, source.ReadOptions{}); err != nil {
+		t.Fatalf("fresh non-member must retain direct grant: %v", err)
+	}
+	f.member("grp_devs", "sid_alice", 2)
+	mustDeny(t, a.CanRead(f.ctx, p, obj, source.ReadOptions{}))
+}
+
+func TestSourceACLEveryoneGrant(t *testing.T) {
+	f := newFixture(t)
+	f.conn("conn_a", "active")
+	obj := f.obj("obj_acl", "conn_a", source.AuthorizationSourceACL)
+	f.completeSnapshot(source.SnapshotGrants, 1, 0)
+	f.grant(obj.ID, source.GrantSubjectAll, "", source.GrantEffectAllow, 1)
+	a := source.NewAuthorizer(f.repo, time.Hour)
+	p := f.principal("alice")
+	if err := a.CanRead(f.ctx, p, obj, source.ReadOptions{}); err != nil {
+		t.Fatalf("everyone allow does not require a source identity: %v", err)
+	}
+	f.grant(obj.ID, source.GrantSubjectAll, "", source.GrantEffectDeny, 1)
+	mustDeny(t, a.CanRead(f.ctx, p, obj, source.ReadOptions{}))
 }
 
 func TestSourceACLDenials(t *testing.T) {

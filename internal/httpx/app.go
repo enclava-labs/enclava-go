@@ -27,36 +27,41 @@ import (
 )
 
 type App struct {
-	authSvc      *auth.Service
-	provider     llm.Provider
-	providerID   string
-	prober       *llm.Prober
-	identity     *postgres.IdentityRepo
-	extractSvc   *extract.Service
-	ragSvc       *rag.Service
-	promptSvc    *prompts.Service
-	chatbotSvc   *chatbot.Service
-	connectorSvc *connectors.Service
-	billingSvc   *billing.Service
-	billingRepo  *postgres.BillingRepo
-	endpoints    *postgres.EndpointsRepo
-	apiKeyAlgo   string
-	apiKeyPepper string
-	apiKeyPrefix string
-	corsOrigins  []string
-	sessionAuth  *SessionAuth
-	maxUploadMB  int64
-	trustProxy   bool
-	executor     *inference.Service
-	bindings     *postgres.ResponseBindingsRepo
-	sourceRepo   *postgres.SourceRepo
-	artifactRepo *postgres.ArtifactRepo
-	mcpRepo      *postgres.MCPToolsRepo
-	mcpTransport *mcp.StreamableHTTP
-	jobsSvc      *jobs.Service
-	rl           *RateLimiter
-	gate         *inferenceGate
-	mux          *http.ServeMux
+	authSvc             *auth.Service
+	provider            llm.Provider
+	providerID          string
+	prober              *llm.Prober
+	identity            *postgres.IdentityRepo
+	extractSvc          *extract.Service
+	ragSvc              *rag.Service
+	promptSvc           *prompts.Service
+	chatbotSvc          *chatbot.Service
+	connectorSvc        *connectors.Service
+	billingSvc          *billing.Service
+	billingRepo         *postgres.BillingRepo
+	endpoints           *postgres.EndpointsRepo
+	apiKeyAlgo          string
+	apiKeyPepper        string
+	apiKeyPrefix        string
+	corsOrigins         []string
+	sessionAuth         *SessionAuth
+	maxUploadMB         int64
+	trustProxy          bool
+	executor            *inference.Service
+	bindings            *postgres.ResponseBindingsRepo
+	sourceRepo          *postgres.SourceRepo
+	artifactRepo        *postgres.ArtifactRepo
+	mcpRepo             *postgres.MCPToolsRepo
+	mcpTransport        *mcp.StreamableHTTP
+	jobsSvc             *jobs.Service
+	securityAudit       SecurityAuditRecorder
+	metricsToken        string
+	metricsAuthDisabled bool
+	metricsJobs         jobCounter
+	metricsAdmission    *inference.Admission
+	rl                  *RateLimiter
+	gate                *inferenceGate
+	mux                 *http.ServeMux
 }
 
 // ConfigureActivity wires the shared durable-job service after construction
@@ -167,6 +172,7 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/health", a.handleHealth)
 	a.mux.HandleFunc("/livez", a.handleLivez)
 	a.mux.HandleFunc("/readyz", a.handleReadyz)
+	a.mux.HandleFunc("/metrics", a.handleMetrics)
 
 	// Paid paths not backed by the shared executor remain unmounted; only
 	// owned metadata and authentication surfaces are registered here.
@@ -218,6 +224,7 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/api/v1/admin/usage/summary", a.authenticated("platform.admin", a.handleAdminUsageSummary))
 	a.mux.HandleFunc("/api/v1/admin/pricing", a.authenticated("pricing.manage", a.handleAdminPricing))
 	a.mux.HandleFunc("/api/v1/admin/billing-audit", a.authenticated("platform.admin", a.handleAdminBillingAudit))
+	a.mux.HandleFunc("/api/v1/admin/security-audit", a.authenticated("platform.admin", a.handleSecurityAudit))
 	// 08-07: the narrow budget write API — create, all-subject list and
 	// limit-only PATCH. The legacy is_unlimited/budget_* fields on the
 	// api-key route stay no-ops; these routes are the real budget surface.

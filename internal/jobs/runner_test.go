@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -318,6 +319,88 @@ func TestRunnerConcurrencyBound(t *testing.T) {
 	}
 	if m := max.Load(); m > int32(capN) {
 		t.Fatalf("concurrency bound violated: %d > %d", m, capN)
+	}
+}
+
+func TestRunnerJobTimeoutFreesSlot(t *testing.T) {
+	for _, dispatched := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dispatched=%t", dispatched), func(t *testing.T) {
+			svc, _, tenant := runnerSetup(t)
+			p := principal(tenant, "a", "c")
+			// The undispatched deadline exercises the retry path: attempt 1
+			// requeues (attempt+1 < maxAttempts), attempt 2 fails terminally.
+			first := enqueue(t, svc, p, req(tenant, "timeout", "op.timeout", "h", 1))
+			var calls atomic.Int32
+			var once sync.Once
+			started := make(chan struct{})
+			canceled := make(chan error, 4)
+			r := jobs.NewRunner(svc, stubResolver{}, map[string]jobs.HandlerFunc{
+				"op.timeout": func(ctx context.Context, claim *jobs.Claim, _ jobs.InputFunc) (string, error) {
+					calls.Add(1)
+					if dispatched {
+						if err := claim.MarkDispatched(ctx); err != nil {
+							return "", err
+						}
+					}
+					once.Do(func() { close(started) })
+					<-ctx.Done()
+					canceled <- ctx.Err()
+					return "", ctx.Err()
+				},
+				"op.next": func(context.Context, *jobs.Claim, jobs.InputFunc) (string, error) {
+					return "ok", nil
+				},
+			}, jobs.RunnerConfig{Concurrency: 1, PollInterval: 5 * time.Millisecond, LeaseTTL: 2 * time.Second, JobTimeout: 100 * time.Millisecond})
+			ctx, stop := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- r.Run(ctx) }()
+			defer func() {
+				stop()
+				if err := <-done; err != nil {
+					t.Errorf("runner returned %v", err)
+				}
+			}()
+			select {
+			case <-started:
+			case <-time.After(3 * time.Second):
+				t.Fatal("handler did not start")
+			}
+			second := enqueue(t, svc, p, req(tenant, "next", "op.next", "h", 1))
+			select {
+			case err := <-canceled:
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("handler cancellation = %v", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("handler was not canceled")
+			}
+			want := jobs.StatusFailed
+			wantCalls := int32(2) // retry, then terminal failure
+			if dispatched {
+				want = jobs.StatusUnknown
+				wantCalls = 1
+			}
+			waitStatus(t, svc, p, first.ID, want, 3*time.Second)
+			if got := calls.Load(); got != wantCalls {
+				t.Fatalf("handler calls = %d, want %d", got, wantCalls)
+			}
+			// The freed slot let a Concurrency=1 runner claim the next job.
+			waitStatus(t, svc, p, second.ID, jobs.StatusSucceeded, 3*time.Second)
+		})
+	}
+}
+
+func TestJobCountsByOperationStatus(t *testing.T) {
+	svc, db, tenant := runnerSetup(t)
+	p := principal(tenant, "a", "c")
+	enqueue(t, svc, p, req(tenant, "one", "op.count", "h", 1))
+	enqueue(t, svc, p, req(tenant, "two", "op.count", "h", 1))
+	counts, err := postgres.NewJobsRepo(db).CountByOperationStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(counts) != 1 || counts[0].Operation != "op.count" || counts[0].Status != jobs.StatusQueued || counts[0].Count != 2 {
+		t.Fatalf("unexpected job counts: %+v", counts)
 	}
 }
 

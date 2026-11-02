@@ -44,7 +44,11 @@ type Builtins struct {
 }
 
 func BuiltinToolDefinitions(bot Instance) ([]map[string]any, error) {
-	return builtinToolDefinitions(bot, nil)
+	tools, err := builtinToolDefinitions(bot, nil)
+	if err == nil {
+		modelToolNames(tools)
+	}
+	return tools, err
 }
 
 func builtinToolDefinitions(bot Instance, allowedMCP map[string]struct{}) ([]map[string]any, error) {
@@ -143,9 +147,6 @@ func (b Builtins) Invoke(ctx context.Context, p auth.Principal, bot Instance, to
 		if err != nil {
 			return BuiltinResult{}, err
 		}
-		if len(value) > maxBuiltinOutputBytes {
-			return BuiltinResult{}, errors.New("chatbot: knowledge tool output exceeds byte limit")
-		}
 		return BuiltinResult{Value: value, InputRefs: ragInputs(results), EvidenceIDs: evidenceIDsForResults(results)}, nil
 	case "evidence.read":
 		if b.Evidence == nil {
@@ -164,9 +165,6 @@ func (b Builtins) Invoke(ctx context.Context, p auth.Principal, bot Instance, to
 		value, err := json.Marshal(text)
 		if err != nil {
 			return BuiltinResult{}, err
-		}
-		if len(value) > maxBuiltinOutputBytes {
-			return BuiltinResult{}, errors.New("chatbot: evidence output exceeds byte limit")
 		}
 		return BuiltinResult{Value: value, InputRefs: ragInputs([]rag.SearchResult{{DocumentID: text.DocumentID, Spans: text.Spans}}), EvidenceIDs: []string{text.EvidenceID}}, nil
 	case "extract.submit":
@@ -219,9 +217,6 @@ func (b Builtins) Invoke(ctx context.Context, p auth.Principal, bot Instance, to
 		value, err := json.Marshal(result)
 		if err != nil {
 			return BuiltinResult{}, err
-		}
-		if len(value) > maxBuiltinOutputBytes {
-			return BuiltinResult{}, ErrInvalidInput
 		}
 		return BuiltinResult{Value: value}, nil
 	default:

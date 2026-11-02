@@ -303,6 +303,120 @@ func TestIdentitySelfServiceAndRevocation(t *testing.T) {
 	_ = sessionID
 }
 
+func TestIdentityPasswordChangeRevokesOtherSessions(t *testing.T) {
+	f := newIdentityFixture(t)
+	audit := postgres.NewSecurityAuditRepo(f.db)
+	f.app.SetSecurityAudit(audit)
+	user := testdb.SeedUser(t, f.db, f.tenant, "password-sessions@example.com", nil)
+	setPassword(t, f.repo, f.tenant, user.ID, "old-password")
+	current, csrf := login(t, f.app, "password-sessions@example.com", "old-password")
+	other, _ := login(t, f.app, "password-sessions@example.com", "old-password")
+
+	rec := sessionDo(t, f.app, http.MethodPost, "/api/v1/identities/me/password",
+		`{"current_password":"wrong","password":"new-password"}`, current, csrf)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("wrong password: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = sessionDo(t, f.app, http.MethodGet, "/api/v1/identities/me", "", other, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("failed change revoked another session: %d", rec.Code)
+	}
+
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/identities/me/password",
+		`{"current_password":"old-password","password":"new-password"}`, current, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("change password: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = sessionDo(t, f.app, http.MethodGet, "/api/v1/identities/me", "", current, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("current session should survive: %d", rec.Code)
+	}
+	rec = sessionDo(t, f.app, http.MethodGet, "/api/v1/identities/me", "", other, nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("other session should be revoked: %d", rec.Code)
+	}
+
+	other, _ = login(t, f.app, "password-sessions@example.com", "new-password")
+	rec = f.admin(t, http.MethodPost, "/api/v1/identities/users/"+user.ID+"/password", `{"password":"admin-reset"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin reset: %d %s", rec.Code, rec.Body.String())
+	}
+	for _, sess := range []*http.Cookie{current, other} {
+		rec = sessionDo(t, f.app, http.MethodGet, "/api/v1/identities/me", "", sess, nil)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("admin reset should revoke every session: %d", rec.Code)
+		}
+	}
+	rows, err := audit.List(context.Background(), f.tenant, 100, "")
+	if err != nil {
+		t.Fatalf("list audit: %v", err)
+	}
+	counts := map[string]int{}
+	for _, row := range rows {
+		if row.TargetKind != "user" || row.TargetID != user.ID || row.Outcome != "success" {
+			t.Fatalf("unexpected audit row: %+v", row)
+		}
+		counts[row.Action]++
+		encoded, err := json.Marshal(row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, secret := range []string{"old-password", "new-password", "admin-reset", "wrong"} {
+			if strings.Contains(string(encoded), secret) {
+				t.Fatalf("audit contains password %q", secret)
+			}
+		}
+	}
+	if counts["auth.password.changed"] != 2 || counts["auth.sessions.revoked"] != 2 || len(rows) != 4 {
+		t.Fatalf("password audit events: %v", counts)
+	}
+}
+
+func TestIdentityRoleSecurityAudit(t *testing.T) {
+	f := newIdentityFixture(t)
+	audit := postgres.NewSecurityAuditRepo(f.db)
+	f.app.SetSecurityAudit(audit)
+	user := testdb.SeedUser(t, f.db, f.tenant, "role-audit@example.com", nil)
+	rec := f.admin(t, http.MethodPost, "/api/v1/identities/roles", `{"name":"audited","scopes":[]}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create role: %d %s", rec.Code, rec.Body.String())
+	}
+	roleID := decodeJSON(t, rec)["id"].(string)
+	for _, tc := range []struct{ method, path, body string }{
+		{http.MethodPatch, "/api/v1/identities/roles/" + roleID, `{"name":"renamed"}`},
+		{http.MethodPut, "/api/v1/identities/users/" + user.ID + "/roles/" + roleID, ""},
+		{http.MethodDelete, "/api/v1/identities/users/" + user.ID + "/roles/" + roleID, ""},
+		{http.MethodDelete, "/api/v1/identities/roles/" + roleID, ""},
+	} {
+		rec = f.admin(t, tc.method, tc.path, tc.body)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s %s: %d %s", tc.method, tc.path, rec.Code, rec.Body.String())
+		}
+	}
+	rows, err := audit.List(context.Background(), f.tenant, 100, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"identity.role.created": roleID, "identity.role.updated": roleID,
+		"identity.role.assigned": user.ID, "identity.role.unassigned": user.ID,
+		"identity.role.deleted": roleID,
+	}
+	for _, row := range rows {
+		target, ok := want[row.Action]
+		if !ok || row.TargetID != target || row.Outcome != "success" || row.ActorID == "" || row.TenantID != f.tenant {
+			t.Fatalf("unexpected role audit row: %+v", row)
+		}
+		if (row.Action == "identity.role.assigned" || row.Action == "identity.role.unassigned") && row.Details["role_id"] != roleID {
+			t.Fatalf("membership audit missing role: %+v", row)
+		}
+		delete(want, row.Action)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing role audit events: %v", want)
+	}
+}
+
 func TestIdentityAdminSessionOpsAndLink(t *testing.T) {
 	f := newIdentityFixture(t)
 	ctx := context.Background()

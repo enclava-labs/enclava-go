@@ -20,7 +20,18 @@ func TestGitHubContentPinsIdentityToConnectionAndRevision(t *testing.T) {
 	mux.HandleFunc("/repos/acme/docs/issues/7/comments", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode([]any{map[string]any{"id": 100, "body": "comment", "updated_at": "2026-01-02T00:00:00Z", "html_url": "https://github.com/acme/docs/issues/7#issuecomment-100"}})
 	})
-	mux.HandleFunc("/repos/acme/docs/pulls", func(w http.ResponseWriter, r *http.Request) { json.NewEncoder(w).Encode([]any{}) })
+	mux.HandleFunc("/repos/acme/docs/pulls", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]any{map[string]any{"id": 101, "number": 8, "title": "Fix bug", "body": "fix", "updated_at": issueRevision}})
+	})
+	mux.HandleFunc("/repos/acme/docs/issues/8/comments", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]any{map[string]any{"id": 102, "body": "discussion"}})
+	})
+	mux.HandleFunc("/repos/acme/docs/pulls/8/comments", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]any{map[string]any{"id": 103, "body": "review"}})
+	})
+	mux.HandleFunc("/repos/acme/docs/collaborators", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]any{map[string]any{"login": "alice", "permissions": map[string]bool{"push": true}}, map[string]any{"id": 42, "permissions": map[string]bool{"pull": true}}})
+	})
 	mux.HandleFunc("/repos/acme/docs/commits/HEAD", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"sha": "commit1"})
 	})
@@ -49,6 +60,9 @@ func TestGitHubContentPinsIdentityToConnectionAndRevision(t *testing.T) {
 	if page.Items[0].URL != "https://github.com/acme/docs/blob/commit1/guide.md" || page.Completeness != CompletenessIncomplete || page.NextCursor == "" {
 		t.Fatalf("unexpected revision/link/completeness: %#v", page)
 	}
+	if page.Items[0].Title != "guide.md" || page.Items[0].ParentNativeID != "github:conn1:acme/docs" || page.Items[0].ParentKind != "repository" {
+		t.Fatalf("file title or repository parent missing: %#v", page.Items[0])
+	}
 	page, err = g.Content(context.Background(), conn, page.NextCursor, 100)
 	if err != nil {
 		t.Fatal(err)
@@ -56,12 +70,42 @@ func TestGitHubContentPinsIdentityToConnectionAndRevision(t *testing.T) {
 	if len(page.Items) != 2 || page.Items[0].Kind != "issues" || page.Items[1].ParentNativeID != page.Items[0].NativeID || page.Items[0].NativeRevision != issueRevision || page.Items[0].URL == "" {
 		t.Fatalf("issue/comment identity or revision missing: %#v", page.Items)
 	}
+	if page.Items[0].Title != "Bug" || page.Items[0].ParentNativeID != "github:conn1:acme/docs" || page.Items[0].ParentKind != "repository" ||
+		page.Items[1].Title != "Bug" || page.Items[1].ParentKind != "issues" || page.Items[1].NativeID != "github:conn1:acme/docs:comment:100" {
+		t.Fatalf("issue/comment title or parent missing: %#v", page.Items)
+	}
 	page, err = g.Content(context.Background(), conn, page.NextCursor, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if page.NextCursor != "" || page.Completeness != CompletenessComplete {
 		t.Fatalf("expected complete terminal page: %#v", page)
+	}
+	if len(page.Items) != 3 || page.Items[0].NativeID != "github:conn1:acme/docs:pulls:101" ||
+		page.Items[0].Title != "Fix bug" || page.Items[0].ParentNativeID != "github:conn1:acme/docs" || page.Items[0].ParentKind != "repository" {
+		t.Fatalf("pull request title or repository parent missing: %#v", page.Items)
+	}
+	for _, item := range page.Items[1:] {
+		if item.Title != "Fix bug" || item.ParentNativeID != page.Items[0].NativeID || item.ParentKind != "pulls" {
+			t.Fatalf("pull request comment title or parent missing: %#v", item)
+		}
+	}
+	if page.Items[1].NativeID != "github:conn1:acme/docs:comment:102" || page.Items[2].NativeID != "github:conn1:acme/docs:review_comment:103" {
+		t.Fatalf("pull request comment IDs changed: %#v", page.Items)
+	}
+	access, err := g.Access(context.Background(), conn, "", 100)
+	if err != nil || len(access.Grants) != 2 || !access.Snapshot {
+		t.Fatalf("collaborators missing: %#v, %v", access, err)
+	}
+	for i, id := range []string{"alice", "42"} {
+		grant := access.Grants[i]
+		if grant.NativeObjectID != "github:conn1:acme/docs" || grant.NativeObjectKind != "repository" || grant.NativePrincipalID != id || grant.Scope != "read" || grant.Effect != "allow" {
+			t.Fatalf("invalid collaborator grant: %#v", grant)
+		}
+	}
+	members, err := g.Membership(context.Background(), conn, "", 100)
+	if err != nil || len(members.Memberships) != 2 || members.Memberships[0].NativeGroupID != "acme/docs" || members.Memberships[0].NativePrincipalID != "alice" {
+		t.Fatalf("collaborator membership missing: %#v, %v", members, err)
 	}
 	issueRevision = "2026-02-01T00:00:00Z"
 	updated, err := g.Content(context.Background(), conn, "", 100)

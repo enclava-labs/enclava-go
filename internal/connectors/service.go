@@ -264,7 +264,14 @@ func (s *Service) ListSources(ctx context.Context, p auth.Principal, sourceType 
 		if wanted != "" && c.Kind != wanted {
 			continue
 		}
-		out = append(out, connectionView(c))
+		view := connectionView(c)
+		if s.observations != nil {
+			view.UnmappedPrincipals, err = s.observations.UnmappedPrincipals(ctx, p.TenantID, c.ID)
+			if err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, view)
 	}
 	if offset > 0 {
 		if offset >= len(out) {
@@ -286,7 +293,14 @@ func (s *Service) GetSource(ctx context.Context, p auth.Principal, id string) (S
 	if err != nil {
 		return Source{}, err
 	}
-	return connectionView(c), nil
+	view := connectionView(c)
+	if s.observations != nil {
+		view.UnmappedPrincipals, err = s.observations.UnmappedPrincipals(ctx, p.TenantID, c.ID)
+		if err != nil {
+			return Source{}, err
+		}
+	}
+	return view, nil
 }
 
 func (s *Service) UpdateSource(ctx context.Context, p auth.Principal, id string, input UpdateSourceInput) (Source, error) {
@@ -399,12 +413,11 @@ func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID str
 	if len(streams) == 0 {
 		return SyncJob{}, errors.New("connector adapter exposes no sync streams")
 	}
-	cfgBytes, err := json.Marshal(conn.Config)
+	configHash, err := connectorConfigHash(conn)
 	if err != nil {
-		return SyncJob{}, fmt.Errorf("hash connection config: %w", err)
+		return SyncJob{}, err
 	}
-	sum := sha256.Sum256(append(cfgBytes, []byte("\x00"+conn.CredentialRef)...))
-	key := "connector.sync:" + conn.ID + ":" + hex.EncodeToString(sum[:])
+	key := "connector.sync:" + conn.ID + ":" + configHash
 	if window != 0 {
 		key += ":w" + strconv.FormatInt(window, 10)
 	}
@@ -416,7 +429,7 @@ func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID str
 			IdempotencyKey: key + ":" + string(stream),
 			Subject:        jobs.Subject{ConnectionID: conn.ID},
 			InputRef:       conn.ID,
-			InputHash:      hex.EncodeToString(sum[:]),
+			InputHash:      configHash,
 			Policy:         map[string]any{"connection_id": conn.ID, "stream": string(stream)},
 		})
 		if err != nil {
@@ -427,6 +440,15 @@ func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID str
 		}
 	}
 	return jobView(response), nil
+}
+
+func connectorConfigHash(conn source.Connection) (string, error) {
+	cfgBytes, err := json.Marshal(conn.Config)
+	if err != nil {
+		return "", fmt.Errorf("hash connection config: %w", err)
+	}
+	sum := sha256.Sum256(append(cfgBytes, []byte("\x00"+conn.CredentialRef)...))
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func jobView(j jobs.Job) SyncJob {

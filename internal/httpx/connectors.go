@@ -38,6 +38,7 @@ func (a *App) handleConnectorSources(w http.ResponseWriter, r *http.Request, pri
 			WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "connector_source_invalid")
 			return
 		}
+		a.recordSecurityAudit(r, principal, "connector.source.created", "connector.source", source.ID, "success")
 		WriteJSON(w, http.StatusCreated, source)
 	default:
 		_ = principal
@@ -131,12 +132,14 @@ func (a *App) handleConnectorSourceByID(w http.ResponseWriter, r *http.Request, 
 			WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "connector_source_invalid")
 			return
 		}
+		a.recordSecurityAudit(r, principal, "connector.source.updated", "connector.source", sourceID, "success")
 		WriteJSON(w, http.StatusOK, source)
 	case http.MethodDelete:
 		if err := a.connectorSvc.DeleteSource(r.Context(), principal, sourceID); err != nil {
 			writeConnectorNotFoundOrError(w, err, "connector_source_delete_failed")
 			return
 		}
+		a.recordSecurityAudit(r, principal, "connector.source.deleted", "connector.source", sourceID, "success")
 		WriteJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": sourceID})
 	default:
 		WriteMethodNotAllowed(w)

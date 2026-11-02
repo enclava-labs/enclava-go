@@ -78,6 +78,7 @@ func main() {
 	bindingsRepo := postgres.NewResponseBindingsRepo(pgDB)
 	mcpRepo := postgres.NewMCPToolsRepo(pgDB)
 	sourceRepo := postgres.NewSourceRepo(pgDB)
+	auditRepo := postgres.NewSecurityAuditRepo(pgDB)
 
 	// Durable artifacts under <data>/artifacts, scratch under <data>/scratch —
 	// sibling roots, since the store rejects nested disjoint roots.
@@ -136,15 +137,7 @@ func main() {
 	}
 	mcpTransport := &mcp.StreamableHTTP{Credential: secretResolver, ClientName: "enclava", ClientVersion: "1"}
 	mcpExecutor := &mcp.Executor{Repository: mcpRepo, Caller: chatbot.MCPCaller{}, Transport: mcpTransport}
-	inferenceSvc, err := inference.NewService(inference.Deps{
-		Endpoints:     endpointsRepo,
-		Sources:       sourceRepo,
-		Authorizer:    source.NewAuthorizer(sourceRepo, 0),
-		Billing:       billingSvc,
-		Secrets:       secretResolver,
-		Artifacts:     artifactRepo,
-		Conversations: postgres.NewChatbotConversationStore(chatbotRepo),
-	}, inference.WithAdmission(inference.NewAdmission(inference.AdmissionConfig{
+	admission := inference.NewAdmission(inference.AdmissionConfig{
 		Execute: inference.ClassLimit{
 			MaxActive: cfg.InferenceMaxActive,
 			MaxQueued: cfg.InferenceMaxQueued,
@@ -158,7 +151,16 @@ func main() {
 			MaxActive: cfg.InferenceFanOutActive,
 			MaxQueued: cfg.InferenceFanOutQueued,
 		},
-	})), inference.WithDefaultMaxOutputTokens(cfg.InferenceDefaultMaxOutputTokens))
+	})
+	inferenceSvc, err := inference.NewService(inference.Deps{
+		Endpoints:     endpointsRepo,
+		Sources:       sourceRepo,
+		Authorizer:    source.NewAuthorizer(sourceRepo, cfg.SourceAccessMaxStale),
+		Billing:       billingSvc,
+		Secrets:       secretResolver,
+		Artifacts:     artifactRepo,
+		Conversations: postgres.NewChatbotConversationStore(chatbotRepo),
+	}, inference.WithAdmission(admission), inference.WithDefaultMaxOutputTokens(cfg.InferenceDefaultMaxOutputTokens))
 	if err != nil {
 		log.Fatalf("inference service init error: %v", err)
 	}
@@ -201,7 +203,11 @@ func main() {
 	qdrantClient := rag.NewQdrantClient(cfg.QdrantURL, cfg.UpstreamTimeout)
 	ragSvc := rag.NewService(ragRepo, qdrantClient, inferenceSvc, cfg.DefaultEmbeddingModel, artifactStore, jobsSvc)
 	ragSvc.SetDefaultEmbeddingDimensions(cfg.DefaultEmbeddingDimensions)
+	ragSvc.SetSourceAccessMaxStale(cfg.SourceAccessMaxStale)
+	ragSvc.SetUtilityModel(cfg.UtilityModel)
+	ragSvc.SetIndexRetirementSoak(cfg.IndexRetirementSoak)
 	previewSvc := extract.NewPreviewService(chunkProfilesRepo, jobsRepoPG, jobsSvc, artifactStore, sourceRepo, cfg.MaxUploadSizeMB)
+	previewSvc.SetSourceAccessMaxStale(cfg.SourceAccessMaxStale)
 	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG)
 	connectorSvc.SetCredentialResolver(secretResolver)
 	adapterFactories := connectors.AdapterFactories{
@@ -235,9 +241,10 @@ func main() {
 		rag.OperationEmbed:       ragSvc.JobHandler(),
 		rag.OperationIngest:      ragSvc.IngestJobHandler(),
 		rag.OperationAccess:      ragSvc.AccessJobHandler(),
+		rag.OperationReembedScan: ragSvc.ReembedScanJobHandler(),
 		connectors.OperationSync: connectorSvc.JobHandler(),
 		chatbot.RunOperation:     chatbotSvc.JobHandler(),
-	}, jobs.RunnerConfig{})
+	}, jobs.RunnerConfig{JobTimeout: cfg.JobTimeout})
 	runnerCtx, stopRunner := context.WithCancel(context.Background())
 	go previewSvc.RunRetention(runnerCtx)
 	runnerDone := make(chan struct{})
@@ -284,6 +291,8 @@ func main() {
 	// Browser dashboard login runs on the server-session handlers from 01-12;
 	// the configured slug resolves per request so `enclava bootstrap` order is free.
 	sessionAuth := httpx.NewSessionAuth(authSvc, auth.NewOIDCService(identityRepo, auth.EnvSecretResolver), cfg.SessionTTL, httpx.DashboardAuthTemplates(), cfg.SessionTenantSlug)
+	sessionAuth.SetSecurityAudit(auditRepo)
+	sessionAuth.SetTrustProxy(cfg.TrustProxyHeaders)
 
 	app := httpx.NewApp(
 		authSvc,
@@ -318,6 +327,8 @@ func main() {
 	)
 	app.ConfigureMCP(mcpRepo, mcpTransport)
 	app.ConfigureActivity(jobsSvc)
+	app.SetSecurityAudit(auditRepo)
+	app.ConfigureMetrics(cfg.MetricsToken, cfg.MetricsAuthDisabled, jobsRepoPG, admission)
 
 	// The extract module mounts its API routes on the app's mux — every
 	// processing call it makes funnels through the shared executor.

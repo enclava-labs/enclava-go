@@ -1,0 +1,194 @@
+[
+  {
+    "query": "How do scientists determine whether a mountain glacier is gaining or losing ice?",
+    "expected": [
+      "alpine-glaciers.md"
+    ]
+  },
+  {
+    "query": "What do ablation stakes and snow pits reveal about an alpine glacier?",
+    "expected": [
+      "alpine-glaciers.md"
+    ]
+  },
+  {
+    "query": "How does a token bucket control bursts of API requests?",
+    "expected": [
+      "api-rate-limits.md"
+    ]
+  },
+  {
+    "query": "Why should clients add jitter after a 429 response?",
+    "expected": [
+      "api-rate-limits.md"
+    ]
+  },
+  {
+    "query": "How can beekeepers estimate varroa infestation before winter?",
+    "expected": [
+      "beehive-health.md"
+    ]
+  },
+  {
+    "query": "What does an alcohol wash measure in a honey bee colony?",
+    "expected": [
+      "beehive-health.md"
+    ]
+  },
+  {
+    "query": "How are fatigue cracks found at welded bridge details?",
+    "expected": [
+      "bridge-inspection.md"
+    ]
+  },
+  {
+    "query": "Why can repeated traffic loads damage a steel bridge?",
+    "expected": [
+      "bridge-inspection.md"
+    ]
+  },
+  {
+    "query": "What happens to coffee beans around first crack?",
+    "expected": [
+      "coffee-roasting.md"
+    ]
+  },
+  {
+    "query": "Which measurements help a roaster control development after first crack?",
+    "expected": [
+      "coffee-roasting.md"
+    ]
+  },
+  {
+    "query": "How can a gardener prevent a compost heap from becoming anaerobic?",
+    "expected": [
+      "compost-balance.md"
+    ]
+  },
+  {
+    "query": "What is the role of brown leaves and green scraps in compost?",
+    "expected": [
+      "compost-balance.md"
+    ]
+  },
+  {
+    "query": "Why do corals turn white during prolonged marine heat?",
+    "expected": [
+      "coral-bleaching.md"
+    ]
+  },
+  {
+    "query": "Does a bleached coral necessarily die immediately?",
+    "expected": [
+      "coral-bleaching.md"
+    ]
+  },
+  {
+    "query": "How should fragile historical court records be stored?",
+    "expected": [
+      "court-archive.md"
+    ]
+  },
+  {
+    "query": "Why is scanning not a substitute for preserving original paper files?",
+    "expected": [
+      "court-archive.md"
+    ]
+  },
+  {
+    "query": "How can emitters and soil sensors improve watering efficiency?",
+    "expected": [
+      "drip-irrigation.md"
+    ]
+  },
+  {
+    "query": "What problem arises when drip irrigation emitters clog?",
+    "expected": [
+      "drip-irrigation.md"
+    ]
+  },
+  {
+    "query": "How can masonry walls be secured to floors against earthquakes?",
+    "expected": [
+      "earthquake-retrofit.md"
+    ]
+  },
+  {
+    "query": "What is the purpose of a continuous seismic load path?",
+    "expected": [
+      "earthquake-retrofit.md"
+    ]
+  },
+  {
+    "query": "Why should cabbage stay under brine when making sauerkraut?",
+    "expected": [
+      "fermentation.md"
+    ]
+  },
+  {
+    "query": "Why do land managers use controlled low intensity burns?",
+    "expected": [
+      "forest-fire.md"
+    ]
+  },
+  {
+    "query": "How does a heat pump provide more heat than its electrical input?",
+    "expected": [
+      "heat-pump.md"
+    ]
+  },
+  {
+    "query": "How do authority records disambiguate authors in a library catalog?",
+    "expected": [
+      "library-catalog.md"
+    ]
+  },
+  {
+    "query": "Why can a damaged lithium ion cell heat itself uncontrollably?",
+    "expected": [
+      "lithium-battery.md"
+    ]
+  },
+  {
+    "query": "How can a garden provide food and nesting habitat for native pollinators?",
+    "expected": [
+      "pollinator-garden.md"
+    ]
+  },
+  {
+    "query": "How does a planted depression manage roof runoff?",
+    "expected": [
+      "rain-garden.md"
+    ]
+  },
+  {
+    "query": "Why do river sampling programs collect field blanks and duplicates?",
+    "expected": [
+      "river-sampling.md"
+    ]
+  },
+  {
+    "query": "What eye protection is needed to view a partial solar eclipse?",
+    "expected": [
+      "solar-eclipse.md"
+    ]
+  },
+  {
+    "query": "Why does wind speed strongly influence turbine power output?",
+    "expected": [
+      "wind-turbine.md"
+    ]
+  },
+  {
+    "query": "How should a grower clear sediment from irrigation lines?",
+    "expected": [
+      "drip-irrigation-maintenance.md"
+    ]
+  },
+  {
+    "query": "How can stored roof runoff be kept free of mosquito breeding?",
+    "expected": [
+      "rain-barrel.md"
+    ]
+  }
+]

@@ -38,10 +38,10 @@ func notionFixtureAdapter(t *testing.T, handler http.Handler) (*NotionAdapter, s
 func TestNotionRecursivePaginationAndStructuredTables(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/pages/root", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"id": "root", "url": "https://www.notion.so/root", "last_edited_time": "2026-01-01T00:00:00Z"})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "root", "url": "https://www.notion.so/root", "last_edited_time": "2026-01-01T00:00:00Z", "properties": map[string]any{"Name": map[string]any{"type": "title", "title": []any{map[string]any{"plain_text": "Root "}, map[string]any{"plain_text": "Page"}}}}})
 	})
 	mux.HandleFunc("/v1/pages/child", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"id": "child", "url": "https://www.notion.so/child", "last_edited_time": "2026-01-02T00:00:00Z"})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "child", "url": "https://www.notion.so/child", "last_edited_time": "2026-01-02T00:00:00Z", "properties": map[string]any{"Title": map[string]any{"type": "title", "title": []any{map[string]any{"plain_text": "Child Page"}}}}})
 	})
 	mux.HandleFunc("/v1/blocks/root/children", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("start_cursor") == "next" {
@@ -78,6 +78,12 @@ func TestNotionRecursivePaginationAndStructuredTables(t *testing.T) {
 	}
 	if byID["nested-block"].ParentNativeID != "child" || byID["table-row"].ParentNativeID != "table" {
 		t.Fatalf("wrong parents: %+v %+v", byID["nested-block"], byID["table-row"])
+	}
+	if byID["root"].Title != "Root Page" || byID["table"].Title != "Root Page" || byID["table-row"].Title != "Root Page" || byID["child"].Title != "Child Page" || byID["nested-block"].Title != "Child Page" {
+		t.Fatalf("wrong page titles: %+v", byID)
+	}
+	if byID["table"].ParentKind != "page" || byID["table-row"].ParentKind != "block" || byID["child"].ParentKind != "page" || byID["nested-block"].ParentKind != "page" {
+		t.Fatalf("wrong parent kinds: %+v", byID)
 	}
 	if byID["root"].URL != "https://www.notion.so/root" || byID["nested-block"].NativeRevision != "r2" || !strings.Contains(string(byID["table-row"].Content), "table_row") {
 		t.Fatalf("native URL/revision/table structure missing: %+v", byID)
@@ -131,7 +137,7 @@ func TestNotionAccessRevokesLostPublisherAndUsesPublishedAudienceGroups(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if page.Completeness != CompletenessComplete || len(page.Grants) != 1 || page.Grants[0].Effect != "deny" || page.Grants[0].Scope != "read" {
+	if page.Completeness != CompletenessComplete || len(page.Grants) != 1 || page.Grants[0].Effect != "deny" || page.Grants[0].Scope != "read" || page.Grants[0].NativeObjectKind != "page" {
 		t.Fatalf("publisher access loss not explicit: %+v", page)
 	}
 	if page.Grants[0].NativeGroupID != "notion:audience:engineering" {
@@ -170,8 +176,9 @@ func TestNotionAccessGrantsSelectedSubtree(t *testing.T) {
 	if len(page.Grants) != 2 {
 		t.Fatalf("expected root and block grants, got %+v", page.Grants)
 	}
+	kinds := map[string]string{"root": "page", "para": "block"}
 	for _, grant := range page.Grants {
-		if grant.Effect != "allow" || grant.Scope != "read" || grant.NativeGroupID != "notion:audience:engineering" {
+		if grant.Effect != "allow" || grant.Scope != "read" || grant.NativeGroupID != "notion:audience:engineering" || grant.NativeObjectKind != kinds[grant.NativeObjectID] {
 			t.Fatalf("unexpected published-audience grant: %+v", grant)
 		}
 	}

@@ -69,7 +69,7 @@ func TestApplyAccessSnapshot(t *testing.T) {
 		return repo.ApplyAccessSnapshot(ctx, tx, idTenantA, "conn_a", 1, []source.SourceGrant{
 			grant("obj_a", "user", "sid_u1", "allow", 1),
 			grant("obj_a", "user", "sid_u1", "deny", 1),
-		})
+		}, 3)
 	}); err != nil {
 		t.Fatalf("apply snapshot 1: %v", err)
 	}
@@ -85,13 +85,29 @@ func TestApplyAccessSnapshot(t *testing.T) {
 	if err := repo.WithTx(ctx, func(tx source.Tx) error {
 		return repo.ApplyAccessSnapshot(ctx, tx, idTenantA, "conn_a", 2, []source.SourceGrant{
 			grant("obj_a", "user", "sid_u1", "allow", 2),
-		})
+		}, 1)
 	}); err != nil {
 		t.Fatalf("apply snapshot 2: %v", err)
 	}
 	allow, deny = countGrants()
 	if allow != 2 || deny != 0 {
 		t.Fatalf("expected rev1+rev2 allows and deny pruned, got allow=%d deny=%d", allow, deny)
+	}
+	var unmapped int
+	if err := db.SQL.QueryRowContext(ctx, `SELECT unmapped_subjects FROM access_snapshots
+		WHERE tenant_id = $1 AND connection_id = 'conn_a' AND kind = 'grants' AND revision = 2`, idTenantA).Scan(&unmapped); err != nil || unmapped != 1 {
+		t.Fatalf("grant unmapped count=%d err=%v", unmapped, err)
+	}
+	grants, err := repo.GrantsForObjects(ctx, idTenantA, "conn_a", []string{"obj_a", "missing"}, 2)
+	if err != nil || len(grants) != 1 || grants[0].SubjectID != "sid_u1" || grants[0].Effect != "allow" {
+		t.Fatalf("current grants=%+v err=%v", grants, err)
+	}
+	if _, err := repo.GrantsForObjects(ctx, idTenantA, "conn_a", []string{"obj_a"}, 1); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("superseded grant revision: %v", err)
+	}
+	grants, err = repo.GrantsForObjects(ctx, idTenantA, "conn_a", []string{"missing"}, 2)
+	if err != nil || len(grants) != 0 {
+		t.Fatalf("empty grants=%+v err=%v", grants, err)
 	}
 
 	// Revision 3 never completes: begin + insert rows via a rolled-back
@@ -100,8 +116,8 @@ func TestApplyAccessSnapshot(t *testing.T) {
 		t.Fatalf("begin snapshot 3: %v", err)
 	}
 	before, _ := countGrants()
-	err := repo.WithTx(ctx, func(tx source.Tx) error {
-		if err := repo.ApplyAccessSnapshot(ctx, tx, idTenantA, "conn_a", 3, nil); err != nil {
+	err = repo.WithTx(ctx, func(tx source.Tx) error {
+		if err := repo.ApplyAccessSnapshot(ctx, tx, idTenantA, "conn_a", 3, nil, 7); err != nil {
 			return err
 		}
 		return errors.New("abort") // caller abandons the observation
@@ -117,13 +133,27 @@ func TestApplyAccessSnapshot(t *testing.T) {
 	// The incomplete revision is distinguishable and not authoritative.
 	var status string
 	if err := db.SQL.QueryRowContext(ctx, `
-		SELECT status FROM access_snapshots
+		SELECT status, unmapped_subjects FROM access_snapshots
 		WHERE tenant_id = $1 AND connection_id = 'conn_a' AND kind = 'grants' AND revision = 3`,
-		idTenantA).Scan(&status); err != nil {
+		idTenantA).Scan(&status, &unmapped); err != nil {
 		t.Fatalf("read snapshot 3: %v", err)
 	}
-	if status != "incomplete" {
-		t.Fatalf("snapshot 3 status = %q, want incomplete", status)
+	if status != "incomplete" || unmapped != 0 {
+		t.Fatalf("snapshot 3 status=%q unmapped=%d, want incomplete and zero", status, unmapped)
+	}
+	if err := repo.BeginSnapshot(ctx, idTenantA, "conn_a", source.SnapshotGrants, 4); err != nil {
+		t.Fatalf("begin all-subject snapshot: %v", err)
+	}
+	if err := repo.WithTx(ctx, func(tx source.Tx) error {
+		return repo.ApplyAccessSnapshot(ctx, tx, idTenantA, "conn_a", 4, []source.SourceGrant{
+			grant("obj_a", source.GrantSubjectAll, "", source.GrantEffectDeny, 4),
+		}, 0)
+	}); err != nil {
+		t.Fatalf("apply all-subject snapshot: %v", err)
+	}
+	grants, err = repo.GrantsForObjects(ctx, idTenantA, "conn_a", []string{"obj_a"}, 4)
+	if err != nil || len(grants) != 1 || grants[0].SubjectKind != source.GrantSubjectAll || grants[0].SubjectID != "" || grants[0].Effect != source.GrantEffectDeny {
+		t.Fatalf("all-subject grant=%+v err=%v", grants, err)
 	}
 }
 
@@ -165,7 +195,7 @@ func TestApplyMembershipSnapshot(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 	if err := repo.WithTx(ctx, func(tx source.Tx) error {
-		return repo.ApplyMembershipSnapshot(ctx, tx, idTenantA, "conn_a", 1, []source.SourceGroupMembership{member("sid_u1", 1)})
+		return repo.ApplyMembershipSnapshot(ctx, tx, idTenantA, "conn_a", 1, []source.SourceGroupMembership{member("sid_u1", 1)}, 2)
 	}); err != nil {
 		t.Fatalf("apply rev1: %v", err)
 	}
@@ -177,14 +207,14 @@ func TestApplyMembershipSnapshot(t *testing.T) {
 	if err := repo.InsertSourceMembership(ctx, member("sid_u2", 2)); err != nil {
 		t.Fatalf("insert incomplete membership: %v", err)
 	}
-	groups, err := repo.GroupIDsForIdentity(ctx, idTenantA, "conn_a", "sid_u1")
+	groups, err := repo.GroupIDsForIdentity(ctx, idTenantA, "conn_a", "sid_u1", 1)
 	if err != nil {
 		t.Fatalf("groups for sid_u1: %v", err)
 	}
 	if len(groups) != 1 || groups[0] != "grp_1" {
 		t.Fatalf("expected sid_u1 still in grp_1 at latest complete rev, got %v", groups)
 	}
-	groups, err = repo.GroupIDsForIdentity(ctx, idTenantA, "conn_a", "sid_u2")
+	groups, err = repo.GroupIDsForIdentity(ctx, idTenantA, "conn_a", "sid_u2", 1)
 	if err != nil {
 		t.Fatalf("groups for sid_u2: %v", err)
 	}
@@ -194,23 +224,31 @@ func TestApplyMembershipSnapshot(t *testing.T) {
 
 	// Completing revision 2 replaces the set atomically.
 	if err := repo.WithTx(ctx, func(tx source.Tx) error {
-		return repo.ApplyMembershipSnapshot(ctx, tx, idTenantA, "conn_a", 2, []source.SourceGroupMembership{member("sid_u2", 2)})
+		return repo.ApplyMembershipSnapshot(ctx, tx, idTenantA, "conn_a", 2, []source.SourceGroupMembership{member("sid_u2", 2)}, 4)
 	}); err != nil {
 		t.Fatalf("apply rev2: %v", err)
 	}
-	groups, err = repo.GroupIDsForIdentity(ctx, idTenantA, "conn_a", "sid_u1")
+	groups, err = repo.GroupIDsForIdentity(ctx, idTenantA, "conn_a", "sid_u1", 2)
 	if err != nil {
 		t.Fatalf("groups for sid_u1 post-rev2: %v", err)
 	}
 	if len(groups) != 0 {
 		t.Fatalf("sid_u1 membership should be retired, got %v", groups)
 	}
-	groups, err = repo.GroupIDsForIdentity(ctx, idTenantA, "conn_a", "sid_u2")
+	groups, err = repo.GroupIDsForIdentity(ctx, idTenantA, "conn_a", "sid_u2", 2)
 	if err != nil {
 		t.Fatalf("groups for sid_u2 post-rev2: %v", err)
 	}
 	if len(groups) != 1 || groups[0] != "grp_1" {
 		t.Fatalf("sid_u2 should be in grp_1, got %v", groups)
+	}
+	if _, err := repo.GroupIDsForIdentity(ctx, idTenantA, "conn_a", "sid_u2", 1); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("superseded membership revision: %v", err)
+	}
+	var unmapped int
+	if err := db.SQL.QueryRowContext(ctx, `SELECT unmapped_subjects FROM access_snapshots
+		WHERE tenant_id = $1 AND connection_id = 'conn_a' AND kind = 'membership' AND revision = 2`, idTenantA).Scan(&unmapped); err != nil || unmapped != 4 {
+		t.Fatalf("membership unmapped count=%d err=%v", unmapped, err)
 	}
 }
 
@@ -258,6 +296,28 @@ func TestSourceRepoObjects(t *testing.T) {
 	if child.ParentObjectID != "obj_parent" {
 		t.Fatalf("child parent = %q", child.ParentObjectID)
 	}
+	ids, err := repo.AncestorObjectIDs(ctx, idTenantA, "conn_a", "obj_child", 1)
+	if err != nil || len(ids) != 2 || ids[0] != "obj_child" || ids[1] != "obj_parent" {
+		t.Fatalf("ancestor chain=%v err=%v", ids, err)
+	}
+	if _, err := repo.AncestorObjectIDs(ctx, idTenantA, "conn_a", "obj_child", 0); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("depth limit: %v", err)
+	}
+	if _, err := repo.AncestorObjectIDs(ctx, idTenantB, "conn_a", "obj_child", 8); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("cross-tenant chain: %v", err)
+	}
+	if _, err := repo.AncestorObjectIDs(ctx, idTenantA, "conn_a", "missing", 8); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("missing object: %v", err)
+	}
+	if err := repo.ObserveObject(ctx, idTenantA, "obj_parent", "obj_child", nil); err != nil {
+		t.Fatalf("create cycle: %v", err)
+	}
+	if _, err := repo.AncestorObjectIDs(ctx, idTenantA, "conn_a", "obj_child", 8); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("cyclic chain: %v", err)
+	}
+	if err := repo.ObserveObject(ctx, idTenantA, "obj_parent", "", nil); err != nil {
+		t.Fatalf("restore parent: %v", err)
+	}
 
 	// Cross-tenant parent insert fails on the composite FK.
 	if _, err := repo.UpsertObject(ctx, source.Object{
@@ -298,6 +358,17 @@ func TestSourceRepoObjects(t *testing.T) {
 	if got.TombstonedAt == nil {
 		t.Fatalf("tombstone flag missing")
 	}
+	if _, err := repo.AncestorObjectIDs(ctx, idTenantA, "conn_a", "obj_child", 8); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("tombstoned chain: %v", err)
+	}
+	revision := "new-revision"
+	if err := repo.ObserveObject(ctx, idTenantA, "obj_child", "obj_parent", &revision); err != nil {
+		t.Fatalf("observe tombstoned object: %v", err)
+	}
+	got, err = repo.GetObject(ctx, idTenantA, "obj_child")
+	if err != nil || got.TombstonedAt != nil || got.UpstreamRevision == nil || *got.UpstreamRevision != revision {
+		t.Fatalf("observed object=%+v err=%v", got, err)
+	}
 }
 
 // TestSourceRepoRestrictions proves deny-capability lists and required
@@ -328,5 +399,124 @@ func TestSourceRepoRestrictions(t *testing.T) {
 	r := got[0]
 	if r.RequiredAssurance != "high" || len(r.DeniedCapabilities) != 2 || len(r.PolicyLabels) != 1 {
 		t.Fatalf("restriction round-trip mismatch: %+v", r)
+	}
+}
+
+// TestIngestHandoffExists proves the crash-window query: a matching jobs row
+// or an index generation for the observed object version both count as
+// durable handoff; unrelated rows do not.
+func TestIngestHandoffExists(t *testing.T) {
+	db, repo, ctx := newRepo(t)
+	seedTenant(t, ctx, db, idTenantA)
+	if err := repo.CreateConnection(ctx, source.Connection{
+		TenantID: idTenantA, ID: "conn_a", Kind: "github", Name: "gh", CredentialRef: "ref"}); err != nil {
+		t.Fatalf("create connection: %v", err)
+	}
+	if _, err := repo.UpsertObject(ctx, source.Object{
+		TenantID: idTenantA, ConnectionID: "conn_a", ID: "obj_a", Kind: "repo",
+		NativeID: "acme/widgets", AuthorizationMode: source.AuthorizationSourceACL,
+		ObservedSeq: 1}); err != nil {
+		t.Fatalf("upsert object: %v", err)
+	}
+	if err := repo.InsertObjectVersion(ctx, idTenantA, source.ObjectVersion{
+		ObjectID: "obj_a", ObservedSeq: 5, ArtifactRef: "art_a",
+		SHA256: "aa", ByteSize: 1, MimeType: "text/plain"}); err != nil {
+		t.Fatalf("insert version: %v", err)
+	}
+	if _, err := db.SQL.ExecContext(ctx, `
+		INSERT INTO knowledge_collections (tenant_id, id, name, qdrant_collection)
+		VALUES ($1, 'col_a', 'Col A', 'qdr_a')`, idTenantA); err != nil {
+		t.Fatalf("insert collection: %v", err)
+	}
+
+	assert := func(want bool, note string) {
+		got, err := repo.IngestHandoffExists(ctx, idTenantA, "conn_a", "col_a", "obj_a", 5)
+		if err != nil || got != want {
+			t.Fatalf("%s: handoff=%v err=%v, want %v", note, got, err, want)
+		}
+	}
+	assert(false, "no jobs or generations")
+
+	// A job covering a different observed seq is not handoff for seq 5.
+	if _, err := db.SQL.ExecContext(ctx, `
+		INSERT INTO jobs (tenant_id, id, operation, status, connection_id,
+		                  object_id, observed_revision, idempotency_key,
+		                  input_hash, principal, submitter_key)
+		VALUES ($1, 'job_other', 'rag.ingest', 'queued', 'conn_a',
+		        'obj_a', 4, 'key-other', 'h', '{}', 'sub')`, idTenantA); err != nil {
+		t.Fatalf("insert unrelated job: %v", err)
+	}
+	assert(false, "job for other seq")
+
+	// Terminated jobs (failed/cancelled/deleted) never count as handoff.
+	for _, st := range []string{"failed", "cancelled", "deleted"} {
+		if _, err := db.SQL.ExecContext(ctx, `
+			INSERT INTO jobs (tenant_id, id, operation, status, connection_id,
+			                  object_id, observed_revision, idempotency_key,
+			                  input_hash, principal, submitter_key)
+			VALUES ($1, $2, 'rag.ingest', $3, 'conn_a',
+			        'obj_a', 5, $4, 'h', '{}', 'sub')`,
+			idTenantA, "job_dead_"+st, st, "key-dead-"+st); err != nil {
+			t.Fatalf("insert %s job: %v", st, err)
+		}
+	}
+	assert(false, "dead job statuses")
+
+	// A job covering exactly (connection, object, seq) is handoff.
+	if _, err := db.SQL.ExecContext(ctx, `
+		INSERT INTO jobs (tenant_id, id, operation, status, connection_id,
+		                  object_id, observed_revision, idempotency_key,
+		                  input_hash, principal, submitter_key)
+		VALUES ($1, 'job_seq5', 'rag.ingest', 'queued', 'conn_a',
+		        'obj_a', 5, 'key-seq5', 'h', '{}', 'sub')`, idTenantA); err != nil {
+		t.Fatalf("insert matching job: %v", err)
+	}
+	assert(true, "job covers seq 5")
+}
+
+// TestIngestHandoffExistsGeneration proves the generation half: a generation
+// for the object version in the target collection is durable handoff even
+// with no jobs row, and only in that collection.
+func TestIngestHandoffExistsGeneration(t *testing.T) {
+	db, repo, ctx := newRepo(t)
+	seedTenant(t, ctx, db, idTenantA)
+	if err := repo.CreateConnection(ctx, source.Connection{
+		TenantID: idTenantA, ID: "conn_a", Kind: "github", Name: "gh", CredentialRef: "ref"}); err != nil {
+		t.Fatalf("create connection: %v", err)
+	}
+	if _, err := repo.UpsertObject(ctx, source.Object{
+		TenantID: idTenantA, ConnectionID: "conn_a", ID: "obj_a", Kind: "repo",
+		NativeID: "acme/widgets", AuthorizationMode: source.AuthorizationSourceACL,
+		ObservedSeq: 1}); err != nil {
+		t.Fatalf("upsert object: %v", err)
+	}
+	if err := repo.InsertObjectVersion(ctx, idTenantA, source.ObjectVersion{
+		ObjectID: "obj_a", ObservedSeq: 3, ArtifactRef: "art_a",
+		SHA256: "aa", ByteSize: 1, MimeType: "text/plain"}); err != nil {
+		t.Fatalf("insert version: %v", err)
+	}
+	for _, col := range []string{"col_a", "col_b"} {
+		if _, err := db.SQL.ExecContext(ctx, `
+			INSERT INTO knowledge_collections (tenant_id, id, name, qdrant_collection)
+			VALUES ($1, $2, $2, 'qdr_' || $2)`, idTenantA, col); err != nil {
+			t.Fatalf("insert collection %s: %v", col, err)
+		}
+	}
+	if _, err := db.SQL.ExecContext(ctx, `
+		INSERT INTO index_generations (tenant_id, id, collection_id,
+		                               object_version_id, generation, state)
+		VALUES ($1, 'gen_a', 'col_a', 'obj_a#3', 1, 'published')`, idTenantA); err != nil {
+		t.Fatalf("insert generation: %v", err)
+	}
+
+	exists, err := repo.IngestHandoffExists(ctx, idTenantA, "conn_a", "col_a", "obj_a", 3)
+	if err != nil || !exists {
+		t.Fatalf("generation in target collection: handoff=%v err=%v", exists, err)
+	}
+	if exists, err := repo.IngestHandoffExists(ctx, idTenantA, "conn_a", "col_b", "obj_a", 3); err != nil || exists {
+		t.Fatalf("generation in other collection must not count: handoff=%v err=%v", exists, err)
+	}
+	if exists, err := repo.IngestHandoffExists(ctx, idTenantA, "conn_a", "col_a", "obj_a", 4); err != nil || exists {
+		t.Fatalf("generation covers seq 3 only: handoff=%v err=%v", exists, err)
 	}
 }

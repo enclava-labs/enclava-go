@@ -10,6 +10,7 @@ import (
 	"enclava-go/internal/auth"
 	"enclava-go/internal/chatbot"
 	"enclava-go/internal/extract"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/rag"
 	"enclava-go/internal/source"
 )
@@ -95,4 +96,223 @@ func containsString(values []string, match string) bool {
 		}
 	}
 	return false
+}
+
+func TestRunToolFailuresAreReturnedToModel(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tool string
+		args string
+	}{
+		{"unknown", "missing", `{}`},
+		{"malformed", "extract_status", `not-json`},
+		{"invoke", "extract_status", `{"job_id":"job"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			call, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"id": "call", "type": "function", "function": map[string]any{"name": tc.tool, "arguments": tc.args}}}}}}})
+			f := newRunWorkerFixture(t, []string{string(call), runWorkerDone}, nil)
+			member, _, _ := runWorkerPrincipals(f.tenant)
+			bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+			bot.Settings = map[string]any{"tools": []any{"extract.status"}}
+			if err := f.chatRepo.Update(context.Background(), bot); err != nil {
+				t.Fatal(err)
+			}
+			run, err := startAndRun(t, f, member, bot.ID, chatbot.AssistantRunInput{Input: "help"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			attempts, err := f.runsRepo.ListRunAttempts(context.Background(), f.tenant, run.ID)
+			if err != nil || len(attempts) != 3 || attempts[1].Status != "failed" {
+				t.Fatalf("attempts=%#v err=%v", attempts, err)
+			}
+			var request struct {
+				Messages []struct {
+					Role    string `json:"role"`
+					Content string `json:"content"`
+				} `json:"messages"`
+				Tools []struct {
+					Function struct {
+						Name string `json:"name"`
+					} `json:"function"`
+				} `json:"tools"`
+			}
+			if err := json.Unmarshal(f.executor.requests[1].Payload, &request); err != nil {
+				t.Fatal(err)
+			}
+			if len(request.Tools) != 1 || request.Tools[0].Function.Name != "extract_status" {
+				t.Fatalf("tool names=%#v", request.Tools)
+			}
+			last := request.Messages[len(request.Messages)-1]
+			if last.Role != "tool" || !strings.Contains(last.Content, `"error"`) {
+				t.Fatalf("tool result=%#v", last)
+			}
+		})
+	}
+}
+
+func TestRunFinalTurnHasNoToolsAndEmptyAnswerFails(t *testing.T) {
+	const call = `{"choices":[{"message":{"tool_calls":[{"id":"call","type":"function","function":{"name":"unknown","arguments":"{}"}}]}}]}`
+	for _, tc := range []struct {
+		name      string
+		answer    string
+		wantError bool
+	}{
+		{"answer", runWorkerDone, false},
+		{"empty", `{"choices":[{"message":{"content":"  "}}]}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRunWorkerFixture(t, []string{call, call, call, tc.answer}, nil)
+			member, _, _ := runWorkerPrincipals(f.tenant)
+			bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+			bot.Settings = map[string]any{"tools": []any{"extract.status"}}
+			if err := f.chatRepo.Update(context.Background(), bot); err != nil {
+				t.Fatal(err)
+			}
+			_, err := startAndRun(t, f, member, bot.ID, chatbot.AssistantRunInput{Input: "help"})
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "assistant returned an empty answer") {
+					t.Fatalf("error=%v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			var request map[string]any
+			if err := json.Unmarshal(f.executor.requests[3].Payload, &request); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := request["tools"]; ok {
+				t.Fatal("final turn included tools")
+			}
+		})
+	}
+}
+
+func TestRunToolDenialAborts(t *testing.T) {
+	const call = `{"choices":[{"message":{"tool_calls":[{"id":"call","type":"function","function":{"name":"evidence_read","arguments":"{\"evidence_id\":\"denied\"}"}}]}}]}`
+	f := newRunWorkerFixtureWithRAG(t, &fakeRAGSearcher{evidenceReadDenied: true}, []string{call, runWorkerDone}, nil)
+	member, _, _ := runWorkerPrincipals(f.tenant)
+	bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+	bot.Settings = map[string]any{"tools": []any{"evidence.read"}}
+	if err := f.chatRepo.Update(context.Background(), bot); err != nil {
+		t.Fatal(err)
+	}
+	run, err := startAndRun(t, f, member, bot.ID, chatbot.AssistantRunInput{Input: "help"})
+	if !errors.Is(err, source.ErrDenied) || len(f.executor.requests) != 1 {
+		t.Fatalf("denial=%v dispatches=%d", err, len(f.executor.requests))
+	}
+	attempts, err := f.runsRepo.ListRunAttempts(context.Background(), f.tenant, run.ID)
+	if err != nil || len(attempts) != 2 || attempts[1].Status != "failed" || attempts[1].Name != "evidence.read" {
+		t.Fatalf("attempts=%#v err=%v", attempts, err)
+	}
+}
+
+type namedMCPDispatcher struct {
+	invoked string
+	err     error
+}
+
+func (d *namedMCPDispatcher) Definitions(context.Context, auth.Principal, auth.Principal, chatbot.Instance) ([]map[string]any, error) {
+	return []map[string]any{{"type": "function", "function": map[string]any{
+		"name": "approved.lookup", "parameters": map[string]any{"type": "object"},
+	}}}, nil
+}
+
+func (d *namedMCPDispatcher) Invoke(_ context.Context, _, _ auth.Principal, _ chatbot.Instance, name string, _ json.RawMessage, _ []source.ObjectRef) (chatbot.BuiltinResult, error) {
+	d.invoked = name
+	if d.err != nil {
+		return chatbot.BuiltinResult{}, d.err
+	}
+	return chatbot.BuiltinResult{Value: json.RawMessage(`{"ok":true}`)}, nil
+}
+
+func TestRunMapsMCPModelNameToApprovedID(t *testing.T) {
+	const call = `{"choices":[{"message":{"tool_calls":[{"id":"call","type":"function","function":{"name":"approved_lookup","arguments":"{}"}}]}}]}`
+	f := newRunWorkerFixture(t, []string{call, runWorkerDone}, nil)
+	dispatcher := &namedMCPDispatcher{}
+	f.svc.ConfigureMCP(dispatcher)
+	member, _, _ := runWorkerPrincipals(f.tenant)
+	bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+	bot.Settings = map[string]any{"tools": []any{"approved.lookup"}}
+	if err := f.chatRepo.Update(context.Background(), bot); err != nil {
+		t.Fatal(err)
+	}
+	_, err := startAndRun(t, f, member, bot.ID, chatbot.AssistantRunInput{Input: "help"})
+	if err != nil || dispatcher.invoked != "approved.lookup" {
+		t.Fatalf("invoked=%q err=%v", dispatcher.invoked, err)
+	}
+	var request struct {
+		Tools []struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(f.executor.requests[0].Payload, &request); err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Tools) != 1 || request.Tools[0].Function.Name != "approved_lookup" {
+		t.Fatalf("definitions=%#v", request.Tools)
+	}
+}
+
+func TestRunTrimsOldHistoryBeforeDispatch(t *testing.T) {
+	ctx := context.Background()
+	f := newRunWorkerFixture(t, []string{runWorkerDone}, nil)
+	member, _, _ := runWorkerPrincipals(f.tenant)
+	bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+	conversation := chatbot.Conversation{TenantID: f.tenant, ID: newRunTestID("conv"), ChatbotID: bot.ID, OwnerActorID: member.ActorID}
+	if err := f.chatRepo.CreateConversation(ctx, conversation); err != nil {
+		t.Fatal(err)
+	}
+	for _, content := range []string{strings.Repeat("oldest", 12000), "recent history"} {
+		if err := f.chatRepo.AddMessage(ctx, chatbot.Message{TenantID: f.tenant, ID: newRunTestID("msg"), ConversationID: conversation.ID, Role: "user", Content: content, OwnerActorID: member.ActorID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := startAndRun(t, f, member, bot.ID, chatbot.AssistantRunInput{Input: "current question", ConversationID: conversation.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(f.executor.requests[0].Payload)
+	if strings.Contains(body, "oldest") || !strings.Contains(body, "recent history") || !strings.Contains(body, "current question") {
+		t.Fatalf("unexpected fitted context: %s", body)
+	}
+}
+
+func TestRunToolPolicyDenialsAbort(t *testing.T) {
+	t.Run("mcp inference denial", func(t *testing.T) {
+		const call = `{"choices":[{"message":{"tool_calls":[{"id":"call","type":"function","function":{"name":"approved_lookup","arguments":"{}"}}]}}]}`
+		f := newRunWorkerFixture(t, []string{call, runWorkerDone}, nil)
+		f.svc.ConfigureMCP(&namedMCPDispatcher{err: inference.ErrDenied})
+		member, _, _ := runWorkerPrincipals(f.tenant)
+		bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+		bot.Settings = map[string]any{"tools": []any{"approved.lookup"}}
+		if err := f.chatRepo.Update(context.Background(), bot); err != nil {
+			t.Fatal(err)
+		}
+		run, err := startAndRun(t, f, member, bot.ID, chatbot.AssistantRunInput{Input: "help"})
+		if !errors.Is(err, inference.ErrDenied) || len(f.executor.requests) != 1 {
+			t.Fatalf("denial=%v dispatches=%d", err, len(f.executor.requests))
+		}
+		attempts, err := f.runsRepo.ListRunAttempts(context.Background(), f.tenant, run.ID)
+		if err != nil || len(attempts) != 2 || attempts[1].Status != "failed" {
+			t.Fatalf("attempts=%#v err=%v", attempts, err)
+		}
+	})
+	t.Run("extract forbidden", func(t *testing.T) {
+		args, _ := json.Marshal(map[string]any{"template_id": "t", "file_name": "f.txt", "mime_type": "text/plain", "content_base64": "eA=="})
+		call, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"id": "call", "type": "function", "function": map[string]any{"name": "extract_submit", "arguments": string(args)}}}}}}})
+		f := newRunWorkerFixture(t, []string{string(call), runWorkerDone}, nil)
+		f.svc.ConfigureRuns(f.runsRepo, f.jobSvc, &extractionStub{err: extract.ErrForbidden}, runPrincipalResolver{})
+		member, _, _ := runWorkerPrincipals(f.tenant)
+		bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
+		bot.Settings = map[string]any{"tools": []any{"extract.submit"}}
+		if err := f.chatRepo.Update(context.Background(), bot); err != nil {
+			t.Fatal(err)
+		}
+		_, err := startAndRun(t, f, member, bot.ID, chatbot.AssistantRunInput{Input: "help"})
+		if !errors.Is(err, extract.ErrForbidden) || len(f.executor.requests) != 1 {
+			t.Fatalf("forbidden=%v dispatches=%d", err, len(f.executor.requests))
+		}
+	})
 }

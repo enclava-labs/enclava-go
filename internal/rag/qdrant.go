@@ -116,7 +116,11 @@ func (c *QdrantClient) UpsertPoints(ctx context.Context, collection string, poin
 		if namedDense {
 			named := map[string]any{"dense": point.Vector}
 			if hasSparse {
-				if text, ok := point.Payload["content"].(string); ok {
+				text, ok := point.Payload["search_text"].(string)
+				if !ok {
+					text, ok = point.Payload["content"].(string)
+				}
+				if ok {
 					named["text"] = map[string]any{"text": text, "model": "qdrant/bm25"}
 				} else {
 					named["text"] = point.Sparse
@@ -206,6 +210,28 @@ func (c *QdrantClient) DeleteCollection(ctx context.Context, collection string) 
 		return fmt.Errorf("qdrant delete collection failed: status=%d body=%s", status, string(resp))
 	}
 	return nil
+}
+
+func (c *QdrantClient) CountPoints(ctx context.Context, collection string) (int64, error) {
+	status, resp, err := c.do(ctx, http.MethodPost, "/collections/"+url.PathEscape(collection)+"/points/count", []byte(`{"exact":true}`))
+	if err != nil {
+		return 0, err
+	}
+	if status >= 300 {
+		return 0, fmt.Errorf("qdrant count failed: status=%d body=%s", status, string(resp))
+	}
+	var result struct {
+		Result *struct {
+			Count *int64 `json:"count"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return 0, fmt.Errorf("decode qdrant count: %w", err)
+	}
+	if result.Result == nil || result.Result.Count == nil {
+		return 0, fmt.Errorf("decode qdrant count: missing count")
+	}
+	return *result.Result.Count, nil
 }
 
 type QdrantSearchPoint struct {

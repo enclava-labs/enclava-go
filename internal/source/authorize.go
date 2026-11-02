@@ -2,6 +2,7 @@ package source
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"enclava-go/internal/auth"
@@ -13,8 +14,8 @@ import (
 // callers cannot distinguish them.
 type Authorizer struct {
 	repo SourceRepository
-	// MaxStale bounds how old the newest COMPLETE access snapshot may be
-	// before source_acl decisions deny. Zero means unbounded.
+	// MaxStale bounds the age of complete grant and membership snapshots.
+	// Zero means unbounded.
 	MaxStale time.Duration
 }
 
@@ -80,44 +81,65 @@ func (a *Authorizer) canReadSourceACL(ctx context.Context, p auth.Principal, obj
 	if obj.ConnectionID == "" {
 		return ErrDenied
 	}
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	rev, completedAt, err := a.repo.LatestCompleteRevision(ctx, obj.TenantID, obj.ConnectionID, SnapshotGrants)
+	if err != nil || completedAt.IsZero() || completedAt.After(now) || (a.MaxStale > 0 && now.Sub(completedAt) > a.MaxStale) {
+		return ErrDenied
+	}
+	objectIDs, err := a.repo.AncestorObjectIDs(ctx, obj.TenantID, obj.ConnectionID, obj.ID, 8)
+	if err != nil {
+		return ErrDenied
+	}
+	grants, err := a.repo.GrantsForObjects(ctx, obj.TenantID, obj.ConnectionID, objectIDs, rev)
+	if err != nil {
+		return ErrDenied
+	}
 	mappedUser := p.UserID
 	if mappedUser == "" {
 		mappedUser = p.ActorID
 	}
 	ident, err := a.repo.SourceIdentityForUser(ctx, obj.TenantID, obj.ConnectionID, mappedUser)
-	if err != nil {
-		return ErrDenied // missing/unmapped identity fails closed
-	}
-	groups, err := a.repo.GroupIDsForIdentity(ctx, obj.TenantID, obj.ConnectionID, ident.ID)
-	if err != nil {
-		return ErrDenied // no complete membership snapshot fails closed
-	}
-	rev, completedAt, err := a.repo.LatestCompleteRevision(ctx, obj.TenantID, obj.ConnectionID, SnapshotGrants)
-	if err != nil {
-		return ErrDenied // no complete grants snapshot fails closed
-	}
-	now := opts.Now
-	if now.IsZero() {
-		now = time.Now()
-	}
-	if a.MaxStale > 0 && now.Sub(completedAt) > a.MaxStale {
+	if err != nil && !errors.Is(err, ErrDenied) {
 		return ErrDenied
 	}
-	grants, err := a.repo.GrantsForObject(ctx, obj.TenantID, obj.ID, rev)
-	if err != nil {
-		return ErrDenied
+	hasGroups := false
+	for _, g := range grants {
+		if g.SubjectKind == GrantSubjectGroup {
+			hasGroups = true
+			break
+		}
+	}
+	var groups []string
+	membershipKnown := false
+	if hasGroups && ident.ID != "" {
+		membershipRev, membershipAt, err := a.repo.LatestCompleteRevision(ctx, obj.TenantID, obj.ConnectionID, SnapshotMembership)
+		if err == nil && !membershipAt.IsZero() && !membershipAt.After(now) && (a.MaxStale <= 0 || now.Sub(membershipAt) <= a.MaxStale) {
+			groups, err = a.repo.GroupIDsForIdentity(ctx, obj.TenantID, obj.ConnectionID, ident.ID, membershipRev)
+			membershipKnown = err == nil
+		}
 	}
 	inGroup := make(map[string]struct{}, len(groups))
-	for _, g := range groups {
-		inGroup[g] = struct{}{}
+	for _, group := range groups {
+		inGroup[group] = struct{}{}
 	}
 	allowed := false
 	for _, g := range grants {
 		var applies bool
 		switch g.SubjectKind {
+		case GrantSubjectAll:
+			applies = true
 		case GrantSubjectUser:
-			applies = g.SubjectID == ident.ID
+			applies = ident.ID != "" && g.SubjectID == ident.ID
 		case GrantSubjectGroup:
+			if !membershipKnown {
+				if g.Effect == GrantEffectDeny {
+					return ErrDenied
+				}
+				continue
+			}
 			_, applies = inGroup[g.SubjectID]
 		}
 		if !applies {

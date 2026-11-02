@@ -72,3 +72,30 @@ func TestCreateEmbeddingsRejectsSizeAboveModel(t *testing.T) {
 		t.Fatalf("1024 dims from a 768-dimension model = %v, want a size error", err)
 	}
 }
+
+func TestDefaultEmbeddingPrefixes(t *testing.T) {
+	instruct := "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+	bge := "Represent this sentence for searching relevant passages: "
+	tests := []struct {
+		model, query, passage string
+	}{
+		{"Qwen/QWEN3-Embedding-4B", instruct, ""},
+		{"org/multilingual-e5-large-instruct", instruct, ""},
+		{"nomic-ai/nomic-embed-text-v1.5", "search_query: ", "search_document: "},
+		{"intfloat/e5-large-v2", "query: ", "passage: "},
+		{"multilingual-e5-small", "query: ", "passage: "},
+		{"BAAI/bge-large-en-v1.5", bge, ""},
+		{"snowflake-arctic-embed-m", bge, ""},
+		{"mxbai-embed-large-v1", bge, ""},
+		{"bge-large-zh", "", ""},
+		{"unknown", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			query, passage := defaultEmbeddingPrefixes(tt.model)
+			if query != tt.query || passage != tt.passage {
+				t.Fatalf("got %q, %q; want %q, %q", query, passage, tt.query, tt.passage)
+			}
+		})
+	}
+}

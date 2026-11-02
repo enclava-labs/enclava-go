@@ -70,6 +70,8 @@ type knowledgeCollectionData struct {
 	Docs             []rag.Document
 	DocMore          bool
 	AnyProcessing    bool
+	ReembedPending   int64
+	ReembedTotal     int64
 	Empty            dashboardEmpty
 	SourcesEmpty     dashboardEmpty
 	Sources          []connectors.Source
@@ -250,6 +252,13 @@ func (a *App) handleDashboardKnowledgeCollection(w http.ResponseWriter, r *http.
 	data.Empty = knowledgeDocumentsEmpty(knowledgeDocumentStatus(r.URL.Query().Get("status")), caps)
 	data.SourcesEmpty = knowledgeSourcesEmpty(c.ID, caps)
 	ctx := r.Context()
+	pending, total, err := a.ragSvc.ReembedProgress(ctx, p, c.ID)
+	if err != nil && !errors.Is(err, source.ErrDenied) {
+		log.Printf("dashboard knowledge re-embed progress: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	data.ReembedPending, data.ReembedTotal = pending, total
 	switch tab {
 	case "documents":
 		status := knowledgeDocumentStatus(r.URL.Query().Get("status"))
@@ -457,13 +466,21 @@ func (a *App) handleDashboardKnowledgeDocuments(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
+	pending, total, err := a.ragSvc.ReembedProgress(r.Context(), p, collectionID)
+	if err != nil && !errors.Is(err, source.ErrDenied) {
+		log.Printf("dashboard knowledge re-embed progress: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	data := knowledgeCollectionData{
-		Collection:    rag.Collection{ID: collectionID},
-		Status:        status,
-		Docs:          docs,
-		DocMore:       more,
-		AnyProcessing: knowledgeAnyProcessing(docs),
-		Empty:         knowledgeDocumentsEmpty(status, caps),
+		Collection:     rag.Collection{ID: collectionID},
+		Status:         status,
+		Docs:           docs,
+		DocMore:        more,
+		AnyProcessing:  knowledgeAnyProcessing(docs),
+		ReembedPending: pending,
+		ReembedTotal:   total,
+		Empty:          knowledgeDocumentsEmpty(status, caps),
 	}
 	a.renderDashboardFragment(w, r, "knowledge_collection", "knowledge-documents", data)
 }

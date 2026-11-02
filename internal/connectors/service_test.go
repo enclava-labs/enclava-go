@@ -202,7 +202,7 @@ func TestPermissionOnlySyncAppliesCanonicalAccessWithoutContentIngest(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	grants, err := f.sourceRepo.GrantsForObject(context.Background(), f.connection.TenantID, object.ID, revision)
+	grants, err := f.sourceRepo.GrantsForObjects(context.Background(), f.connection.TenantID, f.connection.ID, []string{object.ID}, revision)
 	if err != nil || len(grants) != 1 || grants[0].SubjectID != "identity-native-user-1" {
 		t.Fatalf("canonical grants=%+v err=%v", grants, err)
 	}
@@ -249,10 +249,338 @@ func TestCanonicalAccessSnapshotsFollowAtoBtoA(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		current, err := f.sourceRepo.GrantsForObject(context.Background(), f.connection.TenantID, object.ID, revision)
+		current, err := f.sourceRepo.GrantsForObjects(context.Background(), f.connection.TenantID, f.connection.ID, []string{object.ID}, revision)
 		if err != nil || len(current) != 1 || current[0].Effect != effect {
 			t.Fatalf("snapshot %d effect=%q grants=%+v err=%v", i, effect, current, err)
 		}
+	}
+}
+
+func TestSlackParentGrantBeforeContentAndIdentityBinding(t *testing.T) {
+	ctx := context.Background()
+	adapter := &testAdapter{capabilities: AdapterCapabilities{Access: true}}
+	adapter.access = func(context.Context, source.Connection, Cursor, int) (AccessPage, error) {
+		return AccessPage{Grants: []AccessGrant{
+			{NativeObjectID: "slack:C123", NativeObjectKind: "channel", NativePrincipalID: "U-mapped", NativeGroupID: "C123", Scope: "read", Effect: source.GrantEffectAllow},
+			{NativeObjectID: "slack:C123", NativeObjectKind: "channel", NativePrincipalID: "U-unmapped", NativeGroupID: "C123", Scope: "read", Effect: source.GrantEffectAllow},
+		}, Completeness: CompletenessComplete, Snapshot: true}, nil
+	}
+	f := newConnectorFixture(t, adapter)
+	user := testdb.SeedUser(t, f.db, f.tenant, "slack-mapped@example.test", nil)
+	if err := f.sourceRepo.InsertSourceIdentity(ctx, source.SourceIdentity{TenantID: f.tenant, ConnectionID: f.connection.ID, SourceKind: f.connection.Kind, ID: "mapped-slack", NativeID: "U-mapped", MappedUserID: user.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.sourceRepo.InsertSourceIdentity(ctx, source.SourceIdentity{TenantID: f.tenant, ConnectionID: f.connection.ID, SourceKind: f.connection.Kind, ID: "unmapped-slack", NativeID: "U-unmapped"}); err != nil {
+		t.Fatal(err)
+	}
+	f.schedule(t)
+	if _, err := f.runNext(t); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "channel", "slack:C123")
+	if err != nil {
+		t.Fatalf("grant did not create channel stub: %v", err)
+	}
+	if _, err := f.sourceRepo.SourceIdentityForNativeID(ctx, f.tenant, f.connection.ID, "U-unmapped"); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("unmapped source identity resolved as authorized: %v", err)
+	}
+	if err := f.sourceRepo.BeginSnapshot(ctx, f.tenant, f.connection.ID, source.SnapshotMembership, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.sourceRepo.WithTx(ctx, func(tx source.Tx) error {
+		return f.sourceRepo.ApplyMembershipSnapshot(ctx, tx, f.tenant, f.connection.ID, 1, nil, 0)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	adapter.capabilities = AdapterCapabilities{Content: true}
+	adapter.content = func(context.Context, source.Connection, Cursor, int) (ContentPage, error) {
+		return ContentPage{Items: []ContentItem{
+			{NativeID: "slack:C123", Kind: "channel", Text: "channel"},
+			{NativeID: "slack:C123:thread-1", ParentNativeID: "slack:C123", ParentKind: "channel", Kind: "message", Text: "thread message"},
+			{NativeID: "slack:C123:reply-1", ParentNativeID: "slack:C123:thread-1", ParentKind: "message", Kind: "message", Text: "thread reply"},
+		}, Completeness: CompletenessComplete}, nil
+	}
+	if _, err := f.svc.SyncSourceWindowed(ctx, f.principal, f.connection.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.runNext(t); err != nil {
+		t.Fatal(err)
+	}
+	observedParent, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "channel", "slack:C123")
+	if err != nil || observedParent.ID != parent.ID {
+		t.Fatalf("channel stub was not reused: %+v err=%v", observedParent, err)
+	}
+	child, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "message", "slack:C123:thread-1")
+	if err != nil || child.ParentObjectID != parent.ID {
+		t.Fatalf("thread parent = %+v, err=%v", child, err)
+	}
+	reply, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "message", "slack:C123:reply-1")
+	if err != nil || reply.ParentObjectID != child.ID {
+		t.Fatalf("reply parent = %+v, err=%v", reply, err)
+	}
+	authorizer := source.NewAuthorizer(f.sourceRepo, 0)
+	mapped := f.principal
+	mapped.UserID, mapped.ActorID = user.ID, user.ID
+	if err := authorizer.CanRead(ctx, mapped, child, source.ReadOptions{}); err != nil {
+		t.Fatalf("mapped channel member cannot read thread: %v", err)
+	}
+	if err := authorizer.CanRead(ctx, mapped, reply, source.ReadOptions{}); err != nil {
+		t.Fatalf("mapped channel member cannot read nested reply: %v", err)
+	}
+	other := testdb.SeedUser(t, f.db, f.tenant, "slack-unmapped@example.test", nil)
+	unbound := f.principal
+	unbound.UserID, unbound.ActorID = other.ID, other.ID
+	if err := authorizer.CanRead(ctx, unbound, child, source.ReadOptions{}); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("unmapped user read thread: %v", err)
+	}
+	if err := authorizer.CanRead(ctx, unbound, reply, source.ReadOptions{}); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("unmapped user read nested reply: %v", err)
+	}
+	admin := f.principal
+	admin.Scopes[auth.ScopePlatformAdmin] = struct{}{}
+	if _, err := f.svc.BindSourcePrincipal(ctx, admin, BindSourcePrincipalInput{ConnectionID: f.connection.ID, NativeUserID: "U-unmapped", MappedUserID: other.ID, VerificationEvidence: "verified in Slack"}); err != nil {
+		t.Fatal(err)
+	}
+	adapter.capabilities = AdapterCapabilities{Access: true}
+	if _, err := f.svc.SyncSourceWindowed(ctx, f.principal, f.connection.ID, 3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.runNext(t); err != nil {
+		t.Fatal(err)
+	}
+	if err := authorizer.CanRead(ctx, unbound, child, source.ReadOptions{}); err != nil {
+		t.Fatalf("newly mapped channel member cannot read thread: %v", err)
+	}
+	if err := authorizer.CanRead(ctx, unbound, reply, source.ReadOptions{}); err != nil {
+		t.Fatalf("newly mapped channel member cannot read nested reply: %v", err)
+	}
+}
+
+func TestSubjectlessDenyOverridesDirectAllow(t *testing.T) {
+	ctx := context.Background()
+	adapter := &testAdapter{capabilities: AdapterCapabilities{Access: true}}
+	adapter.access = func(context.Context, source.Connection, Cursor, int) (AccessPage, error) {
+		return AccessPage{Grants: []AccessGrant{
+			{NativeObjectID: "doc-1", NativeObjectKind: "document", NativePrincipalID: "native-user", Scope: "read", Effect: source.GrantEffectAllow},
+			{NativeObjectID: "doc-1", NativeObjectKind: "document", Scope: "provider-restriction", Effect: source.GrantEffectDeny},
+		}, Completeness: CompletenessComplete, Snapshot: true}, nil
+	}
+	f := newConnectorFixture(t, adapter)
+	user := testdb.SeedUser(t, f.db, f.tenant, "deny-test@example.test", nil)
+	if err := f.sourceRepo.InsertSourceIdentity(ctx, source.SourceIdentity{TenantID: f.tenant, ConnectionID: f.connection.ID, SourceKind: f.connection.Kind, ID: "deny-test-identity", NativeID: "native-user", MappedUserID: user.ID}); err != nil {
+		t.Fatal(err)
+	}
+	f.schedule(t)
+	if _, err := f.runNext(t); err != nil {
+		t.Fatal(err)
+	}
+	object, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "document", "doc-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, _, err := f.sourceRepo.LatestCompleteRevision(ctx, f.tenant, f.connection.ID, source.SnapshotGrants)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grants, err := f.sourceRepo.GrantsForObjects(ctx, f.tenant, f.connection.ID, []string{object.ID}, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundDeny, foundAllow := false, false
+	for _, grant := range grants {
+		foundDeny = foundDeny || grant.SubjectKind == source.GrantSubjectAll && grant.SubjectID == "" && grant.Effect == source.GrantEffectDeny
+		foundAllow = foundAllow || grant.SubjectID == "deny-test-identity" && grant.Effect == source.GrantEffectAllow
+	}
+	if !foundDeny || !foundAllow {
+		t.Fatalf("missing persisted all-subject deny or direct allow: %+v", grants)
+	}
+	principal := f.principal
+	principal.ActorID, principal.UserID = user.ID, user.ID
+	if err := source.NewAuthorizer(f.sourceRepo, 0).CanRead(ctx, principal, object, source.ReadOptions{}); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("subjectless deny did not override direct allow: %v", err)
+	}
+}
+
+func TestContentDedupPreservesAtoBtoA(t *testing.T) {
+	ctx := context.Background()
+	value := "A"
+	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true}}
+	adapter.content = func(context.Context, source.Connection, Cursor, int) (ContentPage, error) {
+		return ContentPage{Items: []ContentItem{{NativeID: "C123:thread-1", Kind: "thread", Filename: "thread.txt", MIMEType: "text/plain", Text: value}}, Completeness: CompletenessComplete}, nil
+	}
+	f := newConnectorFixture(t, adapter)
+	for i, step := range []struct {
+		content string
+		seq     int64
+	}{{"A", 1}, {"A", 1}, {"B", 2}, {"A", 3}} {
+		value = step.content
+		if _, err := f.svc.SyncSourceWindowed(ctx, f.principal, f.connection.ID, int64(i+1)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.runNext(t); err != nil {
+			t.Fatal(err)
+		}
+		object, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "thread", "C123:thread-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		version, err := f.sourceRepo.LatestObjectVersion(ctx, f.tenant, object.ID)
+		if err != nil || version.ObservedSeq != step.seq {
+			t.Fatalf("step %d: version=%+v err=%v", i, version, err)
+		}
+		var count int64
+		if err := f.db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM jobs WHERE tenant_id=$1 AND operation=$2`, f.tenant, OperationIngest).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != step.seq {
+			t.Fatalf("step %d: got %d ingest jobs, want %d", i, count, step.seq)
+		}
+	}
+}
+
+func TestContentResyncReEnqueuesStrandedVersion(t *testing.T) {
+	ctx := context.Background()
+	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true}}
+	adapter.content = func(context.Context, source.Connection, Cursor, int) (ContentPage, error) {
+		return ContentPage{Items: []ContentItem{{NativeID: "file-1", Kind: "document", Filename: "note.txt", MIMEType: "text/plain", Content: []byte("identical bytes")}}, Completeness: CompletenessComplete, Snapshot: true}, nil
+	}
+	f := newConnectorFixture(t, adapter)
+	f.schedule(t)
+	if _, err := f.runNext(t); err != nil {
+		t.Fatal(err)
+	}
+	object, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "document", "file-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := f.sourceRepo.LatestObjectVersion(ctx, f.tenant, object.ID)
+	if err != nil || version.ObservedSeq != 1 {
+		t.Fatalf("version=%+v err=%v", version, err)
+	}
+	// Simulate a crash after the version row committed but before its ingest
+	// job durably existed: the version+artifact stay, the job is gone.
+	if _, err := f.db.SQL.ExecContext(ctx, `DELETE FROM jobs WHERE tenant_id=$1 AND operation=$2`, f.tenant, OperationIngest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.svc.SyncSourceWindowed(ctx, f.principal, f.connection.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.runNext(t); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := f.jobRows.ListConnectionJobs(ctx, f.tenant, f.connection.ID, jobs.StatusQueued, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, item := range queued {
+		if item.Operation == OperationIngest && item.Subject.ObjectID == object.ID && item.Subject.ObservedRevision == version.ObservedSeq {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("stranded version was not re-enqueued for ingest: %+v", queued)
+	}
+	var versions int64
+	if err := f.db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM source_object_versions WHERE tenant_id=$1 AND object_id=$2`, f.tenant, object.ID).Scan(&versions); err != nil {
+		t.Fatal(err)
+	}
+	if versions != 1 {
+		t.Fatalf("identical bytes must not create a new version row, got %d", versions)
+	}
+}
+
+func TestContentMetadataChangeNewVersionReusesArtifact(t *testing.T) {
+	ctx := context.Background()
+	title, filename, url := "Original Title", "original.txt", "https://example.test/original"
+	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true}}
+	adapter.content = func(context.Context, source.Connection, Cursor, int) (ContentPage, error) {
+		return ContentPage{Items: []ContentItem{{NativeID: "file-1", Kind: "document", Title: title, Filename: filename, MIMEType: "text/plain", URL: url, Content: []byte("identical bytes")}}, Completeness: CompletenessComplete, Snapshot: true}, nil
+	}
+	f := newConnectorFixture(t, adapter)
+	f.schedule(t)
+	if _, err := f.runNext(t); err != nil {
+		t.Fatal(err)
+	}
+	object, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "document", "file-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := f.sourceRepo.LatestObjectVersion(ctx, f.tenant, object.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	title, filename, url = "Renamed Title", "renamed.txt", "https://example.test/renamed"
+	if _, err := f.svc.SyncSourceWindowed(ctx, f.principal, f.connection.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.runNext(t); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := f.sourceRepo.LatestObjectVersion(ctx, f.tenant, object.ID)
+	if err != nil || latest.ObservedSeq != 2 {
+		t.Fatalf("metadata change must allocate a new observed seq: %+v err=%v", latest, err)
+	}
+	if latest.ArtifactRef != first.ArtifactRef || latest.SHA256 != first.SHA256 {
+		t.Fatalf("unchanged bytes must reuse the artifact: first=%+v latest=%+v", first, latest)
+	}
+	if latest.OriginalFilename != filename || provenanceValue(latest.Provenance, "title") != title || provenanceValue(latest.Provenance, "source_uri") != url {
+		t.Fatalf("new version did not carry updated provenance: %+v", latest)
+	}
+	var artifacts int64
+	if err := f.db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM artifacts WHERE tenant_id=$1`, f.tenant).Scan(&artifacts); err != nil {
+		t.Fatal(err)
+	}
+	if artifacts != 1 {
+		t.Fatalf("metadata-only change must not create a new artifact, got %d", artifacts)
+	}
+	queued, err := f.jobRows.ListConnectionJobs(ctx, f.tenant, f.connection.ID, jobs.StatusQueued, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, item := range queued {
+		if item.Operation == OperationIngest && item.Subject.ObservedRevision == 2 && item.InputRef == first.ArtifactRef {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("new version ingest job not queued: %+v", queued)
+	}
+}
+
+func TestConfigurationChangeResetsIncompleteCursor(t *testing.T) {
+	ctx := context.Background()
+	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true}}
+	adapter.content = func(_ context.Context, _ source.Connection, cursor Cursor, _ int) (ContentPage, error) {
+		if cursor == "" {
+			return ContentPage{NextCursor: "old-cursor", Completeness: CompletenessIncomplete}, nil
+		}
+		return ContentPage{}, errors.New("interrupted")
+	}
+	f := newConnectorFixture(t, adapter)
+	f.schedule(t)
+	if _, err := f.runNext(t); err == nil {
+		t.Fatal("expected interrupted sync")
+	}
+	state, err := f.observations.GetStream(ctx, f.tenant, f.connection.ID, string(StreamContent))
+	if err != nil || state.Cursor != "old-cursor" {
+		t.Fatalf("expected persisted cursor: %+v err=%v", state, err)
+	}
+	if _, err := f.svc.UpdateSource(ctx, f.principal, f.connection.ID, UpdateSourceInput{Config: map[string]any{"channel": "C-new"}}); err != nil {
+		t.Fatal(err)
+	}
+	adapter.content = func(_ context.Context, _ source.Connection, cursor Cursor, _ int) (ContentPage, error) {
+		if cursor != "" {
+			t.Fatalf("old configuration cursor reused: %q", cursor)
+		}
+		return ContentPage{Completeness: CompletenessComplete}, nil
+	}
+	if _, err := f.svc.SyncSourceWindowed(ctx, f.principal, f.connection.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.runNext(t); err != nil {
+		t.Fatal(err)
 	}
 }
 

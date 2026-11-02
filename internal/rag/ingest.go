@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/jobs"
@@ -57,6 +60,7 @@ func (s *Service) IngestJobHandler() jobs.HandlerFunc {
 		}
 		var observed struct {
 			Filename       string         `json:"filename"`
+			Title          *string        `json:"title"`
 			MIMEType       string         `json:"mime_type"`
 			NativeID       string         `json:"native_id"`
 			ParentNativeID string         `json:"parent_native_id"`
@@ -77,7 +81,7 @@ func (s *Service) IngestJobHandler() jobs.HandlerFunc {
 		if err := claim.MarkDispatched(ctx); err != nil {
 			return "", err
 		}
-		provenance, err := json.Marshal(map[string]any{
+		provenanceFields := map[string]any{
 			"connection_id":    job.Subject.ConnectionID,
 			"source_kind":      fmt.Sprint(job.Policy["source_kind"]),
 			"native_id":        observed.NativeID,
@@ -85,7 +89,11 @@ func (s *Service) IngestJobHandler() jobs.HandlerFunc {
 			"kind":             observed.Kind,
 			"source_uri":       observed.URL,
 			"locator":          observed.Locator,
-		})
+		}
+		if observed.Title != nil {
+			provenanceFields["title"] = *observed.Title
+		}
+		provenance, err := json.Marshal(provenanceFields)
 		if err != nil {
 			return "", fmt.Errorf("rag ingest: encode connector provenance: %w", err)
 		}
@@ -146,4 +154,65 @@ func applyConnectorStructure(document source.Document, object source.Object, raw
 		}
 	}
 	return document
+}
+
+func embeddingTexts(c Collection, obj source.Object, ver source.ObjectVersion, chunk string, size int) (string, string) {
+	var provenance map[string]any
+	_ = json.Unmarshal([]byte(ver.Provenance), &provenance)
+	title := ver.OriginalFilename
+	if value, exists := provenance["title"]; exists {
+		title, _ = value.(string)
+	} else if obj.ConnectionID != "" && (strings.HasPrefix(obj.Kind, "message") || strings.HasPrefix(obj.Kind, "teams_channel_message") || strings.HasPrefix(obj.Kind, "teams_channel_reply") || strings.HasPrefix(obj.Kind, "teams_chat_message") || obj.Kind == "page" || obj.Kind == "block") {
+		title = ""
+	}
+	title = strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(title))
+	runes := []rune(title)
+	if len(runes) > 120 {
+		runes = runes[:120]
+		for i := len(runes) - 1; i >= 0; i-- {
+			if unicode.IsSpace(runes[i]) {
+				runes = runes[:i]
+				break
+			}
+		}
+		title = strings.TrimSpace(string(runes))
+	}
+	metadata := mapFromPayload(provenance, "metadata")
+	keys := make([]string, 0, len(metadata))
+	for key := range metadata {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	semantic := make([]string, 0, len(keys))
+	keyword := make([]string, 0, len(keys))
+	for _, key := range keys {
+		var value string
+		switch v := metadata[key].(type) {
+		case string:
+			value = v
+		case bool, float64, json.Number:
+			value = fmt.Sprint(v)
+		default:
+			continue
+		}
+		semantic = append(semantic, key+": "+value)
+		keyword = append(keyword, value)
+	}
+	embed := c.PassagePrefix
+	if c.EmbedTitles && title != "" {
+		embed += title + "\n"
+	}
+	embed += chunk
+	metadataText := strings.Join(semantic, "\n")
+	if metadataText != "" && size > 0 && utf8.RuneCountInString(metadataText)*4 < size {
+		embed += "\n" + metadataText
+	}
+	search := chunk
+	if title != "" {
+		search = title + "\n" + search
+	}
+	if len(keyword) > 0 {
+		search += "\n" + strings.Join(keyword, " ")
+	}
+	return embed, search
 }

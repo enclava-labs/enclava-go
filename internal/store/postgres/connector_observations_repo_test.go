@@ -3,6 +3,7 @@ package postgres_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"enclava-go/internal/artifacts"
@@ -22,7 +23,7 @@ func TestConnectorStreamPagesPersistBeforeCursorAndFenceOldRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	repo := postgres.NewConnectorObservationsRepo(db)
-	first, err := repo.StartRun(ctx, tenant, connectionID, string(connectors.StreamContent), "00000000-0000-4000-8000-000000000001")
+	first, err := repo.StartRun(ctx, tenant, connectionID, string(connectors.StreamContent), "00000000-0000-4000-8000-000000000001", "config-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +34,7 @@ func TestConnectorStreamPagesPersistBeforeCursorAndFenceOldRuns(t *testing.T) {
 	if first.Cursor != "opaque-next" || first.ObservedSeq != 1 || first.Complete || !first.Incomplete {
 		t.Fatalf("unexpected incomplete checkpoint: %#v", first)
 	}
-	second, err := repo.StartRun(ctx, tenant, connectionID, string(connectors.StreamContent), "00000000-0000-4000-8000-000000000002")
+	second, err := repo.StartRun(ctx, tenant, connectionID, string(connectors.StreamContent), "00000000-0000-4000-8000-000000000002", "config-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +44,7 @@ func TestConnectorStreamPagesPersistBeforeCursorAndFenceOldRuns(t *testing.T) {
 	if _, err := repo.PersistPage(ctx, first, nil, "stale", true, false, ""); err == nil {
 		t.Fatal("stale run advanced stream checkpoint")
 	}
-	second, err = repo.PersistPage(ctx, second, nil, "", true, false, "")
+	second, err = repo.PersistPage(ctx, second, nil, "delta-checkpoint", true, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,12 +55,12 @@ func TestConnectorStreamPagesPersistBeforeCursorAndFenceOldRuns(t *testing.T) {
 	if !stored.Complete || stored.Incomplete || stored.ObservedSeq != 1 || stored.RunID != second.RunID {
 		t.Fatalf("terminal checkpoint mismatch: %#v", stored)
 	}
-	third, err := repo.StartRun(ctx, tenant, connectionID, string(connectors.StreamContent), "00000000-0000-4000-8000-000000000003")
+	third, err := repo.StartRun(ctx, tenant, connectionID, string(connectors.StreamContent), "00000000-0000-4000-8000-000000000003", "config-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if third.Cursor != "" || third.RunStartSeq != 1 || third.Fence <= second.Fence {
-		t.Fatalf("new complete scan did not reset its cursor boundary: %#v", third)
+	if third.Cursor != "delta-checkpoint" || third.RunStartSeq != 1 || third.Fence <= second.Fence {
+		t.Fatalf("new run did not retain delta checkpoint and reset observation boundary: %#v", third)
 	}
 	currentRun, err := repo.ListObservations(ctx, third)
 	if err != nil {
@@ -68,7 +69,7 @@ func TestConnectorStreamPagesPersistBeforeCursorAndFenceOldRuns(t *testing.T) {
 	if len(currentRun) != 0 {
 		t.Fatalf("new scan inherited observations from prior A→B→A history: %#v", currentRun)
 	}
-	membership, err := repo.StartRun(ctx, tenant, connectionID, string(connectors.StreamMembership), "00000000-0000-4000-8000-000000000004")
+	membership, err := repo.StartRun(ctx, tenant, connectionID, string(connectors.StreamMembership), "00000000-0000-4000-8000-000000000004", "config-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,5 +82,65 @@ func TestConnectorStreamPagesPersistBeforeCursorAndFenceOldRuns(t *testing.T) {
 	}
 	if stillContent.RunID != third.RunID || stillContent.Fence != third.Fence {
 		t.Fatalf("membership run interfered with content stream: %#v", stillContent)
+	}
+
+	third, err = repo.PersistPage(ctx, third, []postgres.ConnectorObservation{{NativeID: "old-config", Payload: json.RawMessage(`{}`)}}, "old-cursor", false, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := repo.StartRun(ctx, tenant, connectionID, string(connectors.StreamContent), "00000000-0000-4000-8000-000000000005", "config-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Cursor != "" || changed.RunStartSeq != third.ObservedSeq || changed.ObservedSeq != third.ObservedSeq || changed.Fence <= third.Fence {
+		t.Fatalf("configuration change did not reset scan boundary: %#v", changed)
+	}
+	if observations, err := repo.ListObservations(ctx, changed); err != nil || len(observations) != 0 {
+		t.Fatalf("configuration change inherited observations: %#v, %v", observations, err)
+	}
+	if _, err := repo.PersistPage(ctx, third, nil, "stale", true, false, ""); err == nil {
+		t.Fatal("old configuration run retained its fence")
+	}
+}
+
+func TestConnectorUnmappedPrincipalsUsesLatestCompleteSnapshots(t *testing.T) {
+	db := testdb.New(t)
+	ctx := context.Background()
+	tenant := testdb.SeedTenant(t, db, "connector-unmapped")
+	other := testdb.SeedTenant(t, db, "connector-unmapped-other")
+	connections := postgres.NewSourceRepo(db)
+	for _, id := range []string{tenant, other} {
+		if err := connections.CreateConnection(ctx, source.Connection{TenantID: id, ID: "conn", Kind: source.ConnectionSlack, Name: "Slack", Status: "active"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repo := postgres.NewConnectorObservationsRepo(db)
+	if count, err := repo.UnmappedPrincipals(ctx, tenant, "conn"); err != nil || count != 0 {
+		t.Fatalf("empty count = %d, %v", count, err)
+	}
+	_, err := db.SQL.ExecContext(ctx, `
+		INSERT INTO access_snapshots (tenant_id, id, connection_id, kind, revision, status, unmapped_subjects)
+		VALUES ($1, 'g1', 'conn', 'grants', 1, 'complete', 10),
+		       ($1, 'g2', 'conn', 'grants', 2, 'complete', 2),
+		       ($1, 'g3', 'conn', 'grants', 3, 'incomplete', 100),
+		       ($1, 'm1', 'conn', 'membership', 1, 'complete', 3),
+		       ($1, 'm2', 'conn', 'membership', 2, 'incomplete', 100),
+		       ($1, 'c1', 'conn', 'content', 1, 'complete', 100),
+		       ($2, 'g4', 'conn', 'grants', 4, 'complete', 100)`, tenant, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count, err := repo.UnmappedPrincipals(ctx, tenant, "conn"); err != nil || count != 5 {
+		t.Fatalf("latest complete count = %d, %v; want 5", count, err)
+	}
+}
+
+func TestConnectorIdentityResolverPropagatesDatabaseErrors(t *testing.T) {
+	db := testdb.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := postgres.NewSourceRepo(db).SourceIdentityForNativeID(ctx, "00000000-0000-4000-8000-000000000001", "conn", "user")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("resolver error = %v, want context.Canceled", err)
 	}
 }

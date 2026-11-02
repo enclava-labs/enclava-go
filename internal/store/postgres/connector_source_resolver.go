@@ -37,11 +37,14 @@ func (r *SourceRepo) SourceIdentityForNativeID(ctx context.Context, tenantID, co
 	var out source.SourceIdentity
 	var mapped sql.NullString
 	err := r.db.SQL.QueryRowContext(ctx, `SELECT tenant_id::text,id,connection_id,source_user_native_id,mapped_user_id FROM source_identities WHERE tenant_id=$1 AND connection_id=$2 AND source_user_native_id=$3`, tenantID, connectionID, nativeID).Scan(&out.TenantID, &out.ID, &out.ConnectionID, &out.NativeID, &mapped)
-	if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) || !mapped.Valid {
+	if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
 		return source.SourceIdentity{}, source.ErrDenied
 	}
 	if err != nil {
 		return source.SourceIdentity{}, fmt.Errorf("resolve source identity: %w", err)
+	}
+	if !mapped.Valid {
+		return source.SourceIdentity{}, source.ErrDenied
 	}
 	out.MappedUserID = mapped.String
 	return out, nil

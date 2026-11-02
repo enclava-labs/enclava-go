@@ -343,6 +343,7 @@ func (a *App) handleIdentityUsers(w http.ResponseWriter, r *http.Request, princi
 			a.writeIdentityError(w, err, "user_create_failed")
 			return
 		}
+		a.recordSecurityAudit(r, principal, "identity.user.created", "user", user.ID, "success")
 		if team != "" {
 			if err := a.identity.UpdateUserTeam(r.Context(), principal.TenantID, user.ID, team); err != nil {
 				log.Printf("update user team %s: %v", user.ID, err)
@@ -397,7 +398,7 @@ func (a *App) handleIdentityUserByID(w http.ResponseWriter, r *http.Request, pri
 			WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 			return
 		}
-		a.setUserPassword(w, r, user, req.Password)
+		a.setUserPassword(w, r, principal, user, req.Password)
 	case "roles":
 		if len(segs) == 2 {
 			if r.Method != http.MethodGet {
@@ -443,7 +444,7 @@ func (a *App) handleIdentityUserByID(w http.ResponseWriter, r *http.Request, pri
 			WriteMethodNotAllowed(w)
 			return
 		}
-		a.revokeUserSession(w, r, principal.TenantID, user.ID, segs[2])
+		a.revokeUserSession(w, r, principal, user.ID, segs[2])
 	case "identities":
 		if len(segs) != 2 || r.Method != http.MethodGet {
 			if r.Method != http.MethodGet {
@@ -502,11 +503,18 @@ func (a *App) handleIdentityUser(w http.ResponseWriter, r *http.Request, princip
 				WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "user_update_failed")
 				return
 			}
+			action := "identity.user.disabled"
+			if status == "active" {
+				action = "identity.user.enabled"
+			}
+			a.recordSecurityAudit(r, principal, action, "user", user.ID, "success")
 			if status != "active" {
 				// Revocation takes effect on the next request for every live
 				// session of the disabled account.
 				if err := a.authSvc.RevokeUserSessions(r.Context(), principal.TenantID, user.ID, "user disabled"); err != nil {
 					log.Printf("revoke sessions for disabled user %s: %v", user.ID, err)
+				} else {
+					a.recordSecurityAudit(r, principal, "auth.sessions.revoked", "user", user.ID, "success")
 				}
 			}
 		}
@@ -516,6 +524,7 @@ func (a *App) handleIdentityUser(w http.ResponseWriter, r *http.Request, princip
 				WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "user_update_failed")
 				return
 			}
+			a.recordSecurityAudit(r, principal, "identity.user.updated", "user", user.ID, "success")
 		}
 		updated, err := a.identity.GetUser(r.Context(), principal.TenantID, user.ID)
 		if err != nil {
@@ -554,6 +563,7 @@ func (a *App) assignRoleChecked(w http.ResponseWriter, r *http.Request, principa
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "role_assign_failed")
 		return false
 	}
+	a.recordSecurityAudit(r, principal, "identity.role.assigned", "user", userID, "success", map[string]any{"role_id": roleID})
 	if respond {
 		WriteJSON(w, http.StatusOK, map[string]any{"assigned": true, "user_id": userID, "role_id": roleID})
 	}
@@ -568,11 +578,12 @@ func (a *App) unassignRoleChecked(w http.ResponseWriter, r *http.Request, princi
 		a.writeRoleWriteError(w, err, "role_unassign_failed")
 		return
 	}
+	a.recordSecurityAudit(r, principal, "identity.role.unassigned", "user", user.ID, "success", map[string]any{"role_id": roleID})
 	WriteJSON(w, http.StatusOK, map[string]any{"assigned": false, "user_id": user.ID, "role_id": roleID})
 }
 
 // setUserPassword rewrites the stored bcrypt hash; plaintext never persists.
-func (a *App) setUserPassword(w http.ResponseWriter, r *http.Request, user auth.User, password string) {
+func (a *App) setUserPassword(w http.ResponseWriter, r *http.Request, principal auth.Principal, user auth.User, password string) {
 	if password == "" {
 		WriteOpenAIError(w, http.StatusBadRequest, "password is required", "invalid_request_error", "missing_password")
 		return
@@ -583,11 +594,17 @@ func (a *App) setUserPassword(w http.ResponseWriter, r *http.Request, user auth.
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "password_hash_failed")
 		return
 	}
-	if err := a.identity.SetPassword(r.Context(), user.TenantID, user.ID, hash, time.Now().UTC()); err != nil {
+	keepSessionID := ""
+	if principal.UserID == user.ID {
+		keepSessionID = principal.SessionID
+	}
+	if err := a.identity.SetPasswordAndRevokeSessions(r.Context(), user.TenantID, user.ID, hash, time.Now().UTC(), keepSessionID); err != nil {
 		log.Printf("set password for %s: %v", user.ID, err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "password_set_failed")
 		return
 	}
+	a.recordSecurityAudit(r, principal, "auth.password.changed", "user", user.ID, "success")
+	a.recordSecurityAudit(r, principal, "auth.sessions.revoked", "user", user.ID, "success")
 	WriteJSON(w, http.StatusOK, map[string]any{"updated": true, "user_id": user.ID})
 }
 
@@ -612,10 +629,10 @@ func serviceAccountDTO(sa auth.ServiceAccount) map[string]any {
 	}
 }
 
-func (a *App) revokeUserSession(w http.ResponseWriter, r *http.Request, tenantID, userID, sessionID string) {
+func (a *App) revokeUserSession(w http.ResponseWriter, r *http.Request, principal auth.Principal, userID, sessionID string) {
 	// The session must belong to the asserted user inside the tenant —
 	// otherwise any session id becomes revocable across accounts.
-	sess, err := a.identity.GetSession(r.Context(), tenantID, sessionID)
+	sess, err := a.identity.GetSession(r.Context(), principal.TenantID, sessionID)
 	if err != nil || sess.UserID != userID {
 		if err != nil {
 			a.writeIdentityError(w, err, "session_fetch_failed")
@@ -624,11 +641,12 @@ func (a *App) revokeUserSession(w http.ResponseWriter, r *http.Request, tenantID
 		WriteOpenAIError(w, http.StatusNotFound, "session not found", "invalid_request_error", "not_found")
 		return
 	}
-	if err := a.authSvc.RevokeSession(r.Context(), tenantID, sessionID, "administrator revocation"); err != nil {
+	if err := a.authSvc.RevokeSession(r.Context(), principal.TenantID, sessionID, "administrator revocation"); err != nil {
 		log.Printf("revoke session %s: %v", sessionID, err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "session_revoke_failed")
 		return
 	}
+	a.recordSecurityAudit(r, principal, "auth.sessions.revoked", "session", sessionID, "success")
 	WriteJSON(w, http.StatusOK, map[string]any{"revoked": true, "id": sessionID})
 }
 
@@ -700,6 +718,7 @@ func (a *App) handleIdentityRoles(w http.ResponseWriter, r *http.Request, princi
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "role_create_failed")
 			return
 		}
+		a.recordSecurityAudit(r, principal, "identity.role.created", "role", role.ID, "success")
 		WriteJSON(w, http.StatusCreated, roleDTO(role, nil))
 	default:
 		WriteMethodNotAllowed(w)
@@ -805,6 +824,7 @@ func (a *App) handleIdentityRolePatch(w http.ResponseWriter, r *http.Request, pr
 		a.writeRoleWriteError(w, err, "role_update_failed")
 		return
 	}
+	a.recordSecurityAudit(r, principal, "identity.role.updated", "role", role.ID, "success")
 	userIDs, err := a.identity.RoleUsers(r.Context(), principal.TenantID, role.ID)
 	if err != nil {
 		log.Printf("role users %s: %v", role.ID, err)
@@ -823,6 +843,7 @@ func (a *App) handleIdentityRoleDelete(w http.ResponseWriter, r *http.Request, p
 		a.writeRoleWriteError(w, err, "role_delete_failed")
 		return
 	}
+	a.recordSecurityAudit(r, principal, "identity.role.deleted", "role", roleID, "success")
 	WriteJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": roleID})
 }
 
@@ -1017,7 +1038,7 @@ func (a *App) handleIdentityMe(w http.ResponseWriter, r *http.Request, principal
 			WriteForbidden(w, "current password is incorrect")
 			return
 		}
-		a.setUserPassword(w, r, user, req.Password)
+		a.setUserPassword(w, r, principal, user, req.Password)
 	case "sessions":
 		if len(segs) == 1 {
 			if r.Method != http.MethodGet {
@@ -1041,7 +1062,7 @@ func (a *App) handleIdentityMe(w http.ResponseWriter, r *http.Request, principal
 			WriteMethodNotAllowed(w)
 			return
 		}
-		a.revokeUserSession(w, r, principal.TenantID, user.ID, segs[1])
+		a.revokeUserSession(w, r, principal, user.ID, segs[1])
 	case "identities":
 		if len(segs) != 1 || r.Method != http.MethodGet {
 			WriteMethodNotAllowed(w)

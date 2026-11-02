@@ -215,6 +215,9 @@ func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data
 		pdfinfo, _ := exec.LookPath("pdfinfo")
 		info, err := runNative(ctx, sandbox, prlimit, pdfinfo, []string{"/work/input"}, dir, 1<<20)
 		if err != nil {
+			if encryptedPDF(info, err) {
+				return source.Document{}, ErrEncryptedDocument
+			}
 			return source.Document{}, fmt.Errorf("%w: PDF metadata: %v", ErrMalformedDocument, err)
 		}
 		pages, err := pdfPageCount(info)
@@ -227,6 +230,9 @@ func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data
 		pdftotext, _ := exec.LookPath("pdftotext")
 		bbox, err := runNative(ctx, sandbox, prlimit, pdftotext, []string{"-bbox", "-f", "1", "-l", strconv.Itoa(pages), "/work/input", "-"}, dir, maxNativeOutput)
 		if err != nil {
+			if encryptedPDF(info, err) {
+				return source.Document{}, ErrEncryptedDocument
+			}
 			return source.Document{}, fmt.Errorf("%w: PDF text: %v", ErrMalformedDocument, err)
 		}
 		blocks, err = parsePDFBBox(bbox)
@@ -292,6 +298,23 @@ func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data
 	document := makeDocument(opts.ObjectRef, ref, blocks)
 	document.ParseWarnings = parseWarnings
 	return document, nil
+}
+
+func encryptedPDF(info []byte, err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "incorrect password") || strings.Contains(message, "incorrect owner password") {
+		return true
+	}
+	for _, line := range strings.Split(string(info), "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if ok && strings.EqualFold(strings.TrimSpace(key), "Encrypted") && strings.HasPrefix(strings.ToLower(strings.TrimSpace(value)), "yes") {
+			return true
+		}
+	}
+	return false
 }
 
 func pdfPageCount(info []byte) (int, error) {

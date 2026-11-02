@@ -702,14 +702,34 @@ func (r *IdentityRepo) UpdateUserStatus(ctx context.Context, tenantID, userID, s
 }
 
 func (r *IdentityRepo) SetPassword(ctx context.Context, tenantID, userID, hash string, at time.Time) error {
-	_, err := r.db.ExecContext(ctx,
-		`UPDATE users SET password_hash = $3, password_set_at = $4
-		 WHERE tenant_id = $1::uuid AND id = $2`,
-		tenantID, userID, hash, at)
-	if err != nil {
-		return fmt.Errorf("set password: %w", err)
-	}
-	return nil
+	return r.SetPasswordAndRevokeSessions(ctx, tenantID, userID, hash, at, "")
+}
+
+func (r *IdentityRepo) SetPasswordAndRevokeSessions(ctx context.Context, tenantID, userID, hash string, at time.Time, keepSessionID string) error {
+	return WithTx(ctx, r.db, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx,
+			`UPDATE users SET password_hash = $3, password_set_at = $4
+			 WHERE tenant_id = $1::uuid AND id = $2`,
+			tenantID, userID, hash, at)
+		if err != nil {
+			return fmt.Errorf("set password: %w", err)
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("set password: %w", err)
+		}
+		if n == 0 {
+			return auth.ErrNotFound
+		}
+		_, err = tx.ExecContext(ctx,
+			`UPDATE sessions SET revoked_at = $3, revoke_reason = 'password_changed'
+			 WHERE tenant_id = $1::uuid AND user_id = $2 AND revoked_at IS NULL AND id <> $4`,
+			tenantID, userID, at, keepSessionID)
+		if err != nil {
+			return fmt.Errorf("revoke sessions after password change: %w", err)
+		}
+		return nil
+	})
 }
 
 func (r *IdentityRepo) TouchLastLogin(ctx context.Context, tenantID, userID string, at time.Time) error {

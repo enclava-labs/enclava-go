@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -164,6 +166,132 @@ func TestExternalChatbotCompletionStreamUsesExecutor(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "data: {\"choices\"") {
 		t.Fatalf("stream body missing SSE data: %s", rec.Body.String())
+	}
+}
+
+func TestStreamingReservesThenFinalizesAssistant(t *testing.T) {
+	ctx := context.Background()
+	db := testdb.New(t)
+	tenant := testdb.SeedTenant(t, db, "chatbot-slow-stream")
+	reader, writer := io.Pipe()
+	defer func() { _ = writer.Close() }()
+	repo := postgres.NewChatbotRepo(db)
+	svc := chatbot.NewService(repo, postgres.NewPromptsRepo(db), nil, &stubExecutor{result: &inference.Result{Body: reader}})
+	p := openChatPrincipal(tenant)
+	if _, err := svc.Create(ctx, p, chatbot.CreateChatbotInput{Name: "Slow", Model: "model", ExternalID: "slow"}); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{chatbotSvc: svc}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"stream":true,"messages":[{"role":"user","content":"hello"}]}`))
+	done := make(chan struct{})
+	go func() {
+		app.handleExternalChatbotCompletion(rec, req, p, "slow")
+		close(done)
+	}()
+	if _, err := io.WriteString(writer, "data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\n\n"); err != nil {
+		t.Fatal(err)
+	}
+	conversations, _, err := svc.ListConversations(ctx, p, 10, "")
+	if err != nil || len(conversations) != 1 {
+		t.Fatalf("conversations: %v %#v", err, conversations)
+	}
+	messages, err := repo.ListMessages(ctx, tenant, conversations[0].ID)
+	if err != nil || len(messages) != 2 || messages[1].Status != "reserved" {
+		t.Fatalf("during stream: %v %#v", err, messages)
+	}
+	reservedID := messages[1].ID
+	if _, err := io.WriteString(writer, "data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\n\ndata: [DONE]\n\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	messages, err = repo.ListMessages(ctx, tenant, conversations[0].ID)
+	if err != nil || len(messages) != 2 || messages[1].ID != reservedID || messages[1].Status != "complete" || messages[1].Content != "hello world" {
+		t.Fatalf("after stream: %v %#v", err, messages)
+	}
+}
+
+func TestStreamingFailureLeavesInterruptedMessage(t *testing.T) {
+	ctx := context.Background()
+	db := testdb.New(t)
+	tenant := testdb.SeedTenant(t, db, "chatbot-failed-stream")
+	repo := postgres.NewChatbotRepo(db)
+	svc := chatbot.NewService(repo, postgres.NewPromptsRepo(db), nil, &stubExecutor{
+		result: streamResult("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"),
+	})
+	p := openChatPrincipal(tenant)
+	if _, err := svc.Create(ctx, p, chatbot.CreateChatbotInput{Name: "Broken", Model: "model", ExternalID: "broken"}); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{chatbotSvc: svc}
+	postChatbotCompletion(t, app, p, "broken", `{"stream":true,"messages":[{"role":"user","content":"hello"}]}`)
+	conversations, _, err := svc.ListConversations(ctx, p, 10, "")
+	if err != nil || len(conversations) != 1 {
+		t.Fatalf("conversations: %v %#v", err, conversations)
+	}
+	view, err := svc.ListConversation(ctx, p, conversations[0].ID)
+	if err != nil || len(view.Messages) != 2 || view.Messages[1].Status != "interrupted" || view.Messages[1].Content != "Response was interrupted before completion." {
+		t.Fatalf("interrupted stream: %v %#v", err, view.Messages)
+	}
+}
+
+type doneNotifyingWriter struct {
+	rec  *httptest.ResponseRecorder
+	done chan<- struct{}
+	once sync.Once
+}
+
+func (w *doneNotifyingWriter) Header() http.Header  { return w.rec.Header() }
+func (w *doneNotifyingWriter) WriteHeader(code int) { w.rec.WriteHeader(code) }
+func (w *doneNotifyingWriter) Write(b []byte) (int, error) {
+	if bytes.Contains(b, []byte("[DONE]")) {
+		w.once.Do(func() { close(w.done) })
+	}
+	return w.rec.Write(b)
+}
+
+func TestStreamingClientDisconnectAfterDoneKeepsComplete(t *testing.T) {
+	db := testdb.New(t)
+	tenant := testdb.SeedTenant(t, db, "chatbot-disconnect-after-done")
+	repo := postgres.NewChatbotRepo(db)
+	reader, writer := io.Pipe()
+	defer func() { _ = writer.Close() }()
+	svc := chatbot.NewService(repo, postgres.NewPromptsRepo(db), nil, &stubExecutor{
+		result: &inference.Result{Body: reader},
+	})
+	p := openChatPrincipal(tenant)
+	if _, err := svc.Create(context.Background(), p, chatbot.CreateChatbotInput{Name: "Done", Model: "model", ExternalID: "done"}); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{chatbotSvc: svc}
+	rec := httptest.NewRecorder()
+	sawDone := make(chan struct{})
+	reqCtx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"stream":true,"messages":[{"role":"user","content":"hello"}]}`)).WithContext(reqCtx)
+	done := make(chan struct{})
+	go func() {
+		app.handleExternalChatbotCompletion(&doneNotifyingWriter{rec: rec, done: sawDone}, req, p, "done")
+		close(done)
+	}()
+	if _, err := io.WriteString(writer, "data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\n\ndata: [DONE]\n\n"); err != nil {
+		t.Fatal(err)
+	}
+	<-sawDone
+	cancel() // client closed right after the terminal event
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	conversations, _, err := svc.ListConversations(context.Background(), p, 10, "")
+	if err != nil || len(conversations) != 1 {
+		t.Fatalf("conversations: %v %#v", err, conversations)
+	}
+	messages, err := repo.ListMessages(context.Background(), tenant, conversations[0].ID)
+	if err != nil || len(messages) != 2 || messages[1].Status != "complete" || messages[1].Content != "hello world" {
+		t.Fatalf("disconnect after [DONE] downgraded the answer: %v %#v", err, messages)
 	}
 }
 

@@ -202,7 +202,7 @@ func (a DriveAdapter) Content(ctx context.Context, c source.Connection, cursor C
 		if len(state.Removed) > 0 {
 			page.NextCursor, err = encodeDriveCursor(state)
 		} else {
-			page.NextCursor, err = encodeDriveCursor(driveCursor{Mode: "changes", Token: state.Token, InScope: state.InScope})
+			page.Checkpoint, err = encodeDriveCursor(driveCursor{Mode: "changes", Token: state.Token, InScope: state.InScope})
 		}
 		return page, err
 	default:
@@ -365,7 +365,7 @@ func (a DriveAdapter) driveItem(ctx context.Context, c source.Connection, f driv
 		return nil, fmt.Errorf("google_drive file %s: %w", f.ID, err)
 	}
 	tm, _ := time.Parse(time.RFC3339, f.ModifiedTime)
-	item := &ContentItem{NativeID: f.ID, Kind: c.Kind, NativeRevision: f.Revision, Filename: f.Name, MIMEType: mime, Content: content, URL: f.WebViewLink}
+	item := &ContentItem{NativeID: f.ID, Kind: c.Kind, NativeRevision: f.Revision, Title: f.Name, Filename: f.Name, MIMEType: mime, Content: content, URL: f.WebViewLink}
 	if len(f.Parents) > 0 {
 		item.ParentNativeID = f.Parents[0]
 	}
@@ -492,7 +492,11 @@ func (a DriveAdapter) driveChanges(ctx context.Context, c source.Connection, sta
 	} else {
 		state.Mode = "changes"
 	}
-	page.NextCursor, err = encodeDriveCursor(state)
+	if payload.Next == "" && len(state.Removed) == 0 {
+		page.Checkpoint, err = encodeDriveCursor(state)
+	} else {
+		page.NextCursor, err = encodeDriveCursor(state)
+	}
 	return page, err
 }
 
@@ -685,24 +689,33 @@ func (a DriveAdapter) Access(ctx context.Context, c source.Connection, cursor Cu
 		if f.DriveID != "" && (f.InheritedPermissionsDisabled == nil || f.CopyRequiresWriterPermission == nil || f.DownloadRestrictions.Item.RestrictedForReaders == nil || f.DownloadRestrictions.Item.RestrictedForWriters == nil) {
 			page.Completeness = CompletenessIncomplete
 		}
+		if (f.CopyRequiresWriterPermission != nil && *f.CopyRequiresWriterPermission) ||
+			(f.DownloadRestrictions.Item.RestrictedForReaders != nil && *f.DownloadRestrictions.Item.RestrictedForReaders) ||
+			(f.DownloadRestrictions.Item.RestrictedForWriters != nil && *f.DownloadRestrictions.Item.RestrictedForWriters) {
+			page.Grants = append(page.Grants, AccessGrant{NativeObjectID: f.ID, Scope: "copy_download_restricted", Effect: "deny"})
+		}
 		for _, p := range f.Permissions {
 			if p.Type == "" || p.ID == "" || p.Role == "" {
 				page.Completeness = CompletenessIncomplete
 				continue
 			}
-			inherited, role, inheritedFrom := false, p.Role, ""
+			inherited, role := false, p.Role
 			for _, d := range p.Details {
 				if d.Inherited {
-					inherited, role, inheritedFrom = true, d.Role, d.InheritedFrom
+					inherited = true
+					if d.Role != "" {
+						role = d.Role
+					}
 				}
 			}
-			grant := AccessGrant{NativeObjectID: f.ID, NativeObjectKind: "file", NativePrincipalID: p.EmailAddress, Scope: role, Effect: "allow", Inherited: inherited}
+			grant := AccessGrant{NativeObjectID: f.ID, NativePrincipalID: p.EmailAddress, Scope: role, Effect: "allow", Inherited: inherited}
 			switch p.Type {
 			case "user":
 				if grant.NativePrincipalID == "" {
 					grant.NativePrincipalID = p.ID
 				}
 			case "group":
+				grant.NativePrincipalID = ""
 				grant.NativeGroupID = firstNonEmpty(p.EmailAddress, p.ID)
 			case "domain":
 				grant.NativePrincipalID = p.Domain
@@ -712,50 +725,13 @@ func (a DriveAdapter) Access(ctx context.Context, c source.Connection, cursor Cu
 				page.Completeness = CompletenessIncomplete
 				continue
 			}
-			if f.DriveID != "" {
-				inheritance := "enabled"
-				if f.InheritedPermissionsDisabled != nil && *f.InheritedPermissionsDisabled {
-					inheritance = "disabled"
-				}
-				grant.Scope += " (shared drive " + f.DriveID + "; inheritance " + inheritance + ")"
-			}
-			copyRestricted, readersRestricted, writersRestricted := false, false, false
-			if f.CopyRequiresWriterPermission != nil {
-				copyRestricted = *f.CopyRequiresWriterPermission
-			}
-			if f.DownloadRestrictions.Item.RestrictedForReaders != nil {
-				readersRestricted = *f.DownloadRestrictions.Item.RestrictedForReaders
-			}
-			if f.DownloadRestrictions.Item.RestrictedForWriters != nil {
-				writersRestricted = *f.DownloadRestrictions.Item.RestrictedForWriters
-			}
-			grant.Scope += fmt.Sprintf(" (copy_restricted=%t; download_readers=%t; download_writers=%t)", copyRestricted, readersRestricted, writersRestricted)
-			if inheritedFrom != "" {
-				grant.Scope += " (inherited from " + inheritedFrom + ")"
-			}
 			page.Grants = append(page.Grants, grant)
-			reader := role == "reader" || role == "commenter"
-			writer := role == "writer" || role == "fileOrganizer" || role == "organizer" || role == "owner"
-			if f.CopyRequiresWriterPermission != nil && *f.CopyRequiresWriterPermission && reader {
-				page.Grants = append(page.Grants, restrictedDriveGrant(grant, "copy"), restrictedDriveGrant(grant, "download"))
-			}
-			if f.DownloadRestrictions.Item.RestrictedForReaders != nil && *f.DownloadRestrictions.Item.RestrictedForReaders && reader {
-				page.Grants = append(page.Grants, restrictedDriveGrant(grant, "download"))
-			}
-			if f.DownloadRestrictions.Item.RestrictedForWriters != nil && *f.DownloadRestrictions.Item.RestrictedForWriters && writer {
-				page.Grants = append(page.Grants, restrictedDriveGrant(grant, "download"))
-			}
 		}
 	}
 	if page.Completeness != CompletenessComplete {
-		page.Snapshot = false
+		page.Snapshot, page.NextCursor = false, ""
 	}
 	return page, nil
-}
-
-func restrictedDriveGrant(grant AccessGrant, operation string) AccessGrant {
-	grant.Scope, grant.Effect = operation, "deny"
-	return grant
 }
 
 func (DriveAdapter) Membership(context.Context, source.Connection, Cursor, int) (MembershipPage, error) {

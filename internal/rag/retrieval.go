@@ -25,6 +25,65 @@ type queryClient interface {
 // The HTTP layer maps it to a 400-class `search_scope_too_large`.
 var ErrSearchWorkExceeded = errors.New("search scope exceeds the authorized work bound")
 
+var ErrUtilityModelNotConfigured = errors.New("utility model is not configured")
+
+func (s *Service) SetUtilityModel(model string) {
+	s.utilityModel = strings.TrimSpace(model)
+}
+
+type queryEmbeddingBinding struct {
+	model, prefix string
+	dims          int
+}
+
+type queryEmbeddingKey struct {
+	queryEmbeddingBinding
+	query string
+}
+
+type queryEmbeddingMemo struct {
+	vectors map[queryEmbeddingKey][]float64
+	scopes  map[queryEmbeddingBinding][]source.ObjectRef
+	denied  map[queryEmbeddingBinding]bool
+}
+
+func newQueryEmbeddingMemo() *queryEmbeddingMemo {
+	return &queryEmbeddingMemo{
+		vectors: make(map[queryEmbeddingKey][]float64),
+		scopes:  make(map[queryEmbeddingBinding][]source.ObjectRef),
+		denied:  make(map[queryEmbeddingBinding]bool),
+	}
+}
+
+func (m *queryEmbeddingMemo) addCollection(tenantID string, candidates []authorizedCandidate) {
+	refs := make([]source.ObjectRef, 0, len(candidates))
+	bindings := make(map[queryEmbeddingBinding]struct{})
+	for _, candidate := range candidates {
+		g := candidate.generation
+		bindings[queryEmbeddingBinding{model: g.EmbeddingModel, prefix: g.QueryPrefix, dims: g.EmbeddingDimensions}] = struct{}{}
+		refs = append(refs, source.ObjectRef{TenantID: tenantID, ObjectID: candidate.object.ID, ObservedSeq: candidate.version.ObservedSeq})
+	}
+	for binding := range bindings {
+		m.scopes[binding] = append(m.scopes[binding], refs...)
+	}
+}
+
+func (s *Service) searchModels(input *SearchInput) error {
+	if input.Rewrite && strings.TrimSpace(input.RewriteModel) == "" {
+		input.RewriteModel = s.utilityModel
+		if strings.TrimSpace(input.RewriteModel) == "" {
+			return ErrUtilityModelNotConfigured
+		}
+	}
+	if input.SelectSections && strings.TrimSpace(input.SectionModel) == "" {
+		input.SectionModel = s.utilityModel
+		if strings.TrimSpace(input.SectionModel) == "" {
+			return ErrUtilityModelNotConfigured
+		}
+	}
+	return nil
+}
+
 // SearchWorkBudget bounds the object/generation authorization work one
 // collection may spend per search. It is a var so tests can tighten it.
 var SearchWorkBudget = 2000
@@ -117,6 +176,9 @@ func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInpu
 	if err := validateSearchQueryMode(input.Query, input.Mode); err != nil {
 		return nil, err
 	}
+	if err := s.searchModels(&input); err != nil {
+		return nil, err
+	}
 	collection, err := s.GetCollection(ctx, p, strings.TrimSpace(input.CollectionID))
 	if err != nil {
 		return nil, err
@@ -125,7 +187,15 @@ func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInpu
 	if err != nil {
 		return nil, err
 	}
-	results, err := s.searchCollection(ctx, p, collection, input, candidates)
+	memo := newQueryEmbeddingMemo()
+	memo.addCollection(p.TenantID, candidates)
+	results, err := s.searchCollection(ctx, p, collection, input, candidates, memo)
+	if err != nil {
+		return nil, err
+	}
+	// Candidates were authorized before the vector query ran; re-check the
+	// surviving hits so a mid-search revocation cannot leak material.
+	results, err = s.reauthorizeResults(ctx, p, results)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +224,7 @@ func validateSearchQueryMode(query string, mode QueryMode) error {
 // pre-authorized candidates: embed, query the vector store within the
 // published-generation filter and re-check every returned point against the
 // candidate set before materializing results.
-func (s *Service) searchCollection(ctx context.Context, p auth.Principal, collection Collection, input SearchInput, candidates []authorizedCandidate) ([]SearchResult, error) {
+func (s *Service) searchCollection(ctx context.Context, p auth.Principal, collection Collection, input SearchInput, candidates []authorizedCandidate, memo *queryEmbeddingMemo) ([]SearchResult, error) {
 	query := strings.TrimSpace(input.Query)
 	current := make(map[string]authorizedCandidate, len(candidates))
 	refs := make([]source.ObjectRef, 0, len(candidates))
@@ -180,13 +250,13 @@ func (s *Service) searchCollection(ctx context.Context, p auth.Principal, collec
 	// searched in the previous index with the previous model, and the
 	// per-index rankings are fused.
 	type binding struct {
-		index, model string
-		dims         int
+		index, model, prefix string
+		dims                 int
 	}
 	groups := make(map[binding][]IndexGeneration)
 	for _, candidate := range current {
 		g := candidate.generation
-		b := binding{g.QdrantCollection, g.EmbeddingModel, g.EmbeddingDimensions}
+		b := binding{g.QdrantCollection, g.EmbeddingModel, g.QueryPrefix, g.EmbeddingDimensions}
 		groups[b] = append(groups[b], g)
 	}
 	bindings := make([]binding, 0, len(groups))
@@ -200,14 +270,17 @@ func (s *Service) searchCollection(ctx context.Context, p auth.Principal, collec
 		if bindings[i].model != bindings[j].model {
 			return bindings[i].model < bindings[j].model
 		}
-		return bindings[i].dims < bindings[j].dims
+		if bindings[i].dims != bindings[j].dims {
+			return bindings[i].dims < bindings[j].dims
+		}
+		return bindings[i].prefix < bindings[j].prefix
 	})
 	// Canonical source kinds resolve once per connection per collection.
 	connectionKinds := make(map[string]string)
 	chunkCache := make(map[string]map[string]DocumentChunk)
 	lists := make([]rankedSearchList, 0, len(bindings))
 	for _, b := range bindings {
-		points, err := s.queryIndex(ctx, p, b.index, b.model, b.dims, groups[b], query, input, refs, limit)
+		points, err := s.queryIndex(ctx, p, b.index, b.model, b.prefix, b.dims, groups[b], query, input, refs, limit, memo)
 		if err != nil {
 			return nil, err
 		}
@@ -255,18 +328,37 @@ func (s *Service) searchCollection(ctx context.Context, p auth.Principal, collec
 
 // queryIndex embeds the query with one index's model and size, then searches
 // that index within the given generations.
-func (s *Service) queryIndex(ctx context.Context, p auth.Principal, index, model string, dims int, generations []IndexGeneration, query string, input SearchInput, refs []source.ObjectRef, limit int) ([]QdrantSearchPoint, error) {
+func (s *Service) queryIndex(ctx context.Context, p auth.Principal, index, model, prefix string, dims int, generations []IndexGeneration, query string, input SearchInput, refs []source.ObjectRef, limit int, memo *queryEmbeddingMemo) ([]QdrantSearchPoint, error) {
 	filter := FilterBuilder(p.TenantID, generations, input.Filter)
 	var vector []float64
 	if input.Mode != QueryLexical {
-		vectors, err := s.embed(ctx, p, model, dims, []string{query}, embedScope{Inputs: refs})
-		if err != nil {
-			return nil, err
+		binding := queryEmbeddingBinding{model: model, prefix: prefix, dims: dims}
+		key := queryEmbeddingKey{queryEmbeddingBinding: binding, query: query}
+		var found bool
+		vector, found = memo.vectors[key]
+		if !found {
+			scope, cache := memo.scopes[binding]
+			if !cache || memo.denied[binding] {
+				cache = false
+				scope = refs
+			}
+			vectors, err := s.embed(ctx, p, model, dims, []string{prefix + query}, embedScope{Inputs: scope})
+			if cache && err != nil && (errors.Is(err, inference.ErrDenied) || errors.Is(err, source.ErrDenied) || errors.Is(err, inference.ErrNoRoute)) {
+				memo.denied[binding] = true
+				cache = false
+				vectors, err = s.embed(ctx, p, model, dims, []string{prefix + query}, embedScope{Inputs: refs})
+			}
+			if err != nil {
+				return nil, err
+			}
+			if len(vectors) == 0 || len(vectors[0]) == 0 {
+				return nil, errors.New("embedding returned no vector")
+			}
+			vector = vectors[0]
+			if cache {
+				memo.vectors[key] = vector
+			}
 		}
-		if len(vectors) == 0 || len(vectors[0]) == 0 {
-			return nil, errors.New("embedding returned no vector")
-		}
-		vector = vectors[0]
 	}
 	client, ok := s.vectorStore.(queryClient)
 	if !ok {
@@ -322,6 +414,19 @@ func (s *Service) sourceKindFor(ctx context.Context, tenantID string, candidate 
 // bounded result set after authorization: denied collections contribute
 // neither results nor counts.
 func (s *Service) SearchReadable(ctx context.Context, p auth.Principal, query string, mode QueryMode, collectionIDs []string, limit int) (SearchReadableResult, error) {
+	return s.SearchReadableWithOptions(ctx, p, query, mode, collectionIDs, limit, SearchReadableOptions{})
+}
+
+type SearchReadableOptions struct {
+	Rewrite        bool
+	SelectSections bool
+}
+
+func (s *Service) SearchReadableWithOptions(ctx context.Context, p auth.Principal, query string, mode QueryMode, collectionIDs []string, limit int, options SearchReadableOptions) (SearchReadableResult, error) {
+	input := SearchInput{Rewrite: options.Rewrite, SelectSections: options.SelectSections}
+	if err := s.searchModels(&input); err != nil {
+		return SearchReadableResult{}, err
+	}
 	if strings.TrimSpace(query) == "" {
 		return SearchReadableResult{}, fmt.Errorf("%w: query is required", ErrInvalidInput)
 	}
@@ -354,7 +459,9 @@ func (s *Service) SearchReadable(ctx context.Context, p auth.Principal, query st
 	}
 	lists := make([]rankedSearchList, 0, len(selected))
 	remaining := SearchWorkBudget
-	for _, collection := range selected {
+	memo := newQueryEmbeddingMemo()
+	candidateSets := make([][]authorizedCandidate, len(selected))
+	for i, collection := range selected {
 		if remaining <= 0 {
 			return SearchReadableResult{}, fmt.Errorf("%w: the request exceeded the %d-object aggregate search bound", ErrSearchWorkExceeded, SearchWorkBudget)
 		}
@@ -367,7 +474,12 @@ func (s *Service) SearchReadable(ctx context.Context, p auth.Principal, query st
 			return SearchReadableResult{}, err
 		}
 		remaining -= examined
-		results, err := s.searchCollection(ctx, p, collection, SearchInput{Query: query, Mode: mode, Limit: perCollection}, candidates)
+		candidateSets[i] = candidates
+		memo.addCollection(p.TenantID, candidates)
+	}
+	for i, collection := range selected {
+		input.Query, input.Mode, input.Limit = query, mode, perCollection
+		results, err := s.searchCollection(ctx, p, collection, input, candidateSets[i], memo)
 		if err != nil {
 			return SearchReadableResult{}, err
 		}
@@ -376,6 +488,10 @@ func (s *Service) SearchReadable(ctx context.Context, p auth.Principal, query st
 		}
 	}
 	results := fuseRankedResults(lists, limit)
+	results, err = s.reauthorizeResults(ctx, p, results)
+	if err != nil {
+		return SearchReadableResult{}, err
+	}
 	// Evidence persists only for results that survive fusion, and locations
 	// resolve once over the fused set — the same retained-block path the
 	// evidence views use.
@@ -490,6 +606,75 @@ func (s *Service) persistResultEvidence(ctx context.Context, p auth.Principal, r
 		results[i].EvidenceID = evidence.ID
 	}
 	return nil
+}
+
+// reauthorizeResults re-runs current authorization on every returned hit just
+// before results are materialized: candidates were authorized before the
+// vector query, and a revocation landing mid-search must not leak content,
+// filenames or facets. Mirrors authorizedCandidates per hit (object CanRead +
+// CanReadVersion + generation still the published current one); dropped hits
+// lose results and counts. Published generations are fetched once per
+// collection the hits touch.
+func (s *Service) reauthorizeResults(ctx context.Context, p auth.Principal, results []SearchResult) ([]SearchResult, error) {
+	if len(results) == 0 {
+		return results, nil
+	}
+	type genKey struct {
+		objectID, versionID string
+		generation          int64
+	}
+	publishedCache := make(map[string]map[genKey]bool)
+	kept := make([]SearchResult, 0, len(results))
+	for i := range results {
+		hit := results[i]
+		object, err := s.repo.GetObject(ctx, p.TenantID, hit.DocumentID)
+		if denied, failure := deniedOrFailed(err); denied {
+			continue
+		} else if failure != nil {
+			return nil, failure
+		}
+		if err := s.authorizer.CanRead(ctx, p, object, source.ReadOptions{}); err != nil {
+			continue
+		}
+		version, err := s.repo.GetObjectVersion(ctx, p.TenantID, hit.DocumentID, object.ObservedSeq)
+		if denied, failure := deniedOrFailed(err); denied {
+			continue
+		} else if failure != nil {
+			return nil, failure
+		}
+		if versionRowID(version) != hit.ObjectVersionID {
+			continue
+		}
+		if err := s.authorizer.CanReadVersion(ctx, p, object, version, source.ReadOptions{}); err != nil {
+			continue
+		}
+		doc, err := s.repo.GetDocument(ctx, p.TenantID, hit.DocumentID)
+		if denied, failure := deniedOrFailed(err); denied {
+			continue
+		} else if failure != nil {
+			return nil, failure
+		}
+		if doc.Status == DocumentStatusRemoved || doc.ObjectVersionID != hit.ObjectVersionID {
+			continue
+		}
+		published, ok := publishedCache[hit.CollectionID]
+		if !ok {
+			generations, err := s.repo.ListPublishedGenerations(ctx, p.TenantID, hit.CollectionID)
+			if err != nil {
+				return nil, err
+			}
+			published = make(map[genKey]bool, len(generations))
+			for _, g := range generations {
+				published[genKey{objectID: g.ObjectID, versionID: g.ObjectVersionID, generation: g.Generation}] = true
+			}
+			publishedCache[hit.CollectionID] = published
+		}
+		if !published[genKey{objectID: hit.DocumentID, versionID: hit.ObjectVersionID, generation: hit.Generation}] {
+			continue
+		}
+		kept = append(kept, hit)
+	}
+	return kept, nil
 }
 
 // resultLocations batch-resolves span block locators over the fused result

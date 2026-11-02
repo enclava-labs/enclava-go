@@ -11,8 +11,29 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strings"
 	"unicode/utf8"
 )
+
+func defaultEmbeddingPrefixes(model string) (query, passage string) {
+	model = strings.ToLower(model)
+	if i := strings.LastIndexByte(model, '/'); i >= 0 {
+		model = model[i+1:]
+	}
+	switch {
+	case strings.HasPrefix(model, "qwen3-embedding"), model == "multilingual-e5-large-instruct":
+		return "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ", ""
+	case strings.HasPrefix(model, "nomic-embed-text"):
+		return "search_query: ", "search_document: "
+	case strings.HasPrefix(model, "e5-"), strings.HasPrefix(model, "multilingual-e5-"):
+		return "query: ", "passage: "
+	case strings.HasPrefix(model, "bge-") && strings.Contains(model, "-en"),
+		strings.HasPrefix(model, "snowflake-arctic-embed"), strings.HasPrefix(model, "mxbai-embed-large"):
+		return "Represent this sentence for searching relevant passages: ", ""
+	default:
+		return "", ""
+	}
+}
 
 func tokenEstimate(text string) int {
 	if text == "" {

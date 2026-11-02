@@ -2,11 +2,16 @@ package httpx
 
 import (
 	"context"
+	"fmt"
+	"html/template"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
+
+	"enclava-go/internal/store/postgres"
 )
 
 // postLogin submits the local credential form through the real mux and
@@ -145,5 +150,145 @@ func TestSessionHXExpiryRedirects(t *testing.T) {
 		if got, want := rec.Header().Get("HX-Redirect"), "/dashboard/login?return_to="+url.QueryEscape(tc.want); got != want {
 			t.Fatalf("%s: expected HX-Redirect %q, got %q", tc.name, want, got)
 		}
+	}
+}
+
+func TestPasswordLoginRateLimits(t *testing.T) {
+	s := newTestSessionAuth()
+	attempt := func(ip, tenant, email string) bool {
+		r := httptest.NewRequest(http.MethodPost, "/dashboard/login", nil)
+		r.RemoteAddr = ip + ":1234"
+		r.Header.Set("X-Forwarded-For", "203.0.113.1")
+		rec := httptest.NewRecorder()
+		allowed := s.allowPasswordAttempt(rec, r, tenant, email)
+		if !allowed && (rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "Too many sign-in attempts. Try again later.")) {
+			t.Fatalf("unexpected throttled response: %d %s", rec.Code, rec.Body.String())
+		}
+		return allowed
+	}
+	for i := range 5 {
+		if !attempt(fmt.Sprintf("192.0.2.%d", i+1), "tenant", "User@Example.com") {
+			t.Fatal("account limited too early")
+		}
+	}
+	if attempt("192.0.2.6", "tenant", " user@example.com ") {
+		t.Fatal("account limit must apply across IPs and normalized email")
+	}
+	for key, window := range s.loginAcctLimit.windows {
+		window.start = window.start.Add(-2 * time.Minute)
+		s.loginAcctLimit.windows[key] = window
+	}
+	if attempt("192.0.2.7", "tenant", "user@example.com") {
+		t.Fatal("account limit must last 15 minutes")
+	}
+	if !attempt("192.0.2.6", "other-tenant", "user@example.com") {
+		t.Fatal("account limit must be tenant scoped")
+	}
+	for i := range 10 {
+		if !attempt("198.51.100.1", "tenant", fmt.Sprintf("user%d@example.com", i)) {
+			t.Fatal("IP limited too early")
+		}
+	}
+	if attempt("198.51.100.1", "tenant", "another@example.com") {
+		t.Fatal("IP limit must apply across accounts")
+	}
+}
+
+func newTestSessionAuth() *SessionAuth {
+	return &SessionAuth{
+		loginIPLimiter: NewRateLimiter(),
+		loginAcctLimit: NewRateLimiter(),
+		loginAccts:     make(map[string]time.Time),
+		templates:      template.Must(template.New("login.tmpl").Parse("{{.Error}}")),
+	}
+}
+
+func TestThrottledIPCreatesNoAccountEntries(t *testing.T) {
+	s := newTestSessionAuth()
+	for i := range 10 {
+		r := httptest.NewRequest(http.MethodPost, "/dashboard/login", nil)
+		r.RemoteAddr = "192.0.2.1:1234"
+		s.allowPasswordAttempt(httptest.NewRecorder(), r, "tenant", fmt.Sprintf("u%d@example.com", i))
+	}
+	if len(s.loginAccts) != 10 {
+		t.Fatalf("pre-throttle accounts = %d, want 10", len(s.loginAccts))
+	}
+	for i := 10; i < 60; i++ {
+		r := httptest.NewRequest(http.MethodPost, "/dashboard/login", nil)
+		r.RemoteAddr = "192.0.2.1:1234"
+		s.allowPasswordAttempt(httptest.NewRecorder(), r, "tenant", fmt.Sprintf("u%d@example.com", i))
+	}
+	if len(s.loginAccts) != 10 || len(s.loginAcctLimit.windows) != 10 {
+		t.Fatalf("throttled IP grew account state: %d buckets, %d windows",
+			len(s.loginAccts), len(s.loginAcctLimit.windows))
+	}
+}
+
+func TestLoginAccountCapSkipsNewAccounts(t *testing.T) {
+	s := newTestSessionAuth()
+	now := time.Now()
+	if !s.trackLoginAccount("k", now) {
+		t.Fatal("empty limiter must accept a new account")
+	}
+	for len(s.loginAccts) < loginAccountCap {
+		s.trackLoginAccount(fmt.Sprintf("acct-%d", len(s.loginAccts)), now)
+	}
+	if !s.trackLoginAccount("k", now) {
+		t.Fatal("tracked account must keep being limited")
+	}
+	if s.trackLoginAccount("new", now) {
+		t.Fatal("new account beyond cap must be skipped")
+	}
+	r := httptest.NewRequest(http.MethodPost, "/dashboard/login", nil)
+	r.RemoteAddr = "198.51.100.2:1234"
+	for range 10 {
+		if !s.allowPasswordAttempt(httptest.NewRecorder(), r, "tenant", "new-account@example.com") {
+			t.Fatal("capped account must not deny before the IP limit")
+		}
+	}
+	if s.allowPasswordAttempt(httptest.NewRecorder(), r, "tenant", "new-account@example.com") {
+		t.Fatal("IP limit must still deny when account limiting is skipped")
+	}
+}
+
+func TestLoginAccountCapEvictsExpired(t *testing.T) {
+	s := newTestSessionAuth()
+	old := time.Now().Add(-loginAccountWindow - time.Minute)
+	for len(s.loginAccts) < loginAccountCap {
+		s.trackLoginAccount(fmt.Sprintf("acct-%d", len(s.loginAccts)), old)
+	}
+	// An account bucket older than its window is evicted at capacity.
+	if !s.trackLoginAccount("fresh", time.Now()) {
+		t.Fatal("expired buckets must free capacity for a new account")
+	}
+	if len(s.loginAccts) != 1 {
+		t.Fatalf("expired buckets retained: %d", len(s.loginAccts))
+	}
+}
+
+type loginAuditRecorder struct {
+	rows []postgres.SecurityAuditRow
+}
+
+func (a *loginAuditRecorder) Insert(_ context.Context, row postgres.SecurityAuditRow) error {
+	a.rows = append(a.rows, row)
+	return nil
+}
+
+func (*loginAuditRecorder) List(context.Context, string, int, string) ([]postgres.SecurityAuditRow, error) {
+	return nil, nil
+}
+
+func TestThrottledLoginIsAuditedWithoutEmail(t *testing.T) {
+	audit := &loginAuditRecorder{}
+	s := newTestSessionAuth()
+	s.securityAudit = audit
+	for range 6 {
+		r := httptest.NewRequest(http.MethodPost, "/dashboard/login", nil)
+		r.RemoteAddr = "192.0.2.1:1234"
+		s.allowPasswordAttempt(httptest.NewRecorder(), r, "tenant", "secret@example.com")
+	}
+	if len(audit.rows) != 1 || audit.rows[0].Action != "auth.login.throttled" || audit.rows[0].Outcome != "throttled" || audit.rows[0].TenantID != "tenant" || audit.rows[0].TargetID != "" {
+		t.Fatalf("unexpected audit records: %+v", audit.rows)
 	}
 }

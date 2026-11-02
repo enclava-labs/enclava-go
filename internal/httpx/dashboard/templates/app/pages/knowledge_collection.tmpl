@@ -5,6 +5,7 @@
      frag-search-results is the only renderer — zero result markup here). */}}
 {{template "page-head" .}}
 {{template "tabs" .Data.Tabs}}
+{{if ne .Data.Tab "documents"}}{{template "knowledge-reembed-progress" .}}{{end}}
 
 {{if eq .Data.Tab "documents"}}
 {{template "frag-knowledge-documents" .}}

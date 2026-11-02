@@ -3,14 +3,11 @@ package chatbot
 import (
 	"context"
 	"encoding/json"
-	"regexp"
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/mcp"
 	"enclava-go/internal/source"
 )
-
-var mcpModelName = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
 
 type MCPRunTools struct {
 	Executor   *mcp.Executor
@@ -50,7 +47,7 @@ func (d MCPRunTools) Definitions(ctx context.Context, p, owner auth.Principal, b
 		for _, approval := range approvals {
 			_, builtinCollision := builtinSchemas[approval.ModelName]
 			_, duplicate := seen[approval.ModelName]
-			if !contains(configured, approval.ModelName) || !mcpModelName.MatchString(approval.ModelName) || builtinCollision || duplicate ||
+			if !contains(configured, approval.ModelName) || builtinCollision || duplicate ||
 				!mcp.HasScopes(p, server.AudienceScopes, approval.CallerScopes) ||
 				!mcp.HasScopes(owner, server.AudienceScopes, approval.CallerScopes) {
 				continue
@@ -69,7 +66,7 @@ func (d MCPRunTools) Definitions(ctx context.Context, p, owner auth.Principal, b
 }
 
 func (d MCPRunTools) Invoke(ctx context.Context, p, owner auth.Principal, bot Instance, modelName string, args json.RawMessage, inputs []source.ObjectRef) (BuiltinResult, error) {
-	if d.Executor == nil || d.Executor.Repository == nil || d.Authorizer == nil || !toolEnabled(bot, modelName) || !mcpModelName.MatchString(modelName) {
+	if d.Executor == nil || d.Executor.Repository == nil || d.Authorizer == nil || !toolEnabled(bot, modelName) {
 		return BuiltinResult{}, mcp.ErrDenied
 	}
 	if err := d.Authorizer.AuthorizeMCPInput(ctx, p, inputs); err != nil {

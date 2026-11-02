@@ -285,3 +285,60 @@ func TestDashboardKnowledgeMemberDocumentRows(t *testing.T) {
 		t.Fatalf("documents partial = %d body=%s", partial.Code, partial.Body.String())
 	}
 }
+
+func TestDashboardKnowledgeReembedProgressAndWarnings(t *testing.T) {
+	f := newKnowledgeFixture(t)
+	sess, csrf, memberID := f.member(t, "know-progress@example.test")
+	col := f.collection(t, "Progress", []string{"*"})
+	f.stageDoc(t, col, "obj_progress", "Report.txt", []string{memberID})
+	f.stageDoc(t, col, "obj_progress_secret", "Secret.txt", []string{"other_actor"})
+
+	ctx := context.Background()
+	if _, err := f.db.SQL.ExecContext(ctx, `
+		UPDATE knowledge_collections SET owner_actor_id=$3 WHERE tenant_id=$1 AND id=$2`,
+		f.tenant, col.ID, memberID); err != nil {
+		t.Fatalf("set collection owner: %v", err)
+	}
+	for _, objectID := range []string{"obj_progress", "obj_progress_secret"} {
+		if _, err := f.db.SQL.ExecContext(ctx, `
+			INSERT INTO index_generations
+				(tenant_id, id, collection_id, object_version_id, generation, state, qdrant_collection, warnings)
+			SELECT $1, 'gen_' || $3, $2, id, 1, 'published', 'old_index', '["Truncated <script>alert(1)</script>"]'::jsonb
+			FROM source_object_versions WHERE tenant_id=$1 AND object_id=$3`,
+			f.tenant, col.ID, objectID); err != nil {
+			t.Fatalf("insert generation: %v", err)
+		}
+	}
+
+	base := "/dashboard/knowledge/" + col.ID
+	for _, path := range []string{base, base + "/search", "/dashboard/partials/knowledge/documents?collection=" + col.ID} {
+		got := f.get(t, sess, csrf, path)
+		body := got.Body.String()
+		if got.Code != http.StatusOK || !strings.Contains(body, "Re-embedding under new settings: 1 of 1 documents left") || !strings.Contains(body, `hx-select="#knowledge-reembed-progress"`) {
+			t.Fatalf("pending progress at %s = %d body=%s", path, got.Code, body)
+		}
+		if path == base && (!strings.Contains(body, "Truncated &lt;script&gt;alert(1)&lt;/script&gt;") || strings.Contains(body, "Truncated <script>") || !strings.Contains(body, "Needs attention") || !strings.Contains(body, `data-label="Status"`)) {
+			t.Fatalf("warning not safely rendered: %s", body)
+		}
+	}
+	other, otherCSRF, _ := f.member(t, "know-progress-reader@example.test")
+	reader := f.get(t, other, otherCSRF, base)
+	if reader.Code != http.StatusOK || strings.Contains(reader.Body.String(), "Re-embedding under new settings:") {
+		t.Fatalf("non-owner progress = %d body=%s", reader.Code, reader.Body.String())
+	}
+
+	if _, err := f.db.SQL.ExecContext(ctx, `
+		UPDATE index_generations g
+		SET qdrant_collection=c.qdrant_collection, embed_titles=c.embed_titles, passage_prefix=c.passage_prefix
+		FROM knowledge_collections c
+		WHERE g.tenant_id=$1 AND g.collection_id=$2 AND c.tenant_id=g.tenant_id AND c.id=g.collection_id`,
+		f.tenant, col.ID); err != nil {
+		t.Fatalf("complete re-embedding: %v", err)
+	}
+	for _, path := range []string{base, "/dashboard/partials/knowledge/documents?collection=" + col.ID} {
+		got := f.get(t, sess, csrf, path)
+		if got.Code != http.StatusOK || strings.Contains(got.Body.String(), "Re-embedding under new settings:") {
+			t.Fatalf("completed progress at %s = %d body=%s", path, got.Code, got.Body.String())
+		}
+	}
+}

@@ -212,8 +212,8 @@ func (a *NotionAdapter) traverse(ctx context.Context) ([]ContentItem, error) {
 func (a *NotionAdapter) traverseSelections(ctx context.Context, selections []notionSelection) ([]ContentItem, error) {
 	items := make([]ContentItem, 0)
 	seen := make(map[string]bool)
-	var walk func(string, string, int, bool) error
-	walk = func(id, parent string, depth int, isPage bool) error {
+	var walk func(string, string, string, string, int, bool) error
+	walk = func(id, parent, parentKind, title string, depth int, isPage bool) error {
 		if depth > a.maxDepth {
 			return nil
 		}
@@ -235,13 +235,35 @@ func (a *NotionAdapter) traverseSelections(ctx context.Context, selections []not
 				return errors.New("notion returned malformed page")
 			}
 			pageURL := page.URL
+			title = ""
+			for _, raw := range page.Properties {
+				var property struct {
+					Type  string `json:"type"`
+					Title []struct {
+						PlainText string `json:"plain_text"`
+					} `json:"title"`
+				}
+				if err := json.Unmarshal(raw, &property); err != nil {
+					return err
+				}
+				if property.Type == "title" {
+					for _, part := range property.Title {
+						title += part.PlainText
+					}
+					break
+				}
+			}
 			if !seen["page:"+id] {
 				seen["page:"+id] = true
-				items = append(items, ContentItem{NativeID: id, ParentNativeID: parent, Kind: "page", NativeRevision: page.LastEdited, URL: pageURL, MIMEType: "application/json", Content: encoded})
+				items = append(items, ContentItem{NativeID: id, ParentNativeID: parent, ParentKind: parentKind, Kind: "page", NativeRevision: page.LastEdited, Title: title, URL: pageURL, MIMEType: "application/json", Content: encoded})
 			}
 			if len(items) > a.maxItems {
 				return errors.New("notion traversal exceeded configured item bound")
 			}
+		}
+		kind := "block"
+		if isPage {
+			kind = "page"
 		}
 		cursor := ""
 		for pages := 0; ; pages++ {
@@ -276,14 +298,14 @@ func (a *NotionAdapter) traverseSelections(ctx context.Context, selections []not
 				}
 				if !seen["block:"+block.ID] {
 					seen["block:"+block.ID] = true
-					items = append(items, ContentItem{NativeID: block.ID, ParentNativeID: id, Kind: "block", NativeRevision: block.LastEdited, URL: block.URL, MIMEType: "application/json", Content: append([]byte(nil), raw...)})
+					items = append(items, ContentItem{NativeID: block.ID, ParentNativeID: id, ParentKind: kind, Kind: "block", NativeRevision: block.LastEdited, Title: title, URL: block.URL, MIMEType: "application/json", Content: append([]byte(nil), raw...)})
 					if len(items) > a.maxItems {
 						return errors.New("notion traversal exceeded configured item bound")
 					}
 				}
 				childPage := block.Type == "child_page"
 				if (block.HasChildren || childPage) && depth < a.maxDepth {
-					if err := walk(block.ID, id, depth+1, childPage); err != nil {
+					if err := walk(block.ID, id, kind, title, depth+1, childPage); err != nil {
 						return err
 					}
 				}
@@ -299,7 +321,7 @@ func (a *NotionAdapter) traverseSelections(ctx context.Context, selections []not
 		return nil
 	}
 	for _, sel := range selections {
-		if err := walk(sel.PageID, "", 0, true); err != nil {
+		if err := walk(sel.PageID, "", "", "", 0, true); err != nil {
 			return nil, fmt.Errorf("notion selected page %q: %w", sel.PageID, err)
 		}
 	}

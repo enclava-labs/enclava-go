@@ -60,6 +60,10 @@ func NewPreviewService(profiles ChunkProfiles, jobRows JobReader, jobSvc *jobs.S
 	return &PreviewService{profiles: profiles, jobRows: jobRows, maintenance: jobRows.(PreviewMaintenance), jobs: jobSvc, artifacts: store, parser: NewParser(store), source: sourceRepo, authorizer: source.NewAuthorizer(sourceRepo, 0), maxBytes: maxUploadMB * 1024 * 1024}
 }
 
+func (s *PreviewService) SetSourceAccessMaxStale(d time.Duration) {
+	s.authorizer.MaxStale = d
+}
+
 func (s *PreviewService) ListProfiles(ctx context.Context, p auth.Principal) ([]source.ChunkProfile, error) {
 	if p.TenantID == "" || s.profiles == nil {
 		return nil, ErrForbidden

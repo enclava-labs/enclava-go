@@ -7,11 +7,14 @@
 package httpx
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"html/template"
 	"log"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"enclava-go/internal/auth"
@@ -26,11 +29,17 @@ const (
 // UUID from the configured slug per request so tenant provisioning order
 // never races startup construction.
 type SessionAuth struct {
-	auth       *auth.Service
-	oidc       *auth.OIDCService
-	sessionTTL time.Duration
-	templates  *template.Template
-	tenantSlug string
+	auth           *auth.Service
+	oidc           *auth.OIDCService
+	sessionTTL     time.Duration
+	templates      *template.Template
+	tenantSlug     string
+	securityAudit  SecurityAuditRecorder
+	loginIPLimiter *RateLimiter
+	loginAcctLimit *RateLimiter
+	loginAcctsMu   sync.Mutex
+	loginAccts     map[string]time.Time
+	trustProxy     bool
 }
 
 // NewSessionAuth builds the handler set. oidc may be nil — provider links
@@ -38,12 +47,75 @@ type SessionAuth struct {
 // tenant the browser login targets.
 func NewSessionAuth(authSvc *auth.Service, oidc *auth.OIDCService, sessionTTL time.Duration, templates *template.Template, tenantSlug string) *SessionAuth {
 	return &SessionAuth{
-		auth:       authSvc,
-		oidc:       oidc,
-		sessionTTL: sessionTTL,
-		templates:  templates,
-		tenantSlug: strings.TrimSpace(tenantSlug),
+		auth:           authSvc,
+		oidc:           oidc,
+		sessionTTL:     sessionTTL,
+		templates:      templates,
+		tenantSlug:     strings.TrimSpace(tenantSlug),
+		loginIPLimiter: NewRateLimiter(),
+		loginAcctLimit: NewRateLimiter(),
+		loginAccts:     make(map[string]time.Time),
 	}
+}
+
+func (s *SessionAuth) SetTrustProxy(trust bool) {
+	s.trustProxy = trust
+}
+
+// loginAccountCap bounds distinct tenant+email buckets so a spray of
+// throwaway addresses cannot grow the limiter map without limit.
+const loginAccountCap = 4096
+
+const loginAccountWindow = 15 * time.Minute
+
+// Login throttling is per process; use shared admission storage for multi-instance enforcement.
+func (s *SessionAuth) allowPasswordAttempt(w http.ResponseWriter, r *http.Request, tenantID, email string) bool {
+	now := time.Now()
+	ip := clientIP(r, s.trustProxy)
+	// A throttled IP must not mint account buckets — check first and bail.
+	if !s.loginIPLimiter.AllowKey(ip, 10, time.Minute, now).Allowed {
+		return s.denyPasswordAttempt(w, r, tenantID)
+	}
+	account := sha256.Sum256([]byte(tenantID + "\x00" + strings.ToLower(strings.TrimSpace(email))))
+	key := fmt.Sprintf("%x", account)
+	if s.trackLoginAccount(key, now) &&
+		!s.loginAcctLimit.AllowKey(key, 5, loginAccountWindow, now).Allowed {
+		return s.denyPasswordAttempt(w, r, tenantID)
+	}
+	return true
+}
+
+// trackLoginAccount reports whether the account key is (or may be) tracked.
+// At capacity, expired buckets are evicted first; account limiting is skipped
+// only while the cap is genuinely full of live entries — the IP limit applies.
+func (s *SessionAuth) trackLoginAccount(key string, now time.Time) bool {
+	s.loginAcctsMu.Lock()
+	defer s.loginAcctsMu.Unlock()
+	if _, ok := s.loginAccts[key]; ok {
+		s.loginAccts[key] = now
+		return true
+	}
+	if len(s.loginAccts) >= loginAccountCap {
+		for k, seen := range s.loginAccts {
+			if now.Sub(seen) >= loginAccountWindow {
+				delete(s.loginAccts, k)
+			}
+		}
+		if len(s.loginAccts) >= loginAccountCap {
+			return false
+		}
+	}
+	s.loginAccts[key] = now
+	return true
+}
+
+func (s *SessionAuth) denyPasswordAttempt(w http.ResponseWriter, r *http.Request, tenantID string) bool {
+	s.recordSecurityAudit(r, auth.Principal{TenantID: tenantID}, "auth.login.throttled", "session", "", "throttled")
+	setNoStoreHeaders(w)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusTooManyRequests)
+	s.renderLogin(w, r, dashboardLoginData{Error: "Too many sign-in attempts. Try again later."})
+	return false
 }
 
 func (s *SessionAuth) tenantID(r *http.Request) (string, error) {
@@ -110,15 +182,21 @@ func (s *SessionAuth) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		s.renderLogin(w, r, dashboardLoginData{Email: email, Error: "Sign-in is not available"})
 		return
 	}
+	if !s.allowPasswordAttempt(w, r, tenantID, email) {
+		return
+	}
 	principal, err := s.auth.AuthenticatePassword(r.Context(), tenantID, email, r.FormValue("password"))
 	if err != nil {
+		s.recordSecurityAudit(r, auth.Principal{TenantID: tenantID}, "auth.login.failed", "session", "", "failure")
 		s.renderLogin(w, r, dashboardLoginData{
 			Email: email, ReturnTo: returnTo,
 			Error: "Invalid email or password",
 		})
 		return
 	}
-	s.issueSessionCookies(w, r, principal.TenantID, principal.UserID)
+	if !s.issueSessionCookies(w, r, principal.TenantID, principal.UserID) {
+		return
+	}
 	target := "/dashboard"
 	if returnTo != "" {
 		target = returnTo
@@ -145,6 +223,11 @@ func (s *SessionAuth) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.auth.RevokeSession(r.Context(), principal.TenantID, principal.SessionID, "logout"); err != nil {
 		log.Printf("revoke session %s: %v", principal.SessionID, err)
+		s.recordSecurityAudit(r, principal, "auth.logout", "session", principal.SessionID, "failure")
+		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "session_revoke_failed")
+		return
+	} else {
+		s.recordSecurityAudit(r, principal, "auth.logout", "session", principal.SessionID, "success")
 	}
 	s.clearSessionCookies(w, r)
 	http.Redirect(w, r, "/dashboard/login", http.StatusSeeOther)
@@ -198,6 +281,7 @@ func (s *SessionAuth) HandleOIDCCallback(w http.ResponseWriter, r *http.Request)
 	res, err := s.oidc.CompleteFlow(r.Context(), tenantID,
 		r.URL.Query().Get("state"), r.URL.Query().Get("code"), externalBase(r))
 	if err != nil {
+		s.recordSecurityAudit(r, auth.Principal{TenantID: tenantID}, "auth.login.failed", "session", "", "failure")
 		log.Printf("oidc callback: %v", err)
 		s.renderLogin(w, r, dashboardLoginData{Error: "OIDC sign-in failed"})
 		return
@@ -211,7 +295,9 @@ func (s *SessionAuth) HandleOIDCCallback(w http.ResponseWriter, r *http.Request)
 		})
 		return
 	}
-	s.issueSessionCookies(w, r, tenantID, res.UserID)
+	if !s.issueSessionCookies(w, r, tenantID, res.UserID) {
+		return
+	}
 	target := "/dashboard"
 	if res.ReturnTo != "" {
 		target = res.ReturnTo
@@ -244,15 +330,21 @@ func (s *SessionAuth) HandleLinkIdentity(w http.ResponseWriter, r *http.Request)
 		WriteUnauthorized(w, "sign-in is not available")
 		return
 	}
+	if !s.allowPasswordAttempt(w, r, tenantID, email) {
+		return
+	}
 	res, err := s.oidc.ConfirmLink(r.Context(), tenantID, linkToken, email, r.FormValue("password"))
 	if err != nil {
+		s.recordSecurityAudit(r, auth.Principal{TenantID: tenantID}, "auth.login.failed", "session", "", "failure")
 		s.renderLogin(w, r, dashboardLoginData{
 			LinkToken: linkToken, LinkEmail: email, ReturnTo: returnTo,
 			Error: "Account linking failed — check the account credentials",
 		})
 		return
 	}
-	s.issueSessionCookies(w, r, tenantID, res.UserID)
+	if !s.issueSessionCookies(w, r, tenantID, res.UserID) {
+		return
+	}
 	target := "/dashboard"
 	if res.ReturnTo != "" {
 		target = res.ReturnTo
@@ -343,12 +435,13 @@ func requireSessionScope(scope string, next http.HandlerFunc) http.HandlerFunc {
 // issueSessionCookies mints the server-side session and sets the opaque
 // HttpOnly cookie plus a script-readable CSRF cookie — never a signed
 // client-side value.
-func (s *SessionAuth) issueSessionCookies(w http.ResponseWriter, r *http.Request, tenantID, userID string) {
-	token, csrf, _, err := s.auth.IssueSession(r.Context(), tenantID, userID, s.sessionTTL)
+func (s *SessionAuth) issueSessionCookies(w http.ResponseWriter, r *http.Request, tenantID, userID string) bool {
+	token, csrf, sessionID, err := s.auth.IssueSession(r.Context(), tenantID, userID, s.sessionTTL)
 	if err != nil {
 		log.Printf("issue session for %s: %v", userID, err)
+		s.recordSecurityAudit(r, auth.Principal{TenantID: tenantID, UserID: userID}, "auth.login.failed", "session", "", "failure")
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "session_issue_failed")
-		return
+		return false
 	}
 	secure := r.TLS != nil
 	expires := time.Now().Add(s.sessionTTL)
@@ -372,6 +465,8 @@ func (s *SessionAuth) issueSessionCookies(w http.ResponseWriter, r *http.Request
 		SameSite: http.SameSiteLaxMode,
 		Secure:   secure,
 	})
+	s.recordSecurityAudit(r, auth.Principal{TenantID: tenantID, UserID: userID, ActorID: userID, ActorKind: auth.ActorKindUser, CredentialID: sessionID, CredentialKind: auth.CredentialKindSession, SessionID: sessionID}, "auth.login.succeeded", "session", sessionID, "success")
+	return true
 }
 
 func (s *SessionAuth) clearSessionCookies(w http.ResponseWriter, r *http.Request) {

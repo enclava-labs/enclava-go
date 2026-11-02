@@ -21,19 +21,19 @@ func NewConnectorObservationsRepo(db *DB) *ConnectorObservationsRepo {
 	return &ConnectorObservationsRepo{db: db}
 }
 
-func (r *ConnectorObservationsRepo) StartRun(ctx context.Context, tenantID, connectionID, stream, runID string) (ConnectorStream, error) {
+func (r *ConnectorObservationsRepo) StartRun(ctx context.Context, tenantID, connectionID, stream, runID, configHash string) (ConnectorStream, error) {
 	var out ConnectorStream
 	err := r.db.SQL.QueryRowContext(ctx, `
-		INSERT INTO connector_streams (tenant_id, connection_id, stream, run_id, fence, cursor, observed_seq, run_start_seq, complete, incomplete, last_error)
-		VALUES ($1, $2, $3, $4, 1, '', 0, 0, false, false, '')
+		INSERT INTO connector_streams (tenant_id, connection_id, stream, run_id, fence, cursor, observed_seq, run_start_seq, complete, incomplete, last_error, config_hash)
+		VALUES ($1, $2, $3, $4, 1, '', 0, 0, false, false, '', $5)
 		ON CONFLICT (tenant_id, connection_id, stream) DO UPDATE SET
 			run_id = EXCLUDED.run_id, fence = connector_streams.fence + 1,
-			cursor = CASE WHEN connector_streams.complete THEN '' ELSE connector_streams.cursor END,
-			run_start_seq = CASE WHEN connector_streams.complete THEN connector_streams.observed_seq ELSE connector_streams.run_start_seq END,
+			cursor = CASE WHEN connector_streams.config_hash <> EXCLUDED.config_hash THEN '' ELSE connector_streams.cursor END,
+			run_start_seq = CASE WHEN connector_streams.complete OR connector_streams.config_hash <> EXCLUDED.config_hash THEN connector_streams.observed_seq ELSE connector_streams.run_start_seq END,
 			observed_seq = connector_streams.observed_seq, complete = false,
-			incomplete = false, last_error = '', updated_at = now()
+			incomplete = false, last_error = '', config_hash = EXCLUDED.config_hash, updated_at = now()
 		RETURNING tenant_id::text, connection_id::text, stream, run_id::text, fence, cursor, observed_seq, run_start_seq, complete, incomplete, last_error`,
-		tenantID, connectionID, stream, runID).Scan(&out.TenantID, &out.ConnectionID, &out.Stream, &out.RunID, &out.Fence, &out.Cursor, &out.ObservedSeq, &out.RunStartSeq, &out.Complete, &out.Incomplete, &out.LastError)
+		tenantID, connectionID, stream, runID, configHash).Scan(&out.TenantID, &out.ConnectionID, &out.Stream, &out.RunID, &out.Fence, &out.Cursor, &out.ObservedSeq, &out.RunStartSeq, &out.Complete, &out.Incomplete, &out.LastError)
 	if err != nil {
 		return ConnectorStream{}, fmt.Errorf("start connector stream: %w", err)
 	}
@@ -105,6 +105,22 @@ func (r *ConnectorObservationsRepo) GetStream(ctx context.Context, tenantID, con
 		return ConnectorStream{}, err
 	}
 	return out, nil
+}
+
+func (r *ConnectorObservationsRepo) UnmappedPrincipals(ctx context.Context, tenantID, connectionID string) (int, error) {
+	var count int
+	err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT COALESCE(sum(unmapped_subjects), 0) FROM (
+			SELECT DISTINCT ON (kind) unmapped_subjects
+			FROM access_snapshots
+			WHERE tenant_id=$1 AND connection_id=$2 AND status='complete'
+			  AND kind IN ('grants', 'membership')
+			ORDER BY kind, revision DESC
+		) latest`, tenantID, connectionID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count unmapped connector principals: %w", err)
+	}
+	return count, nil
 }
 
 func (r *ConnectorObservationsRepo) ListObservations(ctx context.Context, state ConnectorStream) ([]ConnectorObservation, error) {

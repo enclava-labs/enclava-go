@@ -10,6 +10,8 @@ import (
 	"enclava-go/internal/source"
 )
 
+const MaxChunksPerDocument = 4096
+
 // Chunk creates deterministic, span-backed chunks from canonical parser blocks.
 func Chunk(document source.Document, profile source.ChunkProfile) ([]source.Chunk, error) {
 	if err := ValidateChunkProfile(profile); err != nil {
@@ -33,17 +35,48 @@ func Chunk(document source.Document, profile source.ChunkProfile) ([]source.Chun
 		}
 	}
 	var chunks []source.Chunk
+	totalChunks := 0
 	var current source.Chunk
 	flush := func() {
 		if current.Text == "" {
 			return
 		}
-		current.Ordinal = len(chunks)
-		current.ID = chunkID(document.Ref, profile.ID, current.Ordinal, current.Spans)
-		chunks = append(chunks, current)
+		current.Ordinal = totalChunks
+		totalChunks++
+		if len(chunks) < MaxChunksPerDocument {
+			current.ID = chunkID(document.Ref, profile.ID, current.Ordinal, current.Spans)
+			chunks = append(chunks, current)
+		}
 		current = source.Chunk{ObjectRef: document.Ref, ProfileID: profile.ID}
 	}
-	for _, group := range boundaryGroups(document.Blocks, profile.BoundaryStrategy, profile.SizeCodePoints) {
+	var groups [][]source.Block
+	for i := 0; i < len(document.Blocks); {
+		if document.Blocks[i].Kind == "table_header" {
+			end := i + 1
+			for end < len(document.Blocks) && document.Blocks[end].Kind == "table_row" && document.Blocks[end].Locator.Table == document.Blocks[i].Locator.Table {
+				end++
+			}
+			groups = append(groups, document.Blocks[i:end])
+			i = end
+			continue
+		}
+		end := i + 1
+		for end < len(document.Blocks) && document.Blocks[end].Kind != "table_header" {
+			end++
+		}
+		groups = append(groups, boundaryGroups(document.Blocks[i:end], profile.BoundaryStrategy, profile.SizeCodePoints)...)
+		i = end
+	}
+	for _, group := range groups {
+		if group[0].Kind == "table_header" {
+			if profile.TableHandling != "skip" {
+				tableChunks(group, document.Ref, profile, func(chunk source.Chunk) {
+					current = chunk
+					flush()
+				})
+			}
+			continue
+		}
 		if profile.TableHandling == "skip" {
 			filtered := group[:0]
 			for _, block := range group {
@@ -119,7 +152,61 @@ func Chunk(document source.Document, profile source.ChunkProfile) ([]source.Chun
 			}
 		}
 	}
+	if totalChunks > MaxChunksPerDocument {
+		last := &chunks[len(chunks)-1]
+		last.Warnings = append(last.Warnings, fmt.Sprintf("truncated: document produced %d chunks; indexed the first %d", totalChunks, MaxChunksPerDocument))
+	}
 	return chunks, nil
+}
+
+func tableChunks(group []source.Block, ref source.ObjectRef, profile source.ChunkProfile, emit func(source.Chunk)) {
+	header := group[0]
+	newChunk := func() source.Chunk {
+		return source.Chunk{ObjectRef: ref, ProfileID: profile.ID, Text: header.Text,
+			Spans: []source.Span{{Ref: ref, BlockID: header.ID, ByteEnd: len(header.Text)}}}
+	}
+	produced := false
+	current := newChunk()
+	rows := 0
+	for _, row := range group[1:] {
+		if profile.TableHandling == "row-wise" {
+			chunk := newChunk()
+			chunk.Text += "\n" + row.Text
+			chunk.Spans = append(chunk.Spans, source.Span{Ref: ref, BlockID: row.ID, ByteEnd: len(row.Text)})
+			if utf8.RuneCountInString(chunk.Text) > profile.SizeCodePoints {
+				chunk.Warnings = append(chunk.Warnings, "table row exceeded configured size")
+			}
+			emit(chunk)
+			produced = true
+			continue
+		}
+		for start := 0; start < len(row.Text); {
+			remaining := profile.SizeCodePoints - utf8.RuneCountInString(current.Text) - 1
+			if rows > 0 && utf8.RuneCountInString(row.Text[start:]) > remaining {
+				emit(current)
+				produced = true
+				current, rows = newChunk(), 0
+				continue
+			}
+			if remaining < 1 {
+				remaining = 1
+			}
+			end := boundedEnd(row.Text, start, remaining)
+			current.Text += "\n" + row.Text[start:end]
+			current.Spans = append(current.Spans, source.Span{Ref: ref, BlockID: row.ID, ByteStart: start, ByteEnd: end})
+			rows++
+			if end < len(row.Text) {
+				current.Warnings = append(current.Warnings, "source block split at configured Unicode code-point size")
+				emit(current)
+				produced = true
+				current, rows = newChunk(), 0
+			}
+			start = end
+		}
+	}
+	if rows > 0 || !produced {
+		emit(current)
+	}
 }
 
 func boundaryGroups(blocks []source.Block, strategy string, size int) [][]source.Block {
@@ -300,7 +387,7 @@ func groupedChunk(group []source.Block, blocks map[string]source.Block, ref sour
 }
 
 func isTableBlock(block source.Block) bool {
-	return block.Kind == "table" || block.Kind == "table_row"
+	return block.Kind == "table" || block.Kind == "table_row" || block.Kind == "table_header"
 }
 
 func boundedEnd(text string, start, maxRunes int) int {

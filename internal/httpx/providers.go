@@ -113,6 +113,7 @@ func (a *App) handleProviders(w http.ResponseWriter, r *http.Request, p auth.Pri
 			writeProviderNotFoundOrError(w, err, "provider_create_failed")
 			return
 		}
+		a.recordSecurityAudit(r, p, "endpoint.created", "endpoint", endpoint.ID, "success")
 		created, err := a.endpoints.Get(r.Context(), tenantID, endpoint.ID)
 		if err != nil {
 			log.Printf("failed to fetch created provider config: %v", err)
@@ -215,6 +216,7 @@ func (a *App) handleProviderByID(w http.ResponseWriter, r *http.Request, p auth.
 			writeProviderNotFoundOrError(w, err, "provider_update_failed")
 			return
 		}
+		a.recordSecurityAudit(r, p, "endpoint.updated", "endpoint", id, "success")
 		endpoint, err := a.endpoints.Get(r.Context(), tenantID, id)
 		if err != nil {
 			writeProviderNotFoundOrError(w, err, "provider_fetch_failed")
@@ -228,6 +230,7 @@ func (a *App) handleProviderByID(w http.ResponseWriter, r *http.Request, p auth.
 			writeProviderNotFoundOrError(w, err, "provider_delete_failed")
 			return
 		}
+		a.recordSecurityAudit(r, p, "endpoint.deleted", "endpoint", id, "success")
 		WriteJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
 	default:
 		WriteMethodNotAllowed(w)

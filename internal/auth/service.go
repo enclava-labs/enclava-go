@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -12,6 +13,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 const (
@@ -75,6 +78,24 @@ func ParseAPIKey(r *http.Request) string {
 }
 
 var errInvalidCredential = errors.New("invalid credentials")
+
+// The dummy hash is generated per process at the real cost — unknown accounts
+// pay the same bcrypt price without a credential-shaped constant.
+var dummyPasswordHash = newDummyPasswordHash()
+
+func newDummyPasswordHash() string {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		panic(err)
+	}
+	hash, err := bcrypt.GenerateFromPassword(raw, bcrypt.DefaultCost)
+	if err != nil {
+		panic(err)
+	}
+	return string(hash)
+}
+
+var verifyPassword = VerifyPassword
 
 // Authenticate validates a plaintext API key against stored tenant-scoped
 // rows and returns the canonical Principal. The tenant and actor resolve
@@ -238,10 +259,13 @@ func (s *Service) principalFromKey(ctx context.Context, key APIKeyRecord) (Princ
 // the user's principal (password auth precedes session issuance).
 func (s *Service) AuthenticatePassword(ctx context.Context, tenantID, email, password string) (Principal, error) {
 	user, err := s.repo.GetUserByEmail(ctx, tenantID, strings.ToLower(strings.TrimSpace(email)))
-	if err != nil {
-		return Principal{}, errInvalidCredential
+	hash := user.PasswordHash
+	_, hashErr := bcrypt.Cost([]byte(hash))
+	if err != nil || hashErr != nil {
+		hash = dummyPasswordHash
 	}
-	if !VerifyPassword(user.PasswordHash, password) {
+	valid := verifyPassword(hash, password)
+	if err != nil || hashErr != nil || !valid {
 		return Principal{}, errInvalidCredential
 	}
 	if user.Status != "active" {

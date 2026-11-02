@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"enclava-go/internal/artifacts"
@@ -34,6 +35,7 @@ const maxExpandedBytes = 64 << 20
 var (
 	ErrUnsupportedFormat = errors.New("extract: unsupported document format")
 	ErrMalformedDocument = errors.New("extract: malformed document")
+	ErrEncryptedDocument = errors.New("document is password protected")
 	ErrDocumentTooLarge  = errors.New("extract: document exceeds size limit")
 )
 
@@ -78,8 +80,13 @@ func (p *Parser) Parse(ctx context.Context, ref artifacts.Ref, opts ParseOptions
 		ref.SHA256 = hex.EncodeToString(digest[:])
 	}
 	format := formatFor(opts.Filename, opts.MIMEType)
-	if !utf8.Valid(data) && format != "pdf" && format != "image" && format != "docx" && format != "epub" {
-		return source.Document{}, fmt.Errorf("%w: invalid UTF-8", ErrMalformedDocument)
+	var warnings []string
+	if format == "text" || format == "markdown" || format == "html" || format == "csv" || format == "json" {
+		var warning string
+		data, warning = decodeText(data)
+		if warning != "" {
+			warnings = append(warnings, warning)
+		}
 	}
 	var blocks []parseBlock
 	switch format {
@@ -98,6 +105,10 @@ func (p *Parser) Parse(ctx context.Context, ref artifacts.Ref, opts ParseOptions
 		blocks, err = jsonBlocks(data, strings.EqualFold(filepath.Ext(opts.Filename), ".jsonl") || strings.EqualFold(filepath.Ext(opts.Filename), ".ndjson") || strings.Contains(strings.ToLower(opts.MIMEType), "ndjson"))
 	case "docx":
 		blocks, err = docxBlocks(data)
+	case "xlsx":
+		var sheetWarnings []string
+		blocks, sheetWarnings, err = xlsxBlocks(data)
+		warnings = append(warnings, sheetWarnings...)
 	case "epub":
 		blocks, err = epubBlocks(data)
 	case "pdf", "image":
@@ -111,7 +122,9 @@ func (p *Parser) Parse(ctx context.Context, ref artifacts.Ref, opts ParseOptions
 	if len(blocks) == 0 {
 		return source.Document{}, ErrMalformedDocument
 	}
-	return makeDocument(opts.ObjectRef, ref, blocks), nil
+	document := makeDocument(opts.ObjectRef, ref, blocks)
+	document.ParseWarnings = warnings
+	return document, nil
 }
 
 type parseBlock struct {
@@ -134,6 +147,8 @@ func formatFor(name, contentType string) string {
 		return "json"
 	case ext == ".docx" || strings.Contains(media, "wordprocessingml"):
 		return "docx"
+	case ext == ".xlsx" || media == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+		return "xlsx"
 	case ext == ".epub" || media == "application/epub+zip":
 		return "epub"
 	case ext == ".pdf" || media == "application/pdf":
@@ -145,6 +160,37 @@ func formatFor(name, contentType string) string {
 	default:
 		return ""
 	}
+}
+
+func decodeText(data []byte) ([]byte, string) {
+	if utf8.Valid(data) {
+		return data, ""
+	}
+	if len(data) >= 2 && ((data[0] == 0xff && data[1] == 0xfe) || (data[0] == 0xfe && data[1] == 0xff)) {
+		little := data[0] == 0xff
+		units := make([]uint16, 0, (len(data)-2)/2)
+		for i := 2; i+1 < len(data); i += 2 {
+			if little {
+				units = append(units, uint16(data[i])|uint16(data[i+1])<<8)
+			} else {
+				units = append(units, uint16(data[i])<<8|uint16(data[i+1]))
+			}
+		}
+		if len(data)%2 != 0 {
+			units = append(units, 0xfffd)
+		}
+		return []byte(string(utf16.Decode(units))), "decoded as UTF-16: input was not valid UTF-8"
+	}
+	table := [...]rune{0x20ac, 0x81, 0x201a, 0x192, 0x201e, 0x2026, 0x2020, 0x2021, 0x2c6, 0x2030, 0x160, 0x2039, 0x152, 0x8d, 0x17d, 0x8f, 0x90, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014, 0x2dc, 0x2122, 0x161, 0x203a, 0x153, 0x9d, 0x17e, 0x178}
+	var b strings.Builder
+	for _, c := range data {
+		if c >= 0x80 && c <= 0x9f {
+			b.WriteRune(table[c-0x80])
+		} else {
+			b.WriteRune(rune(c))
+		}
+	}
+	return []byte(b.String()), "decoded as windows-1252: input was not valid UTF-8"
 }
 
 func makeDocument(ref source.ObjectRef, artifact artifacts.Ref, in []parseBlock) source.Document {
@@ -461,6 +507,7 @@ func csvBlocks(data []byte) ([]parseBlock, error) {
 	r.FieldsPerRecord = -1
 	var out []parseBlock
 	start, row := 0, 1
+	header := false
 	for {
 		record, err := r.Read()
 		if err == io.EOF {
@@ -471,7 +518,15 @@ func csvBlocks(data []byte) ([]parseBlock, error) {
 		}
 		end := int(r.InputOffset())
 		text := strings.Join(record, "\t")
-		out = append(out, parseBlock{kind: "table_row", text: text, start: start, end: end, locator: source.Locator{Table: "csv", Clause: fmt.Sprint(row)}})
+		if strings.TrimSpace(text) == "" {
+			start, row = end, row+1
+			continue
+		}
+		kind := "table_row"
+		if !header {
+			kind, header = "table_header", true
+		}
+		out = append(out, parseBlock{kind: kind, text: text, start: start, end: end, locator: source.Locator{Table: "csv", Clause: fmt.Sprint(row)}})
 		start, row = end, row+1
 	}
 	return out, nil

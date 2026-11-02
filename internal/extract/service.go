@@ -136,6 +136,7 @@ var uploadMIMEs = map[string]string{
 	".jsonl": "application/json", ".ndjson": "application/json",
 	".tif": "image/tiff", ".tiff": "image/tiff",
 	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 	".epub": "application/epub+zip",
 }
 

@@ -99,6 +99,46 @@ func TestLoadDataDirAndSessionTTLDefaults(t *testing.T) {
 	}
 }
 
+func TestOperationalConfig(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("PRIVATEMODE_API_KEY", "test")
+	t.Setenv("PRIVATEMODE_BASE_URL", "https://example.invalid")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SourceAccessMaxStale != 168*time.Hour || cfg.JobTimeout != 2*time.Hour || cfg.IndexRetirementSoak != 24*time.Hour || cfg.UtilityModel != "" || cfg.MetricsToken != "" || cfg.MetricsAuthDisabled {
+		t.Fatalf("unexpected operational defaults: %+v", cfg)
+	}
+	for _, key := range []string{"SOURCE_ACCESS_MAX_STALE", "JOB_TIMEOUT", "INDEX_RETIREMENT_SOAK"} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, "-1s")
+			if _, err := Load(); err == nil {
+				t.Fatalf("%s accepted negative duration", key)
+			}
+			t.Setenv(key, "0")
+			if _, err := Load(); err != nil {
+				t.Fatalf("%s rejected explicit zero: %v", key, err)
+			}
+			t.Setenv(key, "bad")
+			if _, err := Load(); err == nil {
+				t.Fatalf("%s accepted invalid duration", key)
+			}
+		})
+	}
+	t.Setenv("METRICS_AUTH_DISABLED", "invalid")
+	if _, err := Load(); err == nil {
+		t.Fatal("accepted invalid metrics auth setting")
+	}
+	t.Setenv("METRICS_AUTH_DISABLED", "true")
+	t.Setenv("METRICS_TOKEN", "secret")
+	t.Setenv("UTILITY_MODEL", "model")
+	cfg, err = Load()
+	if err != nil || !cfg.MetricsAuthDisabled || cfg.MetricsToken != "secret" || cfg.UtilityModel != "model" {
+		t.Fatalf("configured operational values not loaded: %+v, %v", cfg, err)
+	}
+}
+
 // TestLoadDefaultEmbeddingDimensions: 1024 is the default only for the
 // default model, other models default to full size, and sizes no model
 // could use are rejected at startup.
@@ -322,6 +362,12 @@ func clearConfigEnv(t *testing.T) {
 		"BOOTSTRAP_API_KEY_MIN_LENGTH",
 		"ENCLAVA_DATA_DIR",
 		"SESSION_TTL",
+		"SOURCE_ACCESS_MAX_STALE",
+		"JOB_TIMEOUT",
+		"INDEX_RETIREMENT_SOAK",
+		"UTILITY_MODEL",
+		"METRICS_TOKEN",
+		"METRICS_AUTH_DISABLED",
 	} {
 		t.Setenv(key, "")
 	}

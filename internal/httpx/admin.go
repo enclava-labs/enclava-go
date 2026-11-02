@@ -164,6 +164,7 @@ func (a *App) handleAdminAPIKeys(w http.ResponseWriter, r *http.Request, princip
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "api_key_create_failed")
 			return
 		}
+		a.recordSecurityAudit(r, principal, "apikey.created", "apikey", record.ID, "success")
 
 		created, err := a.identity.GetAPIKey(r.Context(), principal.TenantID, record.ID)
 		if err != nil {
@@ -271,6 +272,7 @@ func (a *App) handleAdminAPIKeyByID(w http.ResponseWriter, r *http.Request, prin
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "api_key_delete_failed")
 			return
 		}
+		a.recordSecurityAudit(r, principal, "apikey.revoked", "apikey", id, "success")
 		a.recordAPIKeyBillingAudit(r.Context(), "api_key.deleted", id, principal, nil)
 		WriteJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
 		return
@@ -387,6 +389,7 @@ func (a *App) handleAdminAPIKeyByID(w http.ResponseWriter, r *http.Request, prin
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "api_key_delete_failed")
 			return
 		}
+		a.recordSecurityAudit(r, principal, "apikey.revoked", "apikey", id, "success")
 		a.recordAPIKeyBillingAudit(r.Context(), "api_key.deleted", id, principal, nil)
 		WriteJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
 	default:

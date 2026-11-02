@@ -40,6 +40,7 @@ const (
 type ContentItem struct {
 	NativeID, ParentNativeID string
 	Kind, NativeRevision     string
+	Title, ParentKind        string
 	Filename, MIMEType       string
 	Content                  []byte
 	Text                     string
@@ -58,6 +59,7 @@ type AccessGrant struct {
 type ContentPage struct {
 	Items        []ContentItem
 	NextCursor   Cursor
+	Checkpoint   Cursor
 	Completeness Completeness
 	Snapshot     bool
 }
@@ -95,10 +97,11 @@ type StreamState = jobs.ConnectorStreamCheckpoint
 
 type Observation = jobs.ConnectorObservation
 type ObservationRepository interface {
-	StartRun(context.Context, string, string, string, string) (StreamState, error)
+	StartRun(context.Context, string, string, string, string, string) (StreamState, error)
 	GetStream(context.Context, string, string, string) (StreamState, error)
 	PersistPage(context.Context, StreamState, []Observation, string, bool, bool, string) (StreamState, error)
 	ListObservations(context.Context, StreamState) ([]Observation, error)
+	UnmappedPrincipals(context.Context, string, string) (int, error)
 	WithFence(context.Context, StreamState, func(source.Tx) error) error
 }
 
@@ -143,6 +146,7 @@ type Source struct {
 	CreatedAt          time.Time      `json:"created_at"`
 	UpdatedAt          time.Time      `json:"updated_at"`
 	LastSyncAt         *time.Time     `json:"last_sync_at,omitempty"`
+	UnmappedPrincipals int            `json:"unmapped_principals"`
 }
 
 // SyncJob is the wire-stable view of a durable connector.sync jobs row.

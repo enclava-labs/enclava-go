@@ -30,7 +30,7 @@ func TestUpsertUsesQdrantNativeBM25ForIndexedText(t *testing.T) {
 
 	client := NewQdrantClient(server.URL, time.Second)
 	if err := client.UpsertPoints(context.Background(), "test", []QdrantPoint{{
-		ID: "point-1", Vector: []float64{1, 0}, Payload: map[string]any{"content": "native text"},
+		ID: "point-1", Vector: []float64{1, 0}, Payload: map[string]any{"content": "native text", "search_text": "title and keywords"},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -41,8 +41,43 @@ func TestUpsertUsesQdrantNativeBM25ForIndexedText(t *testing.T) {
 	point := points[0].(map[string]any)
 	vectors := point["vector"].(map[string]any)
 	text := vectors["text"].(map[string]any)
-	if text["model"] != "qdrant/bm25" || text["text"] != "native text" {
+	if text["model"] != "qdrant/bm25" || text["text"] != "title and keywords" {
 		t.Fatalf("native sparse vector = %#v", text)
+	}
+	if err := client.UpsertPoints(context.Background(), "test", []QdrantPoint{{
+		ID: "point-2", Vector: []float64{1, 0}, Payload: map[string]any{"content": "fallback"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	point = got["points"].([]any)[0].(map[string]any)
+	text = point["vector"].(map[string]any)["text"].(map[string]any)
+	if text["text"] != "fallback" {
+		t.Fatalf("fallback sparse vector = %#v", text)
+	}
+}
+
+func TestCountPoints(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/collections/test/points/count" {
+			http.NotFound(w, r)
+			return
+		}
+		var body struct {
+			Exact bool `json:"exact"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || !body.Exact {
+			t.Errorf("expected exact count, got %#v, %v", body, err)
+		}
+		_, _ = w.Write([]byte(`{"result":{"count":42}}`))
+	}))
+	defer server.Close()
+	client := NewQdrantClient(server.URL, time.Second)
+	count, err := client.CountPoints(context.Background(), "test")
+	if err != nil || count != 42 {
+		t.Fatalf("count = %d, %v", count, err)
+	}
+	if _, err := client.CountPoints(context.Background(), "missing"); err == nil {
+		t.Fatal("missing collection must fail")
 	}
 }
 

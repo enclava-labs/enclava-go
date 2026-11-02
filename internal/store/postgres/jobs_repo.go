@@ -30,6 +30,26 @@ func NewJobsRepo(db *DB) *JobsRepo {
 
 var _ jobs.JobsRepository = (*JobsRepo)(nil)
 
+func (r *JobsRepo) CountByOperationStatus(ctx context.Context) ([]jobs.JobCount, error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `SELECT operation, status, COUNT(*) FROM jobs WHERE deleted_at IS NULL GROUP BY operation, status ORDER BY operation, status`)
+	if err != nil {
+		return nil, fmt.Errorf("count jobs by operation and status: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var counts []jobs.JobCount
+	for rows.Next() {
+		var count jobs.JobCount
+		if err := rows.Scan(&count.Operation, &count.Status, &count.Count); err != nil {
+			return nil, fmt.Errorf("scan job count: %w", err)
+		}
+		counts = append(counts, count)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read job counts: %w", err)
+	}
+	return counts, nil
+}
+
 const jobColumns = `tenant_id::text, id, operation, status, connection_id,
 	object_id, observed_revision, idempotency_key, input_hash, input_ref,
 	principal, submitter_key, policy, attempts, max_attempts, fence_token,

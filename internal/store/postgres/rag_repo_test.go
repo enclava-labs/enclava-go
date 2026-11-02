@@ -471,3 +471,113 @@ func TestRAGRepoDocumentProjectionTruthAndIdentity(t *testing.T) {
 		t.Fatalf("second collection projection mismatch: %#v", otherDocs[0])
 	}
 }
+
+func TestRAGRepoEmbeddingRecipeAndProgress(t *testing.T) {
+	db := testdb.New(t)
+	ctx := context.Background()
+	tenant := testdb.SeedTenant(t, db, "recipe")
+	otherTenant := testdb.SeedTenant(t, db, "recipe-other")
+	repo := postgres.NewRAGRepo(db)
+	objectID, versionID := seedProjectionFixture(t, db, repo, tenant, "ragcol_recipe")
+	c, err := repo.GetCollection(ctx, tenant, "ragcol_recipe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.QueryPrefix, c.PassagePrefix = "query one ", "passage one "
+	if err := repo.UpdateCollection(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	stageChunks(t, repo, tenant, c.ID, objectID, versionID, 1, "recipe_chunk1")
+	if err := repo.SetGenerationWarnings(ctx, tenant, c.ID, versionID, 1, []string{"truncated"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.BindGeneration(ctx, tenant, versionID, 1, c); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.MarkGenerationState(ctx, tenant, c.ID, versionID, 1, "published"); err != nil {
+		t.Fatal(err)
+	}
+	profile, err := repo.EnsureChunkProfile(ctx, tenant, "rag-"+c.ID+"-structured", 100, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, warnings, err := repo.LatestReusableGeneration(ctx, tenant, c.ID, versionID, profile)
+	if err != nil || gen != 1 || len(warnings) != 1 || warnings[0] != "truncated" {
+		t.Fatalf("reusable generation = %d, %v, %v", gen, warnings, err)
+	}
+	if gen, _, err := repo.LatestReusableGeneration(ctx, otherTenant, c.ID, versionID, profile); err != nil || gen != 0 {
+		t.Fatalf("cross-tenant reusable generation = %d, %v", gen, err)
+	}
+	if err := repo.SetGenerationWarnings(ctx, tenant, c.ID, versionID, 1, nil); err == nil {
+		t.Fatal("published generation warnings must be immutable")
+	}
+	stale := c
+	c.QueryPrefix = "query two "
+	if err := repo.UpdateCollection(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	gens, err := repo.ListPublishedGenerations(ctx, tenant, c.ID)
+	if err != nil || len(gens) != 1 || gens[0].QueryPrefix != c.QueryPrefix || gens[0].PassagePrefix != c.PassagePrefix {
+		t.Fatalf("generation recipe = %#v, %v", gens, err)
+	}
+	pending, total, err := repo.ReembedProgressDocuments(ctx, tenant, c)
+	if err != nil || len(pending) != 0 || len(total) != 1 {
+		t.Fatalf("query-only progress = %v / %v, %v", pending, total, err)
+	}
+	c.PassagePrefix = "passage two "
+	if err := repo.UpdateCollection(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	docs, err := repo.DocumentsToReembed(ctx, tenant, c)
+	if err != nil || len(docs) != 1 {
+		t.Fatalf("passage change pending = %v, %v", docs, err)
+	}
+	stageChunks(t, repo, tenant, c.ID, objectID, versionID, 2, "recipe_chunk2")
+	if err := repo.BindGeneration(ctx, tenant, versionID, 2, stale); err != nil {
+		t.Fatal(err)
+	}
+	var boundQuery string
+	if err := db.SQL.QueryRowContext(ctx, `
+		SELECT query_prefix FROM index_generations
+		WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3 AND generation=2`,
+		tenant, c.ID, versionID).Scan(&boundQuery); err != nil || boundQuery != c.QueryPrefix {
+		t.Fatalf("late binding query prefix = %q, %v", boundQuery, err)
+	}
+	if err := repo.SetGenerationWarnings(ctx, tenant, c.ID, versionID, 2, []string{"latest"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL.ExecContext(ctx, `
+		INSERT INTO jobs (tenant_id, id, operation, status, idempotency_key, input_hash, input_ref, principal, submitter_key, policy)
+		VALUES ($1, 'recipe_job', 'rag.embed', 'queued', 'recipe_job', 'hash', $2, '{}', 'tester', $3::jsonb)`,
+		tenant, versionID, fmt.Sprintf(`{"collection_id":%q,"generation":2}`, c.ID)); err != nil {
+		t.Fatal(err)
+	}
+	docs, err = repo.DocumentsToReembed(ctx, tenant, c)
+	if err != nil || len(docs) != 0 {
+		t.Fatalf("in-flight enqueue candidates = %v, %v", docs, err)
+	}
+	pending, total, err = repo.ReembedProgressDocuments(ctx, tenant, c)
+	if err != nil || len(pending) != 1 || len(total) != 1 {
+		t.Fatalf("in-flight progress = %v / %v, %v", pending, total, err)
+	}
+	doc, err := repo.GetDocument(ctx, tenant, objectID)
+	if err != nil || len(doc.Warnings) != 1 || doc.Warnings[0] != "latest" {
+		t.Fatalf("latest warnings = %#v, %v", doc.Warnings, err)
+	}
+	oldIndex := c.QdrantCollection
+	c.QdrantCollection = oldIndex + "_new"
+	if err := repo.UpdateCollection(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	c, err = repo.GetCollection(ctx, tenant, c.ID)
+	if err != nil || c.RetiredIndexSince[oldIndex].IsZero() {
+		t.Fatalf("retirement timestamp = %v, %v", c.RetiredIndexSince, err)
+	}
+	if err := repo.ForgetRetiredIndex(ctx, tenant, c.ID, oldIndex); err != nil {
+		t.Fatal(err)
+	}
+	c, err = repo.GetCollection(ctx, tenant, c.ID)
+	if err != nil || len(c.RetiredQdrantCollections) != 0 || len(c.RetiredIndexSince) != 0 {
+		t.Fatalf("forgotten retirement = %#v, %v", c, err)
+	}
+}

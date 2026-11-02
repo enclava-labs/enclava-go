@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"enclava-go/internal/auth"
@@ -34,6 +35,7 @@ type Repository interface {
 	CreateConversation(ctx context.Context, c Conversation) error
 	GetConversation(ctx context.Context, tenantID, id string) (Conversation, error)
 	AddMessage(ctx context.Context, m Message) error
+	FinalizeMessage(ctx context.Context, tenantID, id, content, status string) error
 	ListMessages(ctx context.Context, tenantID, conversationID string) ([]Message, error)
 	// ListConversations returns the owner's newest-first conversation
 	// summaries under the opaque keyset cursor (own-only, admins included).
@@ -392,6 +394,14 @@ func (s *Service) CreateChatCompletion(ctx context.Context, p auth.Principal, ch
 	if err != nil {
 		return CompletionOutput{}, err
 	}
+	completed := false
+	defer func() {
+		if !completed {
+			recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			_ = s.InterruptAssistantMessage(recordCtx, p, prepared)
+		}
+	}()
 	res, err := s.executePrepared(ctx, p, prepared)
 	if err != nil {
 		return CompletionOutput{}, err
@@ -407,6 +417,7 @@ func (s *Service) CreateChatCompletion(ctx context.Context, p auth.Principal, ch
 	if err := s.PersistAssistantMessage(ctx, p, prepared, extractAssistantContent(resp)); err != nil {
 		return CompletionOutput{}, err
 	}
+	completed = true
 	resp = appendCompletionMetadata(resp, prepared.Chatbot.ID, prepared.Conversation.ID)
 	return CompletionOutput{
 		Response:       resp,
@@ -503,13 +514,21 @@ func (s *Service) PrepareChatCompletion(ctx context.Context, p auth.Principal, c
 	}
 	inputRefs := mergeObjectRefs(historyRefs, ragInputs(ragResults))
 	evidenceIDs := mergeStrings(historyEvidenceIDs, evidenceIDsForResults(ragResults))
+	assistantID := newID("chatmsg")
+	if err := s.repo.AddMessage(ctx, Message{
+		TenantID: p.TenantID, ID: assistantID, ConversationID: conversation.ID,
+		Role: "assistant", Content: interruptedMessage, Status: "reserved", OwnerActorID: p.ActorID,
+		EvidenceIDs: evidenceIDs, InputRefs: inputRefs,
+	}); err != nil {
+		return PreparedCompletion{}, err
+	}
 	return PreparedCompletion{
 		Request: inference.Request{
 			Capability: inference.CapabilityChat, Model: bot.Model,
 			EndpointID: strings.TrimSpace(bot.ProviderID), Payload: upstreamRequest,
 			Stream: stream, Inputs: inputRefs, Estimate: completionEstimate(upstreamRequest),
 		},
-		Conversation: conversation, Chatbot: bot, Model: bot.Model,
+		Conversation: conversation, Chatbot: bot, Model: bot.Model, AssistantMessageID: assistantID,
 		RAGResultCount: len(ragResults), EvidenceIDs: evidenceIDs, InputRefs: inputRefs,
 	}, nil
 }
@@ -528,18 +547,14 @@ func (s *Service) executePrepared(ctx context.Context, p auth.Principal, prepare
 	return s.executor.Execute(ctx, p, prepared.Request)
 }
 
-// PersistAssistantMessage retains the completed assistant turn. Persistence
-// failures return the real repository error — a lost assistant message is
-// never reported as a successful completion.
+const interruptedMessage = "Response was interrupted before completion."
+
 func (s *Service) PersistAssistantMessage(ctx context.Context, p auth.Principal, prepared PreparedCompletion, assistantContent string) error {
-	if strings.TrimSpace(assistantContent) == "" {
-		return nil
-	}
-	return s.repo.AddMessage(ctx, Message{
-		TenantID: p.TenantID, ID: newID("chatmsg"), ConversationID: prepared.Conversation.ID,
-		Role: "assistant", Content: assistantContent, OwnerActorID: p.ActorID,
-		EvidenceIDs: prepared.EvidenceIDs, InputRefs: prepared.InputRefs,
-	})
+	return s.repo.FinalizeMessage(ctx, p.TenantID, prepared.AssistantMessageID, assistantContent, "complete")
+}
+
+func (s *Service) InterruptAssistantMessage(ctx context.Context, p auth.Principal, prepared PreparedCompletion) error {
+	return s.repo.FinalizeMessage(ctx, p.TenantID, prepared.AssistantMessageID, interruptedMessage, "interrupted")
 }
 
 // ListConversation filters stored source-derived text against current evidence access.
@@ -558,7 +573,7 @@ func (s *Service) ListConversation(ctx context.Context, p auth.Principal, conver
 	if err != nil || !chatbotAllowed(p, bot) {
 		return ConversationView{}, sql.ErrNoRows
 	}
-	messages, _, _, err := s.authorizedHistory(ctx, p, conversation.ID)
+	messages, _, _, err := s.authorizedMessages(ctx, p, conversation.ID, true)
 	if err != nil {
 		return ConversationView{}, err
 	}
@@ -814,6 +829,10 @@ func (s *Service) conversationTitle(ctx context.Context, p auth.Principal, conve
 }
 
 func (s *Service) authorizedHistory(ctx context.Context, p auth.Principal, conversationID string) ([]Message, []source.ObjectRef, []string, error) {
+	return s.authorizedMessages(ctx, p, conversationID, false)
+}
+
+func (s *Service) authorizedMessages(ctx context.Context, p auth.Principal, conversationID string, includeInterrupted bool) ([]Message, []source.ObjectRef, []string, error) {
 	stored, err := s.repo.ListMessages(ctx, p.TenantID, conversationID)
 	if err != nil {
 		return nil, nil, nil, err
@@ -823,6 +842,14 @@ func (s *Service) authorizedHistory(ctx context.Context, p auth.Principal, conve
 	var evidenceIDs []string
 	for _, msg := range stored {
 		if msg.Role != "user" && msg.Role != "assistant" {
+			continue
+		}
+		if msg.Role == "assistant" && (msg.Status == "reserved" || msg.Status == "interrupted") {
+			if includeInterrupted {
+				msg.EvidenceIDs = nil
+				msg.InputRefs = nil
+				history = append(history, msg)
+			}
 			continue
 		}
 		if len(msg.InputRefs) > 0 && len(msg.EvidenceIDs) == 0 {

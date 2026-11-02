@@ -4,6 +4,7 @@
      poll trigger renders only while a non-terminal status exists. Upload /
      Retry / Delete are manager-only — member markup has no action cell. */}}
 <div id="knowledge-documents" hx-get="/dashboard/partials/knowledge/documents?collection={{.Data.Collection.ID}}&status={{.Data.Status}}" hx-swap="outerHTML" hx-trigger="{{if .Data.AnyProcessing}}refresh from:body, every 3s{{else}}refresh from:body{{end}}">
+  {{template "knowledge-reembed-progress" .}}
   <div class="filters" role="group" aria-label="Filter documents by status">
     <a class="chip{{if eq .Data.Status "all"}} active{{end}}" aria-pressed="{{if eq .Data.Status "all"}}true{{else}}false{{end}}" href="/dashboard/knowledge/{{.Data.Collection.ID}}/documents">All</a>
     <a class="chip{{if eq .Data.Status "ready"}} active{{end}}" aria-pressed="{{if eq .Data.Status "ready"}}true{{else}}false{{end}}" href="/dashboard/knowledge/{{.Data.Collection.ID}}/documents?status=ready">{{statusLabel "document" "ready"}}</a>
@@ -24,7 +25,7 @@
       <tbody>
 {{range .Data.Docs}}        <tr>
           <td data-label="Document"><b>{{.FileName}}</b>{{if .SourceURI}}<span class="subline">{{.SourceURI}}</span>{{end}}</td>
-          <td data-label="Status">{{if dashboardNonTerminal .Status}}<span class="pulse" aria-hidden="true">●</span>{{end}}{{statusPill "document" .Status}}{{if .ErrorMessage}}{{$action := dashboardErrorAction .ErrorMessage $.Can}}<span class="subline">{{$action.Text}}{{if $action.Href}} <a href="{{$action.Href}}">{{if eq $action.Href "/dashboard/models/pricing"}}Set price{{else}}View details{{end}}</a>{{end}}</span>{{end}}</td>
+          <td data-label="Status">{{if dashboardNonTerminal .Status}}<span class="pulse" aria-hidden="true">●</span>{{end}}{{statusPill "document" .Status}}{{if .Warnings}} {{statusPill "document" "warning"}}{{range .Warnings}}<span class="subline">{{.}}</span>{{end}}{{end}}{{if .ErrorMessage}}{{$action := dashboardErrorAction .ErrorMessage $.Can}}<span class="subline">{{$action.Text}}{{if $action.Href}} <a href="{{$action.Href}}">{{if eq $action.Href "/dashboard/models/pricing"}}Set price{{else}}View details{{end}}</a>{{end}}</span>{{end}}</td>
           <td data-label="Updated">{{relTime .UpdatedAt}}</td>
 {{if $.Can.KnowledgeManage}}          <td data-label="Actions">
             <span class="row">
@@ -42,4 +43,9 @@
 {{if .Data.Docs}}    <label class="btn primary" for="knowledge-upload-file">{{icon "upload"}}Upload document</label>{{end}}
   </div>
 {{end}}</div>
+{{end}}
+{{define "knowledge-reembed-progress"}}
+<div id="knowledge-reembed-progress" hx-get="/dashboard/partials/knowledge/documents?collection={{.Data.Collection.ID}}&status={{.Data.Status}}" hx-select="#knowledge-reembed-progress" hx-swap="outerHTML" hx-trigger="{{if gt .Data.ReembedPending 0}}refresh from:body, every 3s{{else}}refresh from:body{{end}}">
+  {{if gt .Data.ReembedPending 0}}<div class="card">Re-embedding under new settings: {{.Data.ReembedPending}} of {{.Data.ReembedTotal}} documents left</div>{{end}}
+</div>
 {{end}}

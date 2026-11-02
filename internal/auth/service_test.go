@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -301,6 +302,39 @@ func TestBcryptPasswords(t *testing.T) {
 	}
 	if _, err := svc.AuthenticatePassword(context.Background(), tenant, "pw@example.com", "nope"); err == nil {
 		t.Fatalf("wrong password must fail")
+	}
+}
+
+type missingPasswordUserRepo struct {
+	auth.IdentityRepository
+}
+
+func (missingPasswordUserRepo) GetUserByEmail(context.Context, string, string) (auth.User, error) {
+	return auth.User{}, errors.New("not found")
+}
+
+func TestAuthenticatePasswordMissingUser(t *testing.T) {
+	svc := auth.NewService(missingPasswordUserRepo{}, "")
+	if _, err := svc.AuthenticatePassword(context.Background(), "tenant", "missing@example.com", "password"); err == nil {
+		t.Fatal("missing account must not authenticate")
+	}
+}
+
+type passwordlessUserRepo struct {
+	auth.IdentityRepository
+	hash string
+}
+
+func (r passwordlessUserRepo) GetUserByEmail(context.Context, string, string) (auth.User, error) {
+	return auth.User{Status: "active", PasswordHash: r.hash}, nil
+}
+
+func TestAuthenticatePasswordRejectsInvalidHashes(t *testing.T) {
+	for _, hash := range []string{"", "invalid bcrypt hash"} {
+		svc := auth.NewService(passwordlessUserRepo{hash: hash}, "")
+		if _, err := svc.AuthenticatePassword(context.Background(), "tenant", "user@example.com", "password"); err == nil {
+			t.Fatalf("invalid hash %q must not authenticate", hash)
+		}
 	}
 }
 

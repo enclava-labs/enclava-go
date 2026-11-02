@@ -472,8 +472,8 @@ func TestPrepareChatCompletionSupportsStreamingAndPersistAssistant(t *testing.T)
 	if err != nil {
 		t.Fatalf("list messages after prepare: %v", err)
 	}
-	if len(messages) != 1 || messages[0].Role != "user" {
-		t.Fatalf("expected only request message after prepare, got %#v", messages)
+	if len(messages) != 2 || messages[0].Role != "user" || messages[1].Status != "reserved" || messages[1].Content != "Response was interrupted before completion." {
+		t.Fatalf("expected request and reserved assistant message, got %#v", messages)
 	}
 
 	// Dispatch runs only through the shared executor.
@@ -501,7 +501,7 @@ func TestPrepareChatCompletionSupportsStreamingAndPersistAssistant(t *testing.T)
 	if len(messages) != 2 {
 		t.Fatalf("expected request and assistant messages, got %d", len(messages))
 	}
-	if messages[1].Role != "assistant" || messages[1].Content != "streamed answer" {
+	if messages[1].Role != "assistant" || messages[1].Content != "streamed answer" || messages[1].Status != "complete" || messages[1].ID != prepared.AssistantMessageID {
 		t.Fatalf("unexpected assistant message: %#v", messages[1])
 	}
 }
@@ -532,6 +532,22 @@ func TestCreateChatCompletionUpstreamFailurePreservesError(t *testing.T) {
 	}
 	if atomic.LoadInt32(&f.upstream.calls) != 1 {
 		t.Fatalf("expected one upstream dispatch, got %d", f.upstream.calls)
+	}
+	conversations, _, err := f.svc.ListConversations(ctx, p, 10, "")
+	if err != nil || len(conversations) != 1 {
+		t.Fatalf("list conversations: %v %#v", err, conversations)
+	}
+	view, err := f.svc.ListConversation(ctx, p, conversations[0].ID)
+	if err != nil || len(view.Messages) != 2 || view.Messages[1].Status != "interrupted" || view.Messages[1].Content != "Response was interrupted before completion." {
+		t.Fatalf("interrupted conversation: %v %#v", err, view.Messages)
+	}
+	request := fmt.Sprintf(`{"conversation_id":%q,"messages":[{"role":"user","content":"next question"}]}`, conversations[0].ID)
+	prepared, err := f.svc.PrepareChatCompletion(ctx, p, "failure_bot", []byte(request), false)
+	if err != nil {
+		t.Fatalf("prepare next completion: %v", err)
+	}
+	if strings.Contains(string(prepared.Request.Payload), "Response was interrupted") {
+		t.Fatalf("interrupted response entered history: %s", prepared.Request.Payload)
 	}
 }
 
@@ -618,8 +634,15 @@ func TestResumeConversationRequiresOwnerOrAdmin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list messages: %v", err)
 	}
-	if len(messages) != 1 || messages[0].Content != "first" {
-		t.Fatalf("other actor inserted a message: %#v", messages)
+	// A reservation makes the owner's prepare two rows; the security check is
+	// that none of them came from the other actor.
+	for _, m := range messages {
+		if m.Content == "intrude" || m.OwnerActorID == other.ActorID {
+			t.Fatalf("other actor inserted a message: %#v", messages)
+		}
+		if m.OwnerActorID != owner.ActorID {
+			t.Fatalf("unexpected message owner: %#v", messages)
+		}
 	}
 
 	resumed, err := f.svc.PrepareChatCompletion(ctx, owner, "resume_bot", resumeBody(t, conversationID, "owner again"), false)
@@ -637,8 +660,19 @@ func TestResumeConversationRequiresOwnerOrAdmin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list messages after admin: %v", err)
 	}
-	if len(messages) != 3 || messages[2].Content != "admin" {
-		t.Fatalf("unexpected messages after admin resume: %#v", messages)
+	var lastUserContent string
+	for _, m := range messages {
+		if m.Role == "user" {
+			lastUserContent = m.Content
+		}
+	}
+	if lastUserContent != "admin" {
+		t.Fatalf("last user message = %q, want admin: %#v", lastUserContent, messages)
+	}
+	for _, m := range messages {
+		if m.OwnerActorID != owner.ActorID && m.OwnerActorID != admin.ActorID {
+			t.Fatalf("foreign actor message survived resume: %#v", messages)
+		}
 	}
 
 	// Cross-tenant resume denies identically to a missing conversation.
@@ -1729,9 +1763,7 @@ func TestRunEvidenceHandoffFlowsToExecutorAndReplays(t *testing.T) {
 	}
 }
 
-// TestRunMultiAttemptStepsStayOrdered: a tool-calling run persists one model
-// step then one tool step; steps replay ordered by number with tool-level
-// input only.
+// TestRunMultiAttemptStepsStayOrdered checks the failed tool attempt and resumed model call.
 func TestRunMultiAttemptStepsStayOrdered(t *testing.T) {
 	ctx := context.Background()
 	f := newRunWorkerFixture(t, []string{runWorkerTool, runWorkerDone}, nil)
@@ -1739,14 +1771,14 @@ func TestRunMultiAttemptStepsStayOrdered(t *testing.T) {
 	bot := seedAudienceBot(t, f.chatRepo, f.tenant, []string{runWorkerMember})
 
 	run, handlerErr := startAndRun(t, f, member, bot.ID, chatbot.AssistantRunInput{Input: "use the tool"})
-	if handlerErr == nil {
-		t.Fatal("unapproved tool arguments must fail the run after the tool attempt")
+	if handlerErr != nil {
+		t.Fatalf("run should continue after the tool error: %v", handlerErr)
 	}
 	got, err := f.svc.GetRun(ctx, member, run.ID)
 	if err != nil {
 		t.Fatalf("get run: %v", err)
 	}
-	if len(got.Steps) != 2 || got.Steps[0].Number != 1 || got.Steps[0].Kind != "model" || got.Steps[0].Status != "succeeded" {
+	if len(got.Steps) != 3 || got.Steps[0].Number != 1 || got.Steps[0].Kind != "model" || got.Steps[0].Status != "succeeded" || got.Steps[2].Number != 3 || got.Steps[2].Kind != "model" || got.Steps[2].Status != "succeeded" {
 		t.Fatalf("steps = %#v, want model step first", got.Steps)
 	}
 	tool := got.Steps[1]

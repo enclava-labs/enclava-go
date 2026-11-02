@@ -41,6 +41,7 @@ type RunnerConfig struct {
 	LeaseTTL        time.Duration // lease duration per claim; default 30s
 	HeartbeatEvery  time.Duration // heartbeat cadence; default LeaseTTL/3
 	CancelPollEvery time.Duration // owner-cancel probe cadence; default HeartbeatEvery
+	JobTimeout      time.Duration // per-handler deadline; 0 disables
 }
 
 // Runner leases jobs and executes registered handlers under the fence
@@ -139,6 +140,11 @@ func (r *Runner) execute(ctx context.Context, claim *Claim) {
 
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	if r.cfg.JobTimeout > 0 {
+		var deadlineCancel context.CancelFunc
+		jobCtx, deadlineCancel = context.WithTimeout(jobCtx, r.cfg.JobTimeout)
+		defer deadlineCancel()
+	}
 
 	// Watchdog: heartbeat keeps the lease alive; a heartbeat failure or an
 	// owner cancel-request cancels the handler's context.
@@ -151,6 +157,8 @@ func (r *Runner) execute(ctx context.Context, claim *Claim) {
 		for {
 			select {
 			case <-stop:
+				return
+			case <-jobCtx.Done():
 				return
 			case <-hb.C:
 				if err := claim.Heartbeat(ctx, r.cfg.LeaseTTL); err != nil {
@@ -180,6 +188,17 @@ func (r *Runner) execute(ctx context.Context, claim *Claim) {
 	}
 
 	resultRef, err := handler(jobCtx, claim, open)
+	if errors.Is(jobCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+		err = context.DeadlineExceeded
+		if wanted, checkErr := claim.CancelRequested(context.WithoutCancel(ctx)); checkErr == nil && wanted {
+			r.translate(ctx, claim, resultRef, err)
+			return
+		}
+		if !claim.Dispatched() {
+			_ = claim.Fail(context.WithoutCancel(ctx), err, FailureRetryable)
+			return
+		}
+	}
 	r.translate(ctx, claim, resultRef, err)
 }
 

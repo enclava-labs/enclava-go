@@ -238,16 +238,18 @@ func (a *App) handleRAGSearchReadable(w http.ResponseWriter, r *http.Request, pr
 		return
 	}
 	var request struct {
-		Query         string        `json:"query"`
-		Mode          rag.QueryMode `json:"mode"`
-		CollectionIDs []string      `json:"collection_ids"`
-		Limit         int           `json:"limit"`
+		Query          string        `json:"query"`
+		Mode           rag.QueryMode `json:"mode"`
+		CollectionIDs  []string      `json:"collection_ids"`
+		Limit          int           `json:"limit"`
+		Rewrite        bool          `json:"rewrite"`
+		SelectSections bool          `json:"select_sections"`
 	}
 	if err := DecodeJSON(r, &request); err != nil {
 		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 		return
 	}
-	result, err := a.ragSvc.SearchReadable(r.Context(), principal, request.Query, request.Mode, request.CollectionIDs, request.Limit)
+	result, err := a.ragSvc.SearchReadableWithOptions(r.Context(), principal, request.Query, request.Mode, request.CollectionIDs, request.Limit, rag.SearchReadableOptions{Rewrite: request.Rewrite, SelectSections: request.SelectSections})
 	if err != nil {
 		a.writeRAGNotFoundOrBadRequest(w, err, "rag_search_failed")
 		return
@@ -324,17 +326,18 @@ func (a *App) handleRAGSearch(w http.ResponseWriter, r *http.Request, principal 
 		return
 	}
 	var request struct {
-		Query   string        `json:"query"`
-		Mode    rag.QueryMode `json:"mode"`
-		Limit   int           `json:"limit"`
-		Rewrite bool          `json:"rewrite"`
+		Query          string        `json:"query"`
+		Mode           rag.QueryMode `json:"mode"`
+		Limit          int           `json:"limit"`
+		Rewrite        bool          `json:"rewrite"`
+		SelectSections bool          `json:"select_sections"`
 	}
 	if err := DecodeJSON(r, &request); err != nil {
 		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 		return
 	}
 	results, err := a.ragSvc.Search(r.Context(), principal, rag.SearchInput{
-		CollectionID: collectionID, Query: request.Query, Mode: request.Mode, Limit: request.Limit, Rewrite: request.Rewrite,
+		CollectionID: collectionID, Query: request.Query, Mode: request.Mode, Limit: request.Limit, Rewrite: request.Rewrite, SelectSections: request.SelectSections,
 	})
 	if err != nil {
 		a.writeRAGNotFoundOrBadRequest(w, err, "rag_search_failed")
@@ -463,6 +466,10 @@ func (a *App) writeRAGNotFoundOrBadRequest(w http.ResponseWriter, err error, cod
 	var be budgetExceededError
 	if errors.As(err, &be) || errors.Is(err, billing.ErrBudgetExceeded) {
 		a.WriteBudgetError(w, err)
+		return
+	}
+	if errors.Is(err, rag.ErrUtilityModelNotConfigured) {
+		WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "utility_model_not_configured")
 		return
 	}
 	if errors.Is(err, rag.ErrSearchWorkExceeded) {

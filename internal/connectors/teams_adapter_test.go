@@ -37,12 +37,14 @@ func TestTeamsAdapterPagesChannelRepliesAndChats(t *testing.T) {
 			io.WriteString(w, `{"value":[{"id":"member","userId":"entra-user","tenantId":"directory"}]}`)
 		case "/v1/teams/team/channels":
 			if r.URL.Query().Get("page") == "2" {
-				io.WriteString(w, `{"value":[{"id":"channel2","membershipType":"shared"}]}`)
+				_, _ = io.WriteString(w, `{"value":[{"id":"channel2","membershipType":"shared"},{"id":"channel3","membershipType":"standard"}]}`)
 			} else {
 				io.WriteString(w, `{"value":[{"id":"channel","membershipType":"private"}],"@odata.nextLink":"http://`+r.Host+`/v1/teams/team/channels?page=2"}`)
 			}
-		case "/v1/teams/team/channels/channel2/messages", "/v1/teams/team/channels/channel2/allMembers":
+		case "/v1/teams/team/channels/channel2/messages", "/v1/teams/team/channels/channel3/messages":
 			io.WriteString(w, `{"value":[]}`)
+		case "/v1/teams/team/channels/channel2/allMembers":
+			_, _ = io.WriteString(w, `{"value":[{"id":"shared-member","userId":"shared-user","tenantId":"directory"}]}`)
 		case "/v1/teams/team/channels/channel/members":
 			io.WriteString(w, `{"value":[{"id":"channel-member","userId":"private-user","tenantId":"directory"}]}`)
 		case "/v1/chats/chat/members":
@@ -85,10 +87,10 @@ func TestTeamsAdapterPagesChannelRepliesAndChats(t *testing.T) {
 	if len(page.Items) != 2 || page.NextCursor != "2" || page.Snapshot {
 		t.Fatalf("first page = %#v", page)
 	}
-	if page.Items[0].NativeID != "teams:team:channel:parent" || page.Items[0].Kind != "teams_channel_message:private" || page.Items[0].URL != "https://teams.example/message" {
+	if page.Items[0].NativeID != "teams:team:channel:parent" || page.Items[0].Kind != "teams_channel_message:private" || page.Items[0].URL != "https://teams.example/message" || page.Items[0].Title != "" || page.Items[0].ParentNativeID != "channel" || page.Items[0].ParentKind != "teams_channel" {
 		t.Fatalf("channel item = %#v", page.Items[0])
 	}
-	if page.Items[1].NativeID != "teams:team:channel:parent:attachment:file1" || page.Items[1].ParentNativeID != "teams:team:channel:parent" {
+	if page.Items[1].NativeID != "teams:team:channel:parent:attachment:file1" || page.Items[1].ParentNativeID != "channel" || page.Items[1].ParentKind != "teams_channel" || page.Items[1].Title != "a.txt" {
 		t.Fatalf("attachment item = %#v", page.Items[1])
 	}
 	page, err = a.Content(context.Background(), connection, page.NextCursor, 2)
@@ -98,10 +100,10 @@ func TestTeamsAdapterPagesChannelRepliesAndChats(t *testing.T) {
 	if len(page.Items) != 2 || !page.Snapshot || page.NextCursor != "" {
 		t.Fatalf("terminal page = %#v", page)
 	}
-	if page.Items[0].NativeID != "teams:team:channel:reply" || page.Items[0].ParentNativeID != "teams:team:channel:parent" {
+	if page.Items[0].NativeID != "teams:team:channel:reply" || page.Items[0].ParentNativeID != "channel" || page.Items[0].ParentKind != "teams_channel" || page.Items[0].Title != "" {
 		t.Fatalf("reply = %#v", page.Items[0])
 	}
-	if page.Items[1].NativeID != "teams:chat:chat:chatmsg" || page.Items[1].ParentNativeID != "" || page.Items[1].Kind != "teams_chat_message" {
+	if page.Items[1].NativeID != "teams:chat:chat:chatmsg" || page.Items[1].ParentNativeID != "chat" || page.Items[1].ParentKind != "teams_chat" || page.Items[1].Kind != "teams_chat_message" || page.Items[1].Title != "" {
 		t.Fatalf("chat message = %#v", page.Items[1])
 	}
 	// 429 + page-1 + page-2 listings; the retry itself is proven by the
@@ -120,8 +122,36 @@ func TestTeamsAdapterPagesChannelRepliesAndChats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(members.Memberships) != 1 || !members.Snapshot || members.Memberships[0].Scope != "chat_member" {
+	if len(members.Memberships) != 2 || members.Snapshot || members.NextCursor != "4" {
+		t.Fatalf("second membership page = %#v", members)
+	}
+	members, err = a.Membership(context.Background(), connection, members.NextCursor, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members.Memberships) != 1 || !members.Snapshot || members.Memberships[0].Scope != "member" {
 		t.Fatalf("terminal membership page = %#v", members)
+	}
+	access, err := a.Access(context.Background(), connection, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]struct{ kind, principal string }{
+		"team":     {"teams_team", "directory:entra-user"},
+		"channel":  {"teams_channel", "directory:private-user"},
+		"channel2": {"teams_channel", "directory:shared-user"},
+		"channel3": {"teams_channel", "directory:entra-user"},
+		"chat":     {"teams_chat", "directory:chat-user"},
+	}
+	for _, grant := range access.Grants {
+		expected, ok := want[grant.NativeObjectID]
+		if !ok || expected.kind != grant.NativeObjectKind || expected.principal != grant.NativePrincipalID || grant.Scope != "member" {
+			t.Fatalf("unexpected grant: %#v", grant)
+		}
+		delete(want, grant.NativeObjectID)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing grants: %#v", want)
 	}
 	if len(requests) == 0 {
 		t.Fatal("no Graph requests")

@@ -296,7 +296,7 @@ func (a *TeamsAdapter) Content(ctx context.Context, c source.Connection, cursor 
 						id = at.Name
 					}
 					if id != "" {
-						item := ContentItem{NativeID: "teams:" + team + ":" + channel.ID + ":" + m.ID + ":attachment:" + id, ParentNativeID: "teams:" + team + ":" + channel.ID + ":" + m.ID, Kind: "teams_attachment", Filename: at.Name, MIMEType: at.ContentType, URL: at.ContentURL}
+						item := ContentItem{NativeID: "teams:" + team + ":" + channel.ID + ":" + m.ID + ":attachment:" + id, ParentNativeID: channel.ID, ParentKind: "teams_channel", Kind: "teams_attachment", Title: at.Name, Filename: at.Name, MIMEType: at.ContentType, URL: at.ContentURL}
 						if err := appendItem(item); err != nil {
 							return ContentPage{Completeness: CompletenessIncomplete}, err
 						}
@@ -331,7 +331,7 @@ func (a *TeamsAdapter) Content(ctx context.Context, c source.Connection, cursor 
 			item := teamsMessageItem("", chat, "chat", m, "")
 			item.NativeID = "teams:chat:" + chat + ":" + m.ID
 			item.Kind = "teams_chat_message"
-			item.ParentNativeID = ""
+			item.ParentNativeID, item.ParentKind = chat, "teams_chat"
 			if err := appendItem(item); err != nil {
 				return ContentPage{Completeness: CompletenessIncomplete}, err
 			}
@@ -356,12 +356,8 @@ func teamsMessageItem(team, channel, membership string, m graphMessage, parent s
 	if parent != "" {
 		kind = "teams_channel_reply"
 	}
-	return ContentItem{NativeID: id, ParentNativeID: func() string {
-		if parent != "" {
-			return "teams:" + team + ":" + channel + ":" + parent
-		}
-		return ""
-	}(), Kind: kind + ":" + membership, NativeRevision: m.Modified, Text: m.Body.Content, URL: m.WebURL, CreatedAt: parseTeamsTime(m.Created), UpdatedAt: parseTeamsTime(m.Modified)}
+	parentID, parentKind := channel, "teams_channel"
+	return ContentItem{NativeID: id, ParentNativeID: parentID, ParentKind: parentKind, Kind: kind + ":" + membership, NativeRevision: m.Modified, Text: m.Body.Content, URL: m.WebURL, CreatedAt: parseTeamsTime(m.Created), UpdatedAt: parseTeamsTime(m.Modified)}
 }
 func allowedTeamChannel(config map[string]any, team, channel string) bool {
 	allowed, ok := config["channel_ids"].(map[string]any)
@@ -429,7 +425,7 @@ func (a *TeamsAdapter) enumerateMembers(ctx context.Context, c source.Connection
 				return MembershipPage{}, errors.New("teams member payload is malformed")
 			}
 			principal := teamsPrincipalID(m.TenantID, firstNonEmpty(m.UserID, m.ID))
-			if err := appendGrant(AccessGrant{NativeObjectID: team, NativeObjectKind: "teams_team", NativePrincipalID: principal, NativeGroupID: team, Scope: "team_member", Effect: "allow"}); err != nil {
+			if err := appendGrant(AccessGrant{NativeObjectID: team, NativeObjectKind: "teams_team", NativePrincipalID: principal, NativeGroupID: team, Scope: "member", Effect: "allow"}); err != nil {
 				return MembershipPage{Completeness: CompletenessIncomplete}, err
 			}
 		}
@@ -445,17 +441,22 @@ func (a *TeamsAdapter) enumerateMembers(ctx context.Context, c source.Connection
 			if err := json.Unmarshal(raw, &ch); err != nil || ch.ID == "" {
 				return MembershipPage{}, errors.New("teams channel payload is malformed")
 			}
-			if !allowedTeamChannel(a.connection.Config, team, ch.ID) || (ch.MembershipType != "private" && ch.MembershipType != "shared") {
+			if !allowedTeamChannel(a.connection.Config, team, ch.ID) {
 				continue
 			}
-			path := "members"
-			if ch.MembershipType == "shared" {
-				path = "allMembers"
-			}
-			endpoint := a.baseURL + "/teams/" + teamsID(team) + "/channels/" + teamsID(ch.ID) + "/" + path + "?$top=100"
-			users, err := a.list(ctx, token, endpoint, teamsMaxItems)
-			if err != nil {
-				return MembershipPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list %s channel %s members via %s: %w", ch.MembershipType, ch.ID, path, err)
+			users := members
+			if ch.MembershipType == "private" || ch.MembershipType == "shared" {
+				path := "members"
+				if ch.MembershipType == "shared" {
+					path = "allMembers"
+				}
+				endpoint := a.baseURL + "/teams/" + teamsID(team) + "/channels/" + teamsID(ch.ID) + "/" + path + "?$top=100"
+				users, err = a.list(ctx, token, endpoint, teamsMaxItems)
+				if err != nil {
+					return MembershipPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list %s channel %s members via %s: %w", ch.MembershipType, ch.ID, path, err)
+				}
+			} else if ch.MembershipType != "standard" {
+				return MembershipPage{Completeness: CompletenessIncomplete}, fmt.Errorf("unsupported teams channel membership type %q", ch.MembershipType)
 			}
 			for _, raw := range users {
 				var u struct {
@@ -467,7 +468,7 @@ func (a *TeamsAdapter) enumerateMembers(ctx context.Context, c source.Connection
 					return MembershipPage{}, errors.New("teams channel member payload is malformed")
 				}
 				principal := teamsPrincipalID(u.TenantID, firstNonEmpty(u.UserID, u.ID))
-				if err := appendGrant(AccessGrant{NativeObjectID: ch.ID, NativeObjectKind: "teams_channel", NativePrincipalID: principal, NativeGroupID: team, Scope: "channel_member:" + ch.MembershipType + ":" + path, Effect: "allow"}); err != nil {
+				if err := appendGrant(AccessGrant{NativeObjectID: ch.ID, NativeObjectKind: "teams_channel", NativePrincipalID: principal, NativeGroupID: team, Scope: "member", Effect: "allow"}); err != nil {
 					return MembershipPage{Completeness: CompletenessIncomplete}, err
 				}
 			}
@@ -487,7 +488,7 @@ func (a *TeamsAdapter) enumerateMembers(ctx context.Context, c source.Connection
 			if err := json.Unmarshal(raw, &u); err != nil || (u.ID == "" && u.UserID == "") {
 				return MembershipPage{}, errors.New("teams chat member payload is malformed")
 			}
-			if err := appendGrant(AccessGrant{NativeObjectID: chat, NativeObjectKind: "teams_chat", NativePrincipalID: teamsPrincipalID(u.TenantID, firstNonEmpty(u.UserID, u.ID)), NativeGroupID: chat, Scope: "chat_member", Effect: "allow"}); err != nil {
+			if err := appendGrant(AccessGrant{NativeObjectID: chat, NativeObjectKind: "teams_chat", NativePrincipalID: teamsPrincipalID(u.TenantID, firstNonEmpty(u.UserID, u.ID)), NativeGroupID: chat, Scope: "member", Effect: "allow"}); err != nil {
 				return MembershipPage{Completeness: CompletenessIncomplete}, err
 			}
 		}

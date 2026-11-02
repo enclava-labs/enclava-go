@@ -202,6 +202,7 @@
   <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button>
 </div>
 <p class="muted">Verified mappings from {{if .Data.SourceName}}“{{.Data.SourceName}}”{{else}}this source{{end}}'s native users to Enclava users. Bindings decide whose access a source-native grant can widen.</p>
+{{if gt .Data.Source.UnmappedPrincipals 0}}<p class="help">{{.Data.Source.UnmappedPrincipals}} source accounts have no Enclava binding and get no access</p>{{end}}
 <div class="stack">
   {{range .Data.Bindings}}  <div class="row">
     <code>{{.NativeID}}</code>

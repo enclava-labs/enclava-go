@@ -214,7 +214,7 @@ func (g *GitHubAdapter) treePage(ctx context.Context, c source.Connection, s ghC
 				return ContentPage{}, e
 			}
 		}
-		items = append(items, ContentItem{NativeID: "github:" + c.ID + ":" + g.owner + "/" + g.repo + ":" + entry.Path, Kind: "file", NativeRevision: s.SHA + ":" + firstNonEmpty(blob.SHA, entry.SHA), Filename: entry.Path, Content: data, URL: "https://github.com/" + g.owner + "/" + g.repo + "/blob/" + s.SHA + "/" + entry.Path})
+		items = append(items, ContentItem{NativeID: "github:" + c.ID + ":" + g.owner + "/" + g.repo + ":" + entry.Path, ParentNativeID: "github:" + c.ID + ":" + g.owner + "/" + g.repo, ParentKind: "repository", Kind: "file", NativeRevision: s.SHA + ":" + firstNonEmpty(blob.SHA, entry.SHA), Title: entry.Path, Filename: entry.Path, Content: data, URL: "https://github.com/" + g.owner + "/" + g.repo + "/blob/" + s.SHA + "/" + entry.Path})
 	}
 	if s.Index < len(tree) {
 		return ghPage(items, s), nil
@@ -241,18 +241,15 @@ func (g *GitHubAdapter) discussionPage(ctx context.Context, c source.Connection,
 		if kind == "issues" && r.PullRequest != nil {
 			continue
 		}
-		if kind == "pulls" && r.PullRequest == nil {
-			continue
-		}
 		id := fmt.Sprintf("github:%s:%s:%s:%d", c.ID, g.owner+"/"+g.repo, kind, r.ID)
-		items = append(items, ContentItem{NativeID: id, Kind: kind, NativeRevision: r.UpdatedAt, Filename: r.Title, Text: r.Body, URL: r.HTMLURL})
-		comments, e := g.comments(ctx, c, fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments", g.base, url.PathEscape(g.owner), url.PathEscape(g.repo), r.Number), id, "comment")
+		items = append(items, ContentItem{NativeID: id, ParentNativeID: "github:" + c.ID + ":" + g.owner + "/" + g.repo, ParentKind: "repository", Kind: kind, NativeRevision: r.UpdatedAt, Title: r.Title, Filename: r.Title, Text: r.Body, URL: r.HTMLURL})
+		comments, e := g.comments(ctx, c, fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments", g.base, url.PathEscape(g.owner), url.PathEscape(g.repo), r.Number), id, kind, r.Title, "comment")
 		if e != nil {
 			return ContentPage{}, e
 		}
 		items = append(items, comments...)
 		if kind == "pulls" {
-			comments, e = g.comments(ctx, c, fmt.Sprintf("%s/repos/%s/%s/pulls/%d/comments", g.base, url.PathEscape(g.owner), url.PathEscape(g.repo), r.Number), id, "review_comment")
+			comments, e = g.comments(ctx, c, fmt.Sprintf("%s/repos/%s/%s/pulls/%d/comments", g.base, url.PathEscape(g.owner), url.PathEscape(g.repo), r.Number), id, kind, r.Title, "review_comment")
 			if e != nil {
 				return ContentPage{}, e
 			}
@@ -268,7 +265,7 @@ func (g *GitHubAdapter) discussionPage(ctx context.Context, c source.Connection,
 	}
 	return ContentPage{Items: items, Completeness: CompletenessComplete, Snapshot: true}, nil
 }
-func (g *GitHubAdapter) comments(ctx context.Context, c source.Connection, endpoint, parent, kind string) ([]ContentItem, error) {
+func (g *GitHubAdapter) comments(ctx context.Context, c source.Connection, endpoint, parent, parentKind, title, kind string) ([]ContentItem, error) {
 	var out []ContentItem
 	for page := 1; page <= 100; page++ {
 		var rows []struct {
@@ -281,7 +278,7 @@ func (g *GitHubAdapter) comments(ctx context.Context, c source.Connection, endpo
 			return nil, e
 		}
 		for _, r := range rows {
-			out = append(out, ContentItem{NativeID: fmt.Sprintf("github:%s:%s:%s:%d", c.ID, g.owner+"/"+g.repo, kind, r.ID), ParentNativeID: parent, Kind: kind, NativeRevision: r.UpdatedAt, Text: r.Body, URL: r.HTMLURL})
+			out = append(out, ContentItem{NativeID: fmt.Sprintf("github:%s:%s:%s:%d", c.ID, g.owner+"/"+g.repo, kind, r.ID), ParentNativeID: parent, ParentKind: parentKind, Kind: kind, NativeRevision: r.UpdatedAt, Title: title, Text: r.Body, URL: r.HTMLURL})
 		}
 		if len(rows) < 100 {
 			return out, nil
@@ -306,7 +303,7 @@ func (g *GitHubAdapter) allowed(p string) bool {
 	return false
 }
 func (g *GitHubAdapter) Access(ctx context.Context, c source.Connection, cursor Cursor, limit int) (AccessPage, error) {
-	x, n, e := g.collaborators(ctx, cursor, limit)
+	x, n, e := g.collaborators(ctx, c, cursor, limit)
 	complete := n == ""
 	cmp := CompletenessIncomplete
 	if complete {
@@ -315,7 +312,7 @@ func (g *GitHubAdapter) Access(ctx context.Context, c source.Connection, cursor 
 	return AccessPage{Grants: x, NextCursor: Cursor(n), Completeness: cmp, Snapshot: complete}, e
 }
 func (g *GitHubAdapter) Membership(ctx context.Context, c source.Connection, cursor Cursor, limit int) (MembershipPage, error) {
-	x, n, e := g.collaborators(ctx, cursor, limit)
+	x, n, e := g.collaborators(ctx, c, cursor, limit)
 	complete := n == ""
 	cmp := CompletenessIncomplete
 	if complete {
@@ -323,7 +320,7 @@ func (g *GitHubAdapter) Membership(ctx context.Context, c source.Connection, cur
 	}
 	return MembershipPage{Memberships: x, NextCursor: Cursor(n), Completeness: cmp, Snapshot: complete}, e
 }
-func (g *GitHubAdapter) collaborators(ctx context.Context, cursor Cursor, limit int) ([]AccessGrant, string, error) {
+func (g *GitHubAdapter) collaborators(ctx context.Context, c source.Connection, cursor Cursor, limit int) ([]AccessGrant, string, error) {
 	if limit < 1 || limit > 100 {
 		limit = 100
 	}
@@ -336,9 +333,8 @@ func (g *GitHubAdapter) collaborators(ctx context.Context, cursor Cursor, limit 
 		page = n
 	}
 	var users []struct {
-		Login       string          `json:"login"`
-		ID          int64           `json:"id"`
-		Permissions map[string]bool `json:"permissions"`
+		Login string `json:"login"`
+		ID    int64  `json:"id"`
 	}
 	endpoint := fmt.Sprintf("%s/repos/%s/%s/collaborators?per_page=%d&page=%d", g.base, url.PathEscape(g.owner), url.PathEscape(g.repo), limit, page)
 	if e := g.request(ctx, endpoint, &users); e != nil {
@@ -346,18 +342,11 @@ func (g *GitHubAdapter) collaborators(ctx context.Context, cursor Cursor, limit 
 	}
 	out := make([]AccessGrant, 0, len(users))
 	for _, u := range users {
-		p := "read"
-		for _, x := range []string{"admin", "maintain", "push", "triage", "pull"} {
-			if u.Permissions[x] {
-				p = x
-				break
-			}
-		}
 		id := u.Login
 		if id == "" {
 			id = strconv.FormatInt(u.ID, 10)
 		}
-		out = append(out, AccessGrant{NativePrincipalID: id, NativeGroupID: g.owner + "/" + g.repo, Scope: "repository:" + p, Effect: "allow"})
+		out = append(out, AccessGrant{NativeObjectID: "github:" + c.ID + ":" + g.owner + "/" + g.repo, NativeObjectKind: "repository", NativePrincipalID: id, NativeGroupID: g.owner + "/" + g.repo, Scope: "read", Effect: "allow"})
 	}
 	next := ""
 	if len(users) == limit {

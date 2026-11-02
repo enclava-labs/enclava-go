@@ -48,7 +48,7 @@ func TestGDriveAdapterPagesAndExportsGoogleDoc(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p1.Items) != 1 || p1.Items[0].NativeRevision != "rev1" || p1.Items[0].URL != "https://drive.google.com/open?id=doc" || string(p1.Items[0].Content) != "docx bytes" || p1.Items[0].MIMEType != "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || p1.NextCursor == "" {
+	if len(p1.Items) != 1 || p1.Items[0].Title != "Guide" || p1.Items[0].NativeRevision != "rev1" || p1.Items[0].URL != "https://drive.google.com/open?id=doc" || string(p1.Items[0].Content) != "docx bytes" || p1.Items[0].MIMEType != "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || p1.NextCursor == "" {
 		t.Fatalf("page 1 = %#v", p1)
 	}
 	p2, err := a.Content(context.Background(), c, p1.NextCursor, 1)
@@ -59,7 +59,7 @@ func TestGDriveAdapterPagesAndExportsGoogleDoc(t *testing.T) {
 	if err != nil || state.Mode != "changes" || state.Token != "start-1" {
 		t.Fatalf("checkpoint = %#v, error = %v", state, err)
 	}
-	if len(p2.Items) != 1 || string(p2.Items[0].Content) != "pdf bytes" || p2.Items[0].MIMEType != "application/pdf" {
+	if len(p2.Items) != 1 || p2.Items[0].Title != "manual.pdf" || string(p2.Items[0].Content) != "pdf bytes" || p2.Items[0].MIMEType != "application/pdf" {
 		t.Fatalf("page 2 = %#v", p2)
 	}
 	if listPages != 2 || exports != 1 {
@@ -118,20 +118,37 @@ func TestGDriveAdapterReadsEverySheetAndRestrictions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if access.Completeness != CompletenessComplete || len(access.Grants) != 4 {
-		t.Fatalf("access = %#v", access)
+	if access.Completeness != CompletenessComplete || !access.Snapshot || access.NextCursor != "" || len(access.Grants) != 2 {
+		t.Fatalf("restricted access = %#v", access)
 	}
-	operations := map[string]int{}
-	for _, grant := range access.Grants {
-		if grant.Effect == "deny" {
-			operations[grant.Scope]++
-		}
-		if grant.Effect == "allow" && (!grant.Inherited || grant.NativePrincipalID != "a@example.test" || !strings.Contains(grant.Scope, "shared drive shared-drive-1")) {
-			t.Fatalf("shared-drive grant = %#v", grant)
-		}
+	deny := access.Grants[0]
+	if deny.NativeObjectID != "book" || deny.NativeObjectKind != "" || deny.NativePrincipalID != "" || deny.NativeGroupID != "" || deny.Scope != "copy_download_restricted" || deny.Effect != "deny" {
+		t.Fatalf("restriction deny = %#v", deny)
 	}
-	if operations["copy"] != 1 || operations["download"] != 2 {
-		t.Fatalf("restricted operations = %v", operations)
+	grant := access.Grants[1]
+	if grant.Effect != "allow" || !grant.Inherited || grant.NativePrincipalID != "a@example.test" || grant.NativeObjectKind != "" || grant.Scope != "reader" {
+		t.Fatalf("shared-drive grant = %#v", grant)
+	}
+}
+
+func TestGDriveUnrestrictedAccessUsesRoleScope(t *testing.T) {
+	t.Setenv("CONNECTOR_GOOGLE_DRIVE_TOKEN", "fixture-token")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"files":[{"id":"doc","permissions":[{"id":"u","type":"user","emailAddress":"a@example.test","role":"writer","permissionDetails":[{"inherited":true,"inheritedFrom":"parent","role":"writer"}]},{"id":"g","type":"group","emailAddress":"team@example.test","role":"reader"}]}]}`)
+	}))
+	defer server.Close()
+	c := source.Connection{Kind: SourceTypeGoogleDrive, CredentialRef: "CONNECTOR_GOOGLE_DRIVE_TOKEN", Config: map[string]any{"base_url": server.URL, "folder_id": "root"}}
+	page, err := NewGDriveAdapter(&Service{httpClient: server.Client()}).Access(context.Background(), c, "", 10)
+	if err != nil || page.Completeness != CompletenessComplete || !page.Snapshot || len(page.Grants) != 2 {
+		t.Fatalf("access = %#v, error = %v", page, err)
+	}
+	grant := page.Grants[0]
+	if grant.NativeObjectID != "doc" || grant.NativeObjectKind != "" || grant.Scope != "writer" || !grant.Inherited {
+		t.Fatalf("grant = %#v", grant)
+	}
+	group := page.Grants[1]
+	if group.NativeObjectID != "doc" || group.NativeObjectKind != "" || group.NativePrincipalID != "" || group.NativeGroupID != "team@example.test" || group.Scope != "reader" {
+		t.Fatalf("group grant = %#v", group)
 	}
 }
 
@@ -153,18 +170,18 @@ func TestGDriveChangesDeferDeletesUntilAllPagesComplete(t *testing.T) {
 	a := NewGDriveAdapter(&Service{httpClient: server.Client()})
 	cursor, _ := encodeDriveCursor(driveCursor{Mode: "changes", Token: "old", InScope: []string{"known"}})
 	first, err := a.Content(context.Background(), c, cursor, 10)
-	if err != nil || len(first.Items) != 0 || first.Completeness != CompletenessComplete {
+	if err != nil || len(first.Items) != 0 || first.Completeness != CompletenessComplete || first.NextCursor == "" || first.Checkpoint != "" {
 		t.Fatalf("partial delta = %#v, error = %v", first, err)
 	}
 	second, err := a.Content(context.Background(), c, first.NextCursor, 10)
-	if err != nil || len(second.Items) != 0 {
+	if err != nil || len(second.Items) != 0 || second.NextCursor == "" || second.Checkpoint != "" {
 		t.Fatalf("completed delta page = %#v, error = %v", second, err)
 	}
 	third, err := a.Content(context.Background(), c, second.NextCursor, 10)
-	if err != nil || len(third.Items) != 1 || third.Items[0].NativeID != "known" || third.Items[0].MIMEType != driveDeletedMIME {
+	if err != nil || len(third.Items) != 1 || third.Items[0].NativeID != "known" || third.Items[0].MIMEType != driveDeletedMIME || third.NextCursor != "" || third.Checkpoint == "" {
 		t.Fatalf("delete observations = %#v, error = %v", third, err)
 	}
-	state, err := decodeDriveCursor(third.NextCursor)
+	state, err := decodeDriveCursor(third.Checkpoint)
 	if err != nil || state.Mode != "changes" || state.Token != "current" {
 		t.Fatalf("post-delete checkpoint = %#v, error = %v", state, err)
 	}
@@ -197,9 +214,27 @@ func TestGDriveExpiredChangesTokenStartsBoundedRescan(t *testing.T) {
 		t.Fatalf("rescan page=%#v cursor=%#v err=%v decode=%v rescans=%d lists=%d", page, state, err, decodeErr, rescans, lists)
 	}
 	deletes, err := a.Content(context.Background(), c, page.NextCursor, 10)
-	state, decodeErr = decodeDriveCursor(deletes.NextCursor)
-	if err != nil || decodeErr != nil || len(deletes.Items) != 1 || deletes.Items[0].NativeID != "stale" || deletes.Items[0].MIMEType != driveDeletedMIME || state.Mode != "changes" || state.Token != "fresh" {
+	state, decodeErr = decodeDriveCursor(deletes.Checkpoint)
+	if err != nil || decodeErr != nil || len(deletes.Items) != 1 || deletes.Items[0].NativeID != "stale" || deletes.Items[0].MIMEType != driveDeletedMIME || deletes.NextCursor != "" || state.Mode != "changes" || state.Token != "fresh" {
 		t.Fatalf("rescan deletions=%#v cursor=%#v err=%v decode=%v", deletes, state, err, decodeErr)
+	}
+}
+
+func TestGDriveTerminalDeltaReturnsDurableCheckpoint(t *testing.T) {
+	t.Setenv("CONNECTOR_GOOGLE_DRIVE_TOKEN", "fixture-token")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("pageToken") != "old" {
+			t.Errorf("page token = %q", r.URL.Query().Get("pageToken"))
+		}
+		_, _ = fmt.Fprint(w, `{"newStartPageToken":"fresh","changes":[]}`)
+	}))
+	defer server.Close()
+	c := source.Connection{Kind: SourceTypeGoogleDrive, CredentialRef: "CONNECTOR_GOOGLE_DRIVE_TOKEN", Config: map[string]any{"base_url": server.URL, "folder_id": "root"}}
+	cursor, _ := encodeDriveCursor(driveCursor{Mode: "changes", Token: "old", InScope: []string{"known"}})
+	page, err := NewGDriveAdapter(&Service{httpClient: server.Client()}).Content(context.Background(), c, cursor, 10)
+	state, decodeErr := decodeDriveCursor(page.Checkpoint)
+	if err != nil || decodeErr != nil || page.NextCursor != "" || page.Checkpoint == "" || state.Mode != "changes" || state.Token != "fresh" || len(state.InScope) != 1 || state.InScope[0] != "known" {
+		t.Fatalf("terminal delta=%#v checkpoint=%#v err=%v decode=%v", page, state, err, decodeErr)
 	}
 }
 

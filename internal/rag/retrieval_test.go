@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"enclava-go/internal/auth"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/source"
 )
 
@@ -189,4 +192,214 @@ func TestSelectReadableCollectionsRules(t *testing.T) {
 
 func (d denyContextObject) CanReadObject(_ context.Context, _ auth.Principal, id string) bool {
 	return id != string(d)
+}
+
+type retrievalExecutor struct {
+	requests  []inference.Request
+	denyUnion bool
+}
+
+func (e *retrievalExecutor) Execute(_ context.Context, _ auth.Principal, req inference.Request) (*inference.Result, error) {
+	e.requests = append(e.requests, req)
+	if e.denyUnion && len(req.Inputs) > 1 {
+		return nil, inference.ErrDenied
+	}
+	body := `{"data":[{"index":0,"embedding":[1,2]}]}`
+	if req.Capability == inference.CapabilityChat {
+		body = `{"choices":[{"message":{"content":"rewritten"}}]}`
+	}
+	return &inference.Result{Body: io.NopCloser(strings.NewReader(body))}, nil
+}
+
+type retrievalVectors struct {
+	VectorStore
+	queries []QueryInput
+}
+
+func (v *retrievalVectors) Query(_ context.Context, _ string, input QueryInput) ([]QdrantSearchPoint, error) {
+	v.queries = append(v.queries, input)
+	return nil, nil
+}
+
+func TestSearchCollectionPrefixesAndMemo(t *testing.T) {
+	exec := &retrievalExecutor{}
+	vectors := &retrievalVectors{}
+	svc := &Service{executor: exec, vectorStore: vectors}
+	memo := newQueryEmbeddingMemo()
+	sets := make([][]authorizedCandidate, 0, 3)
+	for i := range 3 {
+		g := IndexGeneration{ObjectVersionID: fmt.Sprint(i), QdrantCollection: fmt.Sprint(i), EmbeddingModel: "model", EmbeddingDimensions: 2, QueryPrefix: "query: "}
+		candidates := []authorizedCandidate{{generation: g, object: source.Object{ID: fmt.Sprint(i)}}}
+		sets = append(sets, candidates)
+		memo.addCollection("t", candidates)
+	}
+	for _, candidates := range sets {
+		_, err := svc.searchCollection(context.Background(), auth.Principal{TenantID: "t"}, Collection{}, SearchInput{Query: "hello", Mode: QueryHybrid}, candidates, memo)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(exec.requests) != 1 {
+		t.Fatalf("embedding calls = %d, want 1", len(exec.requests))
+	}
+	if len(exec.requests[0].Inputs) != 3 || exec.requests[0].Inputs[0].ObjectID != "0" || exec.requests[0].Inputs[1].ObjectID != "1" || exec.requests[0].Inputs[2].ObjectID != "2" {
+		t.Fatalf("union scope = %#v", exec.requests[0].Inputs)
+	}
+	var payload struct {
+		Input []string `json:"input"`
+	}
+	if err := json.Unmarshal(exec.requests[0].Payload, &payload); err != nil || !reflect.DeepEqual(payload.Input, []string{"query: hello"}) {
+		t.Fatalf("embedding input = %#v, %v", payload.Input, err)
+	}
+	if len(vectors.queries) != 3 {
+		t.Fatalf("queries = %d", len(vectors.queries))
+	}
+	for _, query := range vectors.queries {
+		if query.LexicalText != "hello" || len(query.DenseVector) != 2 {
+			t.Fatalf("unexpected query: %#v", query)
+		}
+	}
+}
+
+func TestSearchUtilityModel(t *testing.T) {
+	exec := &retrievalExecutor{}
+	svc := &Service{executor: exec, vectorStore: &retrievalVectors{}}
+	input := SearchInput{Query: "hello", Mode: QueryLexical, Rewrite: true}
+	if err := svc.searchModels(&input); !errors.Is(err, ErrUtilityModelNotConfigured) {
+		t.Fatalf("missing model: %v", err)
+	}
+	svc.SetUtilityModel("utility")
+	if err := svc.searchModels(&input); err != nil {
+		t.Fatal(err)
+	}
+	g := IndexGeneration{ObjectVersionID: "v"}
+	if _, err := svc.searchCollection(context.Background(), auth.Principal{TenantID: "t"}, Collection{}, input, []authorizedCandidate{{generation: g}}, newQueryEmbeddingMemo()); err != nil {
+		t.Fatal(err)
+	}
+	if len(exec.requests) != 1 || exec.requests[0].Model != "utility" || exec.requests[0].Capability != inference.CapabilityChat {
+		t.Fatalf("rewrite requests = %#v", exec.requests)
+	}
+}
+
+func TestSearchCollectionSeparatesQueryPrefixes(t *testing.T) {
+	exec := &retrievalExecutor{}
+	vectors := &retrievalVectors{}
+	svc := &Service{executor: exec, vectorStore: vectors}
+	candidates := []authorizedCandidate{
+		{generation: IndexGeneration{ObjectVersionID: "a", QdrantCollection: "index", EmbeddingModel: "model", EmbeddingDimensions: 2, QueryPrefix: "one: "}},
+		{generation: IndexGeneration{ObjectVersionID: "b", QdrantCollection: "index", EmbeddingModel: "model", EmbeddingDimensions: 2, QueryPrefix: "two: "}},
+	}
+	_, err := svc.searchCollection(context.Background(), auth.Principal{TenantID: "t"}, Collection{}, SearchInput{Query: "hello", Mode: QueryHybrid}, candidates, newQueryEmbeddingMemo())
+	if err != nil || len(exec.requests) != 2 || len(vectors.queries) != 2 {
+		t.Fatalf("requests=%d queries=%d err=%v", len(exec.requests), len(vectors.queries), err)
+	}
+}
+
+func TestSearchCollectionUnionDenialFallsBack(t *testing.T) {
+	exec := &retrievalExecutor{denyUnion: true}
+	svc := &Service{executor: exec, vectorStore: &retrievalVectors{}}
+	memo := newQueryEmbeddingMemo()
+	sets := make([][]authorizedCandidate, 2)
+	for i := range sets {
+		g := IndexGeneration{ObjectVersionID: fmt.Sprint(i), QdrantCollection: fmt.Sprint(i), EmbeddingModel: "model", EmbeddingDimensions: 2}
+		sets[i] = []authorizedCandidate{{generation: g, object: source.Object{ID: fmt.Sprint(i)}}}
+		memo.addCollection("t", sets[i])
+	}
+	for _, candidates := range sets {
+		if _, err := svc.searchCollection(context.Background(), auth.Principal{TenantID: "t"}, Collection{}, SearchInput{Query: "hello", Mode: QueryHybrid}, candidates, memo); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(exec.requests) != 3 || len(exec.requests[0].Inputs) != 2 || len(exec.requests[1].Inputs) != 1 || len(exec.requests[2].Inputs) != 1 ||
+		exec.requests[1].Inputs[0].ObjectID != "0" || exec.requests[2].Inputs[0].ObjectID != "1" {
+		t.Fatalf("fallback scopes = %#v", exec.requests)
+	}
+}
+
+type reauthRepo struct {
+	Repository
+	collection Collection
+	generation IndexGeneration
+	object     source.Object
+	version    source.ObjectVersion
+	revoked    bool
+	point      *QdrantSearchPoint
+}
+
+func (r *reauthRepo) GetCollection(_ context.Context, _ string, id string) (Collection, error) {
+	if id != r.collection.ID {
+		return Collection{}, fmt.Errorf("unknown collection %s", id)
+	}
+	return r.collection, nil
+}
+
+func (r *reauthRepo) ListPublishedGenerationsBounded(_ context.Context, _, id string, _ int) ([]IndexGeneration, error) {
+	if id != r.collection.ID {
+		return nil, nil
+	}
+	return []IndexGeneration{r.generation}, nil
+}
+
+func (r *reauthRepo) ListPublishedGenerations(_ context.Context, _, id string) ([]IndexGeneration, error) {
+	return r.ListPublishedGenerationsBounded(context.Background(), "t", id, 0)
+}
+
+func (r *reauthRepo) GetObject(_ context.Context, _, id string) (source.Object, error) {
+	if r.revoked {
+		now := time.Now()
+		obj := r.object
+		obj.TombstonedAt = &now
+		return obj, nil
+	}
+	return r.object, nil
+}
+
+func (r *reauthRepo) GetObjectVersion(_ context.Context, _, _ string, _ int64) (source.ObjectVersion, error) {
+	return r.version, nil
+}
+
+func (r *reauthRepo) GetDocument(_ context.Context, _, _ string) (Document, error) {
+	return Document{Status: DocumentStatusReady, ObjectVersionID: r.generation.ObjectVersionID}, nil
+}
+
+func (r *reauthRepo) ListGenerationChunks(_ context.Context, _, _, _ string, _ int64) ([]DocumentChunk, error) {
+	return []DocumentChunk{{ID: "chunk-1", Content: "secret"}}, nil
+}
+
+type revokingVectors struct {
+	VectorStore
+	repo *reauthRepo
+}
+
+func (v *revokingVectors) Query(_ context.Context, _ string, _ QueryInput) ([]QdrantSearchPoint, error) {
+	v.repo.revoked = true // revoke lands mid-search, after candidates were authorized
+	return []QdrantSearchPoint{*v.repo.point}, nil
+}
+
+func TestSearchDropsObjectRevokedMidSearch(t *testing.T) {
+	repo := &reauthRepo{
+		collection: Collection{ID: "col-b", IsActive: true, OwnerActorID: "actor"},
+		generation: IndexGeneration{
+			CollectionID: "col-b", QdrantCollection: "index-b", ObjectID: "obj-b",
+			ObjectVersionID: "obj-b#1", Generation: 1, State: "published",
+		},
+		object:  source.Object{ID: "obj-b", TenantID: "t", AuthorizationMode: source.AuthorizationOwner, OwnerActorID: "actor"},
+		version: source.ObjectVersion{ObjectID: "obj-b", ObservedSeq: 1},
+		point: &QdrantSearchPoint{Payload: map[string]any{
+			"document_id": "obj-b", "object_version_id": "obj-b#1",
+			"generation": int64(1), "chunk_id": "chunk-1",
+		}},
+	}
+	svc := &Service{
+		repo:        repo,
+		vectorStore: &revokingVectors{repo: repo},
+		authorizer:  source.NewAuthorizer(repo, 0),
+	}
+	results, err := svc.Search(context.Background(), auth.Principal{TenantID: "t", ActorID: "actor"}, SearchInput{CollectionID: "col-b", Query: "hello", Mode: QueryLexical})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("revoked object leaked %d results: %#v", len(results), results)
+	}
 }

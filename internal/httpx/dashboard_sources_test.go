@@ -1,7 +1,7 @@
 // dashboard_sources_test.go — Sources page + add-source wizard coverage
 // (OA-23, plan 09-02): per-role route gating, real table projections, the
-// five-provider drawer markup and the independently access.manage-gated
-// bindings drawer.
+// five-provider drawer markup, the independently access.manage-gated
+// bindings drawer and the unmapped-principals warning on both surfaces.
 //
 // Obsolete-file handoff for plan 09-10 — this page replaces the old
 // connectors dashboard. Delete then, in the same change:
@@ -387,5 +387,86 @@ func TestDashboardSourcesDrawerProviders(t *testing.T) {
 	}
 	if !strings.Contains(rendered, `value="ragcol_preset"`) {
 		t.Fatal("preset collection not preselected")
+	}
+}
+
+// TestDashboardSourcesUnmappedWarning proves the "source accounts have no
+// Enclava binding" copy is driven by the real access_snapshots projection:
+// it surfaces in the sources table's Permissions cell and inside the
+// access.manage-gated bindings drawer when the latest complete snapshots
+// report unmapped principals, and stays hidden at zero. Assertions pin
+// rendered text only — never markup around the interpolated count.
+func TestDashboardSourcesUnmappedWarning(t *testing.T) {
+	f := newIdentityFixture(t)
+	ctx := context.Background()
+	// Production wires observations in main.go's SetSyncDependencies; the
+	// shared fixture leaves it off (ListSources/GetSource then report zero),
+	// so wire the real repos here before any source rows are read.
+	f.app.connectorSvc.SetSyncDependencies(connectors.AdapterFactories{},
+		postgres.NewConnectorObservationsRepo(f.db), nil, postgres.NewSourceRepo(f.db))
+	sess, csrf := loginUser(t, f, "admin-bindings@example.com",
+		[]string{auth.ScopePlatformAdmin, "connectors.manage", "rag"}, "admin-pass")
+
+	// Two real sources: one seeded with unmapped principals, one clean.
+	made := map[string]string{}
+	for name, body := range map[string]string{
+		"warn":  `{"type":"slack","name":"Unmapped chat","config":{"channel_id":"C456"},"credential_ref":"CONNECTOR_SLACK_UNMAPPED"}`,
+		"clean": `{"type":"github","name":"Mapped repo","config":{"owner":"enclava","repo":"mapped"}}`,
+	} {
+		rec := sessionDo(t, f.app, http.MethodPost, "/api/v1/connectors/sources", body, sess, csrf)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create %s source: expected 201, got %d body=%s", name, rec.Code, rec.Body.String())
+		}
+		id, _ := decodeJSON(t, rec)["id"].(string)
+		if id == "" {
+			t.Fatalf("create %s source: missing id in response", name)
+		}
+		made[name] = id
+	}
+
+	// Latest-complete-per-kind wins: grants rev 2 supersedes rev 1, the
+	// incomplete rev 3 and the content row never count → 3 + 2 = 5 unmapped.
+	if _, err := f.db.SQL.ExecContext(ctx, `
+		INSERT INTO access_snapshots (tenant_id, id, connection_id, kind, revision, status, unmapped_subjects)
+		VALUES ($1, 'snap_g1', $2, 'grants', 1, 'complete', 10),
+		       ($1, 'snap_g2', $2, 'grants', 2, 'complete', 3),
+		       ($1, 'snap_g3', $2, 'grants', 3, 'incomplete', 100),
+		       ($1, 'snap_m1', $2, 'membership', 1, 'complete', 2),
+		       ($1, 'snap_c1', $2, 'content', 1, 'complete', 100)`,
+		f.tenant, made["warn"]); err != nil {
+		t.Fatalf("seed access snapshots: %v", err)
+	}
+	const warning = "5 source accounts have no Enclava binding and get no access"
+
+	// Table page: the warn row carries the Permissions-cell subline; the
+	// clean row proves zero hides it — exactly one occurrence across both.
+	rec := sessionDo(t, f.app, http.MethodGet, "/dashboard/sources", "", sess, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /dashboard/sources: expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	page := rec.Body.String()
+	if !strings.Contains(page, warning) {
+		t.Fatalf("table page missing the unmapped-principals warning %q", warning)
+	}
+	if got := strings.Count(page, "source accounts have no Enclava binding"); got != 1 {
+		t.Fatalf("expected the warning on exactly one row, got %d", got)
+	}
+
+	// Bindings drawer (access.manage-gated): same warning, same zero hiding.
+	rec = sessionDo(t, f.app, http.MethodGet,
+		"/dashboard/partials/sources/bindings?source="+made["warn"], "", sess, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("warn bindings partial: expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, warning) {
+		t.Fatalf("bindings drawer missing the unmapped-principals warning %q", warning)
+	}
+	rec = sessionDo(t, f.app, http.MethodGet,
+		"/dashboard/partials/sources/bindings?source="+made["clean"], "", sess, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clean bindings partial: expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); strings.Contains(body, "source accounts have no Enclava binding") {
+		t.Fatal("clean source rendered the unmapped-principals warning")
 	}
 }

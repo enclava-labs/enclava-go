@@ -4,16 +4,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 	"testing"
 )
 
-func TestRunModelResponseParsesFunctionCallsAndRejectsMalformedArguments(t *testing.T) {
+func TestRunModelResponsePreservesMalformedArguments(t *testing.T) {
 	got, err := parseRunModelResponse([]byte(`{"choices":[{"message":{"content":"","tool_calls":[{"id":"call-1","type":"function","function":{"name":"knowledge.search","arguments":"{\"collection_id\":\"c\",\"query\":\"q\"}"}}]}}]}`))
 	if err != nil || len(got.ToolCalls) != 1 || got.ToolCalls[0].Name != "knowledge.search" {
 		t.Fatalf("parsed calls = %#v err=%v", got, err)
 	}
-	if _, err := parseRunModelResponse([]byte(`{"choices":[{"message":{"tool_calls":[{"id":"call-1","type":"function","function":{"name":"extract.submit","arguments":"not-json"}}]}}]}`)); err == nil {
-		t.Fatal("malformed tool arguments were accepted")
+	malformed, err := parseRunModelResponse([]byte(`{"choices":[{"message":{"tool_calls":[{"id":"call-1","type":"function","function":{"name":"extract.submit","arguments":"not-json"}}]}}]}`))
+	if err != nil || string(malformed.ToolCalls[0].Arguments) != "not-json" {
+		t.Fatalf("malformed tool arguments lost: %#v %v", malformed, err)
 	}
 	if _, err := parseRunModelResponse(json.RawMessage(`{}`)); err == nil {
 		t.Fatal("response without choices was accepted")
@@ -65,5 +68,56 @@ func TestModelAttemptSummaryIsToolSafe(t *testing.T) {
 	}
 	if summary != `{"model":"chat-test-model","messages":3,"tools":2}` {
 		t.Fatalf("summary carries more than the route shape: %q", summary)
+	}
+}
+
+func TestModelToolNamesAreSafeAndReversible(t *testing.T) {
+	ids := []string{"knowledge.search", "knowledge_search", strings.Repeat("x", 70), strings.Repeat("x", 69) + "y"}
+	definitions := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		definitions = append(definitions, map[string]any{"function": map[string]any{"name": id}})
+	}
+	mapping := modelToolNames(definitions)
+	valid := regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
+	for i, definition := range definitions {
+		name := definition["function"].(map[string]any)["name"].(string)
+		if !valid.MatchString(name) || mapping[name] != ids[i] {
+			t.Fatalf("name %q maps to %q, want %q", name, mapping[name], ids[i])
+		}
+	}
+	if len(mapping) != len(ids) {
+		t.Fatalf("colliding names: %#v", mapping)
+	}
+}
+
+func TestFitRunContextTrimsHistoryThenTools(t *testing.T) {
+	messages := []map[string]any{
+		{"role": "system", "content": "system"},
+		{"role": "user", "content": strings.Repeat("old", 100)},
+		{"role": "assistant", "content": "newer history"},
+		{"role": "user", "content": "current"},
+		{"role": "tool", "tool_call_id": "1", "content": strings.Repeat("result", 200)},
+	}
+	payload := map[string]any{"model": "test"}
+	history := 2
+	body, fitted, err := fitRunContext(payload, messages, 1, &history, 300)
+	if err != nil || len(body) > 300 || history != 0 || len(fitted) != 3 {
+		t.Fatalf("body=%d history=%d messages=%#v err=%v", len(body), history, fitted, err)
+	}
+	if fitted[1]["content"] != "current" || !strings.Contains(fitted[2]["content"].(string), "[truncated to fit context]") {
+		t.Fatalf("current message or truncation missing: %#v", fitted)
+	}
+	history = 0
+	_, _, err = fitRunContext(map[string]any{}, []map[string]any{{"role": "system", "content": strings.Repeat("x", 500)}}, 1, &history, 100)
+	if err == nil || !strings.Contains(err.Error(), "run context exceeds the model's context budget") {
+		t.Fatalf("fixed context error = %v", err)
+	}
+}
+
+func TestTruncateToolOutputKeepsMarkerAndUTF8(t *testing.T) {
+	text := strings.Repeat("é", maxBuiltinOutputBytes)
+	got := truncateRunText(text, maxBuiltinOutputBytes, "[truncated]")
+	if len(got) > maxBuiltinOutputBytes || !strings.HasSuffix(got, "[truncated]") || !json.Valid([]byte(`"`+got+`"`)) {
+		t.Fatalf("invalid truncation length=%d", len(got))
 	}
 }

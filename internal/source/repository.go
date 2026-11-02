@@ -55,6 +55,7 @@ type SourceRepository interface {
 	// timestamps and block subsequent reads immediately.
 	UpsertObject(ctx context.Context, o Object) (Object, error)
 	GetObject(ctx context.Context, tenantID, id string) (Object, error)
+	ObserveObject(ctx context.Context, tenantID, objectID, parentID string, upstream *string) error
 	ListObjectsByConnection(ctx context.Context, tenantID, connectionID string) ([]Object, error)
 	MarkObjectDeleted(ctx context.Context, tenantID, id string) error
 	TombstoneObject(ctx context.Context, tenantID, id string) error
@@ -65,6 +66,13 @@ type SourceRepository interface {
 	InsertObjectVersion(ctx context.Context, tenantID string, ver ObjectVersion) error
 	GetObjectVersion(ctx context.Context, tenantID, objectID string, observedSeq int64) (ObjectVersion, error)
 	LatestObjectVersion(ctx context.Context, tenantID, objectID string) (ObjectVersion, error)
+	// IngestHandoffExists reports whether the observed object version durably
+	// reached ingest: true when a live jobs row (queued/running/succeeded —
+	// failed/cancelled/deleted count as missing handoff) exists for
+	// (tenant, connection, object, observed_seq), or when an index generation
+	// exists for that object version in the target collection. Lets a
+	// connector re-enqueue work stranded by the crash window.
+	IngestHandoffExists(ctx context.Context, tenantID, connectionID, collectionID, objectID string, observedSeq int64) (bool, error)
 
 	// Source identities, groups and memberships (upsert by unique keys).
 	InsertSourceIdentity(ctx context.Context, id SourceIdentity) error
@@ -73,12 +81,15 @@ type SourceRepository interface {
 	// SourceIdentityForUser returns the connection-scoped source identity
 	// mapped to an Enclava user, or ErrDenied-shaped not-found.
 	SourceIdentityForUser(ctx context.Context, tenantID, connectionID, userID string) (SourceIdentity, error)
-	// GroupIDsForIdentity lists groups the identity belonged to at the
-	// latest complete membership revision.
-	GroupIDsForIdentity(ctx context.Context, tenantID, connectionID, sourceIdentityID string) ([]string, error)
+	// GroupIDsForIdentity reads the specified complete membership revision and
+	// fails if it is no longer current.
+	GroupIDsForIdentity(ctx context.Context, tenantID, connectionID, sourceIdentityID string, revision int64) ([]string, error)
 
 	// Grants and snapshots.
-	GrantsForObject(ctx context.Context, tenantID, objectID string, accessRevision int64) ([]SourceGrant, error)
+	// AncestorObjectIDs returns the object and its complete, live ancestor chain.
+	// Missing, cross-connection, cyclic or over-depth chains return an error.
+	AncestorObjectIDs(ctx context.Context, tenantID, connectionID, objectID string, maxDepth int) ([]string, error)
+	GrantsForObjects(ctx context.Context, tenantID, connectionID string, objectIDs []string, accessRevision int64) ([]SourceGrant, error)
 	BeginSnapshot(ctx context.Context, tenantID, connectionID, kind string, revision int64) error
 	// LatestCompleteRevision returns the newest COMPLETE snapshot revision
 	// for (connection, kind) with its completion time; not-found when none.
@@ -87,8 +98,8 @@ type SourceRepository interface {
 	// Atomic snapshot application. Both take an open transaction so the
 	// row writes, completion marking and unseen-row pruning commit or roll
 	// back as one observation.
-	ApplyAccessSnapshot(ctx context.Context, tx Tx, tenantID, connectionID string, revision int64, grants []SourceGrant) error
-	ApplyMembershipSnapshot(ctx context.Context, tx Tx, tenantID, connectionID string, revision int64, memberships []SourceGroupMembership) error
+	ApplyAccessSnapshot(ctx context.Context, tx Tx, tenantID, connectionID string, revision int64, grants []SourceGrant, unmappedSubjects int) error
+	ApplyMembershipSnapshot(ctx context.Context, tx Tx, tenantID, connectionID string, revision int64, memberships []SourceGroupMembership, unmappedSubjects int) error
 
 	// Restrictions (server-owned, can only tighten).
 	SetRestriction(ctx context.Context, r SourceRestriction) error

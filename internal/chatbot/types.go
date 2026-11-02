@@ -65,6 +65,7 @@ type Message struct {
 	ConversationID string             `json:"conversation_id"`
 	Role           string             `json:"role"`
 	Content        string             `json:"content"`
+	Status         string             `json:"status"`
 	OwnerActorID   string             `json:"-"`
 	RunID          string             `json:"run_id,omitempty"`
 	Steps          []AssistantRunStep `json:"steps,omitempty"`
@@ -206,11 +207,12 @@ type CompletionOutput struct {
 type PreparedCompletion struct {
 	// Request is the executor input; dispatch goes only through
 	// Service.ExecutePrepared — never a direct provider call.
-	Request        inference.Request
-	Conversation   Conversation
-	Chatbot        Instance
-	Model          string
-	RAGResultCount int
-	EvidenceIDs    []string
-	InputRefs      []source.ObjectRef
+	Request            inference.Request
+	Conversation       Conversation
+	AssistantMessageID string
+	Chatbot            Instance
+	Model              string
+	RAGResultCount     int
+	EvidenceIDs        []string
+	InputRefs          []source.ObjectRef
 }

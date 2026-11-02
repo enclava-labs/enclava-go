@@ -96,6 +96,40 @@ func TestCSVRowsPreserveOrderAndByteSpans(t *testing.T) {
 	}
 }
 
+func TestTextDecodingAndEncryptedPDF(t *testing.T) {
+	data, warning := decodeText([]byte{'n', 'a', 'm', 'e', '\n', 'c', 'a', 'f', 0xe9})
+	blocks, err := csvBlocks(data)
+	if err != nil || len(blocks) != 2 || blocks[1].text != "café" || !strings.Contains(warning, "windows-1252") {
+		t.Fatalf("decoded CSV = %#v, %q, %v", blocks, warning, err)
+	}
+	data, warning = decodeText([]byte{0xff, 0xfe, 'h', 0, 0xe9, 0})
+	if string(data) != "hé" || !strings.Contains(warning, "UTF-16") {
+		t.Fatalf("UTF-16 = %q, %q", data, warning)
+	}
+	info := []byte("Pages: 1\nEncrypted: yes (print:yes)\n")
+	if encryptedPDF(info, nil) || !encryptedPDF(info, errors.New("text extraction failed")) || !encryptedPDF(nil, errors.New("Incorrect password")) {
+		t.Fatal("encrypted PDF classification lost blocked/readable distinction")
+	}
+}
+
+func TestParseDecodingWarnings(t *testing.T) {
+	for _, tc := range []struct {
+		name, mime, text, warning string
+		data                      []byte
+	}{
+		{"data.csv", "text/csv", "café", "windows-1252", []byte("name\ncaf\xe9\n")},
+		{"data.txt", "text/plain", "hé", "UTF-16", []byte{0xff, 0xfe, 'h', 0, 0xe9, 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parser, artifact := testParser(t, tc.data, tc.mime)
+			doc, err := parser.Parse(context.Background(), artifact, ParseOptions{Filename: tc.name, MIMEType: tc.mime, ObjectRef: source.ObjectRef{TenantID: "tenant", ObjectID: "object", ObservedSeq: 1}})
+			if err != nil || !strings.Contains(doc.Blocks[len(doc.Blocks)-1].Text, tc.text) || len(doc.ParseWarnings) != 1 || !strings.Contains(doc.ParseWarnings[0], tc.warning) {
+				t.Fatalf("decoded document = %#v, %v", doc, err)
+			}
+		})
+	}
+}
+
 func TestJSONNumbersAreNotRounded(t *testing.T) {
 	blocks, err := jsonBlocks([]byte(`{"value":9007199254740993}`), false)
 	if err != nil || len(blocks) != 1 {

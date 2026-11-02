@@ -119,6 +119,7 @@ type SourceGroupMembership struct {
 // Grant subjects and effects.
 const (
 	GrantSubjectUser  = "user"
+	GrantSubjectAll   = "all"
 	GrantSubjectGroup = "group"
 
 	GrantEffectAllow = "allow"

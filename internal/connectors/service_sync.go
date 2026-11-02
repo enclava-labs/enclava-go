@@ -28,7 +28,11 @@ const connectorMaxArtifactBytes = 32 << 20
 
 func (s *Service) runDurableStream(ctx context.Context, claim *jobs.Claim, principal auth.Principal, conn source.Connection, adapter Adapter, stream StreamKind) error {
 	job := claim.Job()
-	state, err := s.observations.StartRun(ctx, conn.TenantID, conn.ID, string(stream), job.ID)
+	configHash, err := connectorConfigHash(conn)
+	if err != nil {
+		return err
+	}
+	state, err := s.observations.StartRun(ctx, conn.TenantID, conn.ID, string(stream), job.ID, configHash)
 	if err != nil {
 		return err
 	}
@@ -103,7 +107,11 @@ func (s *Service) runContentStream(ctx context.Context, claim *jobs.Claim, princ
 		if page.Completeness != CompletenessComplete && page.Completeness != CompletenessIncomplete {
 			return errors.New("adapter returned invalid content completeness")
 		}
-		state, err = s.observations.PersistPage(ctx, state, nil, string(page.NextCursor), terminal, !terminal, "")
+		nextCursor := page.NextCursor
+		if terminal {
+			nextCursor = page.Checkpoint
+		}
+		state, err = s.observations.PersistPage(ctx, state, nil, string(nextCursor), terminal, !terminal, "")
 		if err != nil {
 			return err
 		}
@@ -142,15 +150,25 @@ func (s *Service) observeContentItem(ctx context.Context, conn source.Connection
 	}
 	var parentID string
 	if item.ParentNativeID != "" {
-		// Parents may be observed under a different kind than the child
-		// (e.g. Notion block parented by a page), so fall back cross-kind.
-		parent, err := s.canonical.ObjectForNativeID(ctx, conn.TenantID, conn.ID, kind, item.ParentNativeID)
-		if err != nil {
+		parentKind := firstNonEmpty(item.ParentKind, kind)
+		parent, err := s.canonical.ObjectForNativeID(ctx, conn.TenantID, conn.ID, parentKind, item.ParentNativeID)
+		if errors.Is(err, source.ErrDenied) {
 			parent, err = s.canonical.ObjectForNativeIDCrossKind(ctx, conn.TenantID, conn.ID, item.ParentNativeID)
 		}
-		if err == nil {
-			parentID = parent.ID
+		if errors.Is(err, source.ErrDenied) {
+			id, idErr := connectorObjectID()
+			if idErr != nil {
+				return Observation{}, idErr
+			}
+			parent, err = s.canonical.UpsertObject(ctx, source.Object{
+				TenantID: conn.TenantID, ConnectionID: conn.ID, ID: id, Kind: parentKind,
+				NativeID: item.ParentNativeID, AuthorizationMode: source.AuthorizationSourceACL, ObservedSeq: 1,
+			})
 		}
+		if err != nil {
+			return Observation{}, err
+		}
+		parentID = parent.ID
 	}
 	objectID, err := connectorObjectID()
 	if err != nil {
@@ -184,6 +202,8 @@ func (s *Service) observeContentItem(ctx context.Context, conn source.Connection
 		observation.Payload = json.RawMessage(`{}`)
 		return observation, nil
 	}
+	digest := sha256.Sum256(content)
+	unchanged := err == nil && object.DeletedAt == nil && object.TombstonedAt == nil && latest.SHA256 == hex.EncodeToString(digest[:])
 	filename := strings.TrimSpace(item.Filename)
 	if filename == "" {
 		filename = filepath.Base(item.NativeID)
@@ -198,24 +218,49 @@ func (s *Service) observeContentItem(ctx context.Context, conn source.Connection
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
-	writer, ref, err := s.artifacts.Begin(ctx, artifacts.Meta{Ref: artifacts.Ref{TenantID: conn.TenantID, Kind: artifacts.KindOriginal, Version: 1}, MimeType: mimeType}, time.Hour, connectorMaxArtifactBytes)
-	if err != nil {
-		observation.ProcessingError = err.Error()
-		observation.Payload = json.RawMessage(`{}`)
-		return observation, nil
+	metadataChanged := err == nil && (filename != latest.OriginalFilename || provenanceValue(latest.Provenance, "title") != item.Title || provenanceValue(latest.Provenance, "source_uri") != item.URL || mimeType != latest.MimeType)
+	if unchanged {
+		if err := s.canonical.ObserveObject(ctx, conn.TenantID, object.ID, parentID, upstream); err != nil {
+			return Observation{}, err
+		}
+		if !metadataChanged {
+			handedOff, handErr := s.canonical.IngestHandoffExists(ctx, conn.TenantID, conn.ID, conn.TargetCollectionID, object.ID, latest.ObservedSeq)
+			if handErr != nil {
+				return Observation{}, handErr
+			}
+			observation.ObjectRef.ObservedSeq = latest.ObservedSeq
+			if !handedOff {
+				observation.ArtifactRef = artifacts.Ref{TenantID: conn.TenantID, ID: latest.ArtifactRef, Kind: artifacts.KindOriginal, Version: 1, SHA256: latest.SHA256, ByteSize: latest.ByteSize}
+			}
+			observation.Payload = json.RawMessage(`{}`)
+			return observation, nil
+		}
 	}
-	if _, err := io.Copy(writer, bytes.NewReader(content)); err != nil {
-		_ = writer.Abort(ctx)
-		observation.ProcessingError = err.Error()
-		observation.Payload = json.RawMessage(`{}`)
-		return observation, nil
+	var ref artifacts.Ref
+	if metadataChanged {
+		ref = artifacts.Ref{TenantID: conn.TenantID, ID: latest.ArtifactRef, Kind: artifacts.KindOriginal, Version: 1, SHA256: latest.SHA256, ByteSize: latest.ByteSize}
+	} else {
+		writer, _, err := s.artifacts.Begin(ctx, artifacts.Meta{Ref: artifacts.Ref{TenantID: conn.TenantID, Kind: artifacts.KindOriginal, Version: 1}, MimeType: mimeType}, time.Hour, connectorMaxArtifactBytes)
+		if err != nil {
+			observation.ProcessingError = err.Error()
+			observation.Payload = json.RawMessage(`{}`)
+			return observation, nil
+		}
+		if _, err := io.Copy(writer, bytes.NewReader(content)); err != nil {
+			_ = writer.Abort(ctx)
+			observation.ProcessingError = err.Error()
+			observation.Payload = json.RawMessage(`{}`)
+			return observation, nil
+		}
+		if err := writer.Finalize(ctx); err != nil {
+			observation.ProcessingError = err.Error()
+			observation.Payload = json.RawMessage(`{}`)
+			return observation, nil
+		}
+		final := writer.Ref()
+		final.SHA256, final.ByteSize = hex.EncodeToString(digest[:]), int64(len(content))
+		ref = final
 	}
-	if err := writer.Finalize(ctx); err != nil {
-		observation.ProcessingError = err.Error()
-		observation.Payload = json.RawMessage(`{}`)
-		return observation, nil
-	}
-	ref = writer.Ref()
 	if err := s.canonical.InsertObjectVersion(ctx, conn.TenantID, source.ObjectVersion{
 		ObjectID: object.ID, ObservedSeq: seq, ArtifactRef: ref.ID, SHA256: ref.SHA256, ByteSize: ref.ByteSize,
 		MimeType: mimeType, OriginalFilename: filename, UpstreamRevision: upstream,
@@ -225,18 +270,30 @@ func (s *Service) observeContentItem(ctx context.Context, conn source.Connection
 		observation.Payload = json.RawMessage(`{}`)
 		return observation, nil
 	}
+	if err := s.canonical.ObserveObject(ctx, conn.TenantID, object.ID, parentID, upstream); err != nil {
+		return Observation{}, err
+	}
 	observation.ArtifactRef = ref
 	observation.Payload = connectorPayload(item, filename, mimeType)
 	return observation, nil
 }
 
+func provenanceValue(provenance, key string) string {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(provenance), &payload); err != nil {
+		return ""
+	}
+	v, _ := payload[key].(string)
+	return v
+}
+
 func connectorPayload(item ContentItem, filename, mimeType string) json.RawMessage {
-	payload, _ := json.Marshal(map[string]any{"native_id": item.NativeID, "parent_native_id": item.ParentNativeID, "kind": item.Kind, "native_revision": item.NativeRevision, "filename": filename, "mime_type": mimeType, "url": item.URL, "created_at": item.CreatedAt, "updated_at": item.UpdatedAt, "locator": item.Locator})
+	payload, _ := json.Marshal(map[string]any{"native_id": item.NativeID, "parent_native_id": item.ParentNativeID, "kind": item.Kind, "native_revision": item.NativeRevision, "title": item.Title, "filename": filename, "mime_type": mimeType, "url": item.URL, "created_at": item.CreatedAt, "updated_at": item.UpdatedAt, "locator": item.Locator})
 	return payload
 }
 
 func connectorProvenance(conn source.Connection, item ContentItem) string {
-	payload, _ := json.Marshal(map[string]any{"connection_id": conn.ID, "source_kind": conn.Kind, "native_id": item.NativeID, "source_uri": item.URL, "created_at": item.CreatedAt, "updated_at": item.UpdatedAt, "locator": item.Locator})
+	payload, _ := json.Marshal(map[string]any{"connection_id": conn.ID, "source_kind": conn.Kind, "native_id": item.NativeID, "title": item.Title, "source_uri": item.URL, "created_at": item.CreatedAt, "updated_at": item.UpdatedAt, "locator": item.Locator})
 	return string(payload)
 }
 
@@ -343,6 +400,7 @@ func (s *Service) applyGrantSnapshot(ctx context.Context, principal auth.Princip
 	}
 	var grants []source.SourceGrant
 	var memberships []source.SourceGroupMembership
+	unmapped := 0
 	for _, observation := range observations {
 		if observation.ProcessingError != "" {
 			return fmt.Errorf("authorization observation %q failed: %s", observation.NativeID, observation.ProcessingError)
@@ -352,23 +410,42 @@ func (s *Service) applyGrantSnapshot(ctx context.Context, principal auth.Princip
 			return fmt.Errorf("decode authorization observation: %w", err)
 		}
 		if membership {
+			if grant.NativePrincipalID == "" || grant.NativeGroupID == "" {
+				return errors.New("membership requires native principal and group")
+			}
 			group, err := s.resolveOrCreateGroup(ctx, conn, grant.NativeGroupID)
 			if err != nil {
 				return err
 			}
 			identity, err := s.canonical.SourceIdentityForNativeID(ctx, conn.TenantID, conn.ID, grant.NativePrincipalID)
+			if errors.Is(err, source.ErrDenied) {
+				unmapped++
+				continue
+			}
 			if err != nil {
 				return err
 			}
 			memberships = append(memberships, source.SourceGroupMembership{TenantID: conn.TenantID, ConnectionID: conn.ID, GroupID: group.ID, MemberID: identity.ID, AccessRevision: revision})
 			continue
 		}
-		// Provider roles (Drive reader/writer/owner, etc.) all imply
-		// readability for search authorization; unknown values are garbage.
-		if !readCapableScope(grant.Scope) {
+		if grant.Effect == source.GrantEffectAllow && !readCapableScope(grant.Scope) {
 			return fmt.Errorf("unsupported source access scope %q", grant.Scope)
 		}
+		if grant.NativeObjectID == "" {
+			return errors.New("access grant has no native object")
+		}
 		object, err := s.canonical.ObjectForNativeID(ctx, conn.TenantID, conn.ID, firstNonEmpty(grant.NativeObjectKind, conn.Kind), grant.NativeObjectID)
+		if errors.Is(err, source.ErrDenied) {
+			id, idErr := connectorObjectID()
+			if idErr != nil {
+				return idErr
+			}
+			object, err = s.canonical.UpsertObject(ctx, source.Object{
+				TenantID: conn.TenantID, ConnectionID: conn.ID, ID: id,
+				Kind: firstNonEmpty(grant.NativeObjectKind, conn.Kind), NativeID: grant.NativeObjectID,
+				AuthorizationMode: source.AuthorizationSourceACL, ObservedSeq: 1,
+			})
+		}
 		if err != nil {
 			return err
 		}
@@ -380,6 +457,10 @@ func (s *Service) applyGrantSnapshot(ctx context.Context, principal auth.Princip
 		}
 		if grant.NativePrincipalID != "" {
 			identity, err := s.canonical.SourceIdentityForNativeID(ctx, conn.TenantID, conn.ID, grant.NativePrincipalID)
+			if errors.Is(err, source.ErrDenied) {
+				unmapped++
+				continue
+			}
 			if err != nil {
 				return err
 			}
@@ -391,7 +472,10 @@ func (s *Service) applyGrantSnapshot(ctx context.Context, principal auth.Princip
 			}
 			g.SubjectKind, g.SubjectID = source.GrantSubjectGroup, group.ID
 		} else {
-			return errors.New("access grant has no native principal or group")
+			if grant.Effect != source.GrantEffectDeny {
+				return errors.New("access grant has no native principal or group")
+			}
+			g.SubjectKind = source.GrantSubjectAll
 		}
 		grants = append(grants, g)
 	}
@@ -401,9 +485,9 @@ func (s *Service) applyGrantSnapshot(ctx context.Context, principal auth.Princip
 	}
 	if err := s.observations.WithFence(ctx, state, func(tx source.Tx) error {
 		if membership {
-			return s.canonical.ApplyMembershipSnapshot(ctx, tx, conn.TenantID, conn.ID, revision, memberships)
+			return s.canonical.ApplyMembershipSnapshot(ctx, tx, conn.TenantID, conn.ID, revision, memberships, unmapped)
 		}
-		return s.canonical.ApplyAccessSnapshot(ctx, tx, conn.TenantID, conn.ID, revision, grants)
+		return s.canonical.ApplyAccessSnapshot(ctx, tx, conn.TenantID, conn.ID, revision, grants, unmapped)
 	}); err != nil {
 		return err
 	}
@@ -463,6 +547,11 @@ func (s *Service) sweepMissingContent(ctx context.Context, state StreamState) er
 		for _, object := range objects {
 			if _, ok := seen[object.ID]; ok || object.DeletedAt != nil || object.TombstonedAt != nil {
 				continue
+			}
+			if _, err := s.canonical.LatestObjectVersion(ctx, state.TenantID, object.ID); errors.Is(err, source.ErrDenied) {
+				continue
+			} else if err != nil {
+				return err
 			}
 			if err := s.canonical.MarkObjectDeleted(ctx, state.TenantID, object.ID); err != nil {
 				return err

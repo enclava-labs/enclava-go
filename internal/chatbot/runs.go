@@ -8,12 +8,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"enclava-go/internal/auth"
+	"enclava-go/internal/extract"
 	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
+	"enclava-go/internal/mcp"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
 	"enclava-go/internal/source"
@@ -491,9 +495,37 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 		definitions = append(definitions, mcpDefinitions...)
 	}
 	if len(mcpDefinitions) == 0 {
-		definitions, err = BuiltinToolDefinitions(bot)
+		definitions, err = builtinToolDefinitions(bot, nil)
 		if err != nil {
 			return "", err
+		}
+	}
+	toolNames := modelToolNames(definitions)
+	toolSchemas := make(map[string]any, len(definitions))
+	for _, definition := range definitions {
+		function, _ := definition["function"].(map[string]any)
+		name, _ := function["name"].(string)
+		toolSchemas[name] = function["parameters"]
+	}
+	historyStart := 0
+	if rendered.SystemPrompt != "" {
+		historyStart = 1
+	}
+	historyCount := userIndex
+	contextBudget := maxRunContextBytes
+	if provider, ok := s.executor.(interface {
+		ModelContextLength(context.Context, auth.Principal, string, string) (int64, error)
+	}); ok {
+		window, metadataErr := provider.ModelContextLength(ctx, p, bot.Model, strings.TrimSpace(bot.ProviderID))
+		if metadataErr != nil && (errors.Is(metadataErr, context.Canceled) || errors.Is(metadataErr, context.DeadlineExceeded)) {
+			return "", metadataErr
+		}
+		if metadataErr == nil && window > 0 && window < int64(maxRunContextBytes/3+defaultRunMaxTokens) {
+			available := (window - defaultRunMaxTokens) * 3
+			if available < 0 {
+				available = 0
+			}
+			contextBudget = int(available)
 		}
 	}
 	if len(definitions) > 0 {
@@ -534,13 +566,15 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 		if cancelled {
 			return fail(context.Canceled)
 		}
-		body, err := json.Marshal(payload)
+		noTools := turn == maxRunTurns-1 || toolCalls >= maxRunToolCalls
+		if noTools {
+			delete(payload, "tools")
+		}
+		body, fitted, err := fitRunContext(payload, messages, historyStart, &historyCount, contextBudget)
 		if err != nil {
 			return fail(err)
 		}
-		if len(body) > maxRunContextBytes {
-			return fail(invalidInput(errors.New("run context exceeds byte limit")))
-		}
+		messages = fitted
 		attemptNumber++
 		if err := refreshPrincipal(); err != nil {
 			return fail(err)
@@ -610,6 +644,9 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 			if len(turnResult.Content) > maxRunOutputBytes {
 				return fail(errors.New("assistant output exceeds byte limit"))
 			}
+			if strings.TrimSpace(turnResult.Content) == "" {
+				return fail(errors.New("assistant returned an empty answer"))
+			}
 			run.Output, run.Status, run.EvidenceIDs, run.InputRefs = turnResult.Content, jobs.StatusSucceeded, evidenceIDs, inputRefs
 			if strings.TrimSpace(turnResult.Content) != "" {
 				if err := s.runRepo.AddRunMessage(ctx, Message{TenantID: p.TenantID, ID: newID("chatmsg"), ConversationID: run.ConversationID, Role: "assistant", Content: turnResult.Content, OwnerActorID: p.ActorID, RunID: run.ID, EvidenceIDs: evidenceIDs, InputRefs: inputRefs}, run.JobID, claim.Owner, claim.FenceToken); err != nil {
@@ -621,11 +658,12 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 			}
 			return run.ID, nil
 		}
-		if turn+1 >= maxRunTurns || toolCalls+len(turnResult.ToolCalls) > maxRunToolCalls {
-			return fail(errors.New("assistant run exceeded tool or turn limit"))
+		if noTools {
+			return fail(errors.New("assistant returned tool calls when tools were unavailable"))
 		}
 		messages = append(messages, map[string]any{"role": "assistant", "content": turnResult.Content, "tool_calls": turnResult.RawToolCalls})
 		for _, call := range turnResult.ToolCalls {
+			overBudget := toolCalls >= maxRunToolCalls
 			toolCalls++
 			if err := ctx.Err(); err != nil {
 				return fail(err)
@@ -641,7 +679,12 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 			if err := refreshPrincipal(); err != nil {
 				return fail(err)
 			}
-			toolAttempt := AssistantRunAttempt{TenantID: p.TenantID, RunID: run.ID, Number: attemptNumber, Kind: "tool", Name: call.Name, Status: "running", Input: string(call.Arguments), StartedAt: time.Now().UTC()}
+			internalName, known := toolNames[call.Name]
+			attemptName := internalName
+			if !known {
+				attemptName = call.Name
+			}
+			toolAttempt := AssistantRunAttempt{TenantID: p.TenantID, RunID: run.ID, Number: attemptNumber, Kind: "tool", Name: attemptName, Status: "running", Input: string(call.Arguments), StartedAt: time.Now().UTC()}
 			if err := s.runRepo.AddRunAttempt(ctx, toolAttempt, claim.Owner, claim.FenceToken); err != nil {
 				return fail(err)
 			}
@@ -653,27 +696,61 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 			}
 			var toolResult BuiltinResult
 			var invokeErr error
-			if _, isBuiltin := builtinSchemas[call.Name]; isBuiltin {
-				toolResult, invokeErr = builtins.Invoke(ctx, p, bot, call.Name, call.Arguments, inputRefs)
+			ownerFailed := false
+			var argsObject map[string]json.RawMessage
+			if overBudget {
+				invokeErr = errors.New("tool call budget exhausted")
+			} else if !known {
+				invokeErr = errors.New("unknown tool")
+			} else if !json.Valid(call.Arguments) || json.Unmarshal(call.Arguments, &argsObject) != nil || argsObject == nil || !validToolArguments(toolSchemas[call.Name], call.Arguments) {
+				invokeErr = errors.New("malformed tool arguments")
+			} else if _, isBuiltin := builtinSchemas[internalName]; isBuiltin {
+				toolResult, invokeErr = builtins.Invoke(ctx, p, bot, internalName, call.Arguments, inputRefs)
 			} else if s.mcpTools != nil {
 				ownerNow, ownerErr := s.ownerPrincipal(ctx, p, bot)
 				if ownerErr != nil {
 					invokeErr = ownerErr
+					ownerFailed = true
 				} else {
-					toolResult, invokeErr = s.mcpTools.Invoke(ctx, p, ownerNow, bot, call.Name, call.Arguments, inputRefs)
+					toolResult, invokeErr = s.mcpTools.Invoke(ctx, p, ownerNow, bot, internalName, call.Arguments, inputRefs)
 				}
 			} else {
-				invokeErr = ErrInvalidInput
+				invokeErr = errors.New("unknown tool")
+			}
+			oversized := invokeErr == nil && len(toolResult.Value) > maxBuiltinOutputBytes
+			if oversized {
+				toolResult.Value = json.RawMessage(truncateRunText(string(toolResult.Value), maxBuiltinOutputBytes, "[truncated]"))
+				invokeErr = errors.New("tool output exceeds byte limit")
 			}
 			if invokeErr != nil {
 				toolAttempt.Status = "failed"
 				toolAttempt.Error = invokeErr.Error()
 				toolAttempt.EndedAt = time.Now().UTC()
-				_ = s.runRepo.UpdateRunAttempt(ctx, toolAttempt, claim.Owner, claim.FenceToken)
-				return fail(invokeErr)
-			}
-			if len(toolResult.Value) > maxBuiltinOutputBytes {
-				return fail(errors.New("tool output exceeds byte limit"))
+				if err := s.runRepo.UpdateRunAttempt(ctx, toolAttempt, claim.Owner, claim.FenceToken); err != nil {
+					return fail(err)
+				}
+				if ctx.Err() != nil {
+					return fail(ctx.Err())
+				}
+				if ownerFailed || errors.Is(invokeErr, source.ErrDenied) || errors.Is(invokeErr, inference.ErrDenied) || errors.Is(invokeErr, mcp.ErrDenied) || errors.Is(invokeErr, extract.ErrForbidden) || errors.Is(invokeErr, ErrChatbotNotAllowed) || errors.Is(invokeErr, ErrModelNotAllowed) || errors.Is(invokeErr, context.Canceled) || errors.Is(invokeErr, context.DeadlineExceeded) {
+					return fail(invokeErr)
+				}
+				if !oversized {
+					message := "tool invocation failed"
+					if !known {
+						message = "unknown tool"
+					} else if overBudget {
+						message = "tool call budget exhausted"
+					} else if argsObject == nil || errors.Is(invokeErr, ErrInvalidInput) {
+						message = "invalid tool arguments"
+					}
+					value, _ := json.Marshal(map[string]string{"error": message})
+					toolResult.Value = value
+				}
+				messages = append(messages, map[string]any{"role": "tool", "tool_call_id": call.ID, "content": string(toolResult.Value)})
+				if !oversized {
+					continue
+				}
 			}
 			inputRefs = mergeObjectRefs(inputRefs, toolResult.InputRefs)
 			evidenceIDs = mergeStrings(evidenceIDs, toolResult.EvidenceIDs)
@@ -681,13 +758,15 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 			if err := s.runRepo.UpdateRunFenced(ctx, run, claim.Owner, claim.FenceToken); err != nil {
 				return fail(err)
 			}
-			toolAttempt.Status = "succeeded"
-			toolAttempt.Output = string(toolResult.Value)
-			toolAttempt.EndedAt = time.Now().UTC()
-			if err := s.runRepo.UpdateRunAttempt(ctx, toolAttempt, claim.Owner, claim.FenceToken); err != nil {
-				return fail(err)
+			if !oversized {
+				toolAttempt.Status = "succeeded"
+				toolAttempt.Output = string(toolResult.Value)
+				toolAttempt.EndedAt = time.Now().UTC()
+				if err := s.runRepo.UpdateRunAttempt(ctx, toolAttempt, claim.Owner, claim.FenceToken); err != nil {
+					return fail(err)
+				}
+				messages = append(messages, map[string]any{"role": "tool", "tool_call_id": call.ID, "content": string(toolResult.Value)})
 			}
-			messages = append(messages, map[string]any{"role": "tool", "tool_call_id": call.ID, "content": string(toolResult.Value)})
 		}
 		payload["messages"] = messages
 		if len(inputRefs) > 0 {
@@ -797,12 +876,125 @@ func parseRunModelResponse(raw []byte) (runModelResponse, error) {
 		if json.Unmarshal(args, &encoded) == nil {
 			args = json.RawMessage(encoded)
 		}
-		var argsObject map[string]json.RawMessage
-		if call.Type != "function" || call.ID == "" || call.Function.Name == "" || len(args) == 0 || !json.Valid(args) || json.Unmarshal(args, &argsObject) != nil || argsObject == nil {
+		if call.Type != "function" || call.ID == "" || call.Function.Name == "" {
 			return runModelResponse{}, ErrInvalidInput
 		}
 		result.ToolCalls = append(result.ToolCalls, runToolCall{ID: call.ID, Name: call.Function.Name, Arguments: args})
 		result.RawToolCalls = append(result.RawToolCalls, map[string]any{"id": call.ID, "type": "function", "function": map[string]any{"name": call.Function.Name, "arguments": string(args)}})
 	}
 	return result, nil
+}
+
+func validToolArguments(schema any, args json.RawMessage) bool {
+	raw, err := json.Marshal(schema)
+	if err != nil {
+		return false
+	}
+	validate, err := mcp.CompileSchema(raw)
+	return err == nil && mcp.ValidateJSON(validate, args) == nil
+}
+
+func modelToolNames(definitions []map[string]any) map[string]string {
+	ids := make([]string, 0, len(definitions))
+	for _, definition := range definitions {
+		function, _ := definition["function"].(map[string]any)
+		id, _ := function["name"].(string)
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	names := make(map[string]string, len(ids))
+	reverse := make(map[string]string, len(ids))
+	for _, id := range ids {
+		var b strings.Builder
+		for _, r := range id {
+			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' {
+				b.WriteRune(r)
+			} else {
+				b.WriteByte('_')
+			}
+		}
+		base := b.String()
+		if base == "" {
+			base = "_"
+		}
+		if len(base) > 64 {
+			base = base[:64]
+		}
+		name := base
+		for n := 2; ; n++ {
+			if _, exists := reverse[name]; !exists {
+				break
+			}
+			suffix := fmt.Sprintf("_%d", n)
+			prefix := base
+			if len(prefix)+len(suffix) > 64 {
+				prefix = prefix[:64-len(suffix)]
+			}
+			name = prefix + suffix
+		}
+		names[id], reverse[name] = name, id
+	}
+	for _, definition := range definitions {
+		function, _ := definition["function"].(map[string]any)
+		id, _ := function["name"].(string)
+		function["name"] = names[id]
+	}
+	return reverse
+}
+
+func truncateRunText(text string, limit int, marker string) string {
+	if len(text) <= limit {
+		return text
+	}
+	if limit <= len(marker) {
+		return marker
+	}
+	end := limit - len(marker)
+	for end > 0 && !utf8.ValidString(text[:end]) {
+		end--
+	}
+	return text[:end] + marker
+}
+
+func fitRunContext(payload map[string]any, messages []map[string]any, historyStart int, historyCount *int, budget int) ([]byte, []map[string]any, error) {
+	const marker = "[truncated to fit context]"
+	for {
+		payload["messages"] = messages
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return nil, messages, err
+		}
+		if len(body) <= budget {
+			return body, messages, nil
+		}
+		if *historyCount > 0 {
+			messages = append(messages[:historyStart], messages[historyStart+1:]...)
+			*historyCount--
+			continue
+		}
+		largest, size := -1, len(marker)
+		for i, message := range messages {
+			if message["role"] != "tool" {
+				continue
+			}
+			text, _ := message["content"].(string)
+			if len(text) > size {
+				largest, size = i, len(text)
+			}
+		}
+		if largest < 0 {
+			return nil, messages, invalidInput(errors.New("run context exceeds the model's context budget"))
+		}
+		text := messages[largest]["content"].(string)
+		text = strings.TrimSuffix(text, marker)
+		limit := size / 2
+		if limit < len(marker) {
+			limit = len(marker)
+		}
+		if len(text)+len(marker) <= limit {
+			messages[largest]["content"] = marker
+		} else {
+			messages[largest]["content"] = truncateRunText(text+marker, limit, marker)
+		}
+	}
 }

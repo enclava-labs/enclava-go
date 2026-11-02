@@ -225,12 +225,30 @@ func (r *ChatbotRepo) AddMessage(ctx context.Context, m chatbot.Message) error {
 		return fmt.Errorf("marshal message input refs: %w", err)
 	}
 	_, err = r.db.SQL.ExecContext(ctx, `
-		INSERT INTO messages (tenant_id, id, conversation_id, role, content, owner_actor_id, evidence_ids, input_refs, run_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		INSERT INTO messages (tenant_id, id, conversation_id, role, content, owner_actor_id, evidence_ids, input_refs, run_id, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE(NULLIF($10, ''), 'complete'))`,
 		m.TenantID, m.ID, m.ConversationID, m.Role, m.Content,
-		nullableText(m.OwnerActorID), evidenceIDs, inputRefs, nullableText(m.RunID))
+		nullableText(m.OwnerActorID), evidenceIDs, inputRefs, nullableText(m.RunID), m.Status)
 	if err != nil {
 		return fmt.Errorf("add message: %w", err)
+	}
+	return nil
+}
+
+func (r *ChatbotRepo) FinalizeMessage(ctx context.Context, tenantID, id, content, status string) error {
+	result, err := r.db.SQL.ExecContext(ctx, `UPDATE messages SET content = $3, status = $4
+		WHERE tenant_id = $1 AND id = $2 AND role = 'assistant'
+		AND (status = 'reserved' OR (status = $4 AND content = $3))`,
+		tenantID, id, content, status)
+	if err != nil {
+		return fmt.Errorf("finalize message: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return sql.ErrNoRows
 	}
 	return nil
 }
@@ -240,7 +258,7 @@ func (r *ChatbotRepo) AddMessage(ctx context.Context, m chatbot.Message) error {
 func (r *ChatbotRepo) ListMessages(ctx context.Context, tenantID, conversationID string) ([]chatbot.Message, error) {
 	rows, err := r.db.SQL.QueryContext(ctx, `
 		SELECT tenant_id::text, id, conversation_id, role, content,
-		       COALESCE(owner_actor_id, ''), COALESCE(run_id, ''), evidence_ids, input_refs, created_at
+		       COALESCE(owner_actor_id, ''), COALESCE(run_id, ''), evidence_ids, input_refs, created_at, status
 		FROM messages
 		WHERE tenant_id = $1 AND conversation_id = $2
 		ORDER BY created_at ASC, id ASC`, tenantID, conversationID)
@@ -254,7 +272,7 @@ func (r *ChatbotRepo) ListMessages(ctx context.Context, tenantID, conversationID
 		var m chatbot.Message
 		var evidenceIDs, inputRefs []byte
 		if err := rows.Scan(&m.TenantID, &m.ID, &m.ConversationID, &m.Role, &m.Content,
-			&m.OwnerActorID, &m.RunID, &evidenceIDs, &inputRefs, &m.CreatedAt); err != nil {
+			&m.OwnerActorID, &m.RunID, &evidenceIDs, &inputRefs, &m.CreatedAt, &m.Status); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal(evidenceIDs, &m.EvidenceIDs)

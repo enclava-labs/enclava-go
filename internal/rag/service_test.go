@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -27,7 +30,8 @@ import (
 // fakeEmbeddingUpstream is the deterministic executor transport answering
 // embeddings requests — real policy/pricing run inside inference.Service.
 type fakeEmbeddingUpstream struct {
-	calls int
+	calls  int
+	inputs [][]string
 	// midEmbed runs once inside the next embeddings call: a test's window
 	// into an attempt that is still embedding.
 	midEmbed func()
@@ -72,6 +76,7 @@ func (f *fakeEmbeddingUpstream) CreateEmbeddings(ctx context.Context, body []byt
 			inputs = append(inputs, s)
 		}
 	}
+	f.inputs = append(f.inputs, append([]string(nil), inputs...))
 	data := make([]map[string]any, 0, len(inputs))
 	for i, input := range inputs {
 		vector := []float64{float64(len(input)), float64(strings.Count(input, "enclava") + 1), 1}
@@ -200,6 +205,10 @@ func (f *fakeVectorStore) DeleteCollection(ctx context.Context, collection strin
 	return nil
 }
 
+func (f *fakeVectorStore) CountPoints(ctx context.Context, collection string) (int64, error) {
+	return int64(len(f.points[collection])), nil
+}
+
 // Search honours the authorization-scoped filter the service passes —
 // points for non-authorized version ids never match.
 func (f *fakeVectorStore) SearchHybrid(ctx context.Context, collection string, vector []float64, sparse rag.SparseVector, limit int, filter map[string]any) ([]rag.QdrantSearchPoint, error) {
@@ -242,15 +251,17 @@ func (f *fakeVectorStore) Query(ctx context.Context, collection string, input ra
 }
 
 type fixture struct {
-	db        *postgres.DB
-	svc       *rag.Service
-	repo      *postgres.RAGRepo
-	jobs      *jobs.Service
-	store     *artifacts.Store
-	vector    *fakeVectorStore
-	embedding *fakeEmbeddingUpstream
-	tenant    string
-	principal auth.Principal
+	db           *postgres.DB
+	svc          *rag.Service
+	repo         *postgres.RAGRepo
+	jobs         *jobs.Service
+	store        *artifacts.Store
+	artifactRoot string
+	vector       *fakeVectorStore
+	embedding    *fakeEmbeddingUpstream
+	executor     *inference.Service
+	tenant       string
+	principal    auth.Principal
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -261,14 +272,17 @@ func newFixture(t *testing.T) *fixture {
 	jobsRepo := postgres.NewJobsRepo(db)
 	jobsSvc := jobs.NewService(jobsRepo, 0)
 	artifactRepo := postgres.NewArtifactRepo(db)
-	store, err := artifacts.NewStore(t.TempDir(), t.TempDir(), artifactRepo)
+	root := t.TempDir()
+	store, err := artifacts.NewStore(root, t.TempDir(), artifactRepo)
 	if err != nil {
 		t.Fatalf("artifact store: %v", err)
 	}
 	vector := newFakeVectorStore()
 	repo := postgres.NewRAGRepo(db)
 	embedding := &fakeEmbeddingUpstream{}
-	svc := rag.NewService(repo, vector, newExecutor(t, db, tenant, embedding), "embed-test", store, jobsSvc)
+	executor := newExecutor(t, db, tenant, embedding)
+	svc := rag.NewService(repo, vector, executor, "embed-test", store, jobsSvc)
+	svc.SetIndexRetirementSoak(time.Nanosecond)
 	p := auth.Principal{
 		TenantID:            tenant,
 		ActorID:             user.ID,
@@ -280,7 +294,7 @@ func newFixture(t *testing.T) *fixture {
 		AllowedModelsAll:    true,
 		AllowedEndpointsAll: true,
 	}
-	return &fixture{db: db, svc: svc, repo: repo, jobs: jobsSvc, store: store, vector: vector, embedding: embedding, tenant: tenant, principal: p}
+	return &fixture{db: db, svc: svc, repo: repo, jobs: jobsSvc, store: store, artifactRoot: root, vector: vector, embedding: embedding, executor: executor, tenant: tenant, principal: p}
 }
 
 func (f *fixture) collection(t *testing.T) rag.Collection {
@@ -297,26 +311,40 @@ func (f *fixture) collection(t *testing.T) rag.Collection {
 	return c
 }
 
-// runNextJob leases the next queued job, invokes the registered embed
-// handler and completes it — the real worker path under the fenced lease.
+// runNextJob processes any preceding scan jobs, then one non-scan job.
 func (f *fixture) runNextJob(t *testing.T) {
+	t.Helper()
+	for {
+		operation, _ := f.runOneJob(t)
+		if operation != rag.OperationReembedScan {
+			return
+		}
+	}
+}
+
+// runOneJob leases and settles the next durable job, reporting its operation
+// and row ID so tests can prove a scan was re-enqueued rather than deduped.
+func (f *fixture) runOneJob(t *testing.T) (string, string) {
 	t.Helper()
 	ctx := context.Background()
 	claim, err := f.jobs.Lease(ctx, "test-worker", time.Minute)
-	if err != nil {
-		t.Fatalf("lease: %v", err)
+	if err != nil || claim == nil {
+		t.Fatalf("lease: %v (claim %v)", err, claim)
 	}
-	if claim == nil {
-		t.Fatal("no job to lease")
+	operation := claim.Job().Operation
+	handler := f.svc.JobHandler()
+	if operation == rag.OperationReembedScan {
+		handler = f.svc.ReembedScanJobHandler()
 	}
-	resultRef, err := f.svc.JobHandler()(ctx, claim, nil)
+	resultRef, err := handler(ctx, claim, nil)
 	if err != nil {
 		_ = claim.Fail(ctx, err, jobs.FailureFatal)
-		t.Fatalf("embed attempt: %v", err)
+		t.Fatalf("%s attempt: %v", operation, err)
 	}
 	if _, err := claim.Complete(ctx, resultRef); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
+	return operation, claim.Job().ID
 }
 
 func (f *fixture) docStatus(t *testing.T, collectionID, docID string) rag.Document {
@@ -542,17 +570,16 @@ func TestCollectionEmbedsDocumentTitles(t *testing.T) {
 		t.Fatalf("upload document: %v", err)
 	}
 	f.runNextJob(t)
-	// The fake model's first component is the embedded input's length.
-	embeddedLen := func() float64 {
+	lastInput := func() string {
 		t.Helper()
-		points := f.vector.points[c.QdrantCollection]
-		if len(points) != 1 {
-			t.Fatalf("points = %d, want 1", len(points))
+		batch := f.embedding.inputs[len(f.embedding.inputs)-1]
+		if len(batch) != 1 {
+			t.Fatalf("embedding batch = %v, want one chunk", batch)
 		}
-		return points[0].Vector[0]
+		return batch[0]
 	}
-	if got, want := embeddedLen(), float64(len("note.txt\n"+text)); got != want {
-		t.Fatalf("embedded input length %v, want %v with the name prefixed", got, want)
+	if got, want := lastInput(), "note.txt\n"+text; got != want {
+		t.Fatalf("embedded input %q, want %q", got, want)
 	}
 	off := false
 	updated, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{EmbedTitles: &off})
@@ -560,8 +587,361 @@ func TestCollectionEmbedsDocumentTitles(t *testing.T) {
 		t.Fatalf("turn names off = %+v, %v; want same index without names", updated, err)
 	}
 	f.runNextJob(t)
-	if got, want := embeddedLen(), float64(len(text)); got != want {
-		t.Fatalf("embedded input length %v after turning names off, want %v", got, want)
+	if got, want := lastInput(), text; got != want {
+		t.Fatalf("embedded input %q after turning names off, want %q", got, want)
+	}
+	points := f.vector.points[c.QdrantCollection]
+	if len(points) != 1 || points[0].Payload["search_text"] != "note.txt\n"+text {
+		t.Fatalf("search text without title embeddings = %+v", points)
+	}
+}
+
+func TestCollectionPrefixesAndDurableReembedding(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{
+		Name: "prefixes", EmbeddingModel: "nomic-embed-text", ACL: map[string]any{"public": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.QueryPrefix != "search_query: " || c.PassagePrefix != "search_document: " {
+		t.Fatalf("default prefixes = %q, %q", c.QueryPrefix, c.PassagePrefix)
+	}
+	empty := ""
+	explicit, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{
+		Name: "explicit", EmbeddingModel: "nomic-embed-text", QueryPrefix: &empty, PassagePrefix: &empty,
+	})
+	if err != nil || explicit.QueryPrefix != "" || explicit.PassagePrefix != "" {
+		t.Fatalf("explicit empty prefixes = %+v, %v", explicit, err)
+	}
+
+	addEmbeddingEndpoint(t, f.db, f.tenant, "ep-nomic", "nomic-embed-text")
+	if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "note.txt", MimeType: "text/plain", Bytes: []byte("enclava prefix content"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.runNextJob(t)
+	query, passage := "question: ", "document: "
+	updated, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{QueryPrefix: &query, PassagePrefix: &passage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.QueryPrefix != query || updated.PassagePrefix != passage || updated.QdrantCollection == c.QdrantCollection {
+		t.Fatalf("updated prefixes/index = %+v", updated)
+	}
+	pending, total, err := f.svc.ReembedProgress(ctx, f.principal, c.ID)
+	if err != nil || pending != 1 || total != 1 {
+		t.Fatalf("progress before scan = %d/%d, %v", pending, total, err)
+	}
+	if _, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "enclava", Mode: rag.QuerySemantic}); err != nil {
+		t.Fatal(err)
+	}
+	oldQuery := f.embedding.inputs[len(f.embedding.inputs)-1]
+	if len(oldQuery) != 1 || oldQuery[0] != "search_query: enclava" {
+		t.Fatalf("old generation query input = %q", oldQuery)
+	}
+	if op, _ := f.runOneJob(t); op != rag.OperationReembedScan {
+		t.Fatalf("settings job = %q, want scan", op)
+	}
+	pending, total, err = f.svc.ReembedProgress(ctx, f.principal, c.ID)
+	if err != nil || pending != 1 || total != 1 {
+		t.Fatalf("progress after scan = %d/%d, %v", pending, total, err)
+	}
+	f.runNextJob(t)
+	pending, total, err = f.svc.ReembedProgress(ctx, f.principal, c.ID)
+	if err != nil || pending != 0 || total != 1 {
+		t.Fatalf("progress after publication = %d/%d, %v", pending, total, err)
+	}
+	last := f.embedding.inputs[len(f.embedding.inputs)-1]
+	if len(last) != 1 || last[0] != "document: note.txt\nenclava prefix content" {
+		t.Fatalf("re-embedding input = %q", last)
+	}
+	if _, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "enclava", Mode: rag.QuerySemantic}); err != nil {
+		t.Fatal(err)
+	}
+	last = f.embedding.inputs[len(f.embedding.inputs)-1]
+	if len(last) != 1 || last[0] != "question: enclava" {
+		t.Fatalf("query embedding input = %q", last)
+	}
+	queryOnly := "only-query: "
+	queryUpdate, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{QueryPrefix: &queryOnly})
+	if err != nil || queryUpdate.QdrantCollection != updated.QdrantCollection {
+		t.Fatalf("query-only update = %+v, %v", queryUpdate, err)
+	}
+	generations, err := f.repo.ListPublishedGenerations(ctx, f.tenant, c.ID)
+	if err != nil || len(generations) != 1 || generations[0].QueryPrefix != queryOnly || generations[0].Generation != 2 {
+		t.Fatalf("query-only generation = %+v, %v", generations, err)
+	}
+	if _, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "enclava", Mode: rag.QuerySemantic}); err != nil {
+		t.Fatal(err)
+	}
+	last = f.embedding.inputs[len(f.embedding.inputs)-1]
+	if len(last) != 1 || last[0] != "only-query: enclava" {
+		t.Fatalf("query-only embedding input = %q", last)
+	}
+}
+
+func TestUpdateCollectionSkipsScanWithoutPendingWork(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		svc  *rag.Service
+	}{
+		{"configured jobs", f.svc},
+		{"absent jobs", rag.NewService(f.repo, f.vector, f.executor, "embed-test", nil, nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := tc.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{
+				Name: "idle " + tc.name, ACL: map[string]any{"public": true},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			renamed := "renamed " + tc.name
+			updated, err := tc.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{Name: &renamed})
+			if err != nil || updated.Name != renamed {
+				t.Fatalf("update without pending work = %+v, %v", updated, err)
+			}
+			if claim, err := f.jobs.Lease(ctx, "test-worker", time.Minute); err != nil || claim != nil {
+				t.Fatalf("no pending re-embed work still queued %v, %v", claim, err)
+			}
+		})
+	}
+}
+
+func TestUpdateCollectionScanDedupesOnlyWhileQueued(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "note.txt", MimeType: "text/plain", Bytes: []byte("enclava scan dedupe"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.runNextJob(t)
+
+	off, on := false, true
+	if _, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{EmbedTitles: &off}); err != nil {
+		t.Fatal(err)
+	}
+	op, first := f.runOneJob(t)
+	if op != rag.OperationReembedScan {
+		t.Fatalf("first title toggle job = %q, want scan", op)
+	}
+	f.runNextJob(t) // drain the re-embed the first scan queued
+	if _, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{EmbedTitles: &on}); err != nil {
+		t.Fatal(err)
+	}
+	op, second := f.runOneJob(t)
+	if op != rag.OperationReembedScan {
+		t.Fatalf("second title toggle job = %q, want scan", op)
+	}
+	f.runNextJob(t) // drain the re-embed the second scan queued
+	if _, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{EmbedTitles: &off}); err != nil {
+		t.Fatal(err)
+	}
+	name := "save while queued"
+	if _, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{Name: &name}); err != nil {
+		t.Fatal(err)
+	}
+	op, third := f.runOneJob(t)
+	if op != rag.OperationReembedScan {
+		t.Fatalf("queued-scan save job = %q, want scan", op)
+	}
+	seen := map[string]bool{first: true, second: true, third: true}
+	if first == "" || second == "" || third == "" || len(seen) != 3 {
+		t.Fatalf("completed scans deduped instead of queueing new work: %v", seen)
+	}
+	f.runNextJob(t)
+	if claim, err := f.jobs.Lease(ctx, "test-worker", time.Minute); err != nil || claim != nil {
+		t.Fatalf("queued-scan saves produced a duplicate job %v, %v", claim, err)
+	}
+}
+
+func TestIndexTitleAndMetadataBoundaries(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	connector, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "connector-placeholder.txt", MimeType: "text/plain", Bytes: []byte("connector body"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.SQL.ExecContext(ctx, `
+		UPDATE source_object_versions SET provenance='{"source_kind":"slack","title":""}'::jsonb
+		WHERE tenant_id=$1 AND object_id=$2 AND observed_seq=1`, f.tenant, connector.Document.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.runNextJob(t)
+	last := f.embedding.inputs[len(f.embedding.inputs)-1]
+	if len(last) != 1 || last[0] != "connector body" {
+		t.Fatalf("empty connector title used placeholder filename: %q", last)
+	}
+
+	longName := strings.Repeat("界", 130) + ".txt"
+	if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: longName, MimeType: "text/plain", Bytes: []byte("upload body"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.runNextJob(t)
+	last = f.embedding.inputs[len(f.embedding.inputs)-1]
+	if len(last) != 1 || last[0] != strings.Repeat("界", 120)+"\nupload body" {
+		t.Fatalf("long upload title not bounded to 120 runes: %q", last)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		value    string
+		included bool
+	}{
+		{"below", strings.Repeat("x", 21), true}, // "k: " + value is 24 code points
+		{"boundary", strings.Repeat("x", 22), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+				FileName: tc.name + ".txt", MimeType: "text/plain", Bytes: []byte("metadata body"),
+				Metadata: map[string]any{"k": tc.value},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			f.runNextJob(t)
+			last := f.embedding.inputs[len(f.embedding.inputs)-1]
+			if len(last) != 1 || strings.Contains(last[0], "\nk: "+tc.value) != tc.included {
+				t.Fatalf("embedding input at metadata boundary = %q", last)
+			}
+			points := f.vector.points[c.QdrantCollection]
+			searchText, _ := points[len(points)-1].Payload["search_text"].(string)
+			if !strings.Contains(searchText, tc.value) {
+				t.Fatalf("metadata absent from search_text: %q", searchText)
+			}
+		})
+	}
+}
+
+func TestIndexMetadataSearchTextAndWarnings(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	upload, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "note.txt", MimeType: "text/plain", Bytes: []byte("enclava body"),
+		Metadata: map[string]any{"z": "last", "a": "first"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.runNextJob(t)
+	last := f.embedding.inputs[len(f.embedding.inputs)-1]
+	if len(last) != 1 || last[0] != "note.txt\nenclava body\na: first\nz: last" {
+		t.Fatalf("embedding input = %q", last)
+	}
+	points := f.vector.points[c.QdrantCollection]
+	if len(points) != 1 {
+		t.Fatalf("points = %d, want 1", len(points))
+	}
+	searchText, _ := points[0].Payload["search_text"].(string)
+	if !strings.Contains(searchText, "note.txt") || !strings.Contains(searchText, "enclava body") || !strings.Contains(searchText, "first") || !strings.Contains(searchText, "last") {
+		t.Fatalf("search_text = %q", searchText)
+	}
+	if points[0].Payload["content"] != "enclava body" {
+		t.Fatalf("metadata changed authoritative chunk: %v", points[0].Payload["content"])
+	}
+	chunks, err := f.repo.ListGenerationChunks(ctx, f.tenant, c.ID, upload.Document.ObjectVersionID, 1)
+	if err != nil || len(chunks) != 1 || chunks[0].Content != "enclava body" {
+		t.Fatalf("stored chunks = %+v, %v", chunks, err)
+	}
+	version, err := f.repo.GetObjectVersion(ctx, f.tenant, upload.Document.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(f.artifactRoot, f.tenant, version.ArtifactRef)); err != nil {
+		t.Fatalf("withhold original bytes: %v", err)
+	}
+
+	prefix := "passage: "
+	updated, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{PassagePrefix: &prefix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.runNextJob(t)
+	reused, err := f.repo.ListGenerationChunks(ctx, f.tenant, c.ID, upload.Document.ObjectVersionID, 2)
+	if err != nil || len(reused) != len(chunks) || !reflect.DeepEqual(reused[0].SpanRefs, chunks[0].SpanRefs) {
+		t.Fatalf("re-embedding did not reuse chunk spans: old=%+v new=%+v err=%v", chunks, reused, err)
+	}
+	if got := f.vector.points[updated.QdrantCollection]; len(got) != 1 || got[0].Payload["content"] != "enclava body" {
+		t.Fatalf("re-embedded points = %+v", got)
+	}
+	if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "large.txt", MimeType: "text/plain", Bytes: []byte("enclava small body"),
+		Metadata: map[string]any{"long": strings.Repeat("x", 100)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.runNextJob(t)
+	last = f.embedding.inputs[len(f.embedding.inputs)-1]
+	if len(last) != 1 || strings.Contains(last[0], strings.Repeat("x", 100)) {
+		t.Fatalf("oversized metadata in embedding input = %q", last)
+	}
+
+	warned, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "encoding.txt", MimeType: "text/plain", Bytes: []byte{'c', 'a', 'f', 0xe9},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.runNextJob(t)
+	document := f.docStatus(t, c.ID, warned.Document.ID)
+	if len(document.Warnings) == 0 || !strings.Contains(strings.Join(document.Warnings, " "), "windows-1252") {
+		t.Fatalf("document warnings = %q", document.Warnings)
+	}
+	if _, err := f.svc.ReprocessDocument(ctx, f.principal, warned.Document.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.runNextJob(t)
+	if got := f.docStatus(t, c.ID, warned.Document.ID).Warnings; !reflect.DeepEqual(got, document.Warnings) {
+		t.Fatalf("warnings changed after chunk reuse: before=%q after=%q", document.Warnings, got)
+	}
+}
+
+func TestRetiredIndexWaitsForSoakAndReplacementPoints(t *testing.T) {
+	f := newFixture(t)
+	f.svc.SetIndexRetirementSoak(time.Hour)
+	ctx := context.Background()
+	c := f.collection(t)
+	if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "note.txt", MimeType: "text/plain", Bytes: []byte("enclava retirement"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.runNextJob(t)
+	prefix := "passage: "
+	updated, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{PassagePrefix: &prefix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.runNextJob(t)
+	if _, exists := f.vector.points[c.QdrantCollection]; !exists {
+		t.Fatal("retired index dropped during soak")
+	}
+	f.svc.SetIndexRetirementSoak(time.Nanosecond)
+	replacement := f.vector.points[updated.QdrantCollection]
+	f.vector.points[updated.QdrantCollection] = nil
+	if _, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := f.vector.points[c.QdrantCollection]; !exists {
+		t.Fatal("retired index dropped without replacement points")
+	}
+	f.vector.points[updated.QdrantCollection] = replacement
+	if _, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := f.vector.points[c.QdrantCollection]; exists {
+		t.Fatal("unused retired index kept after soak and replacement verification")
 	}
 }
 
@@ -789,7 +1169,8 @@ func TestAttemptRetriesWhenIndexDropped(t *testing.T) {
 	if err := claim.Fail(ctx, err, jobs.FailureRetryable); err != nil {
 		t.Fatalf("fail attempt: %v", err)
 	}
-	// The retry becomes leasable after the runner's short backoff.
+	// The retried attempt becomes leasable after the runner's short backoff;
+	// nothing is published, so no re-embed scan was queued.
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
 		if claim, err = f.jobs.Lease(ctx, "test-worker", time.Minute); err != nil || claim != nil || time.Now().After(deadline) {
 			break

@@ -21,9 +21,10 @@ import (
 )
 
 const (
-	OperationEmbed  = "rag.embed"
-	OperationIngest = "rag.ingest"
-	OperationAccess = "rag.access"
+	OperationEmbed       = "rag.embed"
+	OperationIngest      = "rag.ingest"
+	OperationAccess      = "rag.access"
+	OperationReembedScan = "rag.reembed_scan"
 )
 
 // ErrProfileNotFound marks a chunk_profile_version_id that does not exist in
@@ -108,6 +109,10 @@ type Repository interface {
 	// embedded under other settings than the collection's current index and
 	// document-name choice, with no newer attempt queued or running.
 	DocumentsToReembed(ctx context.Context, tenantID string, c Collection) ([]Document, error)
+	ReembedProgressDocuments(ctx context.Context, tenantID string, c Collection) (pending []Document, total []Document, err error)
+	PendingReembed(ctx context.Context, tenantID string, c Collection) (bool, error)
+	LatestReusableGeneration(ctx context.Context, tenantID, collectionID, versionID, profileVersionID string) (int64, []string, error)
+	SetGenerationWarnings(ctx context.Context, tenantID, collectionID, versionID string, generation int64, warnings []string) error
 }
 
 type VectorStore interface {
@@ -132,6 +137,8 @@ type Service struct {
 	executor                   Executor
 	defaultEmbeddingModel      string
 	defaultEmbeddingDimensions int
+	utilityModel               string
+	indexRetirementSoak        time.Duration
 	artifacts                  *artifacts.Store
 	parser                     *extract.Parser
 	jobs                       *jobs.Service
@@ -163,6 +170,10 @@ func NewService(repo Repository, vectorStore VectorStore, executor Executor, def
 // SetDefaultEmbeddingDimensions sets the vector size a collection on the
 // default model gets when it picks none (0 = the model's full output).
 func (s *Service) SetDefaultEmbeddingDimensions(n int) { s.defaultEmbeddingDimensions = n }
+
+func (s *Service) SetIndexRetirementSoak(d time.Duration) { s.indexRetirementSoak = d }
+
+func (s *Service) SetSourceAccessMaxStale(d time.Duration) { s.authorizer.MaxStale = d }
 
 // DefaultEmbedding reports the deployment default model and its vector size.
 func (s *Service) DefaultEmbedding() (string, int) {
@@ -210,8 +221,6 @@ func newIndexName(collectionID string) string {
 // one snapshot, so concurrent deletes cannot shift it, and it is derived
 // from the generations themselves, so saving the settings again resumes
 // whatever an interrupted change left undone.
-// shortcut: enqueues inline in the request; move to a fan-out job if
-// collections reach tens of thousands of documents.
 func (s *Service) reembedPending(ctx context.Context, p auth.Principal, c Collection) error {
 	docs, err := s.repo.DocumentsToReembed(ctx, p.TenantID, c)
 	if err != nil {
@@ -235,6 +244,88 @@ func (s *Service) reembedPending(ctx context.Context, p auth.Principal, c Collec
 		}
 	}
 	return nil
+}
+
+func (s *Service) enqueueReembedScan(ctx context.Context, p auth.Principal, c Collection) error {
+	pending, err := s.repo.PendingReembed(ctx, p.TenantID, c)
+	if err != nil || !pending {
+		return err
+	}
+	if s.jobs == nil {
+		return errors.New("rag: jobs are not configured")
+	}
+	// A completed scan's identity must never be reused — saving the same
+	// settings twice still needs a fresh scan. Only a live scan dedupes.
+	active, err := s.jobs.ListTenantActivity(ctx, p, []string{OperationReembedScan}, []string{jobs.StatusQueued, jobs.StatusRunning}, 100)
+	if err != nil {
+		return err
+	}
+	for _, job := range active {
+		if stringFromPayload(job.Policy, "collection_id") == c.ID {
+			return nil
+		}
+	}
+	_, _, err = s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
+		TenantID: p.TenantID, Operation: OperationReembedScan,
+		IdempotencyKey: fmt.Sprintf("rag.reembed_scan:%s:%s", c.ID, newID("scan")),
+		InputRef:       c.ID, Policy: map[string]any{"collection_id": c.ID},
+	})
+	return err
+}
+
+func (s *Service) ReembedScanJobHandler() jobs.HandlerFunc {
+	return func(ctx context.Context, claim *jobs.Claim, _ jobs.InputFunc) (string, error) {
+		job := claim.Job()
+		var p auth.Principal
+		if err := json.Unmarshal(job.PrincipalSnapshot, &p); err != nil {
+			return "", fmt.Errorf("decode frozen principal: %w", err)
+		}
+		id := stringFromPayload(job.Policy, "collection_id")
+		if p.TenantID != job.TenantID || id == "" || job.InputRef != id {
+			return "", source.ErrDenied
+		}
+		c, err := s.GetCollection(ctx, p, id)
+		if err != nil {
+			return "", err
+		}
+		if !collectionManageable(c, p) {
+			return "", source.ErrDenied
+		}
+		if err := s.reembedPending(ctx, p, c); err != nil {
+			return "", err
+		}
+		return id, nil
+	}
+}
+
+func (s *Service) ReembedProgress(ctx context.Context, p auth.Principal, collectionID string) (pending, total int64, err error) {
+	c, err := s.GetCollection(ctx, p, collectionID)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !collectionManageable(c, p) {
+		return 0, 0, source.ErrDenied
+	}
+	pendingDocs, totalDocs, err := s.repo.ReembedProgressDocuments(ctx, p.TenantID, c)
+	if err != nil {
+		return 0, 0, err
+	}
+	pendingIDs := make(map[string]struct{}, len(pendingDocs))
+	for _, doc := range pendingDocs {
+		pendingIDs[doc.ID] = struct{}{}
+	}
+	for _, doc := range totalDocs {
+		if denied, failure := deniedOrFailed(s.authorizeDocumentRead(ctx, p, doc)); failure != nil {
+			return 0, 0, failure
+		} else if denied {
+			continue
+		}
+		total++
+		if _, ok := pendingIDs[doc.ID]; ok {
+			pending++
+		}
+	}
+	return pending, total, nil
 }
 
 // reembedDocument queues the document's next generation under c's settings.
@@ -264,8 +355,35 @@ func (s *Service) dropUnusedIndexes(ctx context.Context, tenantID, collectionID 
 	if err != nil {
 		return err
 	}
+	counter, ok := s.vectorStore.(interface {
+		CountPoints(context.Context, string) (int64, error)
+	})
+	if !ok {
+		return nil
+	}
+	published, err := s.repo.ListPublishedGenerations(ctx, tenantID, collectionID)
+	if err != nil {
+		return err
+	}
+	for _, generation := range published {
+		if generation.QdrantCollection == c.QdrantCollection {
+			count, err := counter.CountPoints(ctx, c.QdrantCollection)
+			if err != nil || count <= 0 {
+				return err
+			}
+			break
+		}
+	}
+	soak := s.indexRetirementSoak
+	if soak == 0 {
+		soak = 24 * time.Hour
+	}
 	for _, name := range c.RetiredQdrantCollections {
 		if _, used := live[name]; used || name == c.QdrantCollection {
+			continue
+		}
+		since, known := c.RetiredIndexSince[name]
+		if soak > 0 && (!known || time.Since(since) < soak) {
 			continue
 		}
 		if err := s.vectorStore.DeleteCollection(ctx, name); err != nil {
@@ -314,6 +432,13 @@ func (s *Service) CreateCollection(ctx context.Context, p auth.Principal, input 
 			return Collection{}, err
 		}
 	}
+	queryPrefix, passagePrefix := defaultEmbeddingPrefixes(embeddingModel)
+	if input.QueryPrefix != nil {
+		queryPrefix = *input.QueryPrefix
+	}
+	if input.PassagePrefix != nil {
+		passagePrefix = *input.PassagePrefix
+	}
 	id := newID("ragcol")
 	profileVersionID := ""
 	if input.ChunkProfileVersionID != nil {
@@ -327,6 +452,8 @@ func (s *Service) CreateCollection(ctx context.Context, p auth.Principal, input 
 		OwnerActorID:          p.ActorID,
 		QdrantCollection:      "rag_" + safeCollectionName(id),
 		EmbeddingModel:        embeddingModel,
+		QueryPrefix:           queryPrefix,
+		PassagePrefix:         passagePrefix,
 		EmbeddingDimensions:   embeddingDimensions,
 		EmbedTitles:           input.EmbedTitles == nil || *input.EmbedTitles,
 		ChunkSize:             chunkSize,
@@ -411,6 +538,7 @@ func (s *Service) UpdateCollection(ctx context.Context, p auth.Principal, id str
 		c.Description = strings.TrimSpace(*input.Description)
 	}
 	model, dims := c.EmbeddingModel, c.EmbeddingDimensions
+	passagePrefix := c.PassagePrefix
 	if input.EmbeddingModel != nil {
 		c.EmbeddingModel = strings.TrimSpace(*input.EmbeddingModel)
 	}
@@ -422,7 +550,16 @@ func (s *Service) UpdateCollection(ctx context.Context, p auth.Principal, id str
 			return Collection{}, err
 		}
 	}
-	if c.EmbeddingModel != model || c.EmbeddingDimensions != dims {
+	if c.EmbeddingModel != model {
+		c.QueryPrefix, c.PassagePrefix = defaultEmbeddingPrefixes(c.EmbeddingModel)
+	}
+	if input.QueryPrefix != nil {
+		c.QueryPrefix = *input.QueryPrefix
+	}
+	if input.PassagePrefix != nil {
+		c.PassagePrefix = *input.PassagePrefix
+	}
+	if c.EmbeddingModel != model || c.EmbeddingDimensions != dims || c.PassagePrefix != passagePrefix {
 		// One Qdrant collection holds one model's vectors at one size: the new
 		// settings get their own index while every document re-embeds in the
 		// background, and search reads the previous index until each is done.
@@ -486,9 +623,7 @@ func (s *Service) UpdateCollection(ctx context.Context, p auth.Principal, id str
 	if err != nil {
 		return Collection{}, err
 	}
-	// Every save re-derives the outstanding re-embedding, so a retry after an
-	// interrupted settings change finishes it.
-	if err := s.reembedPending(ctx, p, updated); err != nil {
+	if err := s.enqueueReembedScan(ctx, p, updated); err != nil {
 		return Collection{}, err
 	}
 	// Drops an old index nothing reads any more — at once for an empty
@@ -1026,22 +1161,6 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 			return "", err
 		}
 	}
-	ref := artifacts.Ref{TenantID: job.TenantID, ID: ver.ArtifactRef, Kind: artifacts.KindOriginal}
-	objectRef := source.ObjectRef{TenantID: job.TenantID, ObjectID: objectID, ObservedSeq: seq}
-	document, err := s.parser.Parse(ctx, ref, extract.ParseOptions{
-		Filename: ver.OriginalFilename, MIMEType: ver.MimeType, ObjectRef: objectRef,
-	})
-	if err != nil {
-		return "", err
-	}
-	if len(document.Blocks) == 0 {
-		return "", errors.New("document has no extractable text")
-	}
-	document = applyConnectorStructure(document, obj, ver.Provenance)
-	parserVersion := "extract-v1"
-	if err := s.repo.SaveParsedDocument(ctx, parserVersion, document); err != nil {
-		return "", err
-	}
 	profileVersionID := stringFromPayload(job.Policy, "chunk_profile_version_id")
 	if profileVersionID == "" {
 		// Queued before the freeze landed: fall back to the collection's
@@ -1058,19 +1177,56 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	if err != nil {
 		return "", fmt.Errorf("load frozen chunk profile %s: %w", profileVersionID, err)
 	}
-	profile := source.ChunkProfile{
-		ID: profileRow.ID, ProfileID: profileRow.ProfileID, Version: profileRow.Version,
-		SizeCodePoints: profileRow.SizeCodePoints, OverlapCodePoints: profileRow.OverlapCodePoints,
-		BoundaryStrategy: profileRow.BoundaryStrategy, TableHandling: profileRow.TableHandling,
-		IncludeParents: profileRow.IncludeParents, PreserveClauses: profileRow.PreserveClauses,
-		PreserveAuthorship: profileRow.PreserveAuthorship,
-	}
-	structuredChunks, err := extract.Chunk(document, profile)
+	previous, warnings, err := s.repo.LatestReusableGeneration(ctx, job.TenantID, c.ID, versionRowID(ver), profileVersionID)
 	if err != nil {
 		return "", err
 	}
+	var document source.Document
+	var structuredChunks []source.Chunk
+	var previousChunks []DocumentChunk
+	if previous != 0 {
+		previousChunks, err = s.repo.ListGenerationChunks(ctx, job.TenantID, c.ID, versionRowID(ver), previous)
+		if err != nil {
+			return "", err
+		}
+		for _, chunk := range previousChunks {
+			structuredChunks = append(structuredChunks, source.Chunk{Ordinal: chunk.ChunkIndex, Text: chunk.Content, Spans: chunk.SpanRefs})
+		}
+	} else {
+		ref := artifacts.Ref{TenantID: job.TenantID, ID: ver.ArtifactRef, Kind: artifacts.KindOriginal}
+		objectRef := source.ObjectRef{TenantID: job.TenantID, ObjectID: objectID, ObservedSeq: seq}
+		document, err = s.parser.Parse(ctx, ref, extract.ParseOptions{
+			Filename: ver.OriginalFilename, MIMEType: ver.MimeType, ObjectRef: objectRef,
+		})
+		if err != nil {
+			return "", err
+		}
+		if len(document.Blocks) == 0 {
+			return "", errors.New("document has no extractable text")
+		}
+		document = applyConnectorStructure(document, obj, ver.Provenance)
+		if err := s.repo.SaveParsedDocument(ctx, "extract-v1", document); err != nil {
+			return "", err
+		}
+		structuredChunks, err = extract.Chunk(document, profileRow)
+		if err != nil {
+			return "", err
+		}
+		warnings = append(warnings, document.ParseWarnings...)
+		for _, chunk := range structuredChunks {
+			warnings = append(warnings, chunk.Warnings...)
+		}
+	}
 	if len(structuredChunks) == 0 {
 		return "", errors.New("document has no extractable text")
+	}
+	seenWarnings := make(map[string]bool, len(warnings))
+	uniqueWarnings := make([]string, 0, len(warnings))
+	for _, warning := range warnings {
+		if !seenWarnings[warning] {
+			seenWarnings[warning] = true
+			uniqueWarnings = append(uniqueWarnings, warning)
+		}
 	}
 	// HeaderPath is the real heading ancestry of the chunk's spans, read
 	// from the retained parsed blocks at materialization — never post-hoc
@@ -1104,18 +1260,13 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		return ""
 	}
 	chunkTexts := make([]string, 0, len(structuredChunks))
+	embedTexts := make([]string, 0, len(structuredChunks))
+	searchTexts := make([]string, 0, len(structuredChunks))
 	for _, chunk := range structuredChunks {
 		chunkTexts = append(chunkTexts, chunk.Text)
-	}
-	// The document name ahead of each chunk tells documents apart (measured:
-	// +4.5 MRR points across 11 docs, −4.6 inside one book); only the
-	// embedding input changes, never the stored chunk.
-	embedTexts := chunkTexts
-	if title := strings.TrimSpace(ver.OriginalFilename); c.EmbedTitles && title != "" {
-		embedTexts = make([]string, len(chunkTexts))
-		for i, text := range chunkTexts {
-			embedTexts[i] = title + "\n" + text
-		}
+		embedding, search := embeddingTexts(c, obj, ver, chunk.Text, profileRow.SizeCodePoints)
+		embedTexts = append(embedTexts, embedding)
+		searchTexts = append(searchTexts, search)
 	}
 
 	if err := claim.MarkDispatched(ctx); err != nil {
@@ -1138,7 +1289,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	if err != nil {
 		return "", err
 	}
-	if len(vectors) == 0 || len(vectors[0]) == 0 {
+	if len(vectors) != len(chunkTexts) || len(vectors) == 0 || len(vectors[0]) == 0 {
 		return "", errors.New("provider returned empty embedding")
 	}
 
@@ -1157,13 +1308,17 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 			QdrantPointID: pointID, Metadata: map[string]any{"file_name": ver.OriginalFilename},
 			HeaderPath: headerPathFor(structuredChunks[i].Spans),
 		}
+		if previous != 0 {
+			chunk.ChunkIndex = previousChunks[i].ChunkIndex
+			chunk.HeaderPath = previousChunks[i].HeaderPath
+		}
 		payload := map[string]any{
 			"tenant_id":     job.TenantID,
 			"object_ref":    map[string]any{"tenant_id": job.TenantID, "connection_id": obj.ConnectionID, "object_id": obj.ID, "observed_seq": seq},
 			"collection_id": c.ID, "document_id": obj.ID, "connection_id": obj.ConnectionID,
 			"object_version_id": versionRowID(ver), "observed_seq": seq,
-			"generation": generation, "chunk_id": chunkID, "chunk_index": i,
-			"content": chunkText, "file_name": ver.OriginalFilename,
+			"generation": generation, "chunk_id": chunkID, "chunk_index": chunk.ChunkIndex,
+			"content": chunkText, "search_text": searchTexts[i], "file_name": ver.OriginalFilename,
 			"source_type": obj.Kind, "source_id": obj.NativeID, "source_uri": sourceURI,
 			"metadata": docMetadata, "access_revision": accessRevision, "access_enabled": true,
 		}
@@ -1185,7 +1340,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		payload["block_spans"] = spanPayload
 		chunks = append(chunks, chunk)
 		points = append(points, QdrantPoint{
-			ID: pointID, Vector: vectors[i], Sparse: sparseVector(chunkText), Payload: payload,
+			ID: pointID, Vector: vectors[i], Sparse: sparseVector(searchTexts[i]), Payload: payload,
 		})
 	}
 
@@ -1196,6 +1351,9 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		if errors.Is(err, ErrGenerationSuperseded) {
 			return versionRowID(ver), nil // a newer generation owns the document
 		}
+		return "", err
+	}
+	if err := s.repo.SetGenerationWarnings(ctx, job.TenantID, c.ID, versionRowID(ver), generation, uniqueWarnings); err != nil {
 		return "", err
 	}
 	// The generation records the index this attempt writes to — the settings
@@ -1240,7 +1398,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	// The settings changed after this attempt read them: it published under
 	// the old ones, so queue the document again under the current settings.
 	if latest, err := s.repo.GetCollection(ctx, job.TenantID, c.ID); err == nil &&
-		(latest.QdrantCollection != c.QdrantCollection || latest.EmbedTitles != c.EmbedTitles) {
+		(latest.QdrantCollection != c.QdrantCollection || latest.EmbedTitles != c.EmbedTitles || latest.PassagePrefix != c.PassagePrefix) {
 		if err := s.reembedDocument(ctx, p, latest, obj.ID, versionRowID(ver), seq); err != nil {
 			log.Printf("rag: requeue %s under current settings: %v", obj.ID, err)
 		}

@@ -237,6 +237,7 @@ func (a *App) handleDashboardSourcesDrawer(w http.ResponseWriter, r *http.Reques
 type dashboardSourceBindingsData struct {
 	SourceID   string
 	SourceName string
+	Source     connectors.Source
 	Bindings   []source.SourceIdentity
 }
 
@@ -254,6 +255,7 @@ func (a *App) handleDashboardSourcesBindings(w http.ResponseWriter, r *http.Requ
 	data := dashboardSourceBindingsData{SourceID: sourceID}
 	if src, err := a.connectorSvc.GetSource(r.Context(), p, sourceID); err == nil {
 		data.SourceName = src.Name
+		data.Source = src
 	} else {
 		writeConnectorNotFoundOrError(w, err, "connector_source_fetch_failed")
 		return

@@ -182,6 +182,25 @@ func (a *App) handleExternalChatbotCompletionStream(w http.ResponseWriter, r *ht
 		a.writeChatbotCompletionError(w, ctx, err)
 		return
 	}
+	var assistant strings.Builder
+	// completed is sticky: once [DONE] is forwarded the answer was delivered, so
+	// a later disconnect or scanner error must not downgrade it.
+	completed := false
+	defer func() {
+		recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		finalize := func() error {
+			if completed {
+				return a.chatbotSvc.PersistAssistantMessage(recordCtx, principal, prepared, assistant.String())
+			}
+			return a.chatbotSvc.InterruptAssistantMessage(recordCtx, principal, prepared)
+		}
+		if err := finalize(); err != nil {
+			if err = finalize(); err != nil {
+				log.Printf("chatbot assistant message finalize failed: %v", err)
+			}
+		}
+	}()
 	res, err := a.chatbotSvc.ExecutePrepared(ctx, principal, prepared)
 	if err != nil {
 		a.writeChatbotCompletionError(w, ctx, err)
@@ -204,7 +223,6 @@ func (a *App) handleExternalChatbotCompletionStream(w http.ResponseWriter, r *ht
 	scanner := bufio.NewScanner(res.Body)
 	scanner.Buffer(make([]byte, 0, maxSSELineBytes), maxSSELineBytes)
 	eventData := make([]byte, 0, 256)
-	var assistant strings.Builder
 
 	for {
 		if ctx.Err() != nil {
@@ -228,7 +246,11 @@ func (a *App) handleExternalChatbotCompletionStream(w http.ResponseWriter, r *ht
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "data:") {
 			data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
-			if data == "" || data == "[DONE]" {
+			if data == "[DONE]" {
+				completed = true
+				continue
+			}
+			if data == "" {
 				continue
 			}
 			if len(eventData)+len(data)+1 > maxSSEEventBytes {
@@ -252,11 +274,6 @@ func (a *App) handleExternalChatbotCompletionStream(w http.ResponseWriter, r *ht
 		}
 	}
 
-	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	if err := a.chatbotSvc.PersistAssistantMessage(recordCtx, principal, prepared, assistant.String()); err != nil {
-		log.Printf("chatbot assistant message persist failed: %v", err)
-	}
 }
 
 func chatbotRequestWantsStream(body []byte) bool {
