@@ -337,6 +337,17 @@ func htmlBlocks(text string) []parseBlock {
 	var body strings.Builder
 	blocked := ""
 	suspended := 0
+	// Text outside a recognized block (<div>, table cells, …) is still
+	// evidence: collect it and flush it as a paragraph at each block-level
+	// boundary instead of dropping it.
+	var stray strings.Builder
+	strayStart := 0
+	flushStray := func(end int) {
+		if s := strings.TrimSpace(stray.String()); s != "" {
+			out = append(out, parseBlock{kind: "paragraph", text: s, start: strayStart, end: end})
+		}
+		stray.Reset()
+	}
 	// closeActive ends the open block at end. Whitespace-only blocks (the
 	// empty <p> spacers e-book converters emit) are dropped rather than
 	// failing the whole member back to raw markup.
@@ -373,6 +384,7 @@ func htmlBlocks(text string) []parseBlock {
 			if z.Err() == io.EOF && implicitlyClosed(active) {
 				// HTML may omit the final </p> or </li>.
 				closeActive(offset)
+				flushStray(offset)
 				return out
 			}
 			return nil
@@ -380,12 +392,15 @@ func htmlBlocks(text string) []parseBlock {
 			tag, _ := z.TagName()
 			name := strings.ToLower(string(tag))
 			switch name {
-			case "script", "style", "iframe", "object":
+			case "head", "script", "style", "iframe", "object":
 				if kind == htmltoken.StartTagToken {
 					blocked = name
 				}
 				offset = end
 				continue
+			}
+			if htmlBlockTag(name) {
+				flushStray(offset)
 			}
 			blockKind, level := "", 0
 			switch {
@@ -419,10 +434,18 @@ func htmlBlocks(text string) []parseBlock {
 		case htmltoken.TextToken:
 			if active != nil {
 				body.Write(z.Text())
+			} else {
+				if stray.Len() == 0 {
+					strayStart = offset
+				}
+				stray.Write(z.Text())
 			}
 		case htmltoken.EndTagToken:
 			tag, _ := z.TagName()
 			name := strings.ToLower(string(tag))
+			if htmlBlockTag(name) {
+				flushStray(end)
+			}
 			matches := active != nil && ((active.kind == "heading" && name == fmt.Sprintf("h%d", active.level)) ||
 				(active.kind == "paragraph" && name == "p") || (active.kind == "list_item" && name == "li") ||
 				(active.kind == "code" && name == "pre"))

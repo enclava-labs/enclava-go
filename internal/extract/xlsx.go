@@ -111,7 +111,7 @@ func xlsxBlocks(data []byte) ([]parseBlock, []string, error) {
 	}
 	var blocks []parseBlock
 	var warnings []string
-	cells, offset := 0, 0
+	cells, offset, decoded := 0, 0, 0
 	appendBlock := func(b parseBlock) {
 		b.start, b.end = offset, offset+len(b.text)
 		offset = b.end + 1
@@ -181,6 +181,11 @@ func xlsxBlocks(data []byte) ([]parseBlock, []string, error) {
 					}
 				}
 				values[col-1] = value
+				// Shared/inline strings expand past the ZIP size guard, so cap resolved text too.
+				decoded += len(value)
+				if decoded > maxExpandedBytes {
+					return nil, nil, ErrDocumentTooLarge
+				}
 			}
 			cells += len(values)
 			text := strings.Join(values, "\t")

@@ -161,17 +161,43 @@ func Chunk(document source.Document, profile source.ChunkProfile) ([]source.Chun
 
 func tableChunks(group []source.Block, ref source.ObjectRef, profile source.ChunkProfile, emit func(source.Chunk)) {
 	header := group[0]
+	headerRunes := utf8.RuneCountInString(header.Text)
+	// The header is repeated in every chunk only when it leaves room for the
+	// "\n" join plus at least one row rune; otherwise repeating it would push
+	// every row fragment over the size budget, so it is split once instead.
+	headerFits := headerRunes+1 < profile.SizeCodePoints
 	newChunk := func() source.Chunk {
-		return source.Chunk{ObjectRef: ref, ProfileID: profile.ID, Text: header.Text,
-			Spans: []source.Span{{Ref: ref, BlockID: header.ID, ByteEnd: len(header.Text)}}}
+		chunk := source.Chunk{ObjectRef: ref, ProfileID: profile.ID}
+		if headerFits {
+			chunk.Text = header.Text
+			chunk.Spans = []source.Span{{Ref: ref, BlockID: header.ID, ByteEnd: len(header.Text)}}
+		}
+		return chunk
 	}
 	produced := false
+	if !headerFits {
+		produced = true
+		for start := 0; start < len(header.Text); {
+			end := boundedEnd(header.Text, start, profile.SizeCodePoints)
+			chunk := newChunk()
+			chunk.Text = header.Text[start:end]
+			chunk.Spans = []source.Span{{Ref: ref, BlockID: header.ID, ByteStart: start, ByteEnd: end}}
+			if end < len(header.Text) {
+				chunk.Warnings = append(chunk.Warnings, "source block split at configured Unicode code-point size")
+			}
+			emit(chunk)
+			start = end
+		}
+	}
 	current := newChunk()
 	rows := 0
 	for _, row := range group[1:] {
 		if profile.TableHandling == "row-wise" {
 			chunk := newChunk()
-			chunk.Text += "\n" + row.Text
+			if chunk.Text != "" {
+				chunk.Text += "\n"
+			}
+			chunk.Text += row.Text
 			chunk.Spans = append(chunk.Spans, source.Span{Ref: ref, BlockID: row.ID, ByteEnd: len(row.Text)})
 			if utf8.RuneCountInString(chunk.Text) > profile.SizeCodePoints {
 				chunk.Warnings = append(chunk.Warnings, "table row exceeded configured size")
@@ -181,18 +207,21 @@ func tableChunks(group []source.Block, ref source.ObjectRef, profile source.Chun
 			continue
 		}
 		for start := 0; start < len(row.Text); {
-			remaining := profile.SizeCodePoints - utf8.RuneCountInString(current.Text) - 1
+			remaining := profile.SizeCodePoints - utf8.RuneCountInString(current.Text)
+			if current.Text != "" {
+				remaining--
+			}
 			if rows > 0 && utf8.RuneCountInString(row.Text[start:]) > remaining {
 				emit(current)
 				produced = true
 				current, rows = newChunk(), 0
 				continue
 			}
-			if remaining < 1 {
-				remaining = 1
-			}
 			end := boundedEnd(row.Text, start, remaining)
-			current.Text += "\n" + row.Text[start:end]
+			if current.Text != "" {
+				current.Text += "\n"
+			}
+			current.Text += row.Text[start:end]
 			current.Spans = append(current.Spans, source.Span{Ref: ref, BlockID: row.ID, ByteStart: start, ByteEnd: end})
 			rows++
 			if end < len(row.Text) {

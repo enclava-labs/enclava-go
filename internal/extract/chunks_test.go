@@ -167,6 +167,46 @@ func TestCSVHeaderChunksAndCap(t *testing.T) {
 	}
 }
 
+// TestCSVOversizedHeaderStaysWithinBudget: a header wider than the chunk budget
+// was repeated before every row fragment, producing oversized chunks until the
+// chunk cap dropped the remaining rows. The header is split within budget once
+// and the rows chunk without it, so no header or row text is lost.
+func TestCSVOversizedHeaderStaysWithinBudget(t *testing.T) {
+	input := strings.Repeat("h", 250) + "\n" + strings.Repeat("alice,42\n", 50)
+	parsed, err := csvBlocks([]byte(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := source.ObjectRef{TenantID: "tenant", ObjectID: "csv-wide", ObservedSeq: 1}
+	doc := makeDocument(ref, artifacts.Ref{SHA256: "csv"}, parsed)
+	want := doc.Blocks[0].Text
+	for _, row := range doc.Blocks[1:] {
+		want += row.Text
+	}
+	profile := source.ChunkProfile{ID: "cpv", ProfileID: "csv", Version: 1, SizeCodePoints: 100, BoundaryStrategy: "fixed", TableHandling: "atomic"}
+	for _, handling := range []string{"atomic", "row-wise"} {
+		profile.TableHandling = handling
+		chunks, err := Chunk(doc, profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var joined string
+		for _, chunk := range chunks {
+			if !utf8.ValidString(chunk.Text) || utf8.RuneCountInString(chunk.Text) > profile.SizeCodePoints {
+				t.Fatalf("%s: chunk is invalid UTF-8 or exceeds code-point size: %q", handling, chunk.Text)
+			}
+			joined += strings.ReplaceAll(chunk.Text, "\n", "")
+		}
+		if joined != want {
+			t.Fatalf("%s: chunks lost header or row text: got %d bytes, want %d", handling, len(joined), len(want))
+		}
+		if handling == "atomic" && len(chunks) >= 20 {
+			t.Fatalf("atomic: chunk count not proportional to input: %d", len(chunks))
+		}
+		assertResolvedChunkSpans(t, doc, chunks)
+	}
+}
+
 // TestChunkFixedPacksShortBlocksUpToSize: a converted e-book with one line
 // per paragraph must chunk into size-bounded windows of consecutive lines —
 // one chunk per line made every chunk a sentence fragment.

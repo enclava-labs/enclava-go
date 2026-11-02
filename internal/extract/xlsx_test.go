@@ -1,6 +1,7 @@
 package extract
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -33,5 +34,24 @@ func TestXLSXSheetsAndCellLimit(t *testing.T) {
 	_, warnings, err = xlsxBlocks(writeZip(t, files))
 	if err != nil || len(warnings) != 1 || !strings.HasPrefix(warnings[0], "truncated: sheet First exceeded the cell limit") {
 		t.Fatalf("spreadsheet cell limit warnings=%v err=%v", warnings, err)
+	}
+}
+
+func TestXLSXSharedStringExpansionLimit(t *testing.T) {
+	workbook := `<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Big" r:id="r1"/></sheets></workbook>`
+	rels := `<Relationships><Relationship Id="r1" Target="worksheets/sheet1.xml"/></Relationships>`
+	shared := `<sst><si><t>` + strings.Repeat("x", 1<<20) + `</t></si></sst>`
+	var rows strings.Builder
+	for i := 1; i <= 70; i++ {
+		fmt.Fprintf(&rows, `<row r="%d"><c r="A%d" t="s"><v>0</v></c></row>`, i, i)
+	}
+	files := map[string]string{
+		"xl/workbook.xml":            workbook,
+		"xl/_rels/workbook.xml.rels": rels,
+		"xl/sharedStrings.xml":       shared,
+		"xl/worksheets/sheet1.xml":   `<worksheet><sheetData>` + rows.String() + `</sheetData></worksheet>`,
+	}
+	if _, _, err := xlsxBlocks(writeZip(t, files)); !errors.Is(err, ErrDocumentTooLarge) {
+		t.Fatalf("shared string expansion error=%v", err)
 	}
 }
