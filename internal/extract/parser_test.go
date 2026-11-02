@@ -49,6 +49,26 @@ func TestHTMLBlocksDoNotIncludeScriptsOrFetchResources(t *testing.T) {
 	}
 }
 
+// A block nested inside a list item (<li>…<p>…</p>…</li>) must not
+// silently drop the item's trailing text the way the sibling-boundary
+// rule did.
+func TestHTMLBlocksKeepTextAroundNestedBlocks(t *testing.T) {
+	var texts []string
+	for _, b := range htmlBlocks(`<ul><li>before<p>inside</p>after</li><li>next</li></ul>`) {
+		texts = append(texts, b.text)
+	}
+	if strings.Join(texts, "|") != "before|inside|after|next" {
+		t.Fatalf("nested block lost text: %#v", texts)
+	}
+	texts = nil
+	for _, b := range htmlBlocks(`<ul><li>outer<ul><li>deep</li></ul>tail</li><li>sibling</ul>`) {
+		texts = append(texts, b.text)
+	}
+	if strings.Join(texts, "|") != "outer|deep|tail|sibling" {
+		t.Fatalf("nested list lost text: %#v", texts)
+	}
+}
+
 func TestCSVRowsPreserveOrderAndByteSpans(t *testing.T) {
 	input := []byte("clause,amount\r\nfirst,12.50\r\nsecond,18.75\r\n")
 	blocks, err := csvBlocks(input)

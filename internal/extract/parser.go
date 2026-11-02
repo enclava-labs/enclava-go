@@ -290,6 +290,7 @@ func htmlBlocks(text string) []parseBlock {
 	var active *parseBlock
 	var body strings.Builder
 	blocked := ""
+	suspended := 0
 	// closeActive ends the open block at end. Whitespace-only blocks (the
 	// empty <p> spacers e-book converters emit) are dropped rather than
 	// failing the whole member back to raw markup.
@@ -352,12 +353,20 @@ func htmlBlocks(text string) []parseBlock {
 				blockKind = "code"
 			}
 			if blockKind != "" {
-				if !implicitlyClosed(active) {
-					return nil
+				if active != nil && active.kind == "list_item" {
+					// A block inside <li> is nested, not a sibling
+					// boundary: hold the item open so text after the
+					// inner block still lands in it.
+					suspended++
+					closeActive(offset)
+				} else {
+					if !implicitlyClosed(active) {
+						return nil
+					}
+					// A new block closes an open <p> or <li>, whose end
+					// tags HTML lets authors omit.
+					closeActive(offset)
 				}
-				// A new block closes an open <p> or <li>, whose end tags
-				// HTML lets authors omit.
-				closeActive(offset)
 				body.Reset()
 				active = &parseBlock{kind: blockKind, level: level, start: offset}
 			}
@@ -373,6 +382,11 @@ func htmlBlocks(text string) []parseBlock {
 				(active.kind == "code" && name == "pre"))
 			if matches {
 				closeActive(end)
+				if suspended > 0 {
+					suspended--
+					body.Reset()
+					active = &parseBlock{kind: "list_item", start: end}
+				}
 			}
 		}
 		offset = end
