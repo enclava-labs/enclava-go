@@ -78,6 +78,76 @@ func TestDashboardUsageOverviewUnsettled(t *testing.T) {
 	}
 }
 
+// TestDashboardUsageUnsettledMixedCurrencies covers two review findings:
+// the Unsettled KPI must keep each currency's sum separate (€1.00 + $2.00,
+// never €3.00), and a subject or API key whose only liability is held —
+// zero settled usage — must still render a breakdown row.
+func TestDashboardUsageUnsettledMixedCurrencies(t *testing.T) {
+	f := newBudgetFixture(t)
+	svc := billing.NewService(f.repo)
+	admin := f.adminPrincipal()
+	ctx := context.Background()
+	priced := time.Now().UTC().Add(-time.Minute)
+
+	for id, p := range map[string]billing.Price{
+		"mx-usd": {SubjectType: billing.PriceSubjectModel, SubjectID: "m-usd", Capability: "chat",
+			Unit: billing.UnitInput, RateMicros: 1_000_000, UnitQuantity: 1, Currency: "USD"},
+		"mx-eur": {SubjectType: billing.PriceSubjectModel, SubjectID: "m-eur", Capability: "chat",
+			Unit: billing.UnitInput, RateMicros: 1_000_000, UnitQuantity: 1, Currency: "EUR"},
+	} {
+		if err := f.repo.PutPrice(ctx, f.tenant, id, p, "tester", priced); err != nil {
+			t.Fatalf("put price %s: %v", id, err)
+		}
+	}
+
+	keyUSD := seedOwnedKey(t, f, "usd-key")
+	keyEUR := seedOwnedKey(t, f, "eur-key")
+	hold := func(key auth.APIKeyRecord, owner, model string, units int64) {
+		t.Helper()
+		p := admin
+		p.CredentialKind = "api_key"
+		p.CredentialID = key.ID
+		p.BillingSubjectKind = billing.BudgetSubjectUser
+		p.BillingSubjectID = owner
+		if _, err := svc.Reserve(ctx, p, billing.ReserveRequest{
+			SubjectKeys:    []billing.Subject{{Type: billing.BudgetSubjectAPIKey, ID: key.ID}},
+			BillingSubject: billing.Subject{Type: billing.BudgetSubjectUser, ID: owner},
+			Capability:     "chat", Model: model, EndpointID: "ep",
+			Estimate: billing.Usage{InputUnits: units},
+			Price:    billing.PriceKey{SubjectType: billing.PriceSubjectModel, SubjectID: model},
+		}); err != nil {
+			t.Fatalf("reserve %s %s: %v", model, owner, err)
+		}
+	}
+	// $2.00 held under owner-1/usd-key; €1.00 held under owner-2/eur-key.
+	// Nothing settles — owner-2 and eur-key have no settled usage at all.
+	hold(keyUSD, "owner-1", "m-usd", 2)
+	hold(keyEUR, "owner-2", "m-eur", 1)
+
+	body := renderUsagePage(t, f, f.app.handleDashboardUsagePage, "/dashboard/usage")
+	if !strings.Contains(body, "$2.00") || !strings.Contains(body, "€1.00") {
+		t.Fatalf("unsettled KPI must keep currencies apart: %s", body)
+	}
+	if strings.Contains(body, "€3.00") || strings.Contains(body, "$3.00") {
+		t.Fatalf("unsettled KPI merged currencies into the first code: %s", body)
+	}
+	// Held-only subject and key get zero-spend rows carrying their liability.
+	if !strings.Contains(body, "owner-2") {
+		t.Fatalf("held-only subject must render a by-subject row: %s", body)
+	}
+	if !strings.Contains(body, "eur-key") {
+		t.Fatalf("held-only key must render a by-key row: %s", body)
+	}
+	// Spend-by-subject itself must not claim emptiness beside liability.
+	subjectTable := body[strings.Index(body, "Spend by subject"):]
+	if i := strings.Index(subjectTable, "Spend by API key"); i >= 0 {
+		subjectTable = subjectTable[:i]
+	}
+	if strings.Contains(subjectTable, "No usage in this range") {
+		t.Fatalf("subject table must not claim emptiness beside liability: %s", body)
+	}
+}
+
 func TestDashboardUsageBudgetStatuses(t *testing.T) {
 	f := newBudgetFixture(t)
 	ctx := context.Background()

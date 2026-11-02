@@ -16,10 +16,33 @@
   }
 
   // Date inputs carry YYYY-MM-DD; the budget API needs RFC3339 timestamps.
-  function isoFromDay(value, fallbackNow) {
+  // Calendar days mean local midnight in the form's IANA timezone — resolve
+  // the zone's UTC offset at the candidate instant (DST-correct) via Intl.
+  function zoneOffsetMs(tz, ms) {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).formatToParts(new Date(ms));
+    const got = {};
+    for (const p of parts) got[p.type] = p.value;
+    return Date.UTC(+got.year, +got.month - 1, +got.day, +got.hour, +got.minute, +got.second) - ms;
+  }
+  function zonedMidnight(day, tz) {
+    const guess = Date.parse(day + 'T00:00:00Z');
+    if (isNaN(guess)) return null;
+    try {
+      // The guess's offset may be the neighbouring day's — re-resolve once.
+      return new Date(guess - zoneOffsetMs(tz, guess - zoneOffsetMs(tz, guess)));
+    } catch (e) {
+      // Unrecognized zone: fall back to UTC; the server re-validates anyway.
+      return new Date(guess);
+    }
+  }
+  function isoFromDay(value, tz, fallbackNow) {
     if (value) {
-      const d = new Date(value + 'T00:00:00Z');
-      if (!isNaN(d.getTime())) return d.toISOString();
+      const d = zonedMidnight(value, tz || 'UTC');
+      if (d) return d.toISOString();
     }
     return fallbackNow ? new Date().toISOString() : '';
   }
@@ -40,6 +63,7 @@
         { limit_value: Number(fd.get('limit_value')) });
     } else {
       const subjectType = String(fd.get('subject_type') || 'tenant');
+      const tz = String(fd.get('timezone') || '').trim() || 'UTC';
       const body = {
         name: String(fd.get('name') || '').trim(),
         subject_type: subjectType,
@@ -47,14 +71,14 @@
         limit_value: Number(fd.get('limit_value')),
         currency: String(fd.get('currency') || '').trim().toUpperCase(),
         period: String(fd.get('period') || ''),
-        timezone: String(fd.get('timezone') || '').trim() || 'UTC',
-        starts_at: isoFromDay(fd.get('starts_at'), true),
+        timezone: tz,
+        starts_at: isoFromDay(fd.get('starts_at'), tz, true),
       };
       if (subjectType !== 'tenant') {
         const picker = form.querySelector('[data-subject-for="' + subjectType + '"] select');
         body.subject_id = picker ? String(picker.value || '') : '';
       }
-      const endsAt = isoFromDay(fd.get('ends_at'), false);
+      const endsAt = isoFromDay(fd.get('ends_at'), tz, false);
       if (endsAt) body.ends_at = endsAt;
       request = window.Enclava.api('POST', '/api/v1/admin/budgets', body);
     }

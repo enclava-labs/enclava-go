@@ -244,13 +244,13 @@ func (a *App) usageOverview(ctx context.Context, tenantID string, days int) (usa
 		// money never counts twice. Largest currency leads, code order ties.
 		totals := map[string]int64{}
 		currencies := []string{}
-		for key, amounts := range canonical {
-			cur := amounts[0].Currency
-			if _, seen := totals[cur]; !seen {
-				currencies = append(currencies, cur)
+		for _, amounts := range canonical {
+			for _, amt := range amounts {
+				if _, seen := totals[amt.Currency]; !seen {
+					currencies = append(currencies, amt.Currency)
+				}
+				totals[amt.Currency] += amt.AmountMicros
 			}
-			totals[cur] += sumAmounts(amounts)
-			_ = key
 		}
 		sort.Strings(currencies)
 		primary := ""
@@ -270,7 +270,10 @@ func (a *App) usageOverview(ctx context.Context, tenantID string, days int) (usa
 		out.UnsettledFoot = strings.Join(extras, " + ")
 	}
 
-	out.BySubject = usageSpendRows(subjectRows, func(g postgres.UsageGroupSum) (string, string, string, bool) {
+	out.BySubject = usageSpendRows(mergeUnsettledRows(subjectRows, canonical, func(key string) (st, id string, keep bool) {
+		st, id, _ = strings.Cut(key, "\x00")
+		return st, id, st != billing.BudgetSubjectAPIKey
+	}), func(g postgres.UsageGroupSum) (string, string, string, bool) {
 		if g.SubjectType == billing.BudgetSubjectAPIKey {
 			return "", "", "", false
 		}
@@ -282,7 +285,10 @@ func (a *App) usageOverview(ctx context.Context, tenantID string, days int) (usa
 		return label, term(g.SubjectType), key, true
 	}, canonical)
 
-	out.ByKey = usageSpendRows(subjectRows, func(g postgres.UsageGroupSum) (string, string, string, bool) {
+	out.ByKey = usageSpendRows(mergeUnsettledRows(subjectRows, perKey, func(key string) (st, id string, keep bool) {
+		_, id, _ = strings.Cut(key, "\x00")
+		return billing.BudgetSubjectAPIKey, id, true
+	}), func(g postgres.UsageGroupSum) (string, string, string, bool) {
 		if g.SubjectType != billing.BudgetSubjectAPIKey {
 			return "", "", "", false
 		}
@@ -293,14 +299,6 @@ func (a *App) usageOverview(ctx context.Context, tenantID string, days int) (usa
 		return label, g.SubjectID, "api_key\x00" + g.SubjectID, true
 	}, perKey)
 	return out, nil
-}
-
-func sumAmounts(amounts []MoneyAmount) int64 {
-	var n int64
-	for _, a := range amounts {
-		n += a.AmountMicros
-	}
-	return n
 }
 
 // unsettledAmounts groups unsettled rows into a subject-keyed per-currency
@@ -317,6 +315,33 @@ func unsettledAmounts(rows []postgres.ReportUnsettledRow, attributed bool) map[s
 			Currency:     row.Currency,
 			AmountMicros: row.HeldMicros + row.UnknownMicros,
 		})
+	}
+	return out
+}
+
+// mergeUnsettledRows appends zero-spend UsageGroupSum rows for unsettled
+// (subject, currency) pairs that settled usage never produced — otherwise a
+// held-only subject or key carries KPI liability with no table row. subject
+// decodes a "type\x00id" key into the row's subject fields, keep=false drops
+// keys the table does not show (canonical api_key rows belong to ByKey).
+func mergeUnsettledRows(rows []postgres.UsageGroupSum, unsettled map[string][]MoneyAmount, subject func(key string) (st, id string, keep bool)) []postgres.UsageGroupSum {
+	have := map[[3]string]bool{}
+	for _, g := range rows {
+		have[[3]string{g.SubjectType, g.SubjectID, g.Currency}] = true
+	}
+	out := rows
+	for key, amounts := range unsettled {
+		st, id, keep := subject(key)
+		if !keep {
+			continue
+		}
+		for _, amt := range amounts {
+			if amt.AmountMicros <= 0 || have[[3]string{st, id, amt.Currency}] {
+				continue
+			}
+			have[[3]string{st, id, amt.Currency}] = true
+			out = append(out, postgres.UsageGroupSum{SubjectType: st, SubjectID: id, Currency: amt.Currency})
+		}
 	}
 	return out
 }

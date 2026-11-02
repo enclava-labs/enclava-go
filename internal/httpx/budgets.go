@@ -28,31 +28,6 @@ func billingSubjectOf(p auth.Principal) billing.Subject {
 	return billing.Subject{Type: billing.BudgetSubjectTenant, ID: p.TenantID}
 }
 
-// liabilityForBudget returns (units, amountMicros) of held+settled liability
-// inside the budget's liability window.
-func (a *App) liabilityForBudget(ctx context.Context, tenantID string, budget billing.Budget, now time.Time) (int64, int64, error) {
-	from := billing.LiabilityFrom(budget, now)
-	rows, err := a.billingRepo.Liabilities(ctx, tenantID, budget.Subject, from)
-	if err != nil {
-		return 0, 0, err
-	}
-	var units, micros int64
-	for _, row := range rows {
-		var ok bool
-		micros, ok = checkedBudgetAdd(micros, row.AmountMicros)
-		if !ok {
-			return math.MaxInt64, math.MaxInt64, nil
-		}
-		for _, u := range row.Units {
-			units, ok = checkedBudgetAdd(units, u)
-			if !ok {
-				return math.MaxInt64, math.MaxInt64, nil
-			}
-		}
-	}
-	return units, micros, nil
-}
-
 func checkedBudgetAdd(a, b int64) (int64, bool) {
 	if b > 0 && a > math.MaxInt64-b {
 		return 0, false
@@ -192,14 +167,25 @@ type currencyLiability struct {
 // budgetProgress is the state-separated liability projection mirroring
 // billing.admit() exactly: the same liability window (period start vs the
 // budget's starts_at, whichever is later), held/unknown/settled counted
-// separately per currency. For amount budgets only rows in the budget's own
-// currency count toward progress — other currencies are returned as
+// separately per currency. Once the budget ends the window freezes at its
+// final period — the read evaluates the window at ends_at and drops every
+// liability created at or after it, so a July budget ended August 1 never
+// shows November reservations. For amount budgets only rows in the budget's
+// own currency count toward progress — other currencies are returned as
 // informational liability rows, never in the denominator; tokens budgets
 // count per-kind units across every row. Overflow clamps at MaxInt64 the
 // way admit's checked sums refuse past it.
 func (a *App) budgetProgress(ctx context.Context, tenantID string, budget billing.Budget, now time.Time) (budgetProgressDTO, []budgetLiabilityRow, error) {
-	from := billing.LiabilityFrom(budget, now)
-	rows, err := a.billingRepo.Liabilities(ctx, tenantID, budget.Subject, from)
+	at := now
+	var until time.Time
+	if budget.EndsAt != nil && !now.Before(*budget.EndsAt) {
+		// LiabilityFrom(at) resolves the budget's last applicable period;
+		// until bounds created_at so post-ends_at liability stays out.
+		at = budget.EndsAt.Add(-time.Nanosecond)
+		until = *budget.EndsAt
+	}
+	from := billing.LiabilityFrom(budget, at)
+	rows, err := a.billingRepo.LiabilitiesInWindow(ctx, tenantID, budget.Subject, from, until)
 	if err != nil {
 		return budgetProgressDTO{}, nil, err
 	}

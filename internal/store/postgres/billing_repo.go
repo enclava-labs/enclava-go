@@ -229,7 +229,7 @@ func (t billingTx) SelectPrices(ctx context.Context, tenantID, subjectType, subj
 // tenant-wide over canonical rows; other subjects match their own
 // attribution rows, then their settled usage via the usage record's subject.
 func (t billingTx) Liabilities(ctx context.Context, tenantID string, scope billing.Subject, from time.Time) ([]billing.LiabilityRow, error) {
-	return queryLiabilities(ctx, t.tx, tenantID, scope, from)
+	return queryLiabilities(ctx, t.tx, tenantID, scope, from, time.Time{})
 }
 
 // billingQuerier is satisfied by *sql.DB and *sql.Tx.
@@ -237,7 +237,14 @@ type billingQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
-func queryLiabilities(ctx context.Context, q billingQuerier, tenantID string, scope billing.Subject, from time.Time) ([]billing.LiabilityRow, error) {
+// queryLiabilities bounds the window at [from, until): a zero until means
+// open-ended (the admission read); a real until scopes the projection to
+// liability created before it — the ended-budget read path.
+func queryLiabilities(ctx context.Context, q billingQuerier, tenantID string, scope billing.Subject, from, until time.Time) ([]billing.LiabilityRow, error) {
+	var untilArg any
+	if !until.IsZero() {
+		untilArg = until
+	}
 	acc := map[[2]string]*billing.LiabilityRow{}
 	order := [][2]string{}
 	add := func(state, currency string, amount int64) *billing.LiabilityRow {
@@ -257,11 +264,12 @@ func queryLiabilities(ctx context.Context, q billingQuerier, tenantID string, sc
 		SELECT state, currency::text, COALESCE(SUM(limit_amount_micros), 0)
 		FROM reservations
 		WHERE tenant_id = $1::uuid
+		  AND ($5::timestamptz IS NULL OR created_at < $5)
 		  AND (state = 'held' OR (state = 'unknown' AND created_at >= $4))
 		  AND (CASE WHEN $2 = 'tenant' THEN id NOT LIKE '%/%'
 		            ELSE subject_type = $2 AND subject_id = $3 END)
 		GROUP BY state, currency`,
-		tenantID, scope.Type, scope.ID, from)
+		tenantID, scope.Type, scope.ID, from, untilArg)
 	if err != nil {
 		return nil, fmt.Errorf("held liabilities: %w", err)
 	}
@@ -281,11 +289,12 @@ func queryLiabilities(ctx context.Context, q billingQuerier, tenantID string, sc
 			FROM reservations, LATERAL jsonb_each_text(reserved_units) e
 			WHERE NOT (e.key = 'cached_input' AND reserved_units ? 'input')
 			  AND tenant_id = $1::uuid
+			  AND ($5::timestamptz IS NULL OR created_at < $5)
 			  AND (state = 'held' OR (state = 'unknown' AND created_at >= $4))
 			  AND (CASE WHEN $2 = 'tenant' THEN id NOT LIKE '%/%'
 			            ELSE subject_type = $2 AND subject_id = $3 END)
 		) u GROUP BY state, currency, kind`,
-		tenantID, scope.Type, scope.ID, from)
+		tenantID, scope.Type, scope.ID, from, untilArg)
 	if err != nil {
 		return nil, fmt.Errorf("held liability units: %w", err)
 	}
@@ -295,7 +304,7 @@ func queryLiabilities(ctx context.Context, q billingQuerier, tenantID string, sc
 
 	// Settled usage inside the window: disjoint plain sums per scope rule.
 	var settledScope string
-	args := []any{tenantID, from}
+	args := []any{tenantID, from, untilArg}
 	switch {
 	case scope.Type == billing.BudgetSubjectTenant:
 		settledScope = ""
@@ -303,16 +312,17 @@ func queryLiabilities(ctx context.Context, q billingQuerier, tenantID string, sc
 		// Key-scoped settled usage matches the verified credential
 		// attribution column plus rows whose canonical subject is the key —
 		// a row is returned once either way, so nothing double-counts.
-		settledScope = ` AND (credential_id = $3 OR (subject_type = 'api_key' AND subject_id = $3))`
+		settledScope = ` AND (credential_id = $4 OR (subject_type = 'api_key' AND subject_id = $4))`
 		args = append(args, scope.ID)
 	default:
-		settledScope = ` AND subject_type = $3 AND subject_id = $4`
+		settledScope = ` AND subject_type = $4 AND subject_id = $5`
 		args = append(args, scope.Type, scope.ID)
 	}
 	rows, err = q.QueryContext(ctx, `
 		SELECT 'settled', currency::text, COALESCE(SUM(amount_micros), 0)
 		FROM usage_records
-		WHERE tenant_id = $1::uuid AND created_at >= $2`+settledScope+`
+		WHERE tenant_id = $1::uuid AND created_at >= $2
+		  AND ($3::timestamptz IS NULL OR created_at < $3)`+settledScope+`
 		GROUP BY currency`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("settled liabilities: %w", err)
@@ -323,7 +333,8 @@ func queryLiabilities(ctx context.Context, q billingQuerier, tenantID string, sc
 	rows, err = q.QueryContext(ctx, `
 		SELECT 'settled', currency::text, e.key, SUM(e.value::bigint)
 		FROM usage_records, LATERAL jsonb_each_text(units) e
-		WHERE tenant_id = $1::uuid AND created_at >= $2`+settledScope+`
+		WHERE tenant_id = $1::uuid AND created_at >= $2
+		  AND ($3::timestamptz IS NULL OR created_at < $3)`+settledScope+`
 		GROUP BY currency, e.key`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("settled liability units: %w", err)
@@ -909,7 +920,14 @@ func (r *BillingRepo) ListActiveBudgets(ctx context.Context, tenantID string, su
 // Liabilities is the read-path liability reconstruction used by the retained
 // EnforceBudget guard — identical semantics to the transactional read.
 func (r *BillingRepo) Liabilities(ctx context.Context, tenantID string, scope billing.Subject, from time.Time) ([]billing.LiabilityRow, error) {
-	return queryLiabilities(ctx, r.db, tenantID, scope, from)
+	return queryLiabilities(ctx, r.db, tenantID, scope, from, time.Time{})
+}
+
+// LiabilitiesInWindow scopes the same reconstruction to [from, until): a
+// zero until is open-ended; a real until drops liability created at or
+// after it — the ended-budget final-window read.
+func (r *BillingRepo) LiabilitiesInWindow(ctx context.Context, tenantID string, scope billing.Subject, from, until time.Time) ([]billing.LiabilityRow, error) {
+	return queryLiabilities(ctx, r.db, tenantID, scope, from, until)
 }
 
 // UsageGroupSum aggregates settled usage_records per group key.

@@ -131,6 +131,61 @@ func TestAdminBudgetListStatusesAndDelete(t *testing.T) {
 	}
 }
 
+// An ended budget projects over its final applicable window only: settled
+// usage inside that window counts, anything recorded after ends_at — or in
+// the current period — must not leak into the row.
+func TestAdminBudgetListEndedBudgetFinalWindow(t *testing.T) {
+	f := newBudgetFixture(t)
+	admin := f.adminPrincipal()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	endsAt := now.Add(-24 * time.Hour)
+
+	budget := billing.Budget{
+		Name: "ended", Subject: billing.Subject{Type: billing.BudgetSubjectTenant, ID: f.tenant},
+		Kind: billing.BudgetKindTokens, Period: billing.PeriodMonthly,
+		LimitAmountMicros: 1_000_000, StartsAt: now.Add(-72 * time.Hour), EndsAt: &endsAt,
+	}
+	if err := f.repo.CreateBudget(ctx, f.tenant, "ended-b", budget); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	subject := billing.Subject{Type: billing.BudgetSubjectTenant, ID: f.tenant}
+	// Inside the budget's final period but before ends_at vs recorded after it.
+	insideAt := endsAt.Add(-time.Hour)
+	if from := billing.LiabilityFrom(budget, endsAt.Add(-time.Nanosecond)); insideAt.Before(from) {
+		insideAt = from
+	}
+	seedSettledUsage(t, f, "eb-in", subject, 5, 50, "USD", insideAt)
+	seedSettledUsage(t, f, "eb-out", subject, 7, 70, "USD", endsAt.Add(time.Hour))
+
+	rec := doBudgetHandler(f.app.handleAdminBudgets, admin,
+		httptest.NewRequest(http.MethodGet, "/api/v1/admin/budgets", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Budgets []budgetView `json:"budgets"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var got *budgetView
+	for i := range out.Budgets {
+		if out.Budgets[i].Budget.ID == "ended-b" {
+			got = &out.Budgets[i]
+		}
+	}
+	if got == nil {
+		t.Fatal("ended budget missing from list")
+	}
+	if got.Budget.Status != "ended" {
+		t.Fatalf("status = %q, want ended", got.Budget.Status)
+	}
+	if got.Progress.Counted != 5 {
+		t.Fatalf("counted = %d, want 5 — post-ends_at usage must not count", got.Progress.Counted)
+	}
+}
+
 func TestAdminBudgetCreateCurrencyMustMatchTenantPrices(t *testing.T) {
 	f := newBudgetFixture(t)
 	admin := f.adminPrincipal()
