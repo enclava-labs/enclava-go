@@ -5,6 +5,7 @@ package httpx
 import (
 	"fmt"
 	"html/template"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -93,6 +94,29 @@ func money(micros int64, currency string) string {
 	}
 	if neg {
 		amount = "-" + amount
+	}
+	return amount
+}
+
+// tokenPrice renders a rate as currency per 1M tokens, the way price lists
+// quote it: rate_micros per unit_quantity tokens is exactly
+// rate_micros/unit_quantity currency units per million, so sub-cent prices
+// such as $0.001 keep their digits where money() would round them to $0.00.
+func tokenPrice(rateMicros, unitQuantity int64, currency string) string {
+	if unitQuantity <= 0 {
+		return ""
+	}
+	whole, frac, _ := strings.Cut(new(big.Rat).SetFrac64(rateMicros, unitQuantity).FloatString(12), ".")
+	frac = strings.TrimRight(frac, "0")
+	for len(frac) < 2 {
+		frac += "0"
+	}
+	amount := dashboardGroupDigits(whole) + "." + frac
+	if sym, ok := dashboardMoneySymbols[currency]; ok {
+		return sym + amount
+	}
+	if currency != "" {
+		return amount + " " + currency
 	}
 	return amount
 }

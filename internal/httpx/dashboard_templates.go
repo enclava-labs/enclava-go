@@ -55,6 +55,7 @@ var dashboardBaseFuncs = template.FuncMap{
 	"relTime":     relTime,
 	"absTime":     absTime,
 	"money":       money,
+	"tokenPrice":  tokenPrice,
 	"count":       count,
 	"icon":        icon,
 	"spark":       spark,

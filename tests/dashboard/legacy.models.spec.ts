@@ -113,7 +113,7 @@ test('Set price and Change submit the admin pricing contract and the cell re-ren
   for (const [i, unit] of ['input', 'cached_input', 'output'].entries()) {
     const setButton = row.locator(`button[data-action="models:price"][data-unit="${unit}"]`).first();
     await setButton.click();
-    await page.fill('#models-price-rate', '2500000');
+    await page.fill('#models-price-rate', '2.5');
     await page.fill('#models-price-currency', 'usd');
     await page.click('[data-models-price-form] button[type="submit"]');
 
@@ -149,15 +149,16 @@ test('Set price and Change submit the admin pricing contract and the cell re-ren
   await expect(row).toContainText('via model');
 
   // Change: the priced cell reopens prefilled, names the price set the save
-  // lands in, and the edited rate replaces the old one in that cell.
+  // lands in, and the edited rate replaces the old one in that cell — a
+  // sub-cent per-1M price stays exact end to end.
   const inputCell = row.locator(`td[data-price-cell="${endpoint}|input"]`);
   await inputCell.locator('button[data-action="models:price"]').click();
-  await expect(page.locator('#models-price-rate')).toHaveValue('2500000');
+  await expect(page.locator('#models-price-rate')).toHaveValue('2.5');
   await expect(page.locator('#pop')).toContainText(`Model price — also applies to ${model}`);
-  await page.fill('#models-price-rate', '3000000');
+  await page.fill('#models-price-rate', '0.001');
   await page.click('[data-models-price-form] button[type="submit"]');
-  await expect(inputCell).toContainText('$3.00', { timeout: 10_000 });
-  expect(posts[posts.length - 1].body).toMatchObject({ subject_type: 'model', subject_id: model, unit: 'input', rate_micros: 3000000 });
+  await expect(inputCell).toContainText('$0.001', { timeout: 10_000 });
+  expect(posts[posts.length - 1].body).toMatchObject({ subject_type: 'model', subject_id: model, unit: 'input', rate_micros: 1000, unit_quantity: 1000000 });
 });
 
 test('price history drawer lists the real price rows for the pair', async ({ page }) => {

@@ -16,16 +16,41 @@
 
   const SYMBOLS = { USD: '$', EUR: '\u20AC', GBP: '\u00A3' };
 
-  // Mirror of the server money formatter for the popover preview: integer
-  // micros → "$1,240.50" (symbol prefix for the usual codes, suffix else).
-  function fmtMicros(micros, currency) {
+  // Prices are entered and shown as currency per 1M tokens, as price lists
+  // quote them. rate_micros per unit_quantity tokens is exactly
+  // rate_micros / unit_quantity currency units per 1M, so both directions are
+  // exact; past six decimals the rate moves to a larger token block instead
+  // of being rounded.
+  function priceToRate(text) {
+    const m = /^(\d+)(?:\.(\d*))?$/.exec(String(text).trim());
+    if (!m) return null;
+    const frac = (m[2] || '').replace(/0+$/, '');
+    const extra = Math.max(0, frac.length - 6);
+    if (extra > 6) return null; // finer than one micro per trillion tokens
+    const rate = Number(m[1] + frac.padEnd(6 + extra, '0'));
+    if (!Number.isSafeInteger(rate)) return null;
+    return { rate_micros: rate, unit_quantity: 1000000 * 10 ** extra };
+  }
+
+  // The stored rate as a per-1M decimal; '' when unit_quantity is not a power
+  // of ten (set over the API), so the form never shows a rounded value.
+  function rateToPrice(rateMicros, unitQuantity) {
+    const q = String(unitQuantity);
+    if (!/^10*$/.test(q)) return '';
+    const places = q.length - 1;
+    const digits = String(rateMicros).padStart(places + 1, '0');
+    const whole = digits.slice(0, digits.length - places);
+    const frac = digits.slice(digits.length - places).replace(/0+$/, '');
+    return frac ? whole + '.' + frac : whole;
+  }
+
+  // Mirror of the server tokenPrice formatter: "$0.001", "$2.50", "1,500.00 NOK".
+  function fmtPrice(price, currency) {
     const cur = (currency || 'USD').toUpperCase();
-    const sign = micros < 0 ? '-' : '';
-    const abs = Math.abs(Number(micros) || 0);
-    const whole = Math.floor(abs / 1e6).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-    const cents = Math.floor((abs % 1e6) / 1e4).toString().padStart(2, '0');
+    const [whole, frac = ''] = price.split('.');
+    const amount = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',') + '.' + frac.padEnd(2, '0');
     const sym = SYMBOLS[cur];
-    return sym ? `${sign}${sym}${whole}.${cents}` : `${sign}${whole}.${cents} ${cur}`;
+    return sym ? sym + amount : amount + ' ' + cur;
   }
 
   function closePopoverFromOutside() {
@@ -208,9 +233,9 @@
       '<b data-models-price-title></b>' +
       '<p class="help" data-models-price-pair></p>' +
       '<p class="help" data-models-price-scope></p>' +
-      '<label class="label" for="models-price-rate">Rate — millionths of the currency unit, per 1M tokens</label>' +
-      '<input class="field" id="models-price-rate" name="rate_micros" type="number" min="0" step="1" required aria-describedby="models-price-help">' +
-      '<span class="help" id="models-price-help" data-models-price-preview>Enter a rate to preview it.</span>' +
+      '<label class="label" for="models-price-rate">Price per 1M tokens</label>' +
+      '<input class="field" id="models-price-rate" name="price" type="number" min="0" step="any" inputmode="decimal" required aria-describedby="models-price-help">' +
+      '<span class="help" id="models-price-help" data-models-price-preview>In the currency below, decimals allowed — e.g. 0.15 or 0.001.</span>' +
       '<label class="label" for="models-price-currency">Currency</label>' +
       '<input class="field" id="models-price-currency" name="currency" maxlength="3">' +
       '<p class="field-error" data-models-price-error hidden></p>' +
@@ -223,11 +248,11 @@
       : 'Model price — also applies to ' + d.subjectId + ' on other endpoints that don\u2019t set all of their own prices.';
     form.querySelector('#models-price-currency').setAttribute('value', currency);
     // Change prefills the current rate restated per 1M tokens (what this form
-    // saves); a rate that is not whole micros per 1M stays blank, not rounded.
-    const perMillion = d.rateMicros ? Number(d.rateMicros) * (1000000 / Number(d.unitQuantity)) : NaN;
-    if (Number.isInteger(perMillion)) {
-      form.querySelector('#models-price-rate').setAttribute('value', String(perMillion));
-      form.querySelector('[data-models-price-preview]').textContent = fmtMicros(perMillion, currency) + ' per 1,000,000 tokens';
+    // saves); a rate stored over a non-decimal token block stays blank.
+    const price = d.rateMicros ? rateToPrice(d.rateMicros, d.unitQuantity) : '';
+    if (price) {
+      form.querySelector('#models-price-rate').setAttribute('value', price);
+      form.querySelector('[data-models-price-preview]').textContent = fmtPrice(price, currency) + ' per 1,000,000 tokens';
     }
     const holder = document.createElement('div');
     holder.appendChild(form);
@@ -239,9 +264,9 @@
     const currencyInput = form.querySelector('#models-price-currency');
     const errorSlot = form.querySelector('[data-models-price-error]');
     errorSlot.hidden = true;
-    const rate = Math.trunc(Number(rateInput.value));
-    if (!rateInput.value.trim() || Number.isNaN(rate) || rate < 0) {
-      errorSlot.textContent = 'Rate must be a whole number of millionths, zero or greater.';
+    const rate = priceToRate(rateInput.value);
+    if (!rate) {
+      errorSlot.textContent = 'Enter a price of zero or more, e.g. 0.15 or 0.001.';
       errorSlot.hidden = false;
       return;
     }
@@ -253,8 +278,8 @@
         subject_id: form.dataset.subjectId,
         capability: form.dataset.capability,
         unit: form.dataset.unit,
-        rate_micros: rate,
-        unit_quantity: 1000000,
+        rate_micros: rate.rate_micros,
+        unit_quantity: rate.unit_quantity,
         currency: (currencyInput.value.trim() || 'USD').toUpperCase(),
       });
       Enclava.toast('success', 'Price saved');
@@ -319,15 +344,15 @@
     }
   });
 
-  // Live preview of the popover rate through the shared money shape.
+  // Live preview of the popover price in the shared money shape.
   document.addEventListener('input', (e) => {
     if (!(e.target instanceof Element) || e.target.id !== 'models-price-rate') return;
     const form = e.target.closest('[data-models-price-form]');
     const slot = form && form.querySelector('[data-models-price-preview]');
     if (!slot) return;
-    const micros = Math.trunc(Number(e.target.value));
-    slot.textContent = Number.isNaN(micros) || e.target.value.trim() === ''
-      ? 'Enter a rate to preview it.'
-      : fmtMicros(micros, form.querySelector('#models-price-currency').value) + ' per 1,000,000 tokens';
+    const rate = priceToRate(e.target.value);
+    slot.textContent = rate
+      ? fmtPrice(rateToPrice(rate.rate_micros, rate.unit_quantity), form.querySelector('#models-price-currency').value) + ' per 1,000,000 tokens'
+      : 'In the currency below, decimals allowed — e.g. 0.15 or 0.001.';
   });
 })();

@@ -98,6 +98,27 @@ func TestMoney(t *testing.T) {
 	}
 }
 
+// TestTokenPrice: rates render per 1M tokens without rounding sub-cent prices.
+func TestTokenPrice(t *testing.T) {
+	cases := []struct {
+		rate, qty int64
+		currency  string
+		want      string
+	}{
+		{1000, 1000000, "USD", "$0.001"},   // the $0.001 / 1M case
+		{2500000, 1000000, "USD", "$2.50"}, // whole cents still show two places
+		{5, 10000000, "USD", "$0.0000005"}, // finer than a micro per 1M tokens
+		{1, 1, "EUR", "€1.00"},             // one micro per token
+		{1500000000, 1000000, "NOK", "1,500.00 NOK"},
+		{0, 1000000, "USD", "$0.00"},
+	}
+	for _, c := range cases {
+		if got := tokenPrice(c.rate, c.qty, c.currency); got != c.want {
+			t.Errorf("tokenPrice(%d, %d, %q) = %q, want %q", c.rate, c.qty, c.currency, got, c.want)
+		}
+	}
+}
+
 func TestCount(t *testing.T) {
 	cases := []struct {
 		v    any

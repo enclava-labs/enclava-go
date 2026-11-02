@@ -29,7 +29,7 @@
             {{$row := .}}
             {{range .Cells}}
             <td data-label="{{.UnitLabel}}" data-price-cell="{{$row.EndpointID}}|{{.Unit}}">
-              {{if .Priced}}<b>{{money .RateMicros .Currency}}</b><span class="subline">per {{count .UnitQuantity}} tokens · via {{.Basis}}</span>
+              {{if .Priced}}<b>{{tokenPrice .RateMicros .UnitQuantity .Currency}}</b><span class="subline">per 1,000,000 tokens · via {{.Basis}}</span>
               {{else if .Required}}<span class="price-warning">Not priced — requests refused</span>
               {{else}}<span class="muted">—</span>{{end}}
               {{if or .Priced .Required}}<button type="button" class="btn{{if .Priced}} ghost{{end}}" data-action="models:price" aria-haspopup="dialog" aria-expanded="false"{{if .Priced}} aria-label="Change {{.UnitLabel}} price" data-rate-micros="{{.RateMicros}}" data-unit-quantity="{{.UnitQuantity}}" data-currency="{{.Currency}}"{{end}} data-endpoint="{{$row.EndpointID}}" data-model="{{$row.Model}}" data-capability="{{$row.Capability}}" data-unit="{{.Unit}}" data-unit-label="{{.UnitLabel}}" data-subject-type="{{.Basis}}" data-subject-id="{{.SubjectID}}">{{if .Priced}}Change{{else}}Set price{{end}}</button>{{end}}

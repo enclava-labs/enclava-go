@@ -22,7 +22,7 @@
       <tr>
         <td data-label="Applies to">{{.Subject}}<span class="subline">{{.SubjectID}}</span></td>
         <td data-label="Unit">{{.UnitLabel}}</td>
-        <td data-label="Rate"><b>{{money .RateMicros .Currency}}</b><span class="subline">per {{count .UnitQuantity}} tokens</span></td>
+        <td data-label="Rate"><b>{{tokenPrice .RateMicros .UnitQuantity .Currency}}</b><span class="subline">per 1,000,000 tokens</span></td>
         <td data-label="Effective from">{{relTime .EffectiveFrom}}</td>
       </tr>
       {{end}}
