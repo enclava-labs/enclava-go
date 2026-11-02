@@ -18,7 +18,7 @@
   // Date inputs carry YYYY-MM-DD; the budget API needs RFC3339 timestamps.
   // Calendar days mean local midnight in the form's IANA timezone — resolve
   // the zone's UTC offset at the candidate instant (DST-correct) via Intl.
-  function zoneOffsetMs(tz, ms) {
+  function zonedParts(tz, ms) {
     const parts = new Intl.DateTimeFormat('en-US', {
       timeZone: tz, hourCycle: 'h23', // never "24" for midnight
       year: 'numeric', month: '2-digit', day: '2-digit',
@@ -26,14 +26,38 @@
     }).formatToParts(new Date(ms));
     const got = {};
     for (const p of parts) got[p.type] = p.value;
+    return got;
+  }
+  function zoneOffsetMs(tz, ms) {
+    const got = zonedParts(tz, ms);
     return Date.UTC(+got.year, +got.month - 1, +got.day, +got.hour, +got.minute, +got.second) - ms;
+  }
+  function zonedDayKey(tz, ms) {
+    const got = zonedParts(tz, ms);
+    return got.year + '-' + got.month + '-' + got.day;
   }
   function zonedMidnight(day, tz) {
     const guess = Date.parse(day + 'T00:00:00Z');
     if (isNaN(guess)) return null;
     try {
       // The guess's offset may be the neighbouring day's — re-resolve once.
-      return new Date(guess - zoneOffsetMs(tz, guess - zoneOffsetMs(tz, guess)));
+      const ms = guess - zoneOffsetMs(tz, guess - zoneOffsetMs(tz, guess));
+      const key = zonedDayKey(tz, ms);
+      if (key === day) return new Date(ms);
+      // Midnight was skipped by a DST gap (America/Santiago 2025-09-07) or the
+      // whole day was skipped — resolve forward to the day's first instant:
+      // bound the bracketing instants hourly, then binary-search the boundary.
+      let lo = ms, hi = ms;
+      if (key < day) {
+        for (let i = 0; i < 24 * 32 && zonedDayKey(tz, hi) < day; i++) hi += 3600000;
+      } else {
+        for (let i = 0; i < 24 * 32 && zonedDayKey(tz, lo) > day; i++) lo -= 3600000;
+      }
+      while (hi - lo > 1) {
+        const mid = lo + Math.floor((hi - lo) / 2);
+        if (zonedDayKey(tz, mid) < day) lo = mid; else hi = mid;
+      }
+      return new Date(hi);
     } catch (e) {
       // Unrecognized zone: fall back to UTC; the server re-validates anyway.
       return new Date(guess);
