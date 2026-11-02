@@ -18,7 +18,7 @@ func TestLivingDocumentationPaths(t *testing.T) {
 	}
 	root := os.DirFS(filepath.Dir(filepath.Dir(filename)))
 	tokens := regexp.MustCompile("`([^`\\n]+)`")
-	prefixes := []string{"internal/", "cmd/", "docs/", "scripts/", "tests/", ".planning/", ".github/"}
+	prefixes := []string{"internal/", "cmd/", "docs/", "scripts/", "tests/", ".github/"}
 	// Historical planning documents describe past snapshots, not the current tree.
 	for _, doc := range []string{"docs/api.md", "docs/go-rewrite-contract.md", "docs/cross-cutting.md"} {
 		content, err := fs.ReadFile(root, doc)
@@ -29,6 +29,11 @@ func TestLivingDocumentationPaths(t *testing.T) {
 		for _, match := range tokens.FindAllStringSubmatch(string(content), -1) {
 			ref := match[1]
 			if strings.ContainsAny(ref, "*?<>[]{} \t\r\n") {
+				continue
+			}
+			// .planning/ is a local, untracked workspace: a fresh clone has none of it.
+			if strings.HasPrefix(ref, ".planning/") {
+				t.Errorf("%s cites untracked %s", doc, ref)
 				continue
 			}
 			isPath := false

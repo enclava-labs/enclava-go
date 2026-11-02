@@ -20,7 +20,8 @@ playwright-report/
 # review staging area
 to-delete/
 
-.planning/debug/
+# local planning workspace (never committed)
+.planning/
 
 # dashboard-e2e artifacts
 tests/dashboard/.auth/

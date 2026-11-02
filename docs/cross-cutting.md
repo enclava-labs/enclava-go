@@ -1,6 +1,6 @@
 # Cross-cutting change checklists
 
-These checklists summarize the shared boundaries in `.planning/CONTRACTS.md`; they do not replace service-specific authorization and tests.
+These checklists summarize the shared implementation boundaries; they do not replace service-specific authorization and tests.
 
 ## When you add an HTTP route
 
