@@ -12,23 +12,44 @@ import (
 	"time"
 )
 
-func TestHybridOffsetPrefetchLimits(t *testing.T) {
-	var request map[string]any
+// TestHybridPrefetchIgnoresOffset: every page of a hybrid query must fuse the
+// same candidate set. When prefetch limits grew with offset, page two fused a
+// different ranking than page one — points were skipped and duplicated across
+// concatenated pages.
+func TestHybridPrefetchIgnoresOffset(t *testing.T) {
+	var requests []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Error(err)
 		}
+		requests = append(requests, request)
 		_, _ = w.Write([]byte(`{"result":{"points":[]}}`))
 	}))
 	defer server.Close()
 	client := NewQdrantClient(server.URL, time.Second)
-	_, err := client.Query(context.Background(), "test", QueryInput{Mode: QueryHybrid, DenseVector: []float64{1}, LexicalText: "hello", Limit: 10, Offset: 20})
-	if err != nil {
-		t.Fatal(err)
+	for _, offset := range []int{0, 10, 200, 400} {
+		if _, err := client.Query(context.Background(), "test", QueryInput{Mode: QueryHybrid, DenseVector: []float64{1}, LexicalText: "hello", Limit: 10, Offset: offset}); err != nil {
+			t.Fatal(err)
+		}
 	}
-	for _, branch := range request["prefetch"].([]any) {
-		if branch.(map[string]any)["limit"].(float64) < 30 {
-			t.Fatalf("prefetch does not cover offset and limit: %#v", request)
+	prefetchLimit := func(request map[string]any) float64 {
+		var got float64
+		for _, branch := range request["prefetch"].([]any) {
+			limit := branch.(map[string]any)["limit"].(float64)
+			if got == 0 {
+				got = limit
+			} else if limit != got {
+				t.Fatalf("dense and lexical prefetch limits differ: %#v", request)
+			}
+		}
+		return got
+	}
+	first := prefetchLimit(requests[0])
+	deepest := searchFetchRounds * searchFetchMax
+	for i, request := range requests {
+		if got := prefetchLimit(request); got != first || got < float64(deepest) {
+			t.Fatalf("request %d prefetch limit = %v, want %d for every offset: %#v", i, got, deepest, request)
 		}
 	}
 }

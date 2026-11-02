@@ -270,8 +270,10 @@ func (s *Service) enqueueReembedScan(ctx context.Context, p auth.Principal, c Co
 		return errors.New("rag: jobs are not configured")
 	}
 	// A completed scan's identity must never be reused — saving the same
-	// settings twice still needs a fresh scan. Only a live scan dedupes.
-	active, err := s.jobs.ListTenantActivity(ctx, p, []string{OperationReembedScan}, []string{jobs.StatusQueued, jobs.StatusRunning}, 100)
+	// settings twice still needs a fresh scan. Only a queued scan dedupes: a
+	// running one already froze its document list, so the save must schedule
+	// another pass for the documents it already skipped.
+	active, err := s.jobs.ListTenantActivity(ctx, p, []string{OperationReembedScan}, []string{jobs.StatusQueued}, 100)
 	if err != nil {
 		return err
 	}
@@ -1169,6 +1171,31 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		_ = s.repo.MarkGenerationState(ctx, job.TenantID, collectionID, versionRowID(ver), generation, "superseded")
 		return versionRowID(ver), nil // complete: nothing to index
 	}
+	// A retried attempt whose generation already published (the previous run
+	// died scheduling its successor) skips the billed re-embed — the staged
+	// row would reject it as immutable anyway — and converges on the same
+	// post-publish requeue check.
+	published, err := s.repo.PublishedGenerationForVersion(ctx, job.TenantID, c.ID, versionRowID(ver), generation)
+	if err != nil {
+		return "", err
+	}
+	if published {
+		docs, err := s.repo.DocumentsToReembed(ctx, job.TenantID, c)
+		if err != nil {
+			return "", jobs.Retryable(fmt.Errorf("check stale generation: %w", err))
+		}
+		for _, doc := range docs {
+			if doc.ID != obj.ID {
+				continue
+			}
+			if err := s.reembedDocument(ctx, p, c, obj.ID, versionRowID(ver), seq); err != nil {
+				return "", jobs.Retryable(fmt.Errorf("requeue %s under current settings: %w", obj.ID, err))
+			}
+			break
+		}
+		s.retireIndexes(ctx, job.TenantID, c.ID)
+		return versionRowID(ver), nil
+	}
 	accessRevision := int64(0)
 	if obj.ConnectionID != "" {
 		accessRevision, _, err = s.repo.LatestCompleteRevision(ctx, job.TenantID, obj.ConnectionID, source.SnapshotGrants)
@@ -1434,14 +1461,36 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	}
 	// The settings changed after this attempt read them: it published under
 	// the old ones, so queue the document again under the current settings.
-	if latest, err := s.repo.GetCollection(ctx, job.TenantID, c.ID); err == nil &&
-		(latest.QdrantCollection != c.QdrantCollection || latest.EmbedTitles != c.EmbedTitles || latest.PassagePrefix != c.PassagePrefix) {
-		if err := s.reembedDocument(ctx, p, latest, obj.ID, versionRowID(ver), seq); err != nil {
-			log.Printf("rag: requeue %s under current settings: %v", obj.ID, err)
-		}
+	if err := s.requeueForCurrentSettings(ctx, p, obj.ID, versionRowID(ver), seq, c); err != nil {
+		return "", err
 	}
 	s.retireIndexes(ctx, job.TenantID, c.ID)
 	return versionRowID(ver), nil
+}
+
+// requeueForCurrentSettings enqueues the document's next generation when the
+// collection's current settings differ from the ones bound at this attempt's
+// start. A settings scan may already have skipped this in-flight document,
+// so a transient re-read or enqueue failure returns retryable — reporting
+// success would leave the stale generation pending forever. A collection
+// that no longer exists denies the read: no successor is needed, so the
+// attempt completes.
+func (s *Service) requeueForCurrentSettings(ctx context.Context, p auth.Principal, objectID, versionID string, seq int64, bound Collection) error {
+	current, err := s.repo.GetCollection(ctx, p.TenantID, bound.ID)
+	if err != nil {
+		if errors.Is(err, source.ErrDenied) {
+			s.retireIndexes(ctx, p.TenantID, bound.ID)
+			return nil
+		}
+		return jobs.Retryable(fmt.Errorf("reload collection for re-embed: %w", err))
+	}
+	if current.QdrantCollection == bound.QdrantCollection && current.EmbedTitles == bound.EmbedTitles && current.PassagePrefix == bound.PassagePrefix {
+		return nil
+	}
+	if err := s.reembedDocument(ctx, p, current, objectID, versionID, seq); err != nil {
+		return jobs.Retryable(fmt.Errorf("requeue %s under current settings: %w", objectID, err))
+	}
+	return nil
 }
 
 func retryVectorError(err error) error {

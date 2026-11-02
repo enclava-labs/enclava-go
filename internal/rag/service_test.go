@@ -843,6 +843,41 @@ func TestUpdateCollectionScanDedupesOnlyWhileQueued(t *testing.T) {
 	}
 }
 
+// TestUpdateCollectionScanRequeuesWhileRunning: a running scan already froze
+// its document list, so a settings save must queue another pass — only a
+// still-queued scan dedupes a new one.
+func TestUpdateCollectionScanRequeuesWhileRunning(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "note.txt", MimeType: "text/plain", Bytes: []byte("enclava running scan"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.runNextJob(t)
+
+	off := false
+	if _, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{EmbedTitles: &off}); err != nil {
+		t.Fatal(err)
+	}
+	running, err := f.jobs.Lease(ctx, "test-worker", time.Minute)
+	if err != nil || running == nil || running.Job().Operation != rag.OperationReembedScan {
+		t.Fatalf("lease first scan: %v (claim %v)", err, running)
+	}
+	prefix := "document: "
+	if _, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{PassagePrefix: &prefix}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.jobs.Lease(ctx, "test-worker", time.Minute)
+	if err != nil || second == nil || second.Job().Operation != rag.OperationReembedScan {
+		t.Fatalf("save while a scan runs must queue another scan: %v (claim %v)", err, second)
+	}
+	if second.Job().ID == running.Job().ID {
+		t.Fatal("the running scan was re-leased instead of queueing a new one")
+	}
+}
+
 func TestIndexTitleAndMetadataBoundaries(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
@@ -1214,6 +1249,145 @@ func TestAttemptUnderStaleSettingsRequeues(t *testing.T) {
 	}
 	if _, kept := f.vector.points[c.QdrantCollection]; kept {
 		t.Fatal("old index kept after every document moved")
+	}
+}
+
+// staleRequeueRepo injects failures into the stale-settings requeue an
+// attempt performs after publishing. failRead makes the collection re-read
+// fail once the document's generation is published — the earlier mid-attempt
+// re-read still runs before publishing and passes — failDenied makes it
+// report the collection gone, and failStage makes staging any generation
+// newer than the published one (the successor's) fail. armed only turns on
+// inside midEmbed, so the upload's own staging and the mid-attempt re-read
+// are unaffected.
+type staleRequeueRepo struct {
+	rag.Repository
+	armed        bool
+	failRead     bool
+	failDenied   bool
+	failStage    bool
+	collectionID string
+	versionID    string
+	published    int64
+}
+
+func (r *staleRequeueRepo) GetCollection(ctx context.Context, tenantID, id string) (rag.Collection, error) {
+	if r.armed && (r.failRead || r.failDenied) && id == r.collectionID {
+		published, err := r.PublishedGenerationForVersion(ctx, tenantID, r.collectionID, r.versionID, r.published)
+		if err == nil && published {
+			if r.failDenied {
+				return rag.Collection{}, source.ErrDenied
+			}
+			return rag.Collection{}, errors.New("injected collection read failure")
+		}
+	}
+	return r.Repository.GetCollection(ctx, tenantID, id)
+}
+
+func (r *staleRequeueRepo) ReplaceVersionChunksAndStage(ctx context.Context, tenantID, collectionID, objectID, versionID string, seq, generation int64, profileVersionID string, chunks []rag.DocumentChunk) error {
+	if r.armed && r.failStage && generation > r.published {
+		return errors.New("injected stage failure")
+	}
+	return r.Repository.ReplaceVersionChunksAndStage(ctx, tenantID, collectionID, objectID, versionID, seq, generation, profileVersionID, chunks)
+}
+
+// TestStaleSettingsRequeueFailureFailsAttempt: when a settings change lands
+// mid-embed, the attempt re-queues the document under the current settings
+// after publishing. A failed collection re-read or successor enqueue must
+// fail the attempt — reporting success would drop the re-embed the settings
+// scan already skipped while the document was in flight — and the retried
+// attempt must skip the re-embed of its published generation and finish the
+// requeue. A deleted collection needs no successor: the attempt completes.
+func TestStaleSettingsRequeueFailureFailsAttempt(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		failRead   bool
+		failDenied bool
+		failStage  bool
+		wantErr    bool
+	}{
+		{"collection re-read fails", true, false, false, true},
+		{"successor staging fails", false, false, true, true},
+		{"collection deleted", false, true, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			ctx := context.Background()
+			c := f.collection(t)
+			upload, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+				FileName: "a.txt", MimeType: "text/plain", Bytes: []byte("enclava stale requeue " + tc.name),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			repo := &staleRequeueRepo{
+				Repository:   f.repo,
+				failRead:     tc.failRead,
+				failDenied:   tc.failDenied,
+				failStage:    tc.failStage,
+				collectionID: c.ID,
+				versionID:    upload.Document.ObjectVersionID,
+				published:    1,
+			}
+			svc := rag.NewService(repo, f.vector, f.executor, "embed-test", f.store, f.jobs)
+			off := false
+			f.embedding.midEmbed = func() {
+				if _, err := svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{EmbedTitles: &off}); err != nil {
+					t.Fatalf("switch settings: %v", err)
+				}
+				repo.armed = true
+			}
+			claim, err := f.jobs.Lease(ctx, "test-worker", time.Minute)
+			if err != nil || claim == nil {
+				t.Fatalf("lease: %v", err)
+			}
+			ref, err := svc.JobHandler()(ctx, claim, nil)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("attempt on a deleted collection = %v, want success", err)
+				}
+				if _, err := claim.Complete(ctx, ref); err != nil {
+					t.Fatalf("complete: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("stale-settings requeue failure was acknowledged as success")
+			}
+			if jobs.FailureClassFor(err) != jobs.FailureRetryable {
+				t.Fatalf("requeue failure = %v, want a retryable error so the job is retried", err)
+			}
+			if err := claim.Fail(ctx, err, jobs.FailureRetryable); err != nil {
+				t.Fatalf("fail attempt: %v", err)
+			}
+			// The retried attempt finds its generation published: it skips the
+			// billed re-embed and finishes the successor enqueue.
+			repo.armed = false
+			embeds := f.embedding.calls
+			for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+				if claim, err = f.jobs.Lease(ctx, "test-worker", time.Minute); err != nil || claim != nil || time.Now().After(deadline) {
+					break
+				}
+			}
+			if err != nil || claim == nil {
+				t.Fatalf("lease retry: %v", err)
+			}
+			ref, err = svc.JobHandler()(ctx, claim, nil)
+			if err != nil {
+				t.Fatalf("retried attempt: %v", err)
+			}
+			if f.embedding.calls != embeds {
+				t.Fatal("retried attempt re-embedded the published generation")
+			}
+			if _, err := claim.Complete(ctx, ref); err != nil {
+				t.Fatalf("complete retry: %v", err)
+			}
+			f.runNextJob(t) // drain the settings scan, then run the successor embed
+			pending, total, err := f.svc.ReembedProgress(ctx, f.principal, c.ID)
+			if err != nil || pending != 0 || total != 1 {
+				t.Fatalf("progress after retry = %d/%d, %v", pending, total, err)
+			}
+		})
 	}
 }
 

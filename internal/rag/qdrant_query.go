@@ -73,9 +73,12 @@ func (c *QdrantClient) Query(ctx context.Context, collection string, in QueryInp
 	}
 	path := "/collections/" + url.PathEscape(collection) + "/points/query"
 	payload := map[string]any{"limit": in.Limit, "with_payload": true}
-	prefetchLimit := in.Limit
-	if in.Offset > 0 {
-		prefetchLimit += in.Offset
+	// RRF ordering depends on each branch's candidate set, so the prefetch
+	// limit must not vary with offset or pages would fuse different rankings.
+	// The fixed bound covers the deepest page queryIndex can request.
+	prefetchLimit := searchFetchRounds * searchFetchMax
+	if prefetchLimit < in.Limit {
+		prefetchLimit = in.Limit
 	}
 	dense := map[string]any{"query": in.DenseVector, "using": "dense", "filter": in.Filter, "limit": prefetchLimit}
 	lexical := map[string]any{"query": map[string]any{"text": in.LexicalText, "model": "qdrant/bm25"}, "using": "text", "filter": in.Filter, "limit": prefetchLimit}
