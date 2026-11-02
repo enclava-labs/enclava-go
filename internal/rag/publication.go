@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"time"
 
+	"enclava-go/internal/auth"
 	"enclava-go/internal/jobs"
 	"enclava-go/internal/source"
 )
@@ -38,18 +41,25 @@ func (s *Service) AccessJobHandler() jobs.HandlerFunc {
 		if latest != revision {
 			return "stale access revision", nil
 		}
-		connection, err := s.repo.GetConnection(ctx, job.TenantID, connectionID)
-		if err != nil {
-			return "", err
-		}
 		generations, err := s.repo.ListGenerationsForConnection(ctx, job.TenantID, connectionID)
 		if err != nil {
 			return "", err
 		}
+		revisionField := "grants_revision"
+		if kind == source.SnapshotMembership {
+			revisionField = "membership_revision"
+		}
 		for _, generation := range generations {
-			if generation.Tombstoned || connection.Status != "active" || generation.State == "superseded" {
+			if generation.Tombstoned || generation.State == "superseded" {
 				if err := s.vectorStore.DeleteGenerationPoints(ctx, generation.QdrantCollection, generation.ObjectVersionID, generation.Generation); err != nil {
 					return "", fmt.Errorf("clean inaccessible generation: %w", err)
+				}
+				continue
+			}
+			payload := map[string]any{revisionField: revision, "access_revision": revision, "access_enabled": true}
+			if kind == source.SnapshotGrants {
+				if err := s.projectGenerationAccess(ctx, job.TenantID, generation, payload, generation.State == "published"); err != nil {
+					return "", fmt.Errorf("update access revision: %w", err)
 				}
 				continue
 			}
@@ -57,15 +67,126 @@ func (s *Service) AccessJobHandler() jobs.HandlerFunc {
 				{"key": "object_version_id", "match": map[string]any{"value": generation.ObjectVersionID}},
 				{"key": "generation", "match": map[string]any{"value": generation.Generation}},
 			}}
-			revisionField := "grants_revision"
-			if kind == source.SnapshotMembership {
-				revisionField = "membership_revision"
-			}
-			if err := s.vectorStore.SetPayload(ctx, generation.QdrantCollection, filter, map[string]any{revisionField: revision, "access_revision": revision, "access_enabled": true}); err != nil {
+			if err := s.vectorStore.SetPayload(ctx, generation.QdrantCollection, filter, payload); err != nil {
 				return "", fmt.Errorf("update access revision: %w", err)
 			}
 		}
 		return fmt.Sprintf("%s:%d", connectionID, revision), nil
+	}
+}
+
+// EnqueueAccessBackfills enqueues one job per tenant with an unprojected backlog.
+func (s *Service) EnqueueAccessBackfills(ctx context.Context) error {
+	if s.jobs == nil {
+		return nil
+	}
+	tenants, err := s.repo.TenantsNeedingAccessBackfill(ctx)
+	if err != nil {
+		return err
+	}
+	if len(tenants) == 0 {
+		return nil
+	}
+	for _, tenantID := range tenants {
+		p := auth.Principal{TenantID: tenantID, ActorID: "system", ActorKind: auth.ActorKindServiceAccount}
+		active, err := s.jobs.ListTenantActivity(ctx, p, []string{OperationAccessBackfill}, []string{jobs.StatusQueued, jobs.StatusRunning}, 1)
+		if err != nil {
+			return err
+		}
+		if len(active) > 0 {
+			continue
+		}
+		if _, _, err := s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
+			TenantID: tenantID, Operation: OperationAccessBackfill,
+			IdempotencyKey: OperationAccessBackfill + ":" + tenantID + ":" + newID("fill"),
+			InputRef:       tenantID, InputHash: "backfill",
+			Policy: map[string]any{"tenant_id": tenantID},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) RunAccessBackfillLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := s.EnqueueAccessBackfills(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("rag access backfill enqueue error: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Service) projectGenerationAccess(ctx context.Context, tenantID string, generation IndexGeneration, payload map[string]any, published bool) error {
+	return s.repo.ProjectGenerationAccess(ctx, tenantID, generation.CollectionID, generation.ObjectVersionID, generation.Generation, func(current int64) (int64, error) {
+		object, err := s.repo.GetObject(ctx, tenantID, generation.ObjectID)
+		if err != nil {
+			return 0, fmt.Errorf("project access tokens: %w", err)
+		}
+		tokens, revision, err := s.authorizer.ReadTokens(ctx, object)
+		if err != nil {
+			return 0, err
+		}
+		if revision < current {
+			return current, nil
+		}
+		payload["acl"] = tokens
+		payload["acl_revision"] = revision
+		if published {
+			payload["published"] = true
+		}
+		if err := s.vectorStore.SetPayload(ctx, generation.QdrantCollection, map[string]any{"must": []map[string]any{
+			{"key": "object_version_id", "match": map[string]any{"value": generation.ObjectVersionID}},
+			{"key": "generation", "match": map[string]any{"value": generation.Generation}},
+		}}, payload); err != nil {
+			return 0, err
+		}
+		return revision, nil
+	})
+}
+
+// AccessBackfillJobHandler projects acl + published onto points written
+// before the access projection existed. Durable, idempotent and resumable:
+// rows flip access_projected only after their set-payload write lands, so
+// an interrupted run re-enumerates the same backlog and finishes it.
+func (s *Service) AccessBackfillJobHandler() jobs.HandlerFunc {
+	return func(ctx context.Context, claim *jobs.Claim, _ jobs.InputFunc) (string, error) {
+		job := claim.Job()
+		var p auth.Principal
+		if err := json.Unmarshal(job.PrincipalSnapshot, &p); err != nil {
+			return "", fmt.Errorf("decode frozen principal: %w", err)
+		}
+		if p.TenantID != job.TenantID || job.InputRef != job.TenantID {
+			return "", source.ErrDenied
+		}
+		if s.vectorStore == nil {
+			return "", errors.New("rag access backfill: vector store is not configured")
+		}
+		if err := claim.MarkDispatched(ctx); err != nil {
+			return "", err
+		}
+		projected := 0
+		for {
+			generations, err := s.repo.ListUnprojectedGenerations(ctx, job.TenantID, 200)
+			if err != nil {
+				return "", err
+			}
+			if len(generations) == 0 {
+				return fmt.Sprintf("projected=%d", projected), nil
+			}
+			for _, generation := range generations {
+				if err := s.projectGenerationAccess(ctx, job.TenantID, generation, map[string]any{}, true); err != nil {
+					return "", fmt.Errorf("project generation access: %w", err)
+				}
+				projected++
+			}
+		}
 	}
 }
 

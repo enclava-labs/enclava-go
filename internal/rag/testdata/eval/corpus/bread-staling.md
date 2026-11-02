@@ -1,0 +1,7 @@
+# Why bread goes stale
+
+Stale bread is not dried-out bread, at least not primarily. The main process is starch retrogradation: the starch molecules gelatinized during baking slowly recrystallize as the loaf cools, firming the crumb and pushing water out of the structure. It happens fastest in a refrigerator's two-to-five-degree range, which is why the fridge is the worst place for bread — loaves stale noticeably faster there than at room temperature.
+
+Freezing, by contrast, is the best way to keep bread longer than a day or two. The cold is deep enough that retrogradation effectively stops. Freeze a loaf sliced, sealed airtight, and slices go straight into the toaster without thawing. At room temperature a paper bag or bread box preserves the crust better than plastic, which keeps the crumb soft but turns the crust leathery; plastic wins if soft crust is the goal or the climate is dry.
+
+Staling is partly reversible because it is physical, not spoilage. Revive a day-old loaf by flicking water over the crust and heating it at a moderate oven temperature until the crust crisps again — the heat temporarily re-softens the crystallized starch. Truly dried bread still has uses: dry crumbs for coatings and dumplings, or cubes for croutons. A moldy loaf is a different problem entirely — the visible spot is only part of a mycelium through soft porous bread, so discard the whole loaf rather than trimming.

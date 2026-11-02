@@ -43,14 +43,14 @@ func TestLiveQdrantHybridLexicalAndFilters(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("upsert fixture: %v", err)
 	}
-	filter := FilterBuilder("tenant-live", []IndexGeneration{{ObjectVersionID: "version-live", Generation: 1}}, nil)
+	filter := AccessFilter("tenant-live", []string{"tenant"}, nil)
 	if points, err := client.Query(ctx, collection, QueryInput{Mode: QueryHybrid, DenseVector: []float64{0.1, 0.2, 0.3}, LexicalText: "orchid legal", Filter: filter, Limit: 3}); err != nil || len(points) != 1 {
 		t.Fatalf("hybrid prefetch+RRF: points=%#v err=%v", points, err)
 	}
 	if points, err := client.Query(ctx, collection, QueryInput{Mode: QueryLexical, LexicalText: "orchid legal", Filter: filter, Limit: 3}); err != nil || len(points) != 1 {
 		t.Fatalf("lexical query: points=%#v err=%v", points, err)
 	}
-	narrowed := FilterBuilder("tenant-live", []IndexGeneration{{ObjectVersionID: "version-live", Generation: 1}}, map[string]any{"key": "tenant_id", "match": map[string]any{"value": "other-tenant"}})
+	narrowed := AccessFilter("tenant-live", []string{"tenant"}, map[string]any{"key": "tenant_id", "match": map[string]any{"value": "other-tenant"}})
 	if points, err := client.Query(ctx, collection, QueryInput{Mode: QueryLexical, LexicalText: "orchid legal", Filter: narrowed, Limit: 3}); err != nil || len(points) != 0 {
 		t.Fatalf("narrowing filter: points=%#v err=%v", points, err)
 	}

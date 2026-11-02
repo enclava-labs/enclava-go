@@ -494,6 +494,19 @@ func (r *RAGRepo) AddCollectionItem(ctx context.Context, tenantID, collectionID,
 	return nil
 }
 
+func (r *RAGRepo) CollectionHasObject(ctx context.Context, tenantID, collectionID, objectID string) (bool, error) {
+	var exists bool
+	err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM collection_items
+			WHERE tenant_id=$1 AND collection_id=$2 AND object_id=$3 AND removed_at IS NULL
+		)`, tenantID, collectionID, objectID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check collection membership: %w", err)
+	}
+	return exists, nil
+}
+
 func (r *RAGRepo) RemoveCollectionItem(ctx context.Context, tenantID, collectionID, objectID string) error {
 	res, err := r.db.SQL.ExecContext(ctx, `
 		DELETE FROM collection_items
@@ -506,6 +519,170 @@ func (r *RAGRepo) RemoveCollectionItem(ctx context.Context, tenantID, collection
 		return source.ErrDenied
 	}
 	return nil
+}
+
+// DistinctIndexBindings returns the index bindings the collection's
+// published generations were embedded into, without enumerating documents.
+func (r *RAGRepo) DistinctIndexBindings(ctx context.Context, tenantID, collectionID string) ([]rag.IndexBinding, error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `
+		SELECT DISTINCT COALESCE(NULLIF(g.qdrant_collection, ''), c.qdrant_collection),
+		       CASE WHEN g.qdrant_collection = '' THEN c.embedding_model ELSE g.embedding_model END,
+		       CASE WHEN g.qdrant_collection = '' THEN c.embedding_dimensions ELSE g.embedding_dimensions END,
+		       CASE WHEN g.qdrant_collection = '' THEN c.query_prefix ELSE g.query_prefix END
+		FROM index_generations g
+		JOIN source_object_versions v ON v.tenant_id=g.tenant_id AND v.id=g.object_version_id
+		JOIN source_objects o ON o.tenant_id=v.tenant_id AND o.id=v.object_id
+		JOIN knowledge_collections c ON c.tenant_id=g.tenant_id AND c.id=g.collection_id
+		WHERE g.tenant_id=$1 AND g.collection_id=$2 AND g.state='published'
+		  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL AND o.observed_seq=v.observed_seq`,
+		tenantID, collectionID)
+	if err != nil {
+		return nil, fmt.Errorf("list index bindings: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []rag.IndexBinding
+	for rows.Next() {
+		var b rag.IndexBinding
+		if err := rows.Scan(&b.QdrantCollection, &b.EmbeddingModel, &b.EmbeddingDimensions, &b.QueryPrefix); err != nil {
+			return nil, fmt.Errorf("scan index binding: %w", err)
+		}
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate index bindings: %w", err)
+	}
+	return out, nil
+}
+
+// ListCollectionConnectionIDs returns the distinct connections that have
+// live objects in the collection — bounds the per-search token lookup to
+// connection count, never document count.
+func (r *RAGRepo) ListCollectionConnectionIDs(ctx context.Context, tenantID, collectionID string) ([]string, error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `
+		SELECT DISTINCT o.connection_id
+		FROM collection_items ci
+		JOIN source_objects o ON o.tenant_id=ci.tenant_id AND o.id=ci.object_id
+		WHERE ci.tenant_id=$1 AND ci.collection_id=$2 AND ci.removed_at IS NULL
+		  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL
+		  AND o.connection_id <> ''`, tenantID, collectionID)
+	if err != nil {
+		return nil, fmt.Errorf("list collection connections: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan collection connection: %w", err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate collection connections: %w", err)
+	}
+	return out, nil
+}
+
+// PublishedGenerationForVersion reports whether (version, generation) is
+// currently published in the collection through a live collection item —
+// the per-hit check that replaces listing every published generation.
+func (r *RAGRepo) PublishedGenerationForVersion(ctx context.Context, tenantID, collectionID, versionID string, generation int64) (bool, error) {
+	var ok bool
+	err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT EXISTS (
+		  SELECT 1 FROM index_generations g
+		  JOIN source_object_versions v ON v.tenant_id=g.tenant_id AND v.id=g.object_version_id
+		  JOIN collection_items ci ON ci.tenant_id=g.tenant_id AND ci.collection_id=g.collection_id
+		    AND ci.object_id=v.object_id AND ci.removed_at IS NULL
+		  WHERE g.tenant_id=$1 AND g.collection_id=$2 AND g.object_version_id=$3
+		    AND g.generation=$4 AND g.state='published')`,
+		tenantID, collectionID, versionID, generation).Scan(&ok)
+	if err != nil {
+		return false, fmt.Errorf("check published generation: %w", err)
+	}
+	return ok, nil
+}
+
+func (r *RAGRepo) CurrentPublishedGeneration(ctx context.Context, tenantID, collectionID, objectID, versionID string) (int64, error) {
+	var generation int64
+	err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT COALESCE(MAX(g.generation), 0)
+		FROM index_generations g
+		JOIN source_object_versions v ON v.tenant_id=g.tenant_id AND v.id=g.object_version_id
+		JOIN source_objects o ON o.tenant_id=v.tenant_id AND o.id=v.object_id
+		JOIN collection_items ci ON ci.tenant_id=g.tenant_id AND ci.collection_id=g.collection_id
+		  AND ci.object_id=v.object_id AND ci.removed_at IS NULL
+		WHERE g.tenant_id=$1 AND g.collection_id=$2 AND v.object_id=$3 AND g.object_version_id=$4
+		  AND g.state='published' AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL
+		  AND o.observed_seq=v.observed_seq`, tenantID, collectionID, objectID, versionID).Scan(&generation)
+	if err != nil {
+		return 0, fmt.Errorf("get current published generation: %w", err)
+	}
+	return generation, nil
+}
+
+// ListUnprojectedGenerations returns published generations whose index
+// points were written before the acl/published projection — the durable
+// backlog the access backfill job drains. Marker rows make every pass
+// idempotent; ORDER BY id with LIMIT resumes after interruption.
+func (r *RAGRepo) ListUnprojectedGenerations(ctx context.Context, tenantID string, limit int) ([]rag.IndexGeneration, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := r.db.SQL.QueryContext(ctx, listPublishedGenerationsQuery+`
+		WHERE g.tenant_id=$1 AND g.state='published' AND NOT g.access_projected
+		ORDER BY g.id LIMIT $2`, tenantID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list unprojected generations: %w", err)
+	}
+	return scanPublishedGenerations(rows)
+}
+
+// TenantsNeedingAccessBackfill lists tenants with published generations
+// still lacking the acl/published projection — the startup enqueue check.
+func (r *RAGRepo) TenantsNeedingAccessBackfill(ctx context.Context) ([]string, error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `
+		SELECT DISTINCT tenant_id::text FROM index_generations
+		WHERE state='published' AND NOT access_projected ORDER BY 1`)
+	if err != nil {
+		return nil, fmt.Errorf("list tenants needing access backfill: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan backfill tenant: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+func (r *RAGRepo) ProjectGenerationAccess(ctx context.Context, tenantID, collectionID, versionID string, generation int64, project func(int64) (int64, error)) error {
+	return WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
+		key := fmt.Sprintf("rag-access:%s:%s:%s:%d", tenantID, collectionID, versionID, generation)
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key); err != nil {
+			return err
+		}
+		var current int64
+		if err := tx.QueryRowContext(ctx, `SELECT acl_revision FROM index_generations
+			WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3 AND generation=$4`,
+			tenantID, collectionID, versionID, generation).Scan(&current); err != nil {
+			return err
+		}
+		revision, err := project(current)
+		if err != nil {
+			return err
+		}
+		if revision < current {
+			return fmt.Errorf("access revision %d precedes %d", revision, current)
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE index_generations SET access_projected=TRUE, acl_revision=$5
+			WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3 AND generation=$4`,
+			tenantID, collectionID, versionID, generation, revision)
+		return err
+	})
 }
 
 func (r *RAGRepo) ListCollectionItems(ctx context.Context, tenantID, collectionID string) ([]string, error) {
@@ -1135,7 +1312,7 @@ func (r *RAGRepo) PublishGenerationFenced(ctx context.Context, tenantID, collect
 			return nil
 		}
 		res, err := tx.ExecContext(ctx, `
-			UPDATE index_generations SET state='published', published_at=now(), lease_fence=$6
+			UPDATE index_generations SET state='published', published_at=now(), lease_fence=$6, access_projected=TRUE
 			WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3 AND generation=$4
 			  AND state='staging' AND EXISTS (
 			    SELECT 1 FROM jobs WHERE tenant_id=$1 AND id=$5 AND status='running'

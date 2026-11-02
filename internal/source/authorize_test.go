@@ -380,6 +380,14 @@ func TestSourceACLDenials(t *testing.T) {
 			t.Fatalf("disable: %v", err)
 		}
 		mustDeny(t, a(f).CanRead(f.ctx, f.principal("alice"), obj, source.ReadOptions{}))
+		tokens, rev, err := a(f).ReadTokens(f.ctx, obj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokensEqual(t, tokens, "sid:sid_alice")
+		if rev != 1 {
+			t.Fatalf("grants revision = %d, want 1", rev)
+		}
 	})
 }
 
@@ -442,4 +450,157 @@ func TestRestrictionNarrowing(t *testing.T) {
 	if err := a.CanRead(f.ctx, f.principal("alice"), obj, source.ReadOptions{RequestedRestriction: narrow}); err != nil {
 		t.Fatalf("narrowing request must pass: %v", err)
 	}
+}
+
+func tokensEqual(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("tokens = %#v, want %#v", got, want)
+	}
+	have := map[string]bool{}
+	for _, token := range got {
+		have[token] = true
+	}
+	for _, token := range want {
+		if !have[token] {
+			t.Fatalf("tokens = %#v, missing %q", got, token)
+		}
+	}
+}
+
+func TestReadTokensOwnerAudienceDenyNone(t *testing.T) {
+	f := newFixture(t)
+	a := source.NewAuthorizer(f.repo, time.Hour)
+	owner := source.Object{TenantID: f.tenant, ID: "o", AuthorizationMode: source.AuthorizationOwner, OwnerActorID: "actor-x"}
+	tokens, rev, err := a.ReadTokens(f.ctx, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokensEqual(t, tokens, "actor:actor-x")
+	if rev != 0 {
+		t.Fatalf("owner grants revision = %d, want 0", rev)
+	}
+
+	aud := source.Object{TenantID: f.tenant, ID: "o", AuthorizationMode: source.AuthorizationAudience, Audience: []string{"u1", "*"}}
+	tokens, rev, err = a.ReadTokens(f.ctx, aud)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokensEqual(t, tokens, "actor:u1", "tenant")
+	if rev != 0 {
+		t.Fatalf("audience grants revision = %d, want 0", rev)
+	}
+
+	// Deny-everyone and dead objects project the sentinel, never [].
+	dead := source.Object{TenantID: f.tenant, ID: "o", AuthorizationMode: source.AuthorizationAudience}
+	tokens, rev, err = a.ReadTokens(f.ctx, dead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokensEqual(t, tokens, source.TokenNone)
+	if rev != 0 {
+		t.Fatalf("empty audience grants revision = %d, want 0", rev)
+	}
+	now := time.Now()
+	dead.TombstonedAt = &now
+	dead.Audience = []string{"*"}
+	tokens, rev, err = a.ReadTokens(f.ctx, dead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokensEqual(t, tokens, source.TokenNone)
+	if rev != 0 {
+		t.Fatalf("tombstoned grants revision = %d, want 0", rev)
+	}
+}
+
+func TestReadTokensSourceACLMirrorsAllowPaths(t *testing.T) {
+	f := newFixture(t)
+	f.conn("conn_a", "active")
+	root := f.obj("root", "conn_a", source.AuthorizationSourceACL)
+	child := f.obj("child", "conn_a", source.AuthorizationSourceACL)
+	if _, err := f.db.SQL.ExecContext(f.ctx,
+		`UPDATE source_objects SET parent_object_id = $3 WHERE tenant_id = $1 AND id = $2`,
+		f.tenant, child.ID, root.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.identity("sid_alice", "alice-gh", "alice")
+	f.group("grp_devs", "devs")
+	f.completeSnapshot(source.SnapshotGrants, 1, 0)
+	f.grant(child.ID, source.GrantSubjectUser, "sid_alice", source.GrantEffectAllow, 1)
+	f.grant(root.ID, source.GrantSubjectGroup, "grp_devs", source.GrantEffectAllow, 1)
+	f.grant(child.ID, source.GrantSubjectAll, "", source.GrantEffectDeny, 1) // deny-everyone still projects allows
+
+	a := source.NewAuthorizer(f.repo, time.Hour)
+	tokens, rev, err := a.ReadTokens(f.ctx, child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Allows project for the post-check to enforce the deny; ancestor grants inherit.
+	tokensEqual(t, tokens, "sid:sid_alice", "sgrp:grp_devs")
+	if rev != 1 {
+		t.Fatalf("grants revision = %d, want 1", rev)
+	}
+
+	noAllow := f.obj("no-allow", "conn_a", source.AuthorizationSourceACL)
+	f.grant(noAllow.ID, source.GrantSubjectAll, "", source.GrantEffectDeny, 1)
+	tokens, rev, err = a.ReadTokens(f.ctx, noAllow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokensEqual(t, tokens, source.TokenNone)
+	if rev != 1 {
+		t.Fatalf("deny-only grants revision = %d, want 1", rev)
+	}
+
+	// No grants snapshot → unreadable sentinel, mirroring CanRead's closed default.
+	f.conn("conn_b", "active")
+	orphan := f.obj("orphan", "conn_b", source.AuthorizationSourceACL)
+	tokens, rev, err = a.ReadTokens(f.ctx, orphan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokensEqual(t, tokens, source.TokenNone)
+	if rev != 0 {
+		t.Fatalf("missing snapshot grants revision = %d, want 0", rev)
+	}
+}
+
+func TestQueryTokensIdentityAndGroups(t *testing.T) {
+	f := newFixture(t)
+	f.conn("conn_a", "active")
+	f.conn("conn_b", "active")
+	f.identity("sid_alice", "alice-gh", "alice")
+	f.group("grp_devs", "devs")
+	f.completeSnapshot(source.SnapshotMembership, 1, 0)
+	f.member("grp_devs", "sid_alice", 1)
+
+	a := source.NewAuthorizer(f.repo, time.Hour)
+	p := f.principal("alice")
+	tokens, err := a.QueryTokens(f.ctx, p, []string{"conn_a", "conn_b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokensEqual(t, tokens, "tenant", "actor:"+p.ActorID, "sid:sid_alice", "sgrp:grp_devs")
+
+	// No complete membership snapshot → identity token only, groups unknown.
+	f.conn("conn_c", "active")
+	if err := f.repo.InsertSourceIdentity(f.ctx, source.SourceIdentity{
+		TenantID: f.tenant, ConnectionID: "conn_c", SourceKind: "github",
+		ID: "sid_c", NativeID: "alice-gh", MappedUserID: p.UserID}); err != nil {
+		t.Fatal(err)
+	}
+	tokens, err = a.QueryTokens(f.ctx, p, []string{"conn_c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokensEqual(t, tokens, "tenant", "actor:"+p.ActorID, "sid:sid_c")
+
+	// Delegation adds the delegating actor's token.
+	p.DelegatedByActorID = "delegator"
+	tokens, err = a.QueryTokens(f.ctx, p, []string{"conn_c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokensEqual(t, tokens, "tenant", "actor:"+p.ActorID, "actor:delegator", "sid:sid_c")
 }

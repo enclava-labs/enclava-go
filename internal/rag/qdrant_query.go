@@ -23,22 +23,30 @@ type QueryInput struct {
 	LexicalText string
 	Filter      map[string]any
 	Limit       int
+	Offset      int
 	Mode        QueryMode
 }
 
-// FilterBuilder binds queries to current, published object generations and access state.
-func FilterBuilder(tenantID string, generations []IndexGeneration, narrower map[string]any) map[string]any {
-	generationFilters := make([]any, 0, len(generations))
-	for _, generation := range generations {
-		generationFilters = append(generationFilters, map[string]any{"must": []any{
-			map[string]any{"key": "object_version_id", "match": map[string]any{"value": generation.ObjectVersionID}},
-			map[string]any{"key": "generation", "match": map[string]any{"value": generation.Generation}},
-		}})
+// AccessFilter binds a query to the tenant's published, access-enabled
+// points visible to the principal's token set. Unprojected points (written
+// before the acl/published projection) pass to the authoritative post-check
+// via is_empty so a backfill can never hide a document. Authorization
+// itself is re-checked per hit against PostgreSQL — this filter is a
+// prefilter, never the decision.
+func AccessFilter(tenantID string, tokens []string, narrower map[string]any) map[string]any {
+	aclShould := []any{map[string]any{"is_empty": map[string]any{"key": "acl"}}}
+	if len(tokens) > 0 {
+		aclShould = append([]any{map[string]any{"key": "acl", "match": map[string]any{"any": tokens}}}, aclShould...)
+	}
+	publishedShould := []any{
+		map[string]any{"key": "published", "match": map[string]any{"value": true}},
+		map[string]any{"is_empty": map[string]any{"key": "published"}},
 	}
 	must := []any{
 		map[string]any{"key": "tenant_id", "match": map[string]any{"value": tenantID}},
 		map[string]any{"key": "access_enabled", "match": map[string]any{"value": true}},
-		map[string]any{"should": generationFilters},
+		map[string]any{"should": aclShould},
+		map[string]any{"should": publishedShould},
 	}
 	if narrower != nil {
 		must = append(must, narrower)
@@ -65,8 +73,12 @@ func (c *QdrantClient) Query(ctx context.Context, collection string, in QueryInp
 	}
 	path := "/collections/" + url.PathEscape(collection) + "/points/query"
 	payload := map[string]any{"limit": in.Limit, "with_payload": true}
-	dense := map[string]any{"query": in.DenseVector, "using": "dense", "filter": in.Filter, "limit": in.Limit}
-	lexical := map[string]any{"query": map[string]any{"text": in.LexicalText, "model": "qdrant/bm25"}, "using": "text", "filter": in.Filter, "limit": in.Limit}
+	prefetchLimit := in.Limit
+	if in.Offset > 0 {
+		prefetchLimit += in.Offset
+	}
+	dense := map[string]any{"query": in.DenseVector, "using": "dense", "filter": in.Filter, "limit": prefetchLimit}
+	lexical := map[string]any{"query": map[string]any{"text": in.LexicalText, "model": "qdrant/bm25"}, "using": "text", "filter": in.Filter, "limit": prefetchLimit}
 	switch in.Mode {
 	case QueryHybrid:
 		payload["prefetch"] = []any{dense, lexical}
@@ -76,6 +88,9 @@ func (c *QdrantClient) Query(ctx context.Context, collection string, in QueryInp
 		payload["using"], payload["filter"] = lexical["using"], lexical["filter"]
 	case QuerySemantic:
 		payload["query"], payload["using"], payload["filter"] = dense["query"], dense["using"], dense["filter"]
+	}
+	if in.Offset > 0 {
+		payload["offset"] = in.Offset
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

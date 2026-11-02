@@ -1,0 +1,7 @@
+# Developing gluten in dough
+
+Gluten is the network formed when flour's proteins hydrate and link into elastic sheets. The traditional way to build it is kneading — repeatedly stretching and folding the dough aligns the protein strands, and the dough changes from sticky shaggy mass to smooth elastic ball. The windowpane test checks development: stretch a small piece thin enough to see light through it without tearing.
+
+No-knead methods achieve the same network without labor. Wet dough left overnight develops gluten on its own: the proteins slowly link as the dough rests and folds itself under its own weight. Stretch-and-fold — pulling one edge of the dough up and over the rest every thirty to sixty minutes during bulk fermentation — builds comparable strength to hand kneading for wet artisan doughs, and it aerates the dough at the same time.
+
+When dough tears instead of stretching, either the gluten network is underdeveloped — more folds or kneading will fix it — or it is overworked and broken down, a rarer problem reached after excessive machine mixing. Salt strengthens the network and slows fermentation, which is why it goes in after the initial mixing rest known as autolyse; adding it twenty minutes early lets the flour hydrate without the salt tightening the gluten prematurely. Fats and sugar soften the dough's structure, which is why enriched breads need longer kneading to reach the same strength.

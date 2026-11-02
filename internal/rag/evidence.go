@@ -27,10 +27,6 @@ func (s *Service) ResolveEvidence(ctx context.Context, p auth.Principal, ids []s
 		if err != nil {
 			return nil, err
 		}
-		generationList, err := s.repo.ListPublishedGenerations(ctx, p.TenantID, record.CollectionID)
-		if err != nil {
-			return nil, err
-		}
 		latest, err := s.repo.LatestObjectVersion(ctx, p.TenantID, record.ObjectID)
 		if err != nil {
 			if errors.Is(err, source.ErrDenied) {
@@ -38,14 +34,14 @@ func (s *Service) ResolveEvidence(ctx context.Context, p auth.Principal, ids []s
 			}
 			return nil, err
 		}
+		currentGeneration, err := s.repo.CurrentPublishedGeneration(ctx, p.TenantID, record.CollectionID, record.ObjectID, versionRowID(latest))
+		if err != nil {
+			return nil, err
+		}
 		resolution := EvidenceResolution{ID: record.ID, Status: "superseded", CitedGeneration: record.Generation, Spans: record.SpanRefs}
-		for _, generation := range generationList {
-			if generation.ObjectID == record.ObjectID && generation.ObjectVersionID == versionRowID(latest) {
-				resolution.CurrentGeneration = generation.Generation
-				if versionRowID(latest) == record.ObjectVersionID && generation.Generation == record.Generation {
-					resolution.Status = "current"
-				}
-			}
+		resolution.CurrentGeneration = currentGeneration
+		if currentGeneration != 0 && versionRowID(latest) == record.ObjectVersionID && currentGeneration == record.Generation {
+			resolution.Status = "current"
 		}
 		var provenance map[string]any
 		_ = json.Unmarshal([]byte(version.Provenance), &provenance)
@@ -87,25 +83,19 @@ func (s *Service) ReadEvidence(ctx context.Context, p auth.Principal, id string)
 	} else if failure != nil {
 		return EvidenceText{}, failure
 	}
-	if _, _, err := s.authorizedEvidenceSource(ctx, p, record); err != nil {
+	object, _, err := s.authorizedEvidenceSource(ctx, p, record)
+	if err != nil {
 		if errors.Is(err, source.ErrDenied) {
 			return EvidenceText{}, source.ErrDenied
 		}
 		return EvidenceText{}, err
 	}
-	generations, err := s.repo.ListPublishedGenerations(ctx, p.TenantID, record.CollectionID)
+	if object.ObservedSeq != record.ObservedSeq {
+		return EvidenceText{}, source.ErrDenied
+	}
+	current, err := s.repo.PublishedGenerationForVersion(ctx, p.TenantID, record.CollectionID, record.ObjectVersionID, record.Generation)
 	if err != nil {
 		return EvidenceText{}, err
-	}
-	current := false
-	for _, generation := range generations {
-		if generation.ObjectID == record.ObjectID &&
-			generation.ObjectVersionID == record.ObjectVersionID &&
-			generation.Generation == record.Generation &&
-			generation.State == "published" && !generation.Tombstoned {
-			current = true
-			break
-		}
 	}
 	if !current {
 		return EvidenceText{}, source.ErrDenied
@@ -181,16 +171,9 @@ func (s *Service) authorizedEvidenceSource(ctx context.Context, p auth.Principal
 		}
 		return source.Object{}, source.ObjectVersion{}, err
 	}
-	items, err := s.repo.ListCollectionItems(ctx, p.TenantID, record.CollectionID)
+	member, err := s.repo.CollectionHasObject(ctx, p.TenantID, record.CollectionID, record.ObjectID)
 	if err != nil {
 		return source.Object{}, source.ObjectVersion{}, err
-	}
-	member := false
-	for _, id := range items {
-		if id == record.ObjectID {
-			member = true
-			break
-		}
 	}
 	if !member {
 		return source.Object{}, source.ObjectVersion{}, source.ErrDenied

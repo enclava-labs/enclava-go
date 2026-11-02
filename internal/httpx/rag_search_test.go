@@ -593,16 +593,17 @@ func TestRAGReadableSearchRoute(t *testing.T) {
 		t.Fatalf("member readable search = %d body=%s", memberView.Code, memberView.Body.String())
 	}
 
-	// An exceeded work bound is an explicit search_scope_too_large, never a
-	// silent first-N result set.
-	previous := rag.SearchWorkBudget
-	defer func() { rag.SearchWorkBudget = previous }()
-	rag.SearchWorkBudget = 1
-	bounded := searchReadable(f, f.ownerKey, `{"query":"corpus","mode":"lexical"}`)
+	// Corpus size never bounds a search; the explicit request bound that
+	// remains is the collection-count cap, reported truthfully.
+	ids := make([]string, 0, 21)
+	for i := range 21 {
+		ids = append(ids, fmt.Sprintf("col_%d", i))
+	}
+	wide, _ := json.Marshal(map[string]any{"query": "corpus", "mode": "lexical", "collection_ids": ids})
+	bounded := searchReadable(f, f.ownerKey, string(wide))
 	if bounded.Code != http.StatusBadRequest || !strings.Contains(bounded.Body.String(), "search_scope_too_large") {
 		t.Fatalf("over-bound search = %d body=%s", bounded.Code, bounded.Body.String())
 	}
-	rag.SearchWorkBudget = previous
 	ok := searchReadable(f, f.ownerKey, `{"query":"corpus","mode":"lexical"}`)
 	if ok.Code != http.StatusOK || len(ok.Body.String()) == 0 {
 		t.Fatalf("restored bound search = %d", ok.Code)

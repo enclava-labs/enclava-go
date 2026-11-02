@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -150,6 +151,8 @@ type fakeVectorStore struct {
 	points    map[string][]rag.QdrantPoint
 	lastQuery []float64
 	queried   []string // index names, in query order
+	onPayload func()
+	ensureErr error
 }
 
 func newFakeVectorStore() *fakeVectorStore {
@@ -157,6 +160,11 @@ func newFakeVectorStore() *fakeVectorStore {
 }
 
 func (f *fakeVectorStore) EnsureCollection(ctx context.Context, collection string, vectorSize int) error {
+	if f.ensureErr != nil {
+		err := f.ensureErr
+		f.ensureErr = nil
+		return err
+	}
 	if _, ok := f.points[collection]; !ok {
 		f.points[collection] = nil
 	}
@@ -192,27 +200,46 @@ func (f *fakeVectorStore) DeleteGenerationPoints(ctx context.Context, collection
 }
 
 func (f *fakeVectorStore) SetPayload(ctx context.Context, collection string, filter map[string]any, payload map[string]any) error {
+	must, _ := filter["must"].([]map[string]any)
 	for i := range f.points[collection] {
+		matchPoint := true
+		for _, clause := range must {
+			match, _ := clause["match"].(map[string]any)
+			key, _ := clause["key"].(string)
+			if f.points[collection][i].Payload[key] != match["value"] {
+				matchPoint = false
+				break
+			}
+		}
+		if !matchPoint {
+			continue
+		}
 		for key, value := range payload {
 			f.points[collection][i].Payload[key] = value
 		}
 	}
+	if f.onPayload != nil {
+		f.onPayload()
+	}
 	return nil
 }
 
-func (f *fakeVectorStore) DeleteCollection(ctx context.Context, collection string) error {
+func (f *fakeVectorStore) CountPoints(_ context.Context, collection string) (int64, error) {
+	return int64(len(f.points[collection])), nil
+}
+
+func (f *fakeVectorStore) DeleteCollection(_ context.Context, collection string) error {
 	delete(f.points, collection)
 	return nil
 }
 
-func (f *fakeVectorStore) CountPoints(ctx context.Context, collection string) (int64, error) {
-	return int64(len(f.points[collection])), nil
-}
-
-// Search honours the authorization-scoped filter the service passes —
-// points for non-authorized version ids never match.
+// SearchHybrid honors the access prefilter the service passes: tenant and
+// access_enabled must match, acl must intersect the caller's tokens (or be
+// absent — an unprojected legacy point), and published must be true or
+// absent. Authorization itself is the service's PostgreSQL post-check.
 func (f *fakeVectorStore) SearchHybrid(ctx context.Context, collection string, vector []float64, sparse rag.SparseVector, limit int, filter map[string]any) ([]rag.QdrantSearchPoint, error) {
-	allowed := map[string]bool{}
+	var tenant string
+	var tokens []string
 	if filter != nil {
 		if must, ok := filter["must"].([]any); ok {
 			for _, clause := range must {
@@ -220,11 +247,27 @@ func (f *fakeVectorStore) SearchHybrid(ctx context.Context, collection string, v
 				if !ok {
 					continue
 				}
-				if m["key"] == "object_version_id" {
+				if m["key"] == "tenant_id" {
 					if match, ok := m["match"].(map[string]any); ok {
-						if anyList, ok := match["any"].([]string); ok {
-							for _, v := range anyList {
-								allowed[v] = true
+						tenant, _ = match["value"].(string)
+					}
+				}
+				if should, ok := m["should"].([]any); ok {
+					for _, alt := range should {
+						am, ok := alt.(map[string]any)
+						if !ok || am["key"] != "acl" {
+							continue
+						}
+						if match, ok := am["match"].(map[string]any); ok {
+							switch any := match["any"].(type) {
+							case []string:
+								tokens = any
+							case []any:
+								for _, v := range any {
+									if s, ok := v.(string); ok {
+										tokens = append(tokens, s)
+									}
+								}
 							}
 						}
 					}
@@ -234,20 +277,59 @@ func (f *fakeVectorStore) SearchHybrid(ctx context.Context, collection string, v
 	}
 	out := []rag.QdrantSearchPoint{}
 	for _, point := range f.points[collection] {
-		if len(allowed) > 0 && !allowed[point.Payload["object_version_id"].(string)] {
+		payload := point.Payload
+		if tenant != "" && payload["tenant_id"] != tenant {
 			continue
 		}
-		out = append(out, rag.QdrantSearchPoint{ID: point.ID, Score: 0.99, Payload: point.Payload})
+		if payload["access_enabled"] != true {
+			continue
+		}
+		if acl, present := payload["acl"]; present {
+			allowed := false
+			var entries []string
+			switch list := acl.(type) {
+			case []string:
+				entries = list
+			case []any:
+				for _, v := range list {
+					if s, ok := v.(string); ok {
+						entries = append(entries, s)
+					}
+				}
+			}
+			for _, entry := range entries {
+				for _, token := range tokens {
+					if entry == token {
+						allowed = true
+					}
+				}
+			}
+			if !allowed {
+				continue
+			}
+		}
+		if published, present := payload["published"]; present && published != true {
+			continue
+		}
+		out = append(out, rag.QdrantSearchPoint{ID: point.ID, Score: 0.99, Payload: payload})
 		if len(out) == limit {
 			break
 		}
 	}
 	return out, nil
 }
+
 func (f *fakeVectorStore) Query(ctx context.Context, collection string, input rag.QueryInput) ([]rag.QdrantSearchPoint, error) {
 	f.lastQuery = input.DenseVector
 	f.queried = append(f.queried, collection)
-	return f.SearchHybrid(ctx, collection, input.DenseVector, rag.SparseVector{}, input.Limit, input.Filter)
+	points, err := f.SearchHybrid(ctx, collection, input.DenseVector, rag.SparseVector{}, input.Limit+input.Offset, input.Filter)
+	if err != nil {
+		return nil, err
+	}
+	if input.Offset >= len(points) {
+		return nil, nil
+	}
+	return points[input.Offset:], nil
 }
 
 type fixture struct {
@@ -1192,6 +1274,48 @@ func TestAttemptRetriesWhenIndexDropped(t *testing.T) {
 	}
 }
 
+func TestAttemptRetriesTransientVectorFailure(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "retry.txt", MimeType: "text/plain", Bytes: []byte("transient vector failure"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.vector.ensureErr = fmt.Errorf("qdrant unavailable: %w", rag.ErrVectorStoreUnavailable)
+	claim, err := f.jobs.Lease(ctx, "test-worker", time.Minute)
+	if err != nil || claim == nil {
+		t.Fatalf("lease: %v", err)
+	}
+	_, err = f.svc.JobHandler()(ctx, claim, nil)
+	if jobs.FailureClassFor(err) != jobs.FailureRetryable {
+		t.Fatalf("transient vector failure = %v, want retryable", err)
+	}
+	if err := claim.Fail(ctx, err, jobs.FailureRetryable); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if claim, err = f.jobs.Lease(ctx, "test-worker", time.Minute); err != nil || claim != nil || time.Now().After(deadline) {
+			break
+		}
+	}
+	if err != nil || claim == nil {
+		t.Fatalf("lease retry: %v", err)
+	}
+	ref, err := f.svc.JobHandler()(ctx, claim, nil)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if _, err := claim.Complete(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "transient vector", Mode: rag.QueryLexical})
+	if err != nil || len(results) != 1 {
+		t.Fatalf("search after retry = %#v, %v", results, err)
+	}
+}
+
 func TestLexicalSearchSkipsEmbeddingAndRechecksRevocation(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
@@ -1701,18 +1825,6 @@ func TestServiceFailedDocumentsAndCountAreAuthorized(t *testing.T) {
 // 08-08: bounded readable search, reader upload, extraction import, profile
 // freeze.
 
-// refRecordingExecutor records the input-ref fan-out of every embedding
-// request — the executor Inputs slice is the billing/authorization surface.
-type refRecordingExecutor struct {
-	refCounts []int
-}
-
-func (e *refRecordingExecutor) Execute(ctx context.Context, p auth.Principal, req inference.Request) (*inference.Result, error) {
-	e.refCounts = append(e.refCounts, len(req.Inputs))
-	body := `{"object":"list","data":[{"index":0,"embedding":[1,2,3]}],"usage":{"prompt_tokens":1,"total_tokens":1}}`
-	return &inference.Result{Body: io.NopCloser(strings.NewReader(body))}, nil
-}
-
 // stageSearchDoc stages an authorized published document with one chunk and
 // registers its point with the fake vector store.
 func (f *fixture) stageSearchDoc(t *testing.T, collection rag.Collection, objectID, content, provenance string) {
@@ -1856,69 +1968,100 @@ func TestSearchReadableLimitBoundsFacets(t *testing.T) {
 	}
 }
 
-// TestSearchWorkBoundsAndRefFanOut: the object/work bound is explicit (never
-// silent first-N) and the executor input-ref fan-out stays within the
-// authorized-candidate bound.
-func TestSearchWorkBoundsAndRefFanOut(t *testing.T) {
+// enumerationRepo fails any whole-collection generation listing: the token
+// prefilter path must never enumerate documents to search.
+type enumerationRepo struct {
+	*postgres.RAGRepo
+	listed bool
+}
+
+func (r *enumerationRepo) ListPublishedGenerations(ctx context.Context, tenantID, collectionID string) ([]rag.IndexGeneration, error) {
+	r.listed = true
+	return nil, errors.New("generation enumeration must not run during search")
+}
+
+func (r *enumerationRepo) ListCollectionItems(ctx context.Context, tenantID, collectionID string) ([]string, error) {
+	r.listed = true
+	return nil, errors.New("collection item enumeration must not run during search or evidence reads")
+}
+
+func (r *enumerationRepo) ListPublishedGenerationsBounded(ctx context.Context, tenantID, collectionID string, limit int) ([]rag.IndexGeneration, error) {
+	r.listed = true
+	return nil, errors.New("generation enumeration must not run during search")
+}
+
+// TestSearchBeyondDocumentBound: a collection past the old 2,000-document
+// enumeration bound stays searchable — bindings come from one aggregate
+// read and hits authorize individually, never by listing the corpus.
+func TestSearchBeyondDocumentBound(t *testing.T) {
 	db := testdb.New(t)
 	tenant := testdb.SeedTenant(t, db, "rag-bounds")
 	user := testdb.SeedUser(t, db, tenant, "rag-bounds@example.test", nil)
-	repo := postgres.NewRAGRepo(db)
+	repo := &enumerationRepo{RAGRepo: postgres.NewRAGRepo(db)}
 	vector := newFakeVectorStore()
-	recorder := &refRecordingExecutor{}
-	svc := rag.NewService(repo, vector, recorder, "embed-test", nil, nil)
+	svc := rag.NewService(repo, vector, nil, "embed-test", nil, nil)
 	p := auth.Principal{TenantID: tenant, ActorID: user.ID, UserID: user.ID, ActorKind: auth.ActorKindUser,
 		Scopes: map[string]struct{}{"rag": {}, "rag.manage": {}}}
-	f := &fixture{db: db, svc: svc, repo: repo, vector: vector, tenant: tenant, principal: p}
+	f := &fixture{db: db, svc: svc, repo: repo.RAGRepo, vector: vector, tenant: tenant, principal: p}
 	ctx := context.Background()
-	collection, err := svc.CreateCollection(ctx, p, rag.CreateCollectionInput{Name: "bounded", ACL: map[string]any{"public": true}})
+	collection, err := svc.CreateCollection(ctx, p, rag.CreateCollectionInput{Name: "wide", ACL: map[string]any{"public": true}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		f.stageSearchDoc(t, collection, fmt.Sprintf("obj_w_%d", i), fmt.Sprintf("bounded work %d", i), `{}`)
 	}
-	previous := rag.SearchWorkBudget
-	defer func() { rag.SearchWorkBudget = previous }()
-	rag.SearchWorkBudget = 2
-
-	// Over budget → explicit error on the single-collection path...
-	if _, err := svc.Search(ctx, p, rag.SearchInput{CollectionID: collection.ID, Query: "bounded", Mode: rag.QueryHybrid}); !errors.Is(err, rag.ErrSearchWorkExceeded) {
-		t.Fatalf("over-budget search = %v, want ErrSearchWorkExceeded", err)
+	// 2,100 published audience-* generations with no index points: they
+	// define the aggregate binding but can never reach the post-check.
+	for i, stmt := range []string{
+		`INSERT INTO source_objects (tenant_id, id, kind, native_id, authorization_mode, audience, observed_seq)
+		 SELECT $1, 'bulk_' || g, 'document', 'bulk_' || g, 'audience', '["*"]'::jsonb, 1
+		 FROM generate_series(1, 2100) g`,
+		`INSERT INTO source_object_versions (tenant_id, id, object_id, observed_seq, artifact_ref, content_sha256, byte_size, provenance)
+		 SELECT $1, id || '#1', id, 1, 'art_' || id, 'sha_' || id, 10, '{}'::jsonb
+		 FROM source_objects WHERE tenant_id=$1 AND id LIKE 'bulk_%'`,
+		`INSERT INTO collection_items (tenant_id, id, collection_id, object_id)
+		 SELECT $1, 'ci_' || id, $2, id
+		 FROM source_objects WHERE tenant_id=$1 AND id LIKE 'bulk_%'`,
+		`INSERT INTO index_generations (tenant_id, id, collection_id, object_version_id, generation, state, qdrant_collection, embedding_model, access_projected)
+		 SELECT $1, 'g_' || id, $2, id || '#1', 1, 'published', $3, 'embed-test', TRUE
+		 FROM source_objects WHERE tenant_id=$1 AND id LIKE 'bulk_%'`,
+	} {
+		args := []any{tenant, collection.ID, collection.QdrantCollection}
+		if _, err := db.SQL.ExecContext(ctx, stmt, args[:[]int{1, 1, 2, 3}[i]]...); err != nil {
+			t.Fatalf("bulk fixture: %v", err)
+		}
 	}
-	// ...and on the cross-collection path.
-	if _, err := svc.SearchReadable(ctx, p, "bounded", rag.QueryHybrid, nil, 5); !errors.Is(err, rag.ErrSearchWorkExceeded) {
-		t.Fatalf("over-budget readable search = %v, want ErrSearchWorkExceeded", err)
-	}
-	if len(recorder.refCounts) != 0 {
-		t.Fatalf("over-budget request must not reach the executor: %#v", recorder.refCounts)
-	}
-
-	// Under budget, the search is complete and the executor input-ref
-	// fan-out is exactly the authorized candidate set.
-	rag.SearchWorkBudget = 10
-	results, err := svc.Search(ctx, p, rag.SearchInput{CollectionID: collection.ID, Query: "bounded", Mode: rag.QueryHybrid})
-	if err != nil || len(results) != 3 {
-		t.Fatalf("under-budget search results=%d err=%v", len(results), err)
-	}
-	if len(recorder.refCounts) != 1 || recorder.refCounts[0] != 3 {
-		t.Fatalf("executor ref fan-out = %#v, want one call carrying 3 refs", recorder.refCounts)
-	}
-
-	// The aggregate budget binds across collections of one request: with a
-	// budget of 3 total, a 3-document collection consumes it and any further
-	// collection becomes an explicit error, not silent omission.
-	rag.SearchWorkBudget = 3
-	extra, err := svc.CreateCollection(ctx, p, rag.CreateCollectionInput{Name: "extra", ACL: map[string]any{"public": true}})
+	results, err := svc.Search(ctx, p, rag.SearchInput{CollectionID: collection.ID, Query: "bounded work", Mode: rag.QueryLexical, Limit: 5})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("search over 2,103 documents = %v, want success", err)
 	}
-	f.stageSearchDoc(t, extra, "obj_extra", "bounded extra work", `{}`)
-	if _, err := svc.SearchReadable(ctx, p, "bounded", rag.QueryHybrid, nil, 10); !errors.Is(err, rag.ErrSearchWorkExceeded) {
-		t.Fatalf("aggregate budget = %v, want ErrSearchWorkExceeded", err)
+	if repo.listed {
+		t.Fatal("search enumerated the collection's generations")
 	}
-	if total := recorder.refCounts[len(recorder.refCounts)-1]; total > 3 {
-		t.Fatalf("per-call ref fan-out %d exceeded the bound", total)
+	if len(results) != 3 {
+		t.Fatalf("results=%d, want the 3 staged documents only: %#v", len(results), results)
+	}
+	contextResult, err := svc.BuildContext(ctx, p, results[:1], 100)
+	if err != nil || !strings.Contains(contextResult.Text, "bounded work") {
+		t.Fatalf("context = %#v, err=%v", contextResult, err)
+	}
+	text, err := svc.ReadEvidence(ctx, p, results[0].EvidenceID)
+	if err != nil || !strings.Contains(text.Content, "bounded work") {
+		t.Fatalf("evidence text = %#v, err=%v", text, err)
+	}
+	resolved, err := svc.ResolveEvidence(ctx, p, []string{results[0].EvidenceID})
+	if err != nil || len(resolved) != 1 || resolved[0].Status != "current" || resolved[0].CurrentGeneration != results[0].Generation {
+		t.Fatalf("evidence resolution = %#v, err=%v", resolved, err)
+	}
+	if repo.listed {
+		t.Fatal("context or evidence enumerated generations")
+	}
+	if _, err := svc.SearchReadable(ctx, p, "bounded work", rag.QueryLexical, nil, 5); err != nil {
+		t.Fatalf("readable search over the bound = %v, want success", err)
+	}
+	if repo.listed {
+		t.Fatal("readable search enumerated generations")
 	}
 }
 
@@ -2200,5 +2343,214 @@ func TestProfileFreezeAcrossSettingsChange(t *testing.T) {
 		ChunkProfileVersionID: &[]string{"cpv_missing"}[0],
 	}); !errors.Is(err, rag.ErrInvalidInput) {
 		t.Fatalf("invalid profile update = %v, want ErrInvalidInput", err)
+	}
+}
+
+// TestAccessBackfillProjectsLegacyPoints: staged points written before the
+// access projection pass the prefilter via the is_empty clauses; the
+// backfill then writes acl+published, marks the row projected and is a
+// no-op when run again.
+func TestAccessBackfillProjectsLegacyPoints(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{Name: "legacy", ACL: map[string]any{"public": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.stageSearchDoc(t, c, "obj_legacy", "legacy corpus", `{}`)
+	var projectedBefore int
+	if err := f.db.SQL.QueryRowContext(ctx,
+		`SELECT count(*) FROM index_generations WHERE tenant_id=$1 AND state='published' AND access_projected`, f.tenant).Scan(&projectedBefore); err != nil {
+		t.Fatal(err)
+	}
+	if projectedBefore != 0 {
+		t.Fatalf("staged generation must start unprojected, got %d", projectedBefore)
+	}
+	// Legacy points still answer through the is_empty clauses pre-backfill.
+	pre, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "legacy corpus", Mode: rag.QueryLexical, Limit: 5})
+	if err != nil || len(pre) != 1 {
+		t.Fatalf("unprojected point must still search: %#v err=%v", pre, err)
+	}
+
+	// Enqueue + run the durable backfill once.
+	system := auth.Principal{TenantID: f.tenant, ActorID: "system", ActorKind: auth.ActorKindServiceAccount}
+	if _, _, err := f.jobs.Enqueue(ctx, system, jobs.EnqueueRequest{
+		TenantID: f.tenant, Operation: rag.OperationAccessBackfill, IdempotencyKey: "bf-1",
+		InputRef: f.tenant, InputHash: "backfill", Policy: map[string]any{"tenant_id": f.tenant},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := f.jobs.Lease(ctx, "test-worker", time.Minute)
+	if err != nil || claim == nil {
+		t.Fatalf("lease backfill: %v", err)
+	}
+	result, err := f.svc.AccessBackfillJobHandler()(ctx, claim, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claim.Complete(ctx, result); err != nil {
+		t.Fatal(err)
+	}
+
+	// Points now carry the projected allow tokens and published=true.
+	var payload map[string]any
+	for _, point := range f.vector.points[c.QdrantCollection] {
+		payload = point.Payload
+	}
+	if payload == nil || payload["published"] != true {
+		t.Fatalf("backfill must set published: %#v", payload)
+	}
+	acl, ok := payload["acl"].([]string)
+	if !ok || len(acl) != 2 || !slices.Contains(acl, "actor:"+f.principal.ActorID) || !slices.Contains(acl, "tenant") {
+		t.Fatalf("backfilled acl = %#v, want actor+tenant tokens", payload["acl"])
+	}
+	var projectedAfter int
+	if err := f.db.SQL.QueryRowContext(ctx,
+		`SELECT count(*) FROM index_generations WHERE tenant_id=$1 AND state='published' AND access_projected`, f.tenant).Scan(&projectedAfter); err != nil {
+		t.Fatal(err)
+	}
+	if projectedAfter != 1 {
+		t.Fatalf("projected rows = %d, want 1", projectedAfter)
+	}
+	post, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "legacy corpus", Mode: rag.QueryLexical, Limit: 5})
+	if err != nil || len(post) != 1 {
+		t.Fatalf("projected point must still search: %#v err=%v", post, err)
+	}
+
+	// Idempotent: a second run finds no unprojected backlog.
+	if _, _, err := f.jobs.Enqueue(ctx, system, jobs.EnqueueRequest{
+		TenantID: f.tenant, Operation: rag.OperationAccessBackfill, IdempotencyKey: "bf-2",
+		InputRef: f.tenant, InputHash: "backfill", Policy: map[string]any{"tenant_id": f.tenant},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claim2, err := f.jobs.Lease(ctx, "test-worker", time.Minute)
+	if err != nil || claim2 == nil {
+		t.Fatalf("lease second backfill: %v", err)
+	}
+	result2, err := f.svc.AccessBackfillJobHandler()(ctx, claim2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result2 != "projected=0" {
+		t.Fatalf("second run = %q, want projected=0", result2)
+	}
+	if _, err := claim2.Complete(ctx, result2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Startup enqueue dedupes against live jobs for the same tenant.
+	if err := f.svc.EnqueueAccessBackfills(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPublicationFailureAfterPayloadPreservesOldGeneration(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	upload, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "a.txt", MimeType: "text/plain", Bytes: []byte("publication remains visible"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.runNextJob(t)
+	if _, err := f.svc.ReprocessDocument(ctx, f.principal, upload.Document.ID); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := f.jobs.Lease(ctx, "worker", time.Minute)
+	if err != nil || claim == nil {
+		t.Fatalf("lease: %v", err)
+	}
+	f.vector.onPayload = func() {
+		if _, err := f.db.SQL.ExecContext(ctx, `UPDATE jobs SET lease_expires_at=now()-interval '1 second' WHERE tenant_id=$1 AND id=$2`, f.tenant, claim.JobID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.svc.JobHandler()(ctx, claim, nil); err == nil {
+		t.Fatal("expired publication fence succeeded")
+	}
+	f.vector.onPayload = nil
+	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "publication", Mode: rag.QueryLexical})
+	if err != nil || len(results) != 1 || results[0].Generation != 1 {
+		t.Fatalf("search after failed publication = %#v, %v", results, err)
+	}
+}
+
+func TestAccessBackfillLoopResumesInterruptedJob(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	f.stageSearchDoc(t, c, "obj_interrupted", "interrupted backfill", `{}`)
+	if err := f.svc.EnqueueAccessBackfills(ctx); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := f.jobs.Lease(ctx, "crashed", time.Minute)
+	if err != nil || claim == nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if err := claim.MarkDispatched(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.SQL.ExecContext(ctx, `UPDATE jobs SET lease_expires_at=now()-interval '1 second' WHERE tenant_id=$1 AND id=$2`, f.tenant, claim.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.jobs.Lease(ctx, "sweeper", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	loopCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); f.svc.RunAccessBackfillLoop(loopCtx, 10*time.Millisecond) }()
+	defer func() { cancel(); <-done }()
+	var retry *jobs.Claim
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		retry, err = f.jobs.Lease(ctx, "retry", time.Minute)
+		if err != nil || retry != nil {
+			break
+		}
+	}
+	if err != nil || retry == nil {
+		t.Fatalf("backfill was not re-enqueued: %v", err)
+	}
+	result, err := f.svc.AccessBackfillJobHandler()(ctx, retry, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := retry.Complete(ctx, result); err != nil {
+		t.Fatal(err)
+	}
+	if result != "projected=1" {
+		t.Fatalf("backfill result = %q", result)
+	}
+}
+
+func TestBackfillDoesNotOverwriteNewerProjection(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	f.stageSearchDoc(t, c, "obj_revision", "revision test", `{}`)
+	if _, err := f.db.SQL.ExecContext(ctx, `UPDATE index_generations SET acl_revision=5 WHERE tenant_id=$1 AND collection_id=$2`, f.tenant, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, point := range f.vector.points[c.QdrantCollection] {
+		point.Payload["acl"] = []string{"newer"}
+		point.Payload["acl_revision"] = int64(5)
+		point.Payload["published"] = true
+	}
+	if err := f.svc.EnqueueAccessBackfills(ctx); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := f.jobs.Lease(ctx, "worker", time.Minute)
+	if err != nil || claim == nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if _, err := f.svc.AccessBackfillJobHandler()(ctx, claim, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, point := range f.vector.points[c.QdrantCollection] {
+		if !reflect.DeepEqual(point.Payload["acl"], []string{"newer"}) || point.Payload["acl_revision"] != int64(5) {
+			t.Fatalf("newer payload overwritten: %#v", point.Payload)
+		}
 	}
 }

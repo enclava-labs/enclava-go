@@ -264,3 +264,176 @@ func (a *Authorizer) checkNarrowing(ctx context.Context, obj Object, requested *
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------------
+// Search access projection: the prefilter tokens stamped on index points
+// and the token set a principal matches at query time. Tokens mirror the
+// ALLOW side of CanRead exactly; denies are never projected (the read-time
+// PostgreSQL post-check enforces them), so a token may over-include but the
+// post-check keeps results exact.
+
+// TokenNone is the sentinel ACL for an object nobody can read — a point
+// always carries a non-empty acl array so "no acl" means only "not yet
+// projected".
+const TokenNone = "none"
+
+// ReadTokens computes allow-path tokens and returns the grants revision used
+// for source ACLs (zero when no snapshot was used).
+// Owner and audience tokens mirror CanRead's allow paths; source ACL tokens
+// include grants on the object and its ancestors at the latest complete,
+// non-stale grants revision. Disabled connections retain their tokens so
+// re-enabling them does not require re-projection. Denies and connection
+// status are enforced by the authoritative read-time post-check.
+func (a *Authorizer) ReadTokens(ctx context.Context, obj Object) ([]string, int64, error) {
+	if obj.DeletedAt != nil || obj.TombstonedAt != nil {
+		return []string{TokenNone}, 0, nil
+	}
+	if obj.ConnectionID != "" {
+		_, err := a.repo.GetConnection(ctx, obj.TenantID, obj.ConnectionID)
+		if err != nil {
+			if errors.Is(err, ErrDenied) {
+				return []string{TokenNone}, 0, nil
+			}
+			return nil, 0, err
+		}
+	}
+	switch obj.AuthorizationMode {
+	case AuthorizationOwner:
+		if obj.OwnerActorID == "" {
+			return []string{TokenNone}, 0, nil
+		}
+		return []string{"actor:" + obj.OwnerActorID}, 0, nil
+	case AuthorizationAudience, AuthorizationPublishedAudience:
+		tokens := make([]string, 0, len(obj.Audience))
+		for _, id := range obj.Audience {
+			if id == "*" {
+				tokens = append(tokens, "tenant")
+			} else {
+				tokens = append(tokens, "actor:"+id)
+			}
+		}
+		if len(tokens) == 0 {
+			return []string{TokenNone}, 0, nil
+		}
+		return tokens, 0, nil
+	case AuthorizationSourceACL:
+		return a.sourceACLTokens(ctx, obj)
+	default:
+		return []string{TokenNone}, 0, nil
+	}
+}
+
+// sourceACLTokens projects every ALLOW grant visible at the same snapshot
+// canReadSourceACL evaluates — same revision freshness bound and ancestor
+// chain (max depth 8), deny rows ignored.
+func (a *Authorizer) sourceACLTokens(ctx context.Context, obj Object) ([]string, int64, error) {
+	none := []string{TokenNone}
+	if obj.ConnectionID == "" {
+		return none, 0, nil
+	}
+	now := time.Now()
+	rev, completedAt, err := a.repo.LatestCompleteRevision(ctx, obj.TenantID, obj.ConnectionID, SnapshotGrants)
+	if err != nil || completedAt.IsZero() || completedAt.After(now) || (a.MaxStale > 0 && now.Sub(completedAt) > a.MaxStale) {
+		if err != nil && !errors.Is(err, ErrDenied) {
+			return nil, 0, err
+		}
+		return none, 0, nil
+	}
+	objectIDs, err := a.repo.AncestorObjectIDs(ctx, obj.TenantID, obj.ConnectionID, obj.ID, 8)
+	if err != nil {
+		if errors.Is(err, ErrDenied) {
+			return none, 0, nil
+		}
+		return nil, 0, err
+	}
+	grants, err := a.repo.GrantsForObjects(ctx, obj.TenantID, obj.ConnectionID, objectIDs, rev)
+	if err != nil {
+		if errors.Is(err, ErrDenied) {
+			return none, 0, nil
+		}
+		return nil, 0, err
+	}
+	seen := map[string]struct{}{}
+	tokens := []string{}
+	for _, g := range grants {
+		if g.Effect != GrantEffectAllow {
+			continue
+		}
+		var token string
+		switch g.SubjectKind {
+		case GrantSubjectAll:
+			token = "tenant"
+		case GrantSubjectUser:
+			if g.SubjectID == "" {
+				continue
+			}
+			token = "sid:" + g.SubjectID
+		case GrantSubjectGroup:
+			if g.SubjectID == "" {
+				continue
+			}
+			token = "sgrp:" + g.SubjectID
+		}
+		if token == "" {
+			continue
+		}
+		if _, dup := seen[token]; !dup {
+			seen[token] = struct{}{}
+			tokens = append(tokens, token)
+		}
+	}
+	if len(tokens) == 0 {
+		return none, rev, nil
+	}
+	return tokens, rev, nil
+}
+
+// QueryTokens computes the prefilter token set one principal matches:
+// "actor:<ActorID>", "actor:<DelegatedByActorID>" when delegated and
+// "tenant", plus for every listed connection the principal's mapped source
+// identity ("sid:<identity>") and that identity's group ids ("sgrp:<id>")
+// from the latest complete, non-stale membership snapshot — connections
+// without a usable snapshot contribute no group tokens, consistent with
+// canReadSourceACL treating unknown membership as unproven.
+func (a *Authorizer) QueryTokens(ctx context.Context, p auth.Principal, connectionIDs []string) ([]string, error) {
+	tokens := []string{"tenant"}
+	if p.ActorID != "" {
+		tokens = append(tokens, "actor:"+p.ActorID)
+	}
+	if p.DelegatedByActorID != "" {
+		tokens = append(tokens, "actor:"+p.DelegatedByActorID)
+	}
+	mappedUser := p.UserID
+	if mappedUser == "" {
+		mappedUser = p.ActorID
+	}
+	now := time.Now()
+	for _, connectionID := range connectionIDs {
+		ident, err := a.repo.SourceIdentityForUser(ctx, p.TenantID, connectionID, mappedUser)
+		if err != nil {
+			if errors.Is(err, ErrDenied) {
+				continue
+			}
+			return nil, err
+		}
+		if ident.ID == "" {
+			continue
+		}
+		tokens = append(tokens, "sid:"+ident.ID)
+		membershipRev, membershipAt, err := a.repo.LatestCompleteRevision(ctx, p.TenantID, connectionID, SnapshotMembership)
+		if err != nil || membershipAt.IsZero() || membershipAt.After(now) || (a.MaxStale > 0 && now.Sub(membershipAt) > a.MaxStale) {
+			if err != nil && !errors.Is(err, ErrDenied) {
+				return nil, err
+			}
+			continue
+		}
+		groups, err := a.repo.GroupIDsForIdentity(ctx, p.TenantID, connectionID, ident.ID, membershipRev)
+		if err != nil {
+			continue // unknown membership: no group tokens, as the authorizer
+		}
+		for _, groupID := range groups {
+			tokens = append(tokens, "sgrp:"+groupID)
+		}
+	}
+	return tokens, nil
+}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -21,10 +22,11 @@ import (
 )
 
 const (
-	OperationEmbed       = "rag.embed"
-	OperationIngest      = "rag.ingest"
-	OperationAccess      = "rag.access"
-	OperationReembedScan = "rag.reembed_scan"
+	OperationEmbed          = "rag.embed"
+	OperationIngest         = "rag.ingest"
+	OperationAccess         = "rag.access"
+	OperationAccessBackfill = "rag.access_backfill"
+	OperationReembedScan    = "rag.reembed_scan"
 )
 
 // ErrProfileNotFound marks a chunk_profile_version_id that does not exist in
@@ -64,6 +66,7 @@ type Repository interface {
 	RemoveCollectionItem(ctx context.Context, tenantID, collectionID, objectID string) error
 	MarkCollectionItemRemoved(ctx context.Context, tenantID, collectionID, objectID string) error
 	ListCollectionItems(ctx context.Context, tenantID, collectionID string) ([]string, error)
+	CollectionHasObject(ctx context.Context, tenantID, collectionID, objectID string) (bool, error)
 	ListDocuments(ctx context.Context, tenantID, collectionID, status string, limit, offset int) ([]Document, error)
 	ListFailedDocuments(ctx context.Context, tenantID string, limit, offset int) ([]Document, error)
 	ListTenantDocuments(ctx context.Context, tenantID string, limit, offset int) ([]Document, error)
@@ -95,6 +98,18 @@ type Repository interface {
 	CompleteIndexReconciliation(ctx context.Context, reconciliation IndexReconciliation) error
 	ReserveKnowledgeImport(ctx context.Context, tenantID, collectionID, importRef, objectID, kind string) (reservedObjectID string, complete bool, err error)
 	ListGenerationsForConnection(ctx context.Context, tenantID, connectionID string) ([]IndexGeneration, error)
+	// Search reads bindings and connections without enumerating documents,
+	// then checks each hit against its published generation.
+	DistinctIndexBindings(ctx context.Context, tenantID, collectionID string) ([]IndexBinding, error)
+	ListCollectionConnectionIDs(ctx context.Context, tenantID, collectionID string) ([]string, error)
+	PublishedGenerationForVersion(ctx context.Context, tenantID, collectionID, versionID string, generation int64) (bool, error)
+	CurrentPublishedGeneration(ctx context.Context, tenantID, collectionID, objectID, versionID string) (int64, error)
+	// Access-projection backlog: published generations whose index points
+	// predate the acl/published projection, their marker flip, and the
+	// tenants that still need the backfill job.
+	ListUnprojectedGenerations(ctx context.Context, tenantID string, limit int) ([]IndexGeneration, error)
+	ProjectGenerationAccess(ctx context.Context, tenantID, collectionID, versionID string, generation int64, project func(int64) (int64, error)) error
+	TenantsNeedingAccessBackfill(ctx context.Context) ([]string, error)
 	RecordKnowledgeImport(ctx context.Context, tenantID, collectionID, importRef, objectID, kind string) error
 	GetStoredResult(ctx context.Context, tenantID, jobID string) (StoredResult, error)
 	PublishGenerationFenced(ctx context.Context, tenantID, collectionID, objectID, versionID string, generation int64, jobID, leaseOwner, attemptID string, fenceToken int64) error
@@ -1321,6 +1336,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 			"content": chunkText, "search_text": searchTexts[i], "file_name": ver.OriginalFilename,
 			"source_type": obj.Kind, "source_id": obj.NativeID, "source_uri": sourceURI,
 			"metadata": docMetadata, "access_revision": accessRevision, "access_enabled": true,
+			"published": false,
 		}
 		spanPayload := make([]map[string]any, 0, len(structuredChunks[i].Spans))
 		for _, span := range structuredChunks[i].Spans {
@@ -1374,13 +1390,34 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		return "", jobs.Retryable(fmt.Errorf("collection %s moved to a new index during the attempt", c.ID))
 	}
 	if err := s.vectorStore.EnsureCollection(ctx, c.QdrantCollection, len(vectors[0])); err != nil {
-		return "", err
+		return "", retryVectorError(err)
 	}
 	if err := s.vectorStore.UpsertPoints(ctx, c.QdrantCollection, points); err != nil {
-		return "", err
+		return "", retryVectorError(err)
 	}
-	// Publish only after the durable chunks and index writes exist.
-	err = s.repo.PublishGenerationFenced(ctx, job.TenantID, c.ID, obj.ID, versionRowID(ver), generation, claim.JobID, claim.Owner, claim.AttemptID(), claim.FenceToken)
+	err = s.repo.ProjectGenerationAccess(ctx, job.TenantID, c.ID, versionRowID(ver), generation, func(currentRevision int64) (int64, error) {
+		object, err := s.repo.GetObject(ctx, job.TenantID, obj.ID)
+		if err != nil {
+			return 0, err
+		}
+		tokens, revision, err := s.authorizer.ReadTokens(ctx, object)
+		if err != nil {
+			return 0, err
+		}
+		if revision < currentRevision {
+			return 0, errors.New("rag: access revision moved backwards")
+		}
+		if err := s.vectorStore.SetPayload(ctx, c.QdrantCollection, map[string]any{"must": []map[string]any{
+			{"key": "object_version_id", "match": map[string]any{"value": versionRowID(ver)}},
+			{"key": "generation", "match": map[string]any{"value": generation}},
+		}}, map[string]any{"acl": tokens, "acl_revision": revision, "published": true}); err != nil {
+			return 0, retryVectorError(err)
+		}
+		if err := s.repo.PublishGenerationFenced(ctx, job.TenantID, c.ID, obj.ID, versionRowID(ver), generation, claim.JobID, claim.Owner, claim.AttemptID(), claim.FenceToken); err != nil {
+			return 0, err
+		}
+		return revision, nil
+	})
 	if errors.Is(err, ErrGenerationSuperseded) {
 		// A newer generation published first: drop what this one wrote.
 		if err := s.vectorStore.DeleteGenerationPoints(ctx, c.QdrantCollection, versionRowID(ver), generation); err != nil {
@@ -1405,6 +1442,14 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	}
 	s.retireIndexes(ctx, job.TenantID, c.ID)
 	return versionRowID(ver), nil
+}
+
+func retryVectorError(err error) error {
+	var networkError net.Error
+	if errors.Is(err, ErrVectorStoreUnavailable) || errors.As(err, &networkError) {
+		return jobs.Retryable(err)
+	}
+	return err
 }
 
 // embed dispatches one bounded embedding attempt through the shared

@@ -1,0 +1,7 @@
+# Keeping a sourdough starter
+
+A sourdough starter is a living culture of wild yeast and lactic bacteria maintained by regular feeding of flour and water. A common feeding is one part starter to one part flour and one part water by weight, though hungrier schedules use larger refreshments like 1:2:2 when the culture is sluggish or temperatures are warm. A mature starter doubled within four to eight hours of feeding, domed and bubbly with a pleasantly sour smell, is ready to leaven bread.
+
+Temperature drives the whole schedule. Warm kitchens accelerate fermentation and demand feeding once or twice a day; a culture kept in the refrigerator slows to a weekly feed, convenient for occasional bakers. Feed enough that the culture peaks before it is fed again — a starter kept chronically starved accumulates acid and weakens the yeast population.
+
+Recovery from neglect is usually possible. A healthy starter is pink-free and smells sour, like yogurt or ripe fruit; a sharp acetone or nail-polish smell just signals hunger, fixable by a few generous feedings. Pink, orange or fuzzy growth means mold and the culture should be discarded and restarted. A layer of grey liquid on top, the hooch, is the culture's starving sign — pour it off or stir it back for a more sour flavor, then feed. Keeping a small dried or refrigerated backup insurance culture saves a failed starter from ending sourdough plans for a week.

@@ -160,6 +160,61 @@ func integrationSparse(text string) rag.SparseVector {
 	return rag.SparseVector{Indices: indices, Values: values}
 }
 
+// TestAccessFilterPrefilterIntegration: the acl/published projection
+// prefilters live Qdrant exactly — a sid token matches its principal,
+// "none" matches nobody, and points written before the projection (no
+// acl/published keys) still reach the post-check.
+func TestAccessFilterPrefilterIntegration(t *testing.T) {
+	baseURL := envOrFatal(t, "QDRANT_INTEGRATION_URL")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client := rag.NewQdrantClient(baseURL, 5*time.Second)
+	collection := "rag_acl_" + ragSafeName()
+	defer func() { _ = client.DeleteCollection(context.Background(), collection) }()
+	if err := client.EnsureCollection(ctx, collection, 2); err != nil {
+		t.Fatalf("ensure collection: %v", err)
+	}
+	point := func(payload map[string]any) rag.QdrantPoint {
+		payload["tenant_id"] = "tenant-a"
+		payload["access_enabled"] = true
+		payload["search_text"] = "sharedterm"
+		return rag.QdrantPoint{ID: ragPointID(), Vector: []float64{1, 0}, Sparse: integrationSparse("sharedterm"), Payload: payload}
+	}
+	if err := client.UpsertPoints(ctx, collection, []rag.QdrantPoint{
+		point(map[string]any{"document_id": "doc-a", "acl": []string{"sid:a"}, "published": true}),
+		point(map[string]any{"document_id": "doc-b", "acl": []string{"sid:b"}, "published": true}),
+		point(map[string]any{"document_id": "doc-none", "acl": []string{"none"}, "published": true}),
+		point(map[string]any{"document_id": "doc-legacy"}), // unprojected: no acl/published keys
+		point(map[string]any{"document_id": "doc-staged", "acl": []string{"tenant"}, "published": false}),
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	query := func(tokens []string) map[string]bool {
+		filter := rag.AccessFilter("tenant-a", tokens, nil)
+		points, err := client.Query(ctx, collection, rag.QueryInput{Mode: rag.QueryLexical, LexicalText: "sharedterm", Filter: filter, Limit: 10})
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		docs := map[string]bool{}
+		for _, p := range points {
+			docs[p.Payload["document_id"].(string)] = true
+		}
+		return docs
+	}
+	a := query([]string{"tenant", "actor:x", "sid:a"})
+	if !a["doc-a"] || !a["doc-legacy"] || a["doc-b"] || a["doc-none"] || a["doc-staged"] {
+		t.Fatalf("sid:a view = %#v", a)
+	}
+	b := query([]string{"tenant", "sid:b"})
+	if !b["doc-b"] || !b["doc-legacy"] || b["doc-a"] || b["doc-none"] || b["doc-staged"] {
+		t.Fatalf("sid:b view = %#v", b)
+	}
+	none := query([]string{"actor:y"}) // no tenant token: audience-* hidden
+	if none["doc-a"] || none["doc-b"] || none["doc-none"] || none["doc-staged"] || !none["doc-legacy"] {
+		t.Fatalf("no-token view = %#v", none)
+	}
+}
+
 // TestEmbeddingExecutorIntegration indexes a small text fixture end-to-end:
 // real PostgreSQL, real Qdrant and a real OpenAI-compatible embedding
 // endpoint reached through the shared priced executor — one dispatched

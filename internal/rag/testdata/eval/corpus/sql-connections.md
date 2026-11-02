@@ -1,0 +1,7 @@
+# Connection management and pooling
+
+A database server keeps one backend process per client connection, so every open connection costs memory and scheduling attention. Applications that open a connection per request can exhaust the connection limit under modest traffic; an external pooler lets thousands of client sessions share a small set of real server connections.
+
+The two common pooling modes differ in what state survives. Session pooling assigns one server connection to a client for its whole session, so temporary tables, session settings and prepared statements behave normally. Transaction pooling returns the server connection to the pool after each transaction finishes. It multiplexes connections much more aggressively, but anything scoped to the session breaks: a prepared statement can be re-parsed against a different backend and fail, and SET commands do not persist. Applications on transaction pooling must prepare statements per transaction or rely on the pooler's own prepared-statement support.
+
+Idle connections are the frequent fault. An application that begins a transaction and then waits for external work holds a pooled connection doing nothing; with transaction pooling the pattern known as idle in transaction eventually starves other clients. Keep transactions short, bound the pool to the connections the server can actually serve, and remember that more pooled concurrency does not create more database capacity.

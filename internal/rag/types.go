@@ -114,6 +114,16 @@ type IndexGeneration struct {
 	Tombstoned          bool
 }
 
+// IndexBinding is one distinct index a collection's published generations
+// were embedded into: a query must embed with this model/size/prefix and
+// hit this Qdrant collection.
+type IndexBinding struct {
+	QdrantCollection    string
+	EmbeddingModel      string
+	QueryPrefix         string
+	EmbeddingDimensions int
+}
+
 type IndexReconciliation struct {
 	TenantID         string
 	CollectionID     string

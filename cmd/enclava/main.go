@@ -235,15 +235,16 @@ func main() {
 
 	// Worker: extract, preview and embed jobs use the same durable runner.
 	jobsRunner := jobs.NewRunner(jobsSvc, artifactStore, map[string]jobs.HandlerFunc{
-		extract.OperationProcess: extractSvc.JobHandler(),
-		extract.OperationVision:  extractSvc.JobHandler(),
-		extract.OperationPreview: previewSvc.JobHandler(),
-		rag.OperationEmbed:       ragSvc.JobHandler(),
-		rag.OperationIngest:      ragSvc.IngestJobHandler(),
-		rag.OperationAccess:      ragSvc.AccessJobHandler(),
-		rag.OperationReembedScan: ragSvc.ReembedScanJobHandler(),
-		connectors.OperationSync: connectorSvc.JobHandler(),
-		chatbot.RunOperation:     chatbotSvc.JobHandler(),
+		extract.OperationProcess:    extractSvc.JobHandler(),
+		extract.OperationVision:     extractSvc.JobHandler(),
+		extract.OperationPreview:    previewSvc.JobHandler(),
+		rag.OperationEmbed:          ragSvc.JobHandler(),
+		rag.OperationIngest:         ragSvc.IngestJobHandler(),
+		rag.OperationAccess:         ragSvc.AccessJobHandler(),
+		rag.OperationAccessBackfill: ragSvc.AccessBackfillJobHandler(),
+		rag.OperationReembedScan:    ragSvc.ReembedScanJobHandler(),
+		connectors.OperationSync:    connectorSvc.JobHandler(),
+		chatbot.RunOperation:        chatbotSvc.JobHandler(),
 	}, jobs.RunnerConfig{JobTimeout: cfg.JobTimeout})
 	runnerCtx, stopRunner := context.WithCancel(context.Background())
 	go previewSvc.RunRetention(runnerCtx)
@@ -254,6 +255,8 @@ func main() {
 			log.Printf("jobs runner error: %v", err)
 		}
 	}()
+
+	go ragSvc.RunAccessBackfillLoop(runnerCtx, time.Minute)
 
 	// Scheduled connector syncs: per-source sync_interval (default 1h, min
 	// 5m, "off" disables) re-enqueues connector.sync for due sources.

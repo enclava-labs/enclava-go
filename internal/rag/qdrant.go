@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"time"
 )
+
+var ErrVectorStoreUnavailable = errors.New("vector store unavailable")
 
 type QdrantClient struct {
 	baseURL string
@@ -46,40 +49,15 @@ func (c *QdrantClient) EnsureCollection(ctx context.Context, collection string, 
 	if vectorSize <= 0 {
 		return fmt.Errorf("vector size must be positive")
 	}
-	status, resp, err := c.do(ctx, http.MethodGet, "/collections/"+url.PathEscape(collection), nil)
-	if err == nil && status < 300 {
-		var envelope struct {
-			Result struct {
-				Config struct {
-					Params struct {
-						Vectors map[string]struct {
-							Size     int    `json:"size"`
-							Distance string `json:"distance"`
-						} `json:"vectors"`
-						SparseVectors map[string]json.RawMessage `json:"sparse_vectors"`
-					} `json:"params"`
-				} `json:"config"`
-			} `json:"result"`
-		}
-		if decodeErr := json.Unmarshal(resp, &envelope); decodeErr != nil {
-			return fmt.Errorf("decode existing qdrant schema: %w", decodeErr)
-		}
-		dense, hasDense := envelope.Result.Config.Params.Vectors["dense"]
-		sparse, hasSparse := envelope.Result.Config.Params.SparseVectors["text"]
-		var sparseConfig struct {
-			Modifier string `json:"modifier"`
-		}
-		_ = json.Unmarshal(sparse, &sparseConfig)
-		if !hasDense || dense.Size != vectorSize || dense.Distance != "Cosine" || !hasSparse || sparseConfig.Modifier != "idf" {
-			return fmt.Errorf("qdrant collection %q has incompatible dense/BM25 schema", collection)
-		}
-		return nil
-	}
-	if err != nil && status != http.StatusNotFound {
+	compatible, status, err := c.verifyCollectionSchema(ctx, collection, vectorSize, false)
+	if err != nil {
 		return err
 	}
-	if status != http.StatusNotFound && status != 0 {
-		return fmt.Errorf("qdrant collection check failed with status %d", status)
+	if compatible {
+		return c.ensurePayloadIndexes(ctx, collection)
+	}
+	if status != http.StatusNotFound {
+		return fmt.Errorf("qdrant collection %q has incompatible dense/BM25 schema", collection)
 	}
 
 	body, err := json.Marshal(map[string]any{
@@ -89,12 +67,115 @@ func (c *QdrantClient) EnsureCollection(ctx context.Context, collection string, 
 	if err != nil {
 		return err
 	}
-	status, resp, err = c.do(ctx, http.MethodPut, "/collections/"+url.PathEscape(collection), body)
+	status, resp, err := c.do(ctx, http.MethodPut, "/collections/"+url.PathEscape(collection), body)
 	if err != nil {
 		return err
 	}
-	if status >= 300 {
+	if status == http.StatusConflict {
+		// A concurrent attempt created the same index first: accept it when
+		// the winner's schema is the one this caller requires.
+		compatible, _, err = c.verifyCollectionSchema(ctx, collection, vectorSize, true)
+		if err != nil {
+			return err
+		}
+		if !compatible {
+			return fmt.Errorf("qdrant collection %q has incompatible dense/BM25 schema", collection)
+		}
+	} else if status >= 300 {
 		return fmt.Errorf("qdrant create collection failed: status=%d body=%s", status, string(resp))
+	}
+	return c.ensurePayloadIndexes(ctx, collection)
+}
+
+// verifyCollectionSchema reports whether the existing collection carries the
+// required dense/BM25 schema; status is the GET's HTTP status (0 on
+// transport error).
+func (c *QdrantClient) verifyCollectionSchema(ctx context.Context, collection string, vectorSize int, retryMissing bool) (bool, int, error) {
+	for attempt := 0; ; attempt++ {
+		compatible, status, err := c.checkCollectionSchema(ctx, collection, vectorSize)
+		retry := status >= 500 || (retryMissing && status == http.StatusNotFound)
+		if !retry {
+			return compatible, status, err
+		}
+		if attempt == 4 {
+			if err == nil {
+				err = fmt.Errorf("%w: qdrant collection %q not yet visible", ErrVectorStoreUnavailable, collection)
+			}
+			return false, status, err
+		}
+		timer := time.NewTimer(100 * time.Millisecond << attempt)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false, status, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *QdrantClient) checkCollectionSchema(ctx context.Context, collection string, vectorSize int) (compatible bool, status int, err error) {
+	status, resp, err := c.do(ctx, http.MethodGet, "/collections/"+url.PathEscape(collection), nil)
+	if err != nil {
+		if status != http.StatusNotFound {
+			return false, status, err
+		}
+		return false, status, nil
+	}
+	if status == http.StatusNotFound {
+		return false, status, nil
+	}
+	if status >= 300 {
+		return false, status, fmt.Errorf("qdrant collection check failed with status %d", status)
+	}
+	var envelope struct {
+		Result struct {
+			Config struct {
+				Params struct {
+					Vectors map[string]struct {
+						Size     int    `json:"size"`
+						Distance string `json:"distance"`
+					} `json:"vectors"`
+					SparseVectors map[string]json.RawMessage `json:"sparse_vectors"`
+				} `json:"params"`
+			} `json:"config"`
+		} `json:"result"`
+	}
+	if decodeErr := json.Unmarshal(resp, &envelope); decodeErr != nil {
+		return false, status, fmt.Errorf("decode existing qdrant schema: %w", decodeErr)
+	}
+	dense, hasDense := envelope.Result.Config.Params.Vectors["dense"]
+	sparse, hasSparse := envelope.Result.Config.Params.SparseVectors["text"]
+	var sparseConfig struct {
+		Modifier string `json:"modifier"`
+	}
+	_ = json.Unmarshal(sparse, &sparseConfig)
+	return hasDense && dense.Size == vectorSize && dense.Distance == "Cosine" && hasSparse && sparseConfig.Modifier == "idf", status, nil
+}
+
+// payloadIndexes are the keyword/bool payload indexes every search filter
+// relies on; created idempotently so collections made before the access
+// projection gain them on first touch. tenant_id and collection ids share
+// the index: uuid covers both, keyword does not index uuids.
+var payloadIndexes = []struct{ key, schema string }{
+	{"tenant_id", "keyword"},
+	{"acl", "keyword"},
+	{"published", "bool"},
+	{"access_enabled", "bool"},
+}
+
+func (c *QdrantClient) ensurePayloadIndexes(ctx context.Context, collection string) error {
+	for _, index := range payloadIndexes {
+		body, err := json.Marshal(map[string]any{"field_name": index.key, "field_schema": index.schema})
+		if err != nil {
+			return err
+		}
+		status, resp, err := c.do(ctx, http.MethodPut, "/collections/"+url.PathEscape(collection)+"/index", body)
+		if err != nil {
+			return err
+		}
+		if status >= 300 && status != http.StatusConflict {
+			return fmt.Errorf("qdrant create payload index %q failed: status=%d body=%s", index.key, status, string(resp))
+		}
 	}
 	return nil
 }
@@ -355,12 +436,18 @@ func (c *QdrantClient) do(ctx context.Context, method, path string, body []byte)
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("qdrant request failed: %w", err)
+		if ctx.Err() != nil {
+			return 0, nil, ctx.Err()
+		}
+		return 0, nil, fmt.Errorf("%w: qdrant request failed: %w", ErrVectorStoreUnavailable, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
 	if err != nil {
-		return resp.StatusCode, nil, fmt.Errorf("read qdrant response: %w", err)
+		return resp.StatusCode, nil, fmt.Errorf("%w: read qdrant response: %w", ErrVectorStoreUnavailable, err)
+	}
+	if resp.StatusCode >= 500 {
+		return resp.StatusCode, respBody, fmt.Errorf("%w: qdrant request failed: status=%d body=%s", ErrVectorStoreUnavailable, resp.StatusCode, respBody)
 	}
 	return resp.StatusCode, respBody, nil
 }

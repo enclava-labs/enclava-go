@@ -28,8 +28,8 @@ func TestQueryWireModesAndFilters(t *testing.T) {
 		_, _ = w.Write([]byte(`{"result":{"points":[]}}`))
 	}))
 	defer server.Close()
+	filter := AccessFilter("tenant-1", []string{"tenant", "actor:a"}, nil)
 	client := NewQdrantClient(server.URL, 0)
-	filter := FilterBuilder("tenant-1", []IndexGeneration{{ObjectVersionID: "version-1", Generation: 7}}, nil)
 	if _, err := client.Query(context.Background(), "c", QueryInput{Mode: QueryHybrid, DenseVector: []float64{1, 2}, LexicalText: "hello", Filter: filter, Limit: 3}); err != nil {
 		t.Fatal(err)
 	}
@@ -38,8 +38,16 @@ func TestQueryWireModesAndFilters(t *testing.T) {
 		t.Fatalf("unexpected hybrid body: %#v", request)
 	}
 	clauses := prefetch[0].(map[string]any)["filter"].(map[string]any)["must"].([]any)
-	if clauses[0].(map[string]any)["key"] != "tenant_id" || clauses[1].(map[string]any)["key"] != "access_enabled" || clauses[2].(map[string]any)["should"] == nil {
+	if clauses[0].(map[string]any)["key"] != "tenant_id" || clauses[1].(map[string]any)["key"] != "access_enabled" {
 		t.Fatalf("missing server-scoped filter: %#v", clauses)
+	}
+	aclShould := clauses[2].(map[string]any)["should"].([]any)
+	if aclShould[0].(map[string]any)["key"] != "acl" || aclShould[1].(map[string]any)["is_empty"] == nil {
+		t.Fatalf("missing acl token/unprojected clauses: %#v", aclShould)
+	}
+	pubShould := clauses[3].(map[string]any)["should"].([]any)
+	if pubShould[0].(map[string]any)["key"] != "published" || pubShould[1].(map[string]any)["is_empty"] == nil {
+		t.Fatalf("missing published/unprojected clauses: %#v", pubShould)
 	}
 	if _, ok := prefetch[1].(map[string]any)["query"].(map[string]any); !ok {
 		t.Fatalf("missing native BM25 text query: %#v", prefetch[1])
@@ -56,13 +64,13 @@ func TestQueryWireModesAndFilters(t *testing.T) {
 	}
 }
 
-func TestFilterBuilderCannotOmitServerScope(t *testing.T) {
-	filter := FilterBuilder("tenant-1", []IndexGeneration{{ObjectVersionID: "v1", Generation: 2}}, map[string]any{"key": "kind", "match": map[string]any{"value": "file"}})
+func TestAccessFilterCannotOmitServerScope(t *testing.T) {
+	filter := AccessFilter("tenant-1", []string{"tenant"}, map[string]any{"key": "kind", "match": map[string]any{"value": "file"}})
 	must := filter["must"].([]any)
-	if len(must) != 4 {
-		t.Fatalf("expected tenant, access, generation and narrowing clauses, got %#v", must)
+	if len(must) != 5 {
+		t.Fatalf("expected tenant, access, acl, published and narrowing clauses, got %#v", must)
 	}
-	if must[0].(map[string]any)["key"] != "tenant_id" || must[1].(map[string]any)["key"] != "access_enabled" || must[2].(map[string]any)["should"] == nil {
+	if must[0].(map[string]any)["key"] != "tenant_id" || must[1].(map[string]any)["key"] != "access_enabled" || must[2].(map[string]any)["should"] == nil || must[3].(map[string]any)["should"] == nil {
 		t.Fatalf("missing server scope: %#v", must)
 	}
 }
@@ -97,26 +105,26 @@ type denyContextObject string
 // object.Kind (often just "document").
 func TestSourceKindFallbackChain(t *testing.T) {
 	svc := &Service{}
-	candidate := func(provenance, connectionID string) authorizedCandidate {
-		return authorizedCandidate{
-			object:  source.Object{TenantID: "t", ID: "o", Kind: "document", ConnectionID: connectionID},
-			version: source.ObjectVersion{Provenance: provenance},
-		}
+	object := func(connectionID string) source.Object {
+		return source.Object{TenantID: "t", ID: "o", Kind: "document", ConnectionID: connectionID}
 	}
 	cache := map[string]string{"conn_kind": "slack"}
 	cases := []struct {
-		name      string
-		candidate authorizedCandidate
-		cache     map[string]string
-		want      string
+		name         string
+		provenance   string
+		connectionID string
+		cache        map[string]string
+		want         string
 	}{
-		{"provenance source_kind wins", candidate(`{"source_kind":"github"}`, "conn_kind"), cache, "github"},
-		{"connection kind next", candidate(`{}`, "conn_kind"), cache, "slack"},
-		{"provenance kind last", candidate(`{"kind":"generated"}`, ""), cache, "generated"},
-		{"unknown never object.Kind", candidate(`{}`, ""), cache, "unknown"},
+		{"provenance source_kind wins", `{"source_kind":"github"}`, "conn_kind", cache, "github"},
+		{"connection kind next", `{}`, "conn_kind", cache, "slack"},
+		{"provenance kind last", `{"kind":"generated"}`, "", cache, "generated"},
+		{"unknown never object.Kind", `{}`, "", cache, "unknown"},
 	}
 	for _, tc := range cases {
-		if got := svc.sourceKindFor(context.Background(), "t", tc.candidate, tc.cache); got != tc.want {
+		obj := object(tc.connectionID)
+		ver := source.ObjectVersion{Provenance: tc.provenance}
+		if got := svc.sourceKindFor(context.Background(), "t", obj, ver, tc.cache); got != tc.want {
 			t.Fatalf("%s: sourceKindFor=%q want %q", tc.name, got, tc.want)
 		}
 	}
@@ -196,21 +204,27 @@ func (d denyContextObject) CanReadObject(_ context.Context, _ auth.Principal, id
 
 type retrievalExecutor struct {
 	requests  []inference.Request
-	denyUnion bool
+	denyModel string
+	onChat    func()
 }
 
 func (e *retrievalExecutor) Execute(_ context.Context, _ auth.Principal, req inference.Request) (*inference.Result, error) {
 	e.requests = append(e.requests, req)
-	if e.denyUnion && len(req.Inputs) > 1 {
+	if req.Model == e.denyModel && e.denyModel != "" {
 		return nil, inference.ErrDenied
 	}
 	body := `{"data":[{"index":0,"embedding":[1,2]}]}`
 	if req.Capability == inference.CapabilityChat {
+		if e.onChat != nil {
+			e.onChat()
+		}
 		body = `{"choices":[{"message":{"content":"rewritten"}}]}`
 	}
 	return &inference.Result{Body: io.NopCloser(strings.NewReader(body))}, nil
 }
 
+// retrievalVectors records QueryInputs; it returns no points because these
+// tests assert binding/fan-out behavior, not hits.
 type retrievalVectors struct {
 	VectorStore
 	queries []QueryInput
@@ -221,29 +235,36 @@ func (v *retrievalVectors) Query(_ context.Context, _ string, input QueryInput) 
 	return nil, nil
 }
 
+// searchStubRepo supplies the aggregate reads searchCollection needs; any
+// document-enumeration call would hit the nil embedded Repository and fail.
+type searchStubRepo struct {
+	Repository
+	bindings    []IndexBinding
+	connections []string
+}
+
+func (r *searchStubRepo) DistinctIndexBindings(_ context.Context, _, _ string) ([]IndexBinding, error) {
+	return r.bindings, nil
+}
+
+func (r *searchStubRepo) ListCollectionConnectionIDs(_ context.Context, _, _ string) ([]string, error) {
+	return r.connections, nil
+}
+
 func TestSearchCollectionPrefixesAndMemo(t *testing.T) {
 	exec := &retrievalExecutor{}
 	vectors := &retrievalVectors{}
-	svc := &Service{executor: exec, vectorStore: vectors}
+	repo := &searchStubRepo{}
+	svc := &Service{repo: repo, executor: exec, vectorStore: vectors, authorizer: source.NewAuthorizer(repo, 0)}
 	memo := newQueryEmbeddingMemo()
-	sets := make([][]authorizedCandidate, 0, 3)
 	for i := range 3 {
-		g := IndexGeneration{ObjectVersionID: fmt.Sprint(i), QdrantCollection: fmt.Sprint(i), EmbeddingModel: "model", EmbeddingDimensions: 2, QueryPrefix: "query: "}
-		candidates := []authorizedCandidate{{generation: g, object: source.Object{ID: fmt.Sprint(i)}}}
-		sets = append(sets, candidates)
-		memo.addCollection("t", candidates)
-	}
-	for _, candidates := range sets {
-		_, err := svc.searchCollection(context.Background(), auth.Principal{TenantID: "t"}, Collection{}, SearchInput{Query: "hello", Mode: QueryHybrid}, candidates, memo)
-		if err != nil {
+		repo.bindings = []IndexBinding{{QdrantCollection: fmt.Sprint(i), EmbeddingModel: "model", EmbeddingDimensions: 2, QueryPrefix: "query: "}}
+		if _, err := svc.searchCollection(context.Background(), auth.Principal{TenantID: "t"}, Collection{}, SearchInput{Query: "hello", Mode: QueryHybrid}, memo); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if len(exec.requests) != 1 {
 		t.Fatalf("embedding calls = %d, want 1", len(exec.requests))
-	}
-	if len(exec.requests[0].Inputs) != 3 || exec.requests[0].Inputs[0].ObjectID != "0" || exec.requests[0].Inputs[1].ObjectID != "1" || exec.requests[0].Inputs[2].ObjectID != "2" {
-		t.Fatalf("union scope = %#v", exec.requests[0].Inputs)
 	}
 	var payload struct {
 		Input []string `json:"input"`
@@ -263,7 +284,8 @@ func TestSearchCollectionPrefixesAndMemo(t *testing.T) {
 
 func TestSearchUtilityModel(t *testing.T) {
 	exec := &retrievalExecutor{}
-	svc := &Service{executor: exec, vectorStore: &retrievalVectors{}}
+	repo := &searchStubRepo{bindings: []IndexBinding{{QdrantCollection: "idx"}}}
+	svc := &Service{repo: repo, executor: exec, vectorStore: &retrievalVectors{}, authorizer: source.NewAuthorizer(repo, 0)}
 	input := SearchInput{Query: "hello", Mode: QueryLexical, Rewrite: true}
 	if err := svc.searchModels(&input); !errors.Is(err, ErrUtilityModelNotConfigured) {
 		t.Fatalf("missing model: %v", err)
@@ -272,8 +294,7 @@ func TestSearchUtilityModel(t *testing.T) {
 	if err := svc.searchModels(&input); err != nil {
 		t.Fatal(err)
 	}
-	g := IndexGeneration{ObjectVersionID: "v"}
-	if _, err := svc.searchCollection(context.Background(), auth.Principal{TenantID: "t"}, Collection{}, input, []authorizedCandidate{{generation: g}}, newQueryEmbeddingMemo()); err != nil {
+	if _, err := svc.searchCollection(context.Background(), auth.Principal{TenantID: "t"}, Collection{}, input, newQueryEmbeddingMemo()); err != nil {
 		t.Fatal(err)
 	}
 	if len(exec.requests) != 1 || exec.requests[0].Model != "utility" || exec.requests[0].Capability != inference.CapabilityChat {
@@ -284,35 +305,14 @@ func TestSearchUtilityModel(t *testing.T) {
 func TestSearchCollectionSeparatesQueryPrefixes(t *testing.T) {
 	exec := &retrievalExecutor{}
 	vectors := &retrievalVectors{}
-	svc := &Service{executor: exec, vectorStore: vectors}
-	candidates := []authorizedCandidate{
-		{generation: IndexGeneration{ObjectVersionID: "a", QdrantCollection: "index", EmbeddingModel: "model", EmbeddingDimensions: 2, QueryPrefix: "one: "}},
-		{generation: IndexGeneration{ObjectVersionID: "b", QdrantCollection: "index", EmbeddingModel: "model", EmbeddingDimensions: 2, QueryPrefix: "two: "}},
-	}
-	_, err := svc.searchCollection(context.Background(), auth.Principal{TenantID: "t"}, Collection{}, SearchInput{Query: "hello", Mode: QueryHybrid}, candidates, newQueryEmbeddingMemo())
+	repo := &searchStubRepo{bindings: []IndexBinding{
+		{QdrantCollection: "index", EmbeddingModel: "model", EmbeddingDimensions: 2, QueryPrefix: "one: "},
+		{QdrantCollection: "index", EmbeddingModel: "model", EmbeddingDimensions: 2, QueryPrefix: "two: "},
+	}}
+	svc := &Service{repo: repo, executor: exec, vectorStore: vectors, authorizer: source.NewAuthorizer(repo, 0)}
+	_, err := svc.searchCollection(context.Background(), auth.Principal{TenantID: "t"}, Collection{}, SearchInput{Query: "hello", Mode: QueryHybrid}, newQueryEmbeddingMemo())
 	if err != nil || len(exec.requests) != 2 || len(vectors.queries) != 2 {
 		t.Fatalf("requests=%d queries=%d err=%v", len(exec.requests), len(vectors.queries), err)
-	}
-}
-
-func TestSearchCollectionUnionDenialFallsBack(t *testing.T) {
-	exec := &retrievalExecutor{denyUnion: true}
-	svc := &Service{executor: exec, vectorStore: &retrievalVectors{}}
-	memo := newQueryEmbeddingMemo()
-	sets := make([][]authorizedCandidate, 2)
-	for i := range sets {
-		g := IndexGeneration{ObjectVersionID: fmt.Sprint(i), QdrantCollection: fmt.Sprint(i), EmbeddingModel: "model", EmbeddingDimensions: 2}
-		sets[i] = []authorizedCandidate{{generation: g, object: source.Object{ID: fmt.Sprint(i)}}}
-		memo.addCollection("t", sets[i])
-	}
-	for _, candidates := range sets {
-		if _, err := svc.searchCollection(context.Background(), auth.Principal{TenantID: "t"}, Collection{}, SearchInput{Query: "hello", Mode: QueryHybrid}, candidates, memo); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if len(exec.requests) != 3 || len(exec.requests[0].Inputs) != 2 || len(exec.requests[1].Inputs) != 1 || len(exec.requests[2].Inputs) != 1 ||
-		exec.requests[1].Inputs[0].ObjectID != "0" || exec.requests[2].Inputs[0].ObjectID != "1" {
-		t.Fatalf("fallback scopes = %#v", exec.requests)
 	}
 }
 
@@ -324,6 +324,8 @@ type reauthRepo struct {
 	version    source.ObjectVersion
 	revoked    bool
 	point      *QdrantSearchPoint
+	bindings   []IndexBinding
+	evidence   []EvidenceRecord
 }
 
 func (r *reauthRepo) GetCollection(_ context.Context, _ string, id string) (Collection, error) {
@@ -333,15 +335,31 @@ func (r *reauthRepo) GetCollection(_ context.Context, _ string, id string) (Coll
 	return r.collection, nil
 }
 
-func (r *reauthRepo) ListPublishedGenerationsBounded(_ context.Context, _, id string, _ int) ([]IndexGeneration, error) {
+func (r *reauthRepo) ListCollections(_ context.Context, _ string) ([]Collection, error) {
+	return []Collection{r.collection}, nil
+}
+
+func (r *reauthRepo) SaveEvidence(_ context.Context, record EvidenceRecord) error {
+	r.evidence = append(r.evidence, record)
+	return nil
+}
+
+func (r *reauthRepo) DistinctIndexBindings(_ context.Context, _, id string) ([]IndexBinding, error) {
+	if r.bindings != nil {
+		return r.bindings, nil
+	}
 	if id != r.collection.ID {
 		return nil, nil
 	}
-	return []IndexGeneration{r.generation}, nil
+	return []IndexBinding{{QdrantCollection: r.generation.QdrantCollection, EmbeddingModel: r.generation.EmbeddingModel}}, nil
 }
 
-func (r *reauthRepo) ListPublishedGenerations(_ context.Context, _, id string) ([]IndexGeneration, error) {
-	return r.ListPublishedGenerationsBounded(context.Background(), "t", id, 0)
+func (r *reauthRepo) ListCollectionConnectionIDs(_ context.Context, _, _ string) ([]string, error) {
+	return nil, nil
+}
+
+func (r *reauthRepo) PublishedGenerationForVersion(_ context.Context, _, collectionID, versionID string, generation int64) (bool, error) {
+	return collectionID == r.collection.ID && versionID == r.generation.ObjectVersionID && generation == r.generation.Generation, nil
 }
 
 func (r *reauthRepo) GetObject(_ context.Context, _, id string) (source.Object, error) {
@@ -383,7 +401,7 @@ func TestSearchDropsObjectRevokedMidSearch(t *testing.T) {
 			CollectionID: "col-b", QdrantCollection: "index-b", ObjectID: "obj-b",
 			ObjectVersionID: "obj-b#1", Generation: 1, State: "published",
 		},
-		object:  source.Object{ID: "obj-b", TenantID: "t", AuthorizationMode: source.AuthorizationOwner, OwnerActorID: "actor"},
+		object:  source.Object{ID: "obj-b", TenantID: "t", ObservedSeq: 1, AuthorizationMode: source.AuthorizationOwner, OwnerActorID: "actor"},
 		version: source.ObjectVersion{ObjectID: "obj-b", ObservedSeq: 1},
 		point: &QdrantSearchPoint{Payload: map[string]any{
 			"document_id": "obj-b", "object_version_id": "obj-b#1",
@@ -401,5 +419,85 @@ func TestSearchDropsObjectRevokedMidSearch(t *testing.T) {
 	}
 	if len(results) != 0 {
 		t.Fatalf("revoked object leaked %d results: %#v", len(results), results)
+	}
+}
+
+type fixedRetrievalVectors struct {
+	VectorStore
+	point QdrantSearchPoint
+}
+
+func (v *fixedRetrievalVectors) Query(_ context.Context, _ string, _ QueryInput) ([]QdrantSearchPoint, error) {
+	return []QdrantSearchPoint{v.point}, nil
+}
+
+func searchReauthFixture() (*reauthRepo, auth.Principal) {
+	r := &reauthRepo{
+		collection: Collection{ID: "col", IsActive: true, OwnerActorID: "actor"},
+		generation: IndexGeneration{CollectionID: "col", QdrantCollection: "idx", ObjectID: "obj", ObjectVersionID: "obj#1", Generation: 1},
+		object:     source.Object{ID: "obj", TenantID: "t", ObservedSeq: 1, AuthorizationMode: source.AuthorizationOwner, OwnerActorID: "actor"},
+		version:    source.ObjectVersion{ObjectID: "obj", ObservedSeq: 1},
+		point:      &QdrantSearchPoint{Payload: map[string]any{"document_id": "obj", "object_version_id": "obj#1", "generation": int64(1), "chunk_id": "chunk-1"}},
+	}
+	return r, auth.Principal{TenantID: "t", ActorID: "actor"}
+}
+
+func TestSelectSectionsScopesOnlySentResults(t *testing.T) {
+	exec := &retrievalExecutor{}
+	svc := &Service{executor: exec}
+	results := make([]SearchResult, 21)
+	for i := range results {
+		results[i] = SearchResult{DocumentID: fmt.Sprint(i / 2), ObservedSeq: 1, Content: "snippet"}
+	}
+	svc.selectSections(context.Background(), auth.Principal{TenantID: "t"}, results, "model")
+	want := make([]source.ObjectRef, 10)
+	for i := range want {
+		want[i] = source.ObjectRef{TenantID: "t", ObjectID: fmt.Sprint(i), ObservedSeq: 1}
+	}
+	if len(exec.requests) != 1 || !reflect.DeepEqual(exec.requests[0].Inputs, want) {
+		t.Fatalf("selection inputs = %#v, want %#v", exec.requests, want)
+	}
+}
+
+func TestSearchFinalAuthorizationAfterSelection(t *testing.T) {
+	for _, readable := range []bool{false, true} {
+		t.Run(fmt.Sprint(readable), func(t *testing.T) {
+			repo, principal := searchReauthFixture()
+			exec := &retrievalExecutor{onChat: func() { repo.revoked = true }}
+			svc := &Service{repo: repo, vectorStore: &fixedRetrievalVectors{point: *repo.point}, executor: exec, authorizer: source.NewAuthorizer(repo, 0)}
+			svc.SetUtilityModel("utility")
+			if readable {
+				got, err := svc.SearchReadableWithOptions(context.Background(), principal, "hello", QueryLexical, nil, 5, SearchReadableOptions{SelectSections: true})
+				if err != nil || len(got.Results) != 0 || len(got.Facets) != 0 {
+					t.Fatalf("readable results = %#v, err=%v", got, err)
+				}
+			} else {
+				got, err := svc.Search(context.Background(), principal, SearchInput{CollectionID: "col", Query: "hello", Mode: QueryLexical, SelectSections: true})
+				if err != nil || len(got) != 0 {
+					t.Fatalf("results = %#v, err=%v", got, err)
+				}
+			}
+			if len(exec.requests) != 1 || !repo.revoked || len(repo.evidence) != 0 {
+				t.Fatalf("selection=%#v revoked=%v evidence=%#v", exec.requests, repo.revoked, repo.evidence)
+			}
+		})
+	}
+}
+
+func TestSearchSkipsDeniedEmbeddingBinding(t *testing.T) {
+	repo, principal := searchReauthFixture()
+	repo.bindings = []IndexBinding{
+		{QdrantCollection: "a", EmbeddingModel: "denied", EmbeddingDimensions: 2},
+		{QdrantCollection: "b", EmbeddingModel: "allowed", EmbeddingDimensions: 2},
+	}
+	exec := &retrievalExecutor{denyModel: "denied"}
+	svc := &Service{repo: repo, vectorStore: &fixedRetrievalVectors{point: *repo.point}, executor: exec, authorizer: source.NewAuthorizer(repo, 0)}
+	results, err := svc.Search(context.Background(), principal, SearchInput{CollectionID: "col", Query: "hello", Mode: QuerySemantic})
+	if err != nil || len(results) != 1 || results[0].DocumentID != "obj" || len(repo.evidence) != 1 {
+		t.Fatalf("results = %#v, evidence = %#v, err=%v", results, repo.evidence, err)
+	}
+	repo.bindings = repo.bindings[:1]
+	if _, err := svc.Search(context.Background(), principal, SearchInput{CollectionID: "col", Query: "hello", Mode: QuerySemantic}); !errors.Is(err, inference.ErrDenied) {
+		t.Fatalf("all denied = %v", err)
 	}
 }

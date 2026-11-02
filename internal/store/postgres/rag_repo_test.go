@@ -581,3 +581,118 @@ func TestRAGRepoEmbeddingRecipeAndProgress(t *testing.T) {
 		t.Fatalf("forgotten retirement = %#v, %v", c, err)
 	}
 }
+
+// TestRAGRepoAccessProjectionReads covers the aggregate + per-hit reads the
+// token-prefilter search path relies on: distinct bindings, connection ids
+// and the per-version published check plus the backfill backlog.
+func TestRAGRepoAccessProjectionReads(t *testing.T) {
+	db := testdb.New(t)
+	ctx := context.Background()
+	tenant := testdb.SeedTenant(t, db, "proj")
+	repo := postgres.NewRAGRepo(db)
+	if err := repo.InsertCollection(ctx, rag.Collection{
+		TenantID: tenant, ID: "ragcol_p", Name: "C", QdrantCollection: "rag_p",
+		EmbeddingModel: "m", ChunkSize: 100, ChunkOverlap: 10, IsActive: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	obj, err := repo.UpsertObject(ctx, source.Object{
+		TenantID: tenant, ID: "obj_p", ConnectionID: "", Kind: "upload", NativeID: "up_p",
+		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: "user_1", Audience: []string{"*"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.InsertObjectVersion(ctx, tenant, source.ObjectVersion{
+		ObjectID: obj.ID, ObservedSeq: 1, ArtifactRef: "art_p", SHA256: "abc", ByteSize: 5,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AddCollectionItem(ctx, tenant, "ragcol_p", obj.ID, "user_1"); err != nil {
+		t.Fatal(err)
+	}
+	if present, err := repo.CollectionHasObject(ctx, tenant, "ragcol_p", obj.ID); err != nil || !present {
+		t.Fatalf("existing collection item = %v, %v", present, err)
+	}
+	if present, err := repo.CollectionHasObject(ctx, tenant, "ragcol_p", "other-object"); err != nil || present {
+		t.Fatalf("missing collection item = %v, %v", present, err)
+	}
+	if err := repo.MarkCollectionItemRemoved(ctx, tenant, "ragcol_p", obj.ID); err != nil {
+		t.Fatal(err)
+	}
+	if present, err := repo.CollectionHasObject(ctx, tenant, "ragcol_p", obj.ID); err != nil || present {
+		t.Fatalf("removed collection item = %v, %v", present, err)
+	}
+	if _, err := db.SQL.ExecContext(ctx, `UPDATE collection_items SET removed_at=NULL WHERE tenant_id=$1 AND collection_id=$2 AND object_id=$3`, tenant, "ragcol_p", obj.ID); err != nil {
+		t.Fatal(err)
+	}
+	profileID, err := repo.EnsureChunkProfile(ctx, tenant, "rag-ragcol_p-structured", 100, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks := []rag.DocumentChunk{{ID: "chk_p", DocumentID: obj.ID, CollectionID: "ragcol_p",
+		ChunkIndex: 0, Content: "hi", TokenCount: 1}}
+	if err := repo.ReplaceVersionChunksAndStage(ctx, tenant, "ragcol_p", obj.ID, obj.ID+"#1", 1, 1, profileID, chunks); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.BindGeneration(ctx, tenant, obj.ID+"#1", 1, rag.Collection{
+		ID: "ragcol_p", QdrantCollection: "rag_p", EmbeddingModel: "m", EmbeddingDimensions: 2, QueryPrefix: "q: "}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.MarkGenerationState(ctx, tenant, "ragcol_p", obj.ID+"#1", 1, "published"); err != nil {
+		t.Fatal(err)
+	}
+
+	bindings, err := repo.DistinctIndexBindings(ctx, tenant, "ragcol_p")
+	if err != nil || len(bindings) != 1 || bindings[0].QdrantCollection != "rag_p" {
+		t.Fatalf("bindings = %#v err=%v", bindings, err)
+	}
+	if ok, err := repo.PublishedGenerationForVersion(ctx, tenant, "ragcol_p", obj.ID+"#1", 1); err != nil || !ok {
+		t.Fatalf("published check = %v, %v", ok, err)
+	}
+	if ok, err := repo.PublishedGenerationForVersion(ctx, tenant, "ragcol_p", obj.ID+"#1", 2); err != nil || ok {
+		t.Fatalf("wrong generation must be unpublished: %v, %v", ok, err)
+	}
+	if generation, err := repo.CurrentPublishedGeneration(ctx, tenant, "ragcol_p", obj.ID, obj.ID+"#1"); err != nil || generation != 1 {
+		t.Fatalf("current generation = %d, %v", generation, err)
+	}
+	if generation, err := repo.CurrentPublishedGeneration(ctx, tenant, "ragcol_p", "other-object", obj.ID+"#1"); err != nil || generation != 0 {
+		t.Fatalf("mismatched object generation = %d, %v", generation, err)
+	}
+
+	// Unprojected published generations form the backfill backlog; marking
+	// them projected drains it idempotently.
+	backlog, err := repo.ListUnprojectedGenerations(ctx, tenant, 10)
+	if err != nil || len(backlog) != 1 {
+		t.Fatalf("backlog = %#v err=%v", backlog, err)
+	}
+	if err := repo.ProjectGenerationAccess(ctx, tenant, "ragcol_p", obj.ID+"#1", 1, func(current int64) (int64, error) {
+		if current != 0 {
+			t.Fatalf("initial revision = %d", current)
+		}
+		return 5, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ProjectGenerationAccess(ctx, tenant, "ragcol_p", obj.ID+"#1", 1, func(current int64) (int64, error) {
+		if current != 5 {
+			t.Fatalf("stored revision = %d, want 5", current)
+		}
+		return current, nil
+	}); err != nil {
+		t.Fatalf("repeat projection: %v", err)
+	}
+	backlog, err = repo.ListUnprojectedGenerations(ctx, tenant, 10)
+	if err != nil || len(backlog) != 0 {
+		t.Fatalf("backlog after mark = %#v err=%v", backlog, err)
+	}
+	tenants, err := repo.TenantsNeedingAccessBackfill(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range tenants {
+		if id == tenant {
+			t.Fatalf("fully projected tenant still needs backfill")
+		}
+	}
+}

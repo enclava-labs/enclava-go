@@ -1,194 +1,32 @@
 [
-  {
-    "query": "How do scientists determine whether a mountain glacier is gaining or losing ice?",
-    "expected": [
-      "alpine-glaciers.md"
-    ]
-  },
-  {
-    "query": "What do ablation stakes and snow pits reveal about an alpine glacier?",
-    "expected": [
-      "alpine-glaciers.md"
-    ]
-  },
-  {
-    "query": "How does a token bucket control bursts of API requests?",
-    "expected": [
-      "api-rate-limits.md"
-    ]
-  },
-  {
-    "query": "Why should clients add jitter after a 429 response?",
-    "expected": [
-      "api-rate-limits.md"
-    ]
-  },
-  {
-    "query": "How can beekeepers estimate varroa infestation before winter?",
-    "expected": [
-      "beehive-health.md"
-    ]
-  },
-  {
-    "query": "What does an alcohol wash measure in a honey bee colony?",
-    "expected": [
-      "beehive-health.md"
-    ]
-  },
-  {
-    "query": "How are fatigue cracks found at welded bridge details?",
-    "expected": [
-      "bridge-inspection.md"
-    ]
-  },
-  {
-    "query": "Why can repeated traffic loads damage a steel bridge?",
-    "expected": [
-      "bridge-inspection.md"
-    ]
-  },
-  {
-    "query": "What happens to coffee beans around first crack?",
-    "expected": [
-      "coffee-roasting.md"
-    ]
-  },
-  {
-    "query": "Which measurements help a roaster control development after first crack?",
-    "expected": [
-      "coffee-roasting.md"
-    ]
-  },
-  {
-    "query": "How can a gardener prevent a compost heap from becoming anaerobic?",
-    "expected": [
-      "compost-balance.md"
-    ]
-  },
-  {
-    "query": "What is the role of brown leaves and green scraps in compost?",
-    "expected": [
-      "compost-balance.md"
-    ]
-  },
-  {
-    "query": "Why do corals turn white during prolonged marine heat?",
-    "expected": [
-      "coral-bleaching.md"
-    ]
-  },
-  {
-    "query": "Does a bleached coral necessarily die immediately?",
-    "expected": [
-      "coral-bleaching.md"
-    ]
-  },
-  {
-    "query": "How should fragile historical court records be stored?",
-    "expected": [
-      "court-archive.md"
-    ]
-  },
-  {
-    "query": "Why is scanning not a substitute for preserving original paper files?",
-    "expected": [
-      "court-archive.md"
-    ]
-  },
-  {
-    "query": "How can emitters and soil sensors improve watering efficiency?",
-    "expected": [
-      "drip-irrigation.md"
-    ]
-  },
-  {
-    "query": "What problem arises when drip irrigation emitters clog?",
-    "expected": [
-      "drip-irrigation.md"
-    ]
-  },
-  {
-    "query": "How can masonry walls be secured to floors against earthquakes?",
-    "expected": [
-      "earthquake-retrofit.md"
-    ]
-  },
-  {
-    "query": "What is the purpose of a continuous seismic load path?",
-    "expected": [
-      "earthquake-retrofit.md"
-    ]
-  },
-  {
-    "query": "Why should cabbage stay under brine when making sauerkraut?",
-    "expected": [
-      "fermentation.md"
-    ]
-  },
-  {
-    "query": "Why do land managers use controlled low intensity burns?",
-    "expected": [
-      "forest-fire.md"
-    ]
-  },
-  {
-    "query": "How does a heat pump provide more heat than its electrical input?",
-    "expected": [
-      "heat-pump.md"
-    ]
-  },
-  {
-    "query": "How do authority records disambiguate authors in a library catalog?",
-    "expected": [
-      "library-catalog.md"
-    ]
-  },
-  {
-    "query": "Why can a damaged lithium ion cell heat itself uncontrollably?",
-    "expected": [
-      "lithium-battery.md"
-    ]
-  },
-  {
-    "query": "How can a garden provide food and nesting habitat for native pollinators?",
-    "expected": [
-      "pollinator-garden.md"
-    ]
-  },
-  {
-    "query": "How does a planted depression manage roof runoff?",
-    "expected": [
-      "rain-garden.md"
-    ]
-  },
-  {
-    "query": "Why do river sampling programs collect field blanks and duplicates?",
-    "expected": [
-      "river-sampling.md"
-    ]
-  },
-  {
-    "query": "What eye protection is needed to view a partial solar eclipse?",
-    "expected": [
-      "solar-eclipse.md"
-    ]
-  },
-  {
-    "query": "Why does wind speed strongly influence turbine power output?",
-    "expected": [
-      "wind-turbine.md"
-    ]
-  },
-  {
-    "query": "How should a grower clear sediment from irrigation lines?",
-    "expected": [
-      "drip-irrigation-maintenance.md"
-    ]
-  },
-  {
-    "query": "How can stored roof runoff be kept free of mosquito breeding?",
-    "expected": [
-      "rain-barrel.md"
-    ]
-  }
+  {"query": "Which index structure should index every word inside a text column?", "expected": ["sql-indexes.md"]},
+  {"query": "Why does a table keep growing on disk after repeated row updates?", "expected": ["sql-vacuum.md"]},
+  {"query": "How far behind is my replica and how is that distance measured?", "expected": ["sql-replication.md"]},
+  {"query": "Why do prepared statements break when clients share a small pool of database connections?", "expected": ["sql-connections.md"]},
+  {"query": "Deep list pages get slower the further a reader goes", "expected": ["api-pagination.md"]},
+  {"query": "How should a client wait after the API starts refusing its requests?", "expected": ["api-rate-limiting.md"]},
+  {"query": "How do I retire an old public interface without breaking existing integrations?", "expected": ["api-versioning.md"]},
+  {"query": "How do I prove an incoming callback really came from the sender?", "expected": ["api-webhooks.md"]},
+  {"query": "How should automated services present credentials when calling an API?", "expected": ["api-auth.md"]},
+  {"query": "My compost smells rotten and never heats up", "expected": ["garden-compost.md"]},
+  {"query": "When during the day is it best to water the vegetable bed?", "expected": ["garden-irrigation.md"]},
+  {"query": "The bed stays flooded for days after every rainstorm", "expected": ["garden-drainage.md"]},
+  {"query": "Something is eating holes in lettuce leaves overnight", "expected": ["garden-pests.md"]},
+  {"query": "White dusty film spreading across cucumber foliage", "expected": ["garden-powdery-mildew.md"]},
+  {"query": "How do we decide which incidents page people in the middle of the night?", "expected": ["incident-severity.md"]},
+  {"query": "One person should coordinate the response instead of everyone debugging at once", "expected": ["incident-command.md"]},
+  {"query": "What should we tell customers while the outage is still ongoing?", "expected": ["incident-comms.md"]},
+  {"query": "How to run a blameless review after a production failure", "expected": ["incident-postmortem.md"]},
+  {"query": "My sourdough culture smells like nail polish remover", "expected": ["bread-starter.md"]},
+  {"query": "The loaf splits open unpredictably during the first minutes of baking", "expected": ["bread-oven-spring.md"]},
+  {"query": "Why does leftover bread harden even though it is stored airtight?", "expected": ["bread-staling.md"]},
+  {"query": "The dough keeps tearing instead of stretching thin", "expected": ["bread-kneading.md"]},
+  {"query": "How can I tell the loaf has finished its second rise?", "expected": ["bread-shaping.md"]},
+  {"query": "postgresql vacuum full table lock", "expected": ["sql-vacuum.md"]},
+  {"query": "GIN BRIN B-tree index comparison", "expected": ["sql-indexes.md"]},
+  {"query": "Retry-After header", "expected": ["api-rate-limiting.md"]},
+  {"query": "bread starter feeding ratio 1:2:2", "expected": ["bread-starter.md"]},
+  {"query": "What keeps soil microbes from robbing plant roots when I dig in fresh wood chips?", "expected": ["garden-compost.md"]},
+  {"query": "Low-tech kitchen leftovers that lure and trap leaf-eating night pests", "expected": ["garden-pests.md"]},
+  {"query": "Writing an incident timeline after the system is stable again", "expected": ["incident-postmortem.md"]}
 ]

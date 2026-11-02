@@ -29,11 +29,11 @@ type evalQuery struct {
 }
 
 type evalMetrics struct {
-	Variant string  `json:"variant"`
-	Recall1 float64 `json:"recall_at_1"`
-	Recall5 float64 `json:"recall_at_5"`
-	MRR     float64 `json:"mrr"`
-	ShareA  float64 `json:"share_a_top_5,omitempty"`
+	Variant   string  `json:"variant"`
+	Recall1   float64 `json:"recall_at_1"`
+	Recall5   float64 `json:"recall_at_5"`
+	MRR       float64 `json:"mrr"`
+	ShareTop5 float64 `json:"share_top_5,omitempty"` // share of top-5 hits matching the marked partition
 }
 
 func TestRetrievalEval(t *testing.T) {
@@ -105,7 +105,15 @@ func TestRetrievalEval(t *testing.T) {
 	}
 	vector := rag.NewQdrantClient(qdrantURL, 15*time.Second)
 	svc := rag.NewService(postgres.NewRAGRepo(db), vector, executor, model, store, jobsSvc)
-	evalFS := os.DirFS("testdata/eval")
+	// Corpus format: <dir>/corpus/*.md are the scored documents and
+	// <dir>/queries.json is [{"query": "...", "expected": ["file.md", ...]}]
+	// with expected corpus member names. ENCLAVA_EVAL_CORPUS_DIR points at a
+	// directory in this format to evaluate operator-supplied documents.
+	corpusDir := strings.TrimSpace(os.Getenv("ENCLAVA_EVAL_CORPUS_DIR"))
+	if corpusDir == "" {
+		corpusDir = "testdata/eval"
+	}
+	evalFS := os.DirFS(corpusDir)
 	corpus, err := fs.Glob(evalFS, "corpus/*.md")
 	if err != nil || len(corpus) == 0 {
 		t.Fatalf("read corpus: %v", err)
@@ -132,6 +140,31 @@ func TestRetrievalEval(t *testing.T) {
 			}
 		}
 	}
+	runClaim := func(claim *jobs.Claim) {
+		t.Helper()
+		handler := svc.JobHandler()
+		if operation := claim.Job().Operation; operation == rag.OperationReembedScan {
+			handler = svc.ReembedScanJobHandler()
+		}
+		ref, err := handler(ctx, claim, nil)
+		if err != nil {
+			_ = claim.Fail(ctx, err, jobs.FailureFatal)
+			t.Fatalf("%s attempt: %v", claim.Job().Operation, err)
+		}
+		if _, err := claim.Complete(ctx, ref); err != nil {
+			t.Fatalf("complete %s: %v", claim.Job().Operation, err)
+		}
+	}
+	runJobs := func(n int) {
+		t.Helper()
+		for i := range n {
+			claim, err := jobsSvc.Lease(ctx, "eval-worker", 5*time.Minute)
+			if err != nil || claim == nil {
+				t.Fatalf("lease job %d of %d: %v", i+1, n, err)
+			}
+			runClaim(claim)
+		}
+	}
 	create := func(titles bool, dims int, prefix *string, files []string) (rag.Collection, map[string]string) {
 		t.Helper()
 		c, err := svc.CreateCollection(ctx, p, rag.CreateCollectionInput{Name: "Eval " + ragSafeName(), EmbeddingModel: model, EmbeddingDimensions: &dims, EmbedTitles: &titles, QueryPrefix: prefix, ChunkSize: 2000, ChunkOverlap: 0, ACL: map[string]any{"public": true}})
@@ -154,28 +187,17 @@ func TestRetrievalEval(t *testing.T) {
 				t.Fatalf("upload %s: %v", member, err)
 			}
 			ids[upload.Document.ID] = path.Base(member)
-			claim, err := jobsSvc.Lease(ctx, "eval-worker", 5*time.Minute)
-			if err != nil || claim == nil {
-				t.Fatalf("lease %s: %v", member, err)
-			}
-			ref, err := svc.JobHandler()(ctx, claim, nil)
-			if err != nil {
-				_ = claim.Fail(ctx, err, jobs.FailureFatal)
-				t.Fatalf("index %s: %v", member, err)
-			}
-			if _, err := claim.Complete(ctx, ref); err != nil {
-				t.Fatalf("complete %s: %v", member, err)
-			}
+			runJobs(1) // the upload's single embed job
 		}
 		return c, ids
 	}
-	measure := func(name string, collections []string, ids map[string]string, mode rag.QueryMode, mixing bool) evalMetrics {
+	measure := func(name string, collections []string, ids map[string]string, mode rag.QueryMode, mark func(rag.SearchResult) bool) evalMetrics {
 		t.Helper()
 		m := evalMetrics{Variant: name}
-		var a, total int
+		var marked, total int
 		for _, q := range queries {
 			var results []rag.SearchResult
-			if mixing {
+			if len(collections) > 1 {
 				found, err := svc.SearchReadable(ctx, p, q.Query, mode, collections, 5)
 				if err != nil {
 					t.Fatalf("search %s: %v", name, err)
@@ -194,11 +216,9 @@ func TestRetrievalEval(t *testing.T) {
 			}
 			matched := make(map[string]bool)
 			for i, result := range results {
-				if mixing {
-					total++
-					if result.CollectionID == collections[0] {
-						a++
-					}
+				total++
+				if mark != nil && mark(result) {
+					marked++
 				}
 				file := ids[result.DocumentID]
 				if expected[file] && !matched[file] {
@@ -217,7 +237,7 @@ func TestRetrievalEval(t *testing.T) {
 		m.Recall5 /= float64(len(queries))
 		m.MRR /= float64(len(queries))
 		if total > 0 {
-			m.ShareA = float64(a) / float64(total)
+			m.ShareTop5 = float64(marked) / float64(total)
 		}
 		return m
 	}
@@ -239,7 +259,7 @@ func TestRetrievalEval(t *testing.T) {
 				c, ids := create(titles, dims, prefix, corpus)
 				for _, mode := range []rag.QueryMode{rag.QueryHybrid, rag.QuerySemantic, rag.QueryLexical} {
 					name := fmt.Sprintf("titles=%t dims=%d prefix=%s mode=%s", titles, dims, prefixName, mode)
-					m := measure(name, []string{c.ID}, ids, mode, false)
+					m := measure(name, []string{c.ID}, ids, mode, nil)
 					metrics = append(metrics, m)
 					if titles && dims == 0 && !empty && mode == rag.QueryHybrid {
 						baseline = m
@@ -257,13 +277,46 @@ func TestRetrievalEval(t *testing.T) {
 	for id, file := range idsB {
 		idsA[id] = file
 	}
-	mix := measure("mix titles=true dims=0 prefix=registry mode=hybrid", []string{ca.ID, cb.ID}, idsA, rag.QueryHybrid, true)
+	mix := measure("mix titles=true dims=0 prefix=registry mode=hybrid", []string{ca.ID, cb.ID}, idsA, rag.QueryHybrid, func(r rag.SearchResult) bool { return r.CollectionID == ca.ID })
 	metrics = append(metrics, mix)
+
+	csw, idsS := create(true, 0, nil, corpus)
+	// A true partial model switch inside one collection: change the vector
+	// size (same model, Matryoshka truncation), let the re-embed scan enqueue
+	// new-generation jobs, migrate only ~10% of the corpus and let Search
+	// fuse old- and new-index partitions for the rest.
+	switchDims := dimensions / 2
+	if switchDims < 32 {
+		switchDims = 32
+	}
+	if switchDims < dimensions {
+		oldIndex := csw.QdrantCollection
+		pre := measure("switch pre", []string{csw.ID}, idsS, rag.QueryHybrid, nil)
+		updated, err := svc.UpdateCollection(ctx, p, csw.ID, rag.UpdateCollectionInput{EmbeddingDimensions: &switchDims})
+		if err != nil {
+			t.Fatalf("switch embedding dimensions: %v", err)
+		}
+		if updated.QdrantCollection == oldIndex {
+			t.Fatal("settings change did not allocate a new index")
+		}
+		t.Cleanup(func() {
+			if err := vector.DeleteCollection(context.Background(), updated.QdrantCollection); err != nil {
+				t.Errorf("delete switched Qdrant collection: %v", err)
+			}
+		})
+		migrate := (len(corpus) + 9) / 10
+		runJobs(1 + migrate) // one re-embed scan, then a tenth of its embed jobs
+		post := measure("switch partial", []string{csw.ID}, idsS, rag.QueryHybrid, func(r rag.SearchResult) bool { return r.Generation >= 2 })
+		metrics = append(metrics, pre, post)
+		t.Logf("partial switch to %d dims (%d/%d documents migrated): recall@1 %.3f vs %.3f; recall@5 %.3f vs %.3f; MRR %.3f vs %.3f; migrated share of top-5 %.3f", switchDims, migrate, len(corpus), post.Recall1, pre.Recall1, post.Recall5, pre.Recall5, post.MRR, pre.MRR, post.ShareTop5)
+	} else {
+		t.Logf("skipping partial-switch measurement: model has only %d dimensions", dimensions)
+	}
 	t.Logf("%-66s %8s %8s %8s", "variant", "recall@1", "recall@5", "MRR")
 	for _, m := range metrics {
 		t.Logf("%-66s %8.3f %8.3f %8.3f", m.Variant, m.Recall1, m.Recall5, m.MRR)
 	}
-	t.Logf("mixing vs baseline: recall@1 %.3f vs %.3f; recall@5 %.3f vs %.3f; MRR %.3f vs %.3f; A share of top-5 %.3f", mix.Recall1, baseline.Recall1, mix.Recall5, baseline.Recall5, mix.MRR, baseline.MRR, mix.ShareA)
+	t.Logf("mixing vs baseline: recall@1 %.3f vs %.3f; recall@5 %.3f vs %.3f; MRR %.3f vs %.3f; A share of top-5 %.3f", mix.Recall1, baseline.Recall1, mix.Recall5, baseline.Recall5, mix.MRR, baseline.MRR, mix.ShareTop5)
 	out, err := json.MarshalIndent(struct {
 		Model      string        `json:"model"`
 		Dimensions int           `json:"dimensions"`
