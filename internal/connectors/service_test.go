@@ -2,7 +2,10 @@ package connectors
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -674,5 +677,132 @@ func TestConnectorHTTPClientRefusesPrivateDial(t *testing.T) {
 	}
 	if _, err := client.Transport.RoundTrip(req); err == nil {
 		t.Fatal("private-address dial accepted, want refusal")
+	}
+}
+
+// TestContentSyncRewriteAndRetargetHandoff covers two regressions: a content
+// change alongside a metadata change must persist the new bytes instead of
+// reusing the stale artifact, and retargeting the connector to a different
+// collection must enqueue a fresh ingest handoff rather than treating the
+// old collection's job as durable.
+func TestContentSyncRewriteAndRetargetHandoff(t *testing.T) {
+	ctx := context.Background()
+	item := ContentItem{NativeID: "file-1", Kind: "document", Filename: "note.txt", MIMEType: "text/plain", Title: "note", URL: "https://example.test/note", Content: []byte("old body")}
+	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true}}
+	adapter.content = func(context.Context, source.Connection, Cursor, int) (ContentPage, error) {
+		return ContentPage{Items: []ContentItem{item}, Completeness: CompletenessComplete, Snapshot: true}, nil
+	}
+	f := newConnectorFixture(t, adapter)
+	sync := func(window int64) {
+		t.Helper()
+		if _, err := f.svc.SyncSourceWindowed(ctx, f.principal, f.connection.ID, window); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.runNext(t); err != nil {
+			t.Fatal(err)
+		}
+	}
+	latest := func() source.ObjectVersion {
+		t.Helper()
+		object, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "document", "file-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		version, err := f.sourceRepo.LatestObjectVersion(ctx, f.tenant, object.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return version
+	}
+	digest := func(body string) string {
+		sum := sha256.Sum256([]byte(body))
+		return hex.EncodeToString(sum[:])
+	}
+	drainIngests := func() map[string]bool {
+		t.Helper()
+		seen := map[string]bool{}
+		for {
+			claim, err := f.jobs.Lease(ctx, "ingest-drain", time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if claim == nil {
+				return seen
+			}
+			job := claim.Job()
+			if job.Operation != OperationIngest {
+				t.Fatalf("unexpected queued job %q", job.Operation)
+			}
+			collection, _ := job.Policy["collection_id"].(string)
+			seen[collection] = true
+			if _, err := claim.Complete(ctx, "{}"); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	readBody := func(artifactID string) string {
+		t.Helper()
+		reader, err := f.artifacts.Read(ctx, artifacts.Ref{TenantID: f.tenant, ID: artifactID, Kind: artifacts.KindOriginal, Version: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reader.Close() }()
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+
+	sync(1)
+	v1 := latest()
+	if v1.ArtifactRef == "" || v1.SHA256 != digest("old body") {
+		t.Fatalf("initial version mismatch: %+v", v1)
+	}
+	if !drainIngests()[f.connection.TargetCollectionID] {
+		t.Fatalf("initial ingest not enqueued for %s", f.connection.TargetCollectionID)
+	}
+
+	// Content and metadata both change: the new bytes must be stored, not the
+	// stale artifact reused.
+	item.Title, item.URL, item.Content = "note v2", "https://example.test/note-v2", []byte("new body")
+	sync(2)
+	v2 := latest()
+	if v2.ObservedSeq != v1.ObservedSeq+1 || v2.ArtifactRef == v1.ArtifactRef || v2.SHA256 != digest("new body") {
+		t.Fatalf("changed content did not produce a new artifact version: %+v", v2)
+	}
+	if body := readBody(v2.ArtifactRef); body != "new body" {
+		t.Fatalf("persisted artifact body %q, want %q", body, "new body")
+	}
+	drainIngests()
+
+	// Metadata-only change still reuses the artifact.
+	item.Title = "note v3"
+	sync(3)
+	v3 := latest()
+	if v3.ArtifactRef != v2.ArtifactRef || v3.SHA256 != digest("new body") {
+		t.Fatalf("metadata-only change must reuse artifact: %+v", v3)
+	}
+	drainIngests()
+
+	// Retargeting enqueues ingest for the new collection despite the old
+	// collection's completed handoff.
+	conn, err := f.sourceRepo.GetConnection(ctx, f.tenant, f.connection.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.TargetCollectionID = "collection-b"
+	if err := f.sourceRepo.UpdateConnection(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	sync(4)
+	if seen := drainIngests(); !seen["collection-b"] {
+		t.Fatalf("retargeted ingest not enqueued for collection-b: %v", seen)
+	}
+
+	// Re-sync to the same target stays idempotent.
+	sync(5)
+	if seen := drainIngests(); len(seen) != 0 {
+		t.Fatalf("same-collection re-sync enqueued ingest: %v", seen)
 	}
 }

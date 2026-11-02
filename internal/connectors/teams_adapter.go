@@ -377,13 +377,13 @@ func allowedTeamChannel(config map[string]any, team, channel string) bool {
 }
 
 func (a *TeamsAdapter) Membership(ctx context.Context, c source.Connection, cursor Cursor, limit int) (MembershipPage, error) {
-	return a.enumerateMembers(ctx, c, cursor, limit)
+	return a.enumerateMembers(ctx, c, cursor, limit, true)
 }
 func (a *TeamsAdapter) Access(ctx context.Context, c source.Connection, cursor Cursor, limit int) (AccessPage, error) {
-	page, err := a.enumerateMembers(ctx, c, cursor, limit)
+	page, err := a.enumerateMembers(ctx, c, cursor, limit, false)
 	return AccessPage{Grants: page.Memberships, NextCursor: page.NextCursor, Completeness: page.Completeness, Snapshot: page.Snapshot}, err
 }
-func (a *TeamsAdapter) enumerateMembers(ctx context.Context, c source.Connection, cursor Cursor, limit int) (MembershipPage, error) {
+func (a *TeamsAdapter) enumerateMembers(ctx context.Context, c source.Connection, cursor Cursor, limit int, membership bool) (MembershipPage, error) {
 	if c.ID != a.connection.ID || c.Kind != source.ConnectionTeams {
 		return MembershipPage{}, errors.New("teams adapter connection mismatch")
 	}
@@ -444,19 +444,27 @@ func (a *TeamsAdapter) enumerateMembers(ctx context.Context, c source.Connection
 			if !allowedTeamChannel(a.connection.Config, team, ch.ID) {
 				continue
 			}
-			users := members
-			if ch.MembershipType == "private" || ch.MembershipType == "shared" {
-				path := "members"
-				if ch.MembershipType == "shared" {
-					path = "allMembers"
+			if ch.MembershipType == "standard" {
+				// Standard channels inherit team access: one grant on the team
+				// group instead of duplicating every member row per channel.
+				if !membership {
+					if err := appendGrant(AccessGrant{NativeObjectID: ch.ID, NativeObjectKind: "teams_channel", NativeGroupID: team, Scope: "member", Effect: "allow"}); err != nil {
+						return MembershipPage{Completeness: CompletenessIncomplete}, err
+					}
 				}
-				endpoint := a.baseURL + "/teams/" + teamsID(team) + "/channels/" + teamsID(ch.ID) + "/" + path + "?$top=100"
-				users, err = a.list(ctx, token, endpoint, teamsMaxItems)
-				if err != nil {
-					return MembershipPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list %s channel %s members via %s: %w", ch.MembershipType, ch.ID, path, err)
-				}
-			} else if ch.MembershipType != "standard" {
+				continue
+			}
+			if ch.MembershipType != "private" && ch.MembershipType != "shared" {
 				return MembershipPage{Completeness: CompletenessIncomplete}, fmt.Errorf("unsupported teams channel membership type %q", ch.MembershipType)
+			}
+			path := "members"
+			if ch.MembershipType == "shared" {
+				path = "allMembers"
+			}
+			endpoint := a.baseURL + "/teams/" + teamsID(team) + "/channels/" + teamsID(ch.ID) + "/" + path + "?$top=100"
+			users, err := a.list(ctx, token, endpoint, teamsMaxItems)
+			if err != nil {
+				return MembershipPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list %s channel %s members via %s: %w", ch.MembershipType, ch.ID, path, err)
 			}
 			for _, raw := range users {
 				var u struct {
@@ -468,7 +476,7 @@ func (a *TeamsAdapter) enumerateMembers(ctx context.Context, c source.Connection
 					return MembershipPage{}, errors.New("teams channel member payload is malformed")
 				}
 				principal := teamsPrincipalID(u.TenantID, firstNonEmpty(u.UserID, u.ID))
-				if err := appendGrant(AccessGrant{NativeObjectID: ch.ID, NativeObjectKind: "teams_channel", NativePrincipalID: principal, NativeGroupID: team, Scope: "member", Effect: "allow"}); err != nil {
+				if err := appendGrant(AccessGrant{NativeObjectID: ch.ID, NativeObjectKind: "teams_channel", NativePrincipalID: principal, NativeGroupID: ch.ID, Scope: "member", Effect: "allow"}); err != nil {
 					return MembershipPage{Completeness: CompletenessIncomplete}, err
 				}
 			}

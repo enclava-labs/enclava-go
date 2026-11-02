@@ -441,9 +441,10 @@ func TestIngestHandoffExists(t *testing.T) {
 	if _, err := db.SQL.ExecContext(ctx, `
 		INSERT INTO jobs (tenant_id, id, operation, status, connection_id,
 		                  object_id, observed_revision, idempotency_key,
-		                  input_hash, principal, submitter_key)
+		                  input_hash, principal, submitter_key, policy)
 		VALUES ($1, 'job_other', 'rag.ingest', 'queued', 'conn_a',
-		        'obj_a', 4, 'key-other', 'h', '{}', 'sub')`, idTenantA); err != nil {
+		        'obj_a', 4, 'key-other', 'h', '{}', 'sub',
+		        '{"collection_id":"col_a"}'::jsonb)`, idTenantA); err != nil {
 		t.Fatalf("insert unrelated job: %v", err)
 	}
 	assert(false, "job for other seq")
@@ -453,25 +454,32 @@ func TestIngestHandoffExists(t *testing.T) {
 		if _, err := db.SQL.ExecContext(ctx, `
 			INSERT INTO jobs (tenant_id, id, operation, status, connection_id,
 			                  object_id, observed_revision, idempotency_key,
-			                  input_hash, principal, submitter_key)
+			                  input_hash, principal, submitter_key, policy)
 			VALUES ($1, $2, 'rag.ingest', $3, 'conn_a',
-			        'obj_a', 5, $4, 'h', '{}', 'sub')`,
+			        'obj_a', 5, $4, 'h', '{}', 'sub',
+			        '{"collection_id":"col_a"}'::jsonb)`,
 			idTenantA, "job_dead_"+st, st, "key-dead-"+st); err != nil {
 			t.Fatalf("insert %s job: %v", st, err)
 		}
 	}
 	assert(false, "dead job statuses")
 
-	// A job covering exactly (connection, object, seq) is handoff.
+	// A job covering exactly (connection, object, seq, collection) is handoff.
 	if _, err := db.SQL.ExecContext(ctx, `
 		INSERT INTO jobs (tenant_id, id, operation, status, connection_id,
 		                  object_id, observed_revision, idempotency_key,
-		                  input_hash, principal, submitter_key)
+		                  input_hash, principal, submitter_key, policy)
 		VALUES ($1, 'job_seq5', 'rag.ingest', 'queued', 'conn_a',
-		        'obj_a', 5, 'key-seq5', 'h', '{}', 'sub')`, idTenantA); err != nil {
+		        'obj_a', 5, 'key-seq5', 'h', '{}', 'sub',
+		        '{"collection_id":"col_a"}'::jsonb)`, idTenantA); err != nil {
 		t.Fatalf("insert matching job: %v", err)
 	}
 	assert(true, "job covers seq 5")
+
+	// A job targeting a different collection is not handoff for col_b.
+	if got, err := repo.IngestHandoffExists(ctx, idTenantA, "conn_a", "col_b", "obj_a", 5); err != nil || got {
+		t.Fatalf("job for col_a must not count for col_b: handoff=%v err=%v", got, err)
+	}
 }
 
 // TestIngestHandoffExistsGeneration proves the generation half: a generation

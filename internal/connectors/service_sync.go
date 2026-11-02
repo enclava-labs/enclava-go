@@ -237,7 +237,7 @@ func (s *Service) observeContentItem(ctx context.Context, conn source.Connection
 		}
 	}
 	var ref artifacts.Ref
-	if metadataChanged {
+	if unchanged {
 		ref = artifacts.Ref{TenantID: conn.TenantID, ID: latest.ArtifactRef, Kind: artifacts.KindOriginal, Version: 1, SHA256: latest.SHA256, ByteSize: latest.ByteSize}
 	} else {
 		writer, _, err := s.artifacts.Begin(ctx, artifacts.Meta{Ref: artifacts.Ref{TenantID: conn.TenantID, Kind: artifacts.KindOriginal, Version: 1}, MimeType: mimeType}, time.Hour, connectorMaxArtifactBytes)
@@ -302,7 +302,7 @@ func (s *Service) enqueueContent(ctx context.Context, principal auth.Principal, 
 		if observation.ArtifactRef.ID == "" || observation.ProcessingError != "" || observation.ObjectRef.ObjectID == "" || observation.ObjectRef.ObservedSeq <= 0 {
 			continue
 		}
-		key := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%d", conn.ID, observation.ObjectRef.ObjectID, observation.ObjectRef.ObservedSeq)))
+		key := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s\x00%d", conn.ID, conn.TargetCollectionID, observation.ObjectRef.ObjectID, observation.ObjectRef.ObservedSeq)))
 		_, _, err := s.jobs.Enqueue(ctx, principal, jobs.EnqueueRequest{
 			TenantID: principal.TenantID, Operation: OperationIngest,
 			IdempotencyKey: OperationIngest + ":" + hex.EncodeToString(key[:]),

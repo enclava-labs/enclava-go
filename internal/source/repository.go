@@ -67,11 +67,12 @@ type SourceRepository interface {
 	GetObjectVersion(ctx context.Context, tenantID, objectID string, observedSeq int64) (ObjectVersion, error)
 	LatestObjectVersion(ctx context.Context, tenantID, objectID string) (ObjectVersion, error)
 	// IngestHandoffExists reports whether the observed object version durably
-	// reached ingest: true when a live jobs row (queued/running/succeeded —
-	// failed/cancelled/deleted count as missing handoff) exists for
-	// (tenant, connection, object, observed_seq), or when an index generation
-	// exists for that object version in the target collection. Lets a
-	// connector re-enqueue work stranded by the crash window.
+	// reached ingest for the target collection: true when a live jobs row
+	// (queued/running/succeeded — failed/cancelled/deleted count as missing
+	// handoff) exists for (tenant, connection, object, observed_seq) carrying
+	// this collection in its policy, or when an index generation exists for
+	// that object version in the target collection. Lets a connector
+	// re-enqueue work stranded by the crash window or a retarget.
 	IngestHandoffExists(ctx context.Context, tenantID, connectionID, collectionID, objectID string, observedSeq int64) (bool, error)
 
 	// Source identities, groups and memberships (upsert by unique keys).

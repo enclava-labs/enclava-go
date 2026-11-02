@@ -555,16 +555,17 @@ func (r *SourceRepo) GetObjectVersionByArtifact(ctx context.Context, tenantID, a
 // IngestHandoffExists proves a connector observation survived the crash
 // window between version insert and ingest dispatch: a live jobs row
 // (queued/running/succeeded — failed/cancelled/deleted never ran or lost the
-// work) covering (connection, object, observed_seq), or any index generation
-// for that object version in the target collection, counts as durable
-// handoff.
+// work) covering (connection, object, observed_seq) and targeting this
+// collection, or any index generation for that object version in the target
+// collection, counts as durable handoff.
 func (r *SourceRepo) IngestHandoffExists(ctx context.Context, tenantID, connectionID, collectionID, objectID string, observedSeq int64) (bool, error) {
 	var exists bool
 	err := r.db.SQL.QueryRowContext(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM jobs
 			WHERE tenant_id = $1 AND connection_id = $2 AND object_id = $3
-			  AND observed_revision = $4 AND status IN ('queued','running','succeeded')
+			  AND observed_revision = $4 AND policy->>'collection_id' = $5
+			  AND status IN ('queued','running','succeeded')
 		) OR EXISTS (
 			SELECT 1 FROM index_generations g
 			JOIN source_object_versions v
