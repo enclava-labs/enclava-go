@@ -154,11 +154,12 @@ func TestAdmissionQueuedCallerProceedsOnRelease(t *testing.T) {
 	if err := first.Body.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// The queued caller proceeds only once the drain finishes: unblock
-	// the held body so the permit releases, then serve a self-ending
-	// stream for the second attempt.
-	held.unblock()
+	// The queued caller proceeds only once the drain finishes: publish the
+	// self-ending stream for the second attempt first, then unblock the
+	// held body so the permit releases — the wake must happen after the
+	// replacement is visible.
 	f.upstream.stream = io.NopCloser(strings.NewReader("data: [DONE]\n\n"))
+	held.unblock()
 	out := <-done
 	if out.err != nil {
 		t.Fatalf("queued request: %v", out.err)
