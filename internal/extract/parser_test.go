@@ -69,6 +69,22 @@ func TestHTMLBlocksKeepTextAroundNestedBlocks(t *testing.T) {
 	}
 }
 
+// The EPUB member fallback (htmlText) joins inline text contiguously —
+// INV-<span>123</span>-A must not gain paragraph breaks — while block
+// boundaries and <br> still separate lines.
+func TestEPUBFallbackJoinsInlineAndSplitsBlocks(t *testing.T) {
+	data := writeZip(t, map[string]string{
+		"chap.xhtml": `<html><body><div>INV-<span>123</span>-A <em>x</em></div><div>second</div><div>line<br>break</div></body></html>`,
+	})
+	blocks, err := epubBlocks(data)
+	if err != nil || len(blocks) != 1 {
+		t.Fatalf("EPUB fallback blocks=%#v err=%v", blocks, err)
+	}
+	if got, want := blocks[0].text, "INV-123-A x\n\nsecond\n\nline\n\nbreak"; got != want {
+		t.Fatalf("fallback text = %q, want %q", got, want)
+	}
+}
+
 func TestCSVRowsPreserveOrderAndByteSpans(t *testing.T) {
 	input := []byte("clause,amount\r\nfirst,12.50\r\nsecond,18.75\r\n")
 	blocks, err := csvBlocks(input)

@@ -406,26 +406,54 @@ func htmlText(text string) string {
 	z := htmltoken.NewTokenizer(strings.NewReader(text))
 	var b strings.Builder
 	skip := ""
+	// sep keeps one blank line between blocks; inline runs stay joined.
+	sep := func() {
+		if s := b.String(); strings.TrimSpace(s) != "" && !strings.HasSuffix(s, "\n\n") {
+			b.WriteString("\n\n")
+		}
+	}
 	for {
 		switch z.Next() {
 		case htmltoken.ErrorToken:
 			return b.String()
-		case htmltoken.StartTagToken:
+		case htmltoken.StartTagToken, htmltoken.SelfClosingTagToken:
 			tag, _ := z.TagName()
-			if name := strings.ToLower(string(tag)); skip == "" && (name == "head" || name == "script" || name == "style") {
+			name := strings.ToLower(string(tag))
+			switch {
+			case skip == "" && (name == "head" || name == "script" || name == "style"):
 				skip = name
+			case skip == "" && htmlBlockTag(name):
+				sep()
 			}
 		case htmltoken.EndTagToken:
-			if tag, _ := z.TagName(); strings.EqualFold(string(tag), skip) {
+			tag, _ := z.TagName()
+			name := strings.ToLower(string(tag))
+			switch {
+			case strings.EqualFold(name, skip):
 				skip = ""
+			case skip == "" && htmlBlockTag(name):
+				sep()
 			}
 		case htmltoken.TextToken:
 			if skip == "" {
 				b.Write(z.Text())
-				b.WriteString("\n\n")
 			}
 		}
 	}
+}
+
+// htmlBlockTag reports whether tag opens or closes a block-level element —
+// where stripped text gets a blank line — as opposed to inline markup that
+// must not split a text run (INV-<span>123</span>-A stays INV-123-A).
+func htmlBlockTag(name string) bool {
+	switch name {
+	case "p", "div", "section", "article", "header", "footer", "main", "aside",
+		"nav", "blockquote", "pre", "ul", "ol", "li", "dl", "dt", "dd",
+		"table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption",
+		"form", "fieldset", "figure", "figcaption", "hr", "br", "body":
+		return true
+	}
+	return len(name) == 2 && name[0] == 'h' && name[1] >= '1' && name[1] <= '6'
 }
 
 func csvBlocks(data []byte) ([]parseBlock, error) {
