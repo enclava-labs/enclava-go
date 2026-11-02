@@ -123,18 +123,21 @@ func TestAccountingStreamResponsesTerminal(t *testing.T) {
 	}
 }
 
-// waitStreamFinalized polls until the stream's once-only accounting ran —
-// Close returns promptly now that terminal usage drains in the background.
+// waitStreamFinalized waits until the stream's once-only accounting ran to
+// completion — Close returns promptly now that terminal usage drains in the
+// background. finalized flips before the finish callback inside the once-
+// block, so readMu (which serializes finalize) is the completion signal.
 func waitStreamFinalized(t *testing.T, s *accountingStream) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if s.finalized.Load() {
-			return
+	for !s.finalized.Load() {
+		if !time.Now().Before(deadline) {
+			t.Fatal("stream accounting never finalized")
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatal("stream accounting never finalized")
+	s.readMu.Lock()
+	s.readMu.Unlock()
 }
 
 func TestAccountingStreamEarlyCloseRetainsLiability(t *testing.T) {
