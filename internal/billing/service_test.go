@@ -639,10 +639,11 @@ func TestPromptBoundPricedOnceAtHigherRate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
-	// Bound = 100 prompt tokens at the higher input rate + 10 output:
-	// 100*10 + 10*5 = 1050, never (100*10)+(100*3)+(10*5).
-	if res.LimitAmountMicros != 1050 {
-		t.Fatalf("bound %d, want 1050", res.LimitAmountMicros)
+	// Bound = 100 prompt tokens at the higher input rate + 10 output +
+	// 1 micro rounding headroom for the two independently rounded prompt
+	// kinds: 100*10 + 10*5 + 1, never (100*10)+(100*3)+(10*5).
+	if res.LimitAmountMicros != 1051 {
+		t.Fatalf("bound %d, want 1051", res.LimitAmountMicros)
 	}
 	// Token budget counted 110 (100 prompt once + 10 output): 40 headroom.
 	if _, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 41})); !errors.Is(err, billing.ErrBudgetExceeded) {
@@ -659,6 +660,58 @@ func TestPromptBoundPricedOnceAtHigherRate(t *testing.T) {
 	}
 	if rec.AmountMicros != 60*10+30*3+5*5 {
 		t.Fatalf("settled %d, want 715", rec.AmountMicros)
+	}
+}
+
+func TestPromptBoundCoversSeparateSettlementRounding(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	// 1 micro per 100 tokens for both prompt kinds: a 50+50 split settles
+	// as ceil(50/100)+ceil(50/100) = 2, so the folded bound needs the
+	// per-term rounding headroom, not just the once-rounded 1.
+	f.modelPrice(t, "p-in", billing.UnitInput, 1, 100, "USD")
+	f.modelPrice(t, "p-cin", billing.UnitCachedInput, 1, 100, "USD")
+	f.budget(t, "b1", billing.BudgetSubjectAPIKey, f.keyID, billing.BudgetKindAmount, 3, "USD")
+
+	res, err := f.svc.Reserve(ctx, f.principal,
+		f.req(billing.Usage{InputUnits: 100, CachedInputUnits: 100}))
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if res.LimitAmountMicros != 2 {
+		t.Fatalf("bound %d, want 2 (worst-case settlement within the prompt bound)", res.LimitAmountMicros)
+	}
+
+	// Only one prompt kind declared: the once-rounded bound is exact, no
+	// headroom is charged.
+	single, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 100}))
+	if err != nil {
+		t.Fatalf("single-kind reserve: %v", err)
+	}
+	if single.LimitAmountMicros != 1 {
+		t.Fatalf("single-kind bound %d, want 1", single.LimitAmountMicros)
+	}
+
+	// The reservation covers the worst split: 50 uncached + 50 cached
+	// settles at 2, never above the held bound.
+	rec, err := f.svc.Settle(ctx, f.principal, res.ID,
+		billing.Usage{InputUnits: 50, CachedInputUnits: 50})
+	if err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if rec.AmountMicros != 2 || rec.AmountMicros > res.LimitAmountMicros {
+		t.Fatalf("settled %d, want 2 <= bound %d", rec.AmountMicros, res.LimitAmountMicros)
+	}
+
+	// 1-micro budget: existing liability of 3 plus a proposed bound of 2
+	// must not admit.
+	g := newFixture(t)
+	g.modelPrice(t, "p-in", billing.UnitInput, 1, 100, "USD")
+	g.modelPrice(t, "p-cin", billing.UnitCachedInput, 1, 100, "USD")
+	g.budget(t, "b1", billing.BudgetSubjectAPIKey, g.keyID, billing.BudgetKindAmount, 1, "USD")
+	if _, err := g.svc.Reserve(ctx, g.principal,
+		g.req(billing.Usage{InputUnits: 100, CachedInputUnits: 100})); !errors.Is(err, billing.ErrBudgetExceeded) {
+		t.Fatalf("expected ErrBudgetExceeded, got %v", err)
 	}
 }
 

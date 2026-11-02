@@ -108,6 +108,16 @@ func (s *Service) Reserve(ctx context.Context, p auth.Principal, req ReserveRequ
 		if err != nil {
 			return err
 		}
+		// Both prompt kinds declared: settlement ceils cached and
+		// uncached input separately while the fold rounds once, so the
+		// hold needs the <1-micro second-term headroom.
+		if estimate[UnitInput] > 0 && estimate[UnitCachedInput] > 0 {
+			var overflow bool
+			bound, overflow = checkedAdd(bound, 1)
+			if overflow {
+				return ErrArithmeticOverflow
+			}
+		}
 
 		for _, b := range budgets {
 			from := LiabilityFrom(b, now)
