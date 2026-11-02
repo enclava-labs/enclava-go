@@ -302,6 +302,44 @@ func (r *RAGRepo) LiveIndexNames(ctx context.Context, tenantID, collectionID str
 	return names, rows.Err()
 }
 
+// DocumentsToReembed snapshots the live documents whose latest version is
+// published under another index or document-name choice than the
+// collection's current ones and has no newer embed job queued or running.
+func (r *RAGRepo) DocumentsToReembed(ctx context.Context, tenantID string, c rag.Collection) ([]rag.Document, error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `
+		SELECT o.id, v.id, v.observed_seq
+		FROM collection_items ci
+		JOIN source_objects o ON o.tenant_id=ci.tenant_id AND o.id=ci.object_id
+		JOIN source_object_versions v ON v.tenant_id=o.tenant_id AND v.object_id=o.id AND v.observed_seq=o.observed_seq
+		JOIN index_generations g ON g.tenant_id=ci.tenant_id AND g.collection_id=ci.collection_id
+		  AND g.object_version_id=v.id AND g.state='published'
+		WHERE ci.tenant_id=$1 AND ci.collection_id=$2 AND ci.removed_at IS NULL
+		  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL
+		  AND g.qdrant_collection <> '' AND (g.qdrant_collection <> $3 OR g.embed_titles <> $4)
+		  AND NOT EXISTS (
+		    SELECT 1 FROM index_generations n
+		    JOIN jobs j ON j.tenant_id=n.tenant_id AND j.input_ref=n.object_version_id
+		      AND j.operation='`+rag.OperationEmbed+`' AND j.policy->>'collection_id'=n.collection_id
+		      AND j.policy->>'generation'=n.generation::text AND j.status IN ('queued', 'running')
+		    WHERE n.tenant_id=g.tenant_id AND n.collection_id=g.collection_id
+		      AND n.object_version_id=g.object_version_id AND n.generation > g.generation
+		      AND n.state='staging')
+		ORDER BY o.id`, tenantID, c.ID, c.QdrantCollection, c.EmbedTitles)
+	if err != nil {
+		return nil, fmt.Errorf("list documents to re-embed: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var docs []rag.Document
+	for rows.Next() {
+		d := rag.Document{CollectionID: c.ID}
+		if err := rows.Scan(&d.ID, &d.ObjectVersionID, &d.ObservedSeq); err != nil {
+			return nil, err
+		}
+		docs = append(docs, d)
+	}
+	return docs, rows.Err()
+}
+
 func (r *RAGRepo) DeleteCollection(ctx context.Context, tenantID, id string) error {
 	res, err := r.db.SQL.ExecContext(ctx,
 		`DELETE FROM knowledge_collections WHERE tenant_id = $1 AND id = $2`, tenantID, id)
@@ -819,6 +857,9 @@ func (r *RAGRepo) ReplaceVersionChunksAndStage(ctx context.Context, tenantID, co
 			FOR UPDATE`, tenantID, collectionID, versionID, generation).Scan(&state); err != nil {
 			return fmt.Errorf("read staged generation: %w", err)
 		}
+		if state == "superseded" {
+			return fmt.Errorf("generation %d: %w", generation, rag.ErrGenerationSuperseded)
+		}
 		if state != "staging" {
 			return fmt.Errorf("generation %d is immutable in state %q", generation, state)
 		}
@@ -860,24 +901,37 @@ func (r *RAGRepo) ReplaceVersionChunksAndStage(ctx context.Context, tenantID, co
 // written to — before any point exists, so cleanup always finds them.
 func (r *RAGRepo) BindGeneration(ctx context.Context, tenantID, versionID string, generation int64, c rag.Collection) error {
 	res, err := r.db.SQL.ExecContext(ctx, `
-		UPDATE index_generations SET qdrant_collection = $5, embedding_model = $6, embedding_dimensions = $7
+		UPDATE index_generations SET qdrant_collection = $5, embedding_model = $6, embedding_dimensions = $7,
+		       embed_titles = $8
 		WHERE tenant_id = $1 AND collection_id = $2 AND object_version_id = $3 AND generation = $4
 		  AND state = 'staging'`,
-		tenantID, c.ID, versionID, generation, c.QdrantCollection, c.EmbeddingModel, c.EmbeddingDimensions)
+		tenantID, c.ID, versionID, generation, c.QdrantCollection, c.EmbeddingModel, c.EmbeddingDimensions, c.EmbedTitles)
 	if err != nil {
 		return fmt.Errorf("bind generation index: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
-		return fmt.Errorf("generation %d is no longer staged", generation)
+		return fmt.Errorf("generation %d: %w", generation, rag.ErrGenerationSuperseded)
 	}
 	return nil
 }
 
+// PublishGenerationFenced makes a staged generation the document's live one.
+// Publications of one document run one at a time, and generations are
+// ordered by creation: one older than the published generation is superseded
+// instead of published (rag.ErrGenerationSuperseded), and publishing
+// supersedes every older one still staging, so a slow worker can never
+// replace newer vectors — nor keep an index alive that cleanup then drops.
 func (r *RAGRepo) PublishGenerationFenced(ctx context.Context, tenantID, collectionID, objectID, versionID string, generation int64, jobID, leaseOwner, attemptID string, fenceToken int64) error {
-	return WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
+	superseded := false
+	err := WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+			"rag-publish:"+tenantID+":"+collectionID+":"+objectID); err != nil {
+			return fmt.Errorf("lock document publication: %w", err)
+		}
 		var state string
+		var createdAt time.Time
 		err := tx.QueryRowContext(ctx, `
-			SELECT g.state
+			SELECT g.state, g.created_at
 			FROM index_generations g
 			JOIN source_object_versions v ON v.tenant_id=g.tenant_id AND v.id=g.object_version_id
 			JOIN source_objects o ON o.tenant_id=v.tenant_id AND o.id=v.object_id
@@ -888,34 +942,60 @@ func (r *RAGRepo) PublishGenerationFenced(ctx context.Context, tenantID, collect
 			  AND j.id=$6 AND j.status='running' AND j.lease_owner=$7
 			  AND j.fence_token=$8 AND j.dispatched_attempt_id=$9
 			  AND j.lease_expires_at > now()
-			FOR UPDATE OF g`, tenantID, collectionID, versionID, generation, objectID, jobID, leaseOwner, fenceToken, attemptID).Scan(&state)
+			FOR UPDATE OF g`, tenantID, collectionID, versionID, generation, objectID, jobID, leaseOwner, fenceToken, attemptID).Scan(&state, &createdAt)
 		if err != nil {
 			return fmt.Errorf("generation publication fence: %w", err)
 		}
+		if state == "superseded" {
+			superseded = true
+			return nil
+		}
 		if state != "staging" {
 			return fmt.Errorf("generation is not staged: %s", state)
+		}
+		var newer bool
+		if err := tx.QueryRowContext(ctx, `
+			SELECT EXISTS (
+			  SELECT 1 FROM index_generations n
+			  JOIN source_object_versions nv ON nv.tenant_id=n.tenant_id AND nv.id=n.object_version_id
+			  WHERE n.tenant_id=$1 AND n.collection_id=$2 AND nv.object_id=$3
+			    AND n.state='published' AND n.created_at > $4)`,
+			tenantID, collectionID, objectID, createdAt).Scan(&newer); err != nil {
+			return fmt.Errorf("check newer publication: %w", err)
+		}
+		// Whatever loses is superseded and its points queued for cleanup:
+		// this generation when a newer one is already published, otherwise
+		// the published generation and every older one still staging.
+		losers := `state='published' OR (state='staging' AND created_at < $4)`
+		args := []any{tenantID, collectionID, objectID, createdAt}
+		if newer {
+			superseded = true
+			losers = `object_version_id=$4 AND generation=$5`
+			args = []any{tenantID, collectionID, objectID, versionID, generation}
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO index_reconciliation
 			    (tenant_id, collection_id, object_version_id, generation, fence_token, state)
 			SELECT tenant_id, collection_id, object_version_id, generation, lease_fence, 'pending'
 			FROM index_generations
-			WHERE tenant_id=$1 AND collection_id=$2 AND state='published'
+			WHERE tenant_id=$1 AND collection_id=$2 AND (`+losers+`)
 			  AND object_version_id IN (
 			    SELECT id FROM source_object_versions WHERE tenant_id=$1 AND object_id=$3
 			  )
 			ON CONFLICT (tenant_id, collection_id, object_version_id, generation)
-			DO UPDATE SET state='pending', fence_token=EXCLUDED.fence_token`,
-			tenantID, collectionID, objectID); err != nil {
+			DO UPDATE SET state='pending', fence_token=EXCLUDED.fence_token`, args...); err != nil {
 			return fmt.Errorf("queue superseded generation cleanup: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `
-			UPDATE index_generations old SET state='superseded'
-			FROM source_object_versions ov
-			WHERE old.tenant_id=$1 AND old.collection_id=$2 AND old.state='published'
-			  AND ov.tenant_id=old.tenant_id AND ov.id=old.object_version_id
-			  AND ov.object_id=$3`, tenantID, collectionID, objectID); err != nil {
+			UPDATE index_generations SET state='superseded'
+			WHERE tenant_id=$1 AND collection_id=$2 AND (`+losers+`)
+			  AND object_version_id IN (
+			    SELECT id FROM source_object_versions WHERE tenant_id=$1 AND object_id=$3
+			  )`, args...); err != nil {
 			return fmt.Errorf("supersede previous generation: %w", err)
+		}
+		if superseded {
+			return nil
 		}
 		res, err := tx.ExecContext(ctx, `
 			UPDATE index_generations SET state='published', published_at=now(), lease_fence=$6
@@ -933,6 +1013,10 @@ func (r *RAGRepo) PublishGenerationFenced(ctx context.Context, tenantID, collect
 		}
 		return nil
 	})
+	if err == nil && superseded {
+		return rag.ErrGenerationSuperseded
+	}
+	return err
 }
 
 func (r *RAGRepo) MarkGenerationState(ctx context.Context, tenantID, collectionID, versionID string, generation int64, state string) error {

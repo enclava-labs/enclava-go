@@ -80,6 +80,9 @@ dropped once no document uses it.
 its document's name — better across many documents, worse inside a single
 long one such as a book. Changing it with `PUT` re-embeds in the background.
 
+Every `PUT` also queues any document still embedded under older settings, so
+repeating a `PUT` that failed midway finishes the re-embedding it started.
+
 ## 3. Structured extraction
 
 ```bash

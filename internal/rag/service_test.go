@@ -28,6 +28,9 @@ import (
 // embeddings requests — real policy/pricing run inside inference.Service.
 type fakeEmbeddingUpstream struct {
 	calls int
+	// midEmbed runs once inside the next embeddings call: a test's window
+	// into an attempt that is still embedding.
+	midEmbed func()
 }
 
 func (f *fakeEmbeddingUpstream) CreateChatCompletion(ctx context.Context, body []byte) ([]byte, error) {
@@ -48,6 +51,10 @@ func (f *fakeEmbeddingUpstream) DoResponsesStream(ctx context.Context, method, p
 
 func (f *fakeEmbeddingUpstream) CreateEmbeddings(ctx context.Context, body []byte) ([]byte, error) {
 	f.calls++
+	if hook := f.midEmbed; hook != nil {
+		f.midEmbed = nil
+		hook()
+	}
 	var payload struct {
 		Model string `json:"model"`
 		Input any    `json:"input"`
@@ -555,6 +562,252 @@ func TestCollectionEmbedsDocumentTitles(t *testing.T) {
 	f.runNextJob(t)
 	if got, want := embeddedLen(), float64(len(text)); got != want {
 		t.Fatalf("embedded input length %v after turning names off, want %v", got, want)
+	}
+}
+
+// TestOlderAttemptNeverReplacesNewerGeneration: an attempt still embedding
+// when a newer generation of its document publishes under switched settings
+// is superseded instead of publishing over it, so cleanup can drop the old
+// index without leaving the document unsearchable.
+func TestOlderAttemptNeverReplacesNewerGeneration(t *testing.T) {
+	f := newFixture(t)
+	addEmbeddingEndpoint(t, f.db, f.tenant, "ep-embed-wide", "embed-wide")
+	ctx := context.Background()
+	c := f.collection(t)
+	upload, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "a.txt", MimeType: "text/plain", Bytes: []byte("enclava fenced publication"),
+	})
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	f.runNextJob(t) // generation 1, original index
+	if _, err := f.svc.ReprocessDocument(ctx, f.principal, upload.Document.ID); err != nil {
+		t.Fatalf("reprocess: %v", err)
+	}
+	older, err := f.jobs.Lease(ctx, "slow-worker", time.Minute) // generation 2
+	if err != nil || older == nil {
+		t.Fatalf("lease older attempt: %v", err)
+	}
+	dims, model := 32, "embed-wide"
+	f.embedding.midEmbed = func() {
+		if _, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{EmbeddingModel: &model, EmbeddingDimensions: &dims}); err != nil {
+			t.Fatalf("switch settings: %v", err)
+		}
+		if _, err := f.svc.ReprocessDocument(ctx, f.principal, upload.Document.ID); err != nil {
+			t.Fatalf("reprocess under new settings: %v", err)
+		}
+		f.runNextJob(t) // generation 3 publishes first
+	}
+	ref, err := f.svc.JobHandler()(ctx, older, nil)
+	if err != nil {
+		t.Fatalf("older attempt: %v", err)
+	}
+	if _, err := older.Complete(ctx, ref); err != nil {
+		t.Fatalf("complete older attempt: %v", err)
+	}
+
+	current, _ := f.svc.GetCollection(ctx, f.principal, c.ID)
+	if _, kept := f.vector.points[c.QdrantCollection]; kept {
+		t.Fatalf("original index %s kept after its last generation was superseded", c.QdrantCollection)
+	}
+	for _, pt := range f.vector.points[current.QdrantCollection] {
+		if pt.Payload["generation"] != int64(3) {
+			t.Fatalf("index holds generation %v points, want only generation 3", pt.Payload["generation"])
+		}
+	}
+	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "enclava fenced", Mode: rag.QuerySemantic})
+	if err != nil || len(results) == 0 || results[0].Generation != 3 {
+		t.Fatalf("search after the race = %+v, %v; want generation 3", results, err)
+	}
+}
+
+// TestOlderAttemptCannotSupersedeNewer: on an unchanged index, an older
+// generation finishing after a newer one published is refused and its
+// points dropped; the newer generation stays the live one.
+func TestOlderAttemptCannotSupersedeNewer(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	upload, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "a.txt", MimeType: "text/plain", Bytes: []byte("enclava publication order"),
+	})
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	f.runNextJob(t) // generation 1
+	if _, err := f.svc.ReprocessDocument(ctx, f.principal, upload.Document.ID); err != nil {
+		t.Fatalf("reprocess: %v", err)
+	}
+	older, err := f.jobs.Lease(ctx, "slow-worker", time.Minute) // generation 2
+	if err != nil || older == nil {
+		t.Fatalf("lease older attempt: %v", err)
+	}
+	f.embedding.midEmbed = func() {
+		if _, err := f.svc.ReprocessDocument(ctx, f.principal, upload.Document.ID); err != nil {
+			t.Fatalf("reprocess again: %v", err)
+		}
+		f.runNextJob(t) // generation 3 publishes first
+	}
+	ref, err := f.svc.JobHandler()(ctx, older, nil)
+	if err != nil {
+		t.Fatalf("older attempt: %v", err)
+	}
+	if _, err := older.Complete(ctx, ref); err != nil {
+		t.Fatalf("complete older attempt: %v", err)
+	}
+	for _, pt := range f.vector.points[c.QdrantCollection] {
+		if pt.Payload["generation"] != int64(3) {
+			t.Fatalf("index holds generation %v points, want only generation 3", pt.Payload["generation"])
+		}
+	}
+	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "enclava publication", Mode: rag.QuerySemantic})
+	if err != nil || len(results) == 0 || results[0].Generation != 3 {
+		t.Fatalf("search = %+v, %v; want generation 3 live", results, err)
+	}
+}
+
+// TestSettingsRetryResumesReembedding: a settings change whose re-embedding
+// never got queued (interrupted request) is finished by saving the same
+// settings again, and switching back to earlier settings never reuses an
+// index name that cleanup may still be dropping.
+func TestSettingsRetryResumesReembedding(t *testing.T) {
+	f := newFixture(t)
+	addEmbeddingEndpoint(t, f.db, f.tenant, "ep-embed-wide", "embed-wide")
+	ctx := context.Background()
+	c := f.collection(t)
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+			FileName: name, MimeType: "text/plain", Bytes: []byte("enclava resume " + name),
+		}); err != nil {
+			t.Fatalf("upload %s: %v", name, err)
+		}
+		f.runNextJob(t)
+	}
+	// The interrupted change: new settings committed, nothing enqueued.
+	interrupted := c
+	interrupted.EmbeddingModel, interrupted.EmbeddingDimensions = "embed-wide", 32
+	interrupted.QdrantCollection = c.QdrantCollection + "_interrupted"
+	if err := f.repo.UpdateCollection(ctx, interrupted); err != nil {
+		t.Fatalf("commit settings: %v", err)
+	}
+	dims, model := 32, "embed-wide"
+	if _, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{EmbeddingModel: &model, EmbeddingDimensions: &dims}); err != nil {
+		t.Fatalf("retry settings: %v", err)
+	}
+	for range 3 {
+		f.runNextJob(t)
+	}
+	if claim, err := f.jobs.Lease(ctx, "test-worker", time.Minute); err != nil || claim != nil {
+		t.Fatalf("unexpected extra job after resuming: %v %v", claim, err)
+	}
+	if got := len(f.vector.points[interrupted.QdrantCollection]); got != 3 {
+		t.Fatalf("new index holds %d points, want all 3 documents", got)
+	}
+	if _, kept := f.vector.points[c.QdrantCollection]; kept {
+		t.Fatal("old index kept after every document moved")
+	}
+
+	original, zero := "embed-test", 0
+	back, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{EmbeddingModel: &original, EmbeddingDimensions: &zero})
+	if err != nil {
+		t.Fatalf("switch back: %v", err)
+	}
+	if back.QdrantCollection == c.QdrantCollection || back.QdrantCollection == interrupted.QdrantCollection {
+		t.Fatalf("switching back reused index %s", back.QdrantCollection)
+	}
+}
+
+// TestAttemptUnderStaleSettingsRequeues: a document that publishes under
+// settings switched while it was embedding (its old index still serving
+// another document) is queued again under the current ones, so no document
+// stays on a retired index.
+func TestAttemptUnderStaleSettingsRequeues(t *testing.T) {
+	f := newFixture(t)
+	addEmbeddingEndpoint(t, f.db, f.tenant, "ep-embed-wide", "embed-wide")
+	ctx := context.Background()
+	c := f.collection(t)
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+			FileName: name, MimeType: "text/plain", Bytes: []byte("enclava stale settings " + name),
+		}); err != nil {
+			t.Fatalf("upload %s: %v", name, err)
+		}
+		if name == "a.txt" {
+			f.runNextJob(t) // a.txt published, keeping the old index in use
+		}
+	}
+	dims, model := 32, "embed-wide"
+	f.embedding.midEmbed = func() {
+		if _, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{EmbeddingModel: &model, EmbeddingDimensions: &dims}); err != nil {
+			t.Fatalf("switch settings: %v", err)
+		}
+	}
+	f.runNextJob(t) // b.txt publishes under the old settings, then requeues
+	f.runNextJob(t) // a.txt, queued by the switch
+	f.runNextJob(t) // b.txt under the new settings
+	current, _ := f.svc.GetCollection(ctx, f.principal, c.ID)
+	points := f.vector.points[current.QdrantCollection]
+	if len(points) != 2 || len(points[0].Vector) != dims || len(points[1].Vector) != dims {
+		t.Fatalf("current index points = %v, want both documents at %d dimensions", points, dims)
+	}
+	if _, kept := f.vector.points[c.QdrantCollection]; kept {
+		t.Fatal("old index kept after every document moved")
+	}
+}
+
+// TestAttemptRetriesWhenIndexDropped: an attempt whose index was retired and
+// dropped while it embedded retries under the current settings instead of
+// recreating the dropped index.
+func TestAttemptRetriesWhenIndexDropped(t *testing.T) {
+	f := newFixture(t)
+	addEmbeddingEndpoint(t, f.db, f.tenant, "ep-embed-wide", "embed-wide")
+	ctx := context.Background()
+	c := f.collection(t)
+	if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "a.txt", MimeType: "text/plain", Bytes: []byte("enclava dropped index"),
+	}); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	dims, model := 32, "embed-wide"
+	f.embedding.midEmbed = func() {
+		// Nothing is published yet, so the switch drops the old index at once.
+		if _, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{EmbeddingModel: &model, EmbeddingDimensions: &dims}); err != nil {
+			t.Fatalf("switch settings: %v", err)
+		}
+	}
+	claim, err := f.jobs.Lease(ctx, "test-worker", time.Minute)
+	if err != nil || claim == nil {
+		t.Fatalf("lease: %v", err)
+	}
+	_, err = f.svc.JobHandler()(ctx, claim, nil)
+	if jobs.FailureClassFor(err) != jobs.FailureRetryable {
+		t.Fatalf("attempt on a dropped index = %v, want a retryable error", err)
+	}
+	if _, recreated := f.vector.points[c.QdrantCollection]; recreated {
+		t.Fatal("dropped index was recreated")
+	}
+	if err := claim.Fail(ctx, err, jobs.FailureRetryable); err != nil {
+		t.Fatalf("fail attempt: %v", err)
+	}
+	// The retry becomes leasable after the runner's short backoff.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if claim, err = f.jobs.Lease(ctx, "test-worker", time.Minute); err != nil || claim != nil || time.Now().After(deadline) {
+			break
+		}
+	}
+	if err != nil || claim == nil {
+		t.Fatalf("lease retry: %v", err)
+	}
+	ref, err := f.svc.JobHandler()(ctx, claim, nil)
+	if err != nil {
+		t.Fatalf("retried attempt: %v", err)
+	}
+	if _, err := claim.Complete(ctx, ref); err != nil {
+		t.Fatalf("complete retry: %v", err)
+	}
+	current, _ := f.svc.GetCollection(ctx, f.principal, c.ID)
+	if points := f.vector.points[current.QdrantCollection]; len(points) != 1 || len(points[0].Vector) != dims {
+		t.Fatalf("current index points = %v, want the document at %d dimensions", points, dims)
 	}
 }
 

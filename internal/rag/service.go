@@ -2,14 +2,13 @@ package rag
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -31,6 +30,10 @@ const (
 // the calling tenant — a caller-input failure (HTTP 400), distinct from
 // infrastructure errors.
 var ErrProfileNotFound = errors.New("chunk profile version not found")
+
+// ErrGenerationSuperseded reports a generation that may no longer publish: a
+// newer generation of the same document already is, or replaced it.
+var ErrGenerationSuperseded = errors.New("generation superseded by a newer one")
 
 // Repository is the tenant-scoped persistence boundary for rag.Service over
 // the canonical source/object/version/domain schema. Implemented by
@@ -101,6 +104,10 @@ type Repository interface {
 	// the collection's retired list once its index is gone.
 	LiveIndexNames(ctx context.Context, tenantID, collectionID string) (map[string]struct{}, error)
 	ForgetRetiredIndex(ctx context.Context, tenantID, collectionID, name string) error
+	// DocumentsToReembed lists live documents whose published generation was
+	// embedded under other settings than the collection's current index and
+	// document-name choice, with no newer attempt queued or running.
+	DocumentsToReembed(ctx context.Context, tenantID string, c Collection) ([]Document, error)
 }
 
 type VectorStore interface {
@@ -191,38 +198,52 @@ func (s *Service) probeEmbedding(ctx context.Context, p auth.Principal, model st
 	return nil
 }
 
-// indexName names the Qdrant collection of one embedding configuration, so
-// the same settings always land in the same index.
-func indexName(collectionID, model string, dims int) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d", model, dims)))
-	return "rag_" + safeCollectionName(collectionID) + "_" + hex.EncodeToString(sum[:4])
+// newIndexName names a fresh Qdrant collection for a settings change. Names
+// are never reused, so cleanup of a retired index can never hit a collection
+// that switched back to the same settings.
+func newIndexName(collectionID string) string {
+	return safeCollectionName(newID("rag_" + collectionID))
 }
 
-// reembedDocuments queues a new generation of every live document under the
-// collection's current settings; each keeps serving its published
-// generation from the previous index until the new one publishes.
+// reembedPending queues a new generation for every live document still
+// published under other settings, with none already in flight. The set is
+// one snapshot, so concurrent deletes cannot shift it, and it is derived
+// from the generations themselves, so saving the settings again resumes
+// whatever an interrupted change left undone.
 // shortcut: enqueues inline in the request; move to a fan-out job if
 // collections reach tens of thousands of documents.
-func (s *Service) reembedDocuments(ctx context.Context, p auth.Principal, c Collection) error {
-	const page = 200
-	for offset := 0; ; offset += page {
-		docs, err := s.repo.ListDocuments(ctx, p.TenantID, c.ID, "", page, offset)
-		if err != nil {
+func (s *Service) reembedPending(ctx context.Context, p auth.Principal, c Collection) error {
+	docs, err := s.repo.DocumentsToReembed(ctx, p.TenantID, c)
+	if err != nil {
+		return err
+	}
+	for _, doc := range docs {
+		obj, err := s.repo.GetObject(ctx, p.TenantID, doc.ID)
+		if denied, failure := deniedOrFailed(err); failure != nil {
+			return failure
+		} else if denied {
+			continue
+		}
+		// Same rule as a manual reprocess: only documents the caller can read.
+		if denied, failure := deniedOrFailed(s.authorizer.CanRead(ctx, p, obj, source.ReadOptions{})); failure != nil {
+			return failure
+		} else if denied {
+			continue
+		}
+		if err := s.reembedDocument(ctx, p, c, doc.ID, doc.ObjectVersionID, doc.ObservedSeq); err != nil {
 			return err
 		}
-		for _, doc := range docs {
-			gen, err := s.repo.NextGeneration(ctx, p.TenantID, c.ID, doc.ObjectVersionID)
-			if err != nil {
-				return err
-			}
-			if err := s.enqueueEmbed(ctx, p, c, doc.ID, doc.ObjectVersionID, doc.ObservedSeq, gen); err != nil {
-				return err
-			}
-		}
-		if len(docs) < page {
-			return nil
-		}
 	}
+	return nil
+}
+
+// reembedDocument queues the document's next generation under c's settings.
+func (s *Service) reembedDocument(ctx context.Context, p auth.Principal, c Collection, objectID, versionID string, seq int64) error {
+	gen, err := s.repo.NextGeneration(ctx, p.TenantID, c.ID, versionID)
+	if err != nil {
+		return err
+	}
+	return s.enqueueEmbed(ctx, p, c, objectID, versionID, seq, gen)
 }
 
 // retireIndexes drops the collection's retired indexes that no live
@@ -401,21 +422,18 @@ func (s *Service) UpdateCollection(ctx context.Context, p auth.Principal, id str
 			return Collection{}, err
 		}
 	}
-	newIndex := c.EmbeddingModel != model || c.EmbeddingDimensions != dims
-	if newIndex {
+	if c.EmbeddingModel != model || c.EmbeddingDimensions != dims {
 		// One Qdrant collection holds one model's vectors at one size: the new
 		// settings get their own index while every document re-embeds in the
 		// background, and search reads the previous index until each is done.
 		if err := s.probeEmbedding(ctx, p, c.EmbeddingModel, c.EmbeddingDimensions); err != nil {
 			return Collection{}, err
 		}
-		c.QdrantCollection = indexName(c.ID, c.EmbeddingModel, c.EmbeddingDimensions)
+		c.QdrantCollection = newIndexName(c.ID)
 	}
-	reembed := newIndex
-	if input.EmbedTitles != nil && *input.EmbedTitles != c.EmbedTitles {
-		// Only passages change: re-embed in place, generation by generation.
+	if input.EmbedTitles != nil {
+		// Only passages change: documents re-embed in place.
 		c.EmbedTitles = *input.EmbedTitles
-		reembed = true
 	}
 	if input.ChunkSize != nil || input.ChunkOverlap != nil {
 		chunkSize := c.ChunkSize
@@ -468,10 +486,10 @@ func (s *Service) UpdateCollection(ctx context.Context, p auth.Principal, id str
 	if err != nil {
 		return Collection{}, err
 	}
-	if reembed {
-		if err := s.reembedDocuments(ctx, p, updated); err != nil {
-			return Collection{}, err
-		}
+	// Every save re-derives the outstanding re-embedding, so a retry after an
+	// interrupted settings change finishes it.
+	if err := s.reembedPending(ctx, p, updated); err != nil {
+		return Collection{}, err
 	}
 	// Drops an old index nothing reads any more — at once for an empty
 	// collection, and a retry point for an earlier failed cleanup.
@@ -1175,12 +1193,27 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	// any Qdrant write; a crash leaves a staging generation, never a doc
 	// claiming indexed state.
 	if err := s.repo.ReplaceVersionChunksAndStage(ctx, job.TenantID, c.ID, obj.ID, versionRowID(ver), seq, generation, profileVersionID, chunks); err != nil {
+		if errors.Is(err, ErrGenerationSuperseded) {
+			return versionRowID(ver), nil // a newer generation owns the document
+		}
 		return "", err
 	}
 	// The generation records the index this attempt writes to — the settings
 	// read at its start, even if the collection switches meanwhile.
 	if err := s.repo.BindGeneration(ctx, job.TenantID, versionRowID(ver), generation, c); err != nil {
+		if errors.Is(err, ErrGenerationSuperseded) {
+			return versionRowID(ver), nil
+		}
 		return "", err
+	}
+	// An index retired and already dropped while this attempt embedded must
+	// not be recreated: retry under the collection's current settings.
+	current, err := s.repo.GetCollection(ctx, job.TenantID, c.ID)
+	if err != nil {
+		return "", err
+	}
+	if current.QdrantCollection != c.QdrantCollection && !slices.Contains(current.RetiredQdrantCollections, c.QdrantCollection) {
+		return "", jobs.Retryable(fmt.Errorf("collection %s moved to a new index during the attempt", c.ID))
 	}
 	if err := s.vectorStore.EnsureCollection(ctx, c.QdrantCollection, len(vectors[0])); err != nil {
 		return "", err
@@ -1189,11 +1222,28 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		return "", err
 	}
 	// Publish only after the durable chunks and index writes exist.
-	if err := s.repo.PublishGenerationFenced(ctx, job.TenantID, c.ID, obj.ID, versionRowID(ver), generation, claim.JobID, claim.Owner, claim.AttemptID(), claim.FenceToken); err != nil {
+	err = s.repo.PublishGenerationFenced(ctx, job.TenantID, c.ID, obj.ID, versionRowID(ver), generation, claim.JobID, claim.Owner, claim.AttemptID(), claim.FenceToken)
+	if errors.Is(err, ErrGenerationSuperseded) {
+		// A newer generation published first: drop what this one wrote.
+		if err := s.vectorStore.DeleteGenerationPoints(ctx, c.QdrantCollection, versionRowID(ver), generation); err != nil {
+			log.Printf("rag: drop superseded generation %s/%d: %v", versionRowID(ver), generation, err)
+		}
+		s.retireIndexes(ctx, job.TenantID, c.ID)
+		return versionRowID(ver), nil
+	}
+	if err != nil {
 		return "", err
 	}
 	if err := s.ReconcileIndexPoints(ctx, job.TenantID); err != nil {
 		return "", err
+	}
+	// The settings changed after this attempt read them: it published under
+	// the old ones, so queue the document again under the current settings.
+	if latest, err := s.repo.GetCollection(ctx, job.TenantID, c.ID); err == nil &&
+		(latest.QdrantCollection != c.QdrantCollection || latest.EmbedTitles != c.EmbedTitles) {
+		if err := s.reembedDocument(ctx, p, latest, obj.ID, versionRowID(ver), seq); err != nil {
+			log.Printf("rag: requeue %s under current settings: %v", obj.ID, err)
+		}
 	}
 	s.retireIndexes(ctx, job.TenantID, c.ID)
 	return versionRowID(ver), nil
