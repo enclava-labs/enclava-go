@@ -482,7 +482,7 @@ func TestDashboardRouteRoleMatrix(t *testing.T) {
 		{"/dashboard/knowledge/col_bogus", [4]int{nf, nf, nf, deny}},
 		{"/dashboard/partials/knowledge/collections", [4]int{ok, ok, ok, deny}},
 		{"/dashboard/partials/knowledge/documents?collection=" + collID, [4]int{ok, ok, ok, deny}},
-		{"/dashboard/partials/knowledge/documents", [4]int{http.StatusInternalServerError, http.StatusInternalServerError, http.StatusInternalServerError, deny}}, // empty collection id is a service error, not the uniform 404
+		{"/dashboard/partials/knowledge/documents", [4]int{nf, nf, nf, deny}}, // missing/unknown collection id answers the uniform 404, not a service error
 		{"/dashboard/partials/knowledge/sources?collection=" + collID, [4]int{ok, ok, deny, deny}},
 		{"/dashboard/partials/knowledge/profiles", [4]int{ok, ok, deny, deny}},
 		// Sources (cap connectors.manage; bindings is access.manage).

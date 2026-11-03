@@ -2728,3 +2728,70 @@ func TestBackfillDoesNotOverwriteNewerProjection(t *testing.T) {
 		}
 	}
 }
+
+// TestExtractionResultImportRequiresValidationAck: a succeeded extract job
+// whose stored result carries validation_errors is refused until the caller
+// explicitly acknowledges them; a clean result imports without the flag.
+func TestExtractionResultImportRequiresValidationAck(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+
+	w, inputRef, err := f.store.Begin(ctx, artifacts.Meta{Ref: artifacts.Ref{TenantID: f.tenant, Kind: artifacts.KindOriginal}, MimeType: "text/plain"}, time.Minute, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("source body")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Finalize(ctx); err != nil {
+		t.Fatal(err)
+	}
+	inputRef = w.Ref()
+	if _, err := f.repo.UpsertObject(ctx, source.Object{TenantID: f.tenant, ID: "extract_src2", Kind: "upload", NativeID: "extract-native2",
+		AuthorizationMode: source.AuthorizationOwner, OwnerActorID: f.principal.ActorID, ObservedSeq: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repo.InsertObjectVersion(ctx, f.tenant, source.ObjectVersion{ObjectID: "extract_src2", ObservedSeq: 1,
+		ArtifactRef: inputRef.ID, SHA256: inputRef.SHA256, ByteSize: inputRef.ByteSize, MimeType: "text/plain", OriginalFilename: "source.txt"}); err != nil {
+		t.Fatal(err)
+	}
+
+	resultDoc := []byte(`{"id":"res_needs","data":{"amount":"oops"},"validation_errors":["schema validation failed at /amount"]}`)
+	rw, resultRef, err := f.store.Begin(ctx, artifacts.Meta{Ref: artifacts.Ref{TenantID: f.tenant, Kind: artifacts.KindResult}, MimeType: "application/json"}, time.Minute, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rw.Write(resultDoc); err != nil {
+		t.Fatal(err)
+	}
+	if err := rw.Finalize(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resultRef = rw.Ref()
+	job, _, err := f.jobs.Enqueue(ctx, f.principal, jobs.EnqueueRequest{
+		TenantID: f.tenant, Operation: "extract.process", IdempotencyKey: "extract-ack-1",
+		InputRef: inputRef.ID, Policy: map[string]any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := f.jobs.Lease(ctx, "test-worker", time.Minute)
+	if err != nil || claim == nil {
+		t.Fatal("lease")
+	}
+	if _, err := claim.Complete(ctx, resultRef.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := f.svc.ImportStoredResult(ctx, f.principal, rag.ImportResultInput{CollectionID: c.ID, ResultJobID: job.ID}); !errors.Is(err, rag.ErrValidationAckRequired) {
+		t.Fatalf("unacknowledged import = %v, want ErrValidationAckRequired", err)
+	}
+	out, err := f.svc.ImportStoredResult(ctx, f.principal, rag.ImportResultInput{CollectionID: c.ID, ResultJobID: job.ID, AcknowledgeValidation: true})
+	if err != nil {
+		t.Fatalf("acknowledged import: %v", err)
+	}
+	if out.Document.SourceType != "generated" {
+		t.Fatalf("imported document: %#v", out.Document)
+	}
+}

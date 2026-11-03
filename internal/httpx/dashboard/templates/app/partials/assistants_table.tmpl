@@ -4,7 +4,7 @@
      audience, status, REAL per-assistant conversation counts. The wrapper
      re-fetches on Enclava.refresh() (D-17). Arg: assistantsPageData. */}}
 <div class="card" id="assistants-table" hx-get="/dashboard/partials/assistants/table" hx-trigger="refresh from:body" hx-swap="outerHTML">
-{{if .Data.Table.Rows}}  <div class="tablewrap">
+{{if .Data.Table.Rows}}  <div class="tablewrap" role="region" tabindex="0" aria-label="Assistants">
     <table>
       <thead>
         <tr>

@@ -15,6 +15,7 @@ import (
 
 	"enclava-go/internal/artifacts"
 	"enclava-go/internal/auth"
+	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
 	"enclava-go/internal/rag"
 	"enclava-go/internal/source"
@@ -779,5 +780,43 @@ func TestRAGCollectionDocumentsUploadRoute(t *testing.T) {
 	list.ServeHTTP(drec, download)
 	if drec.Code != http.StatusOK || drec.Body.String() != content {
 		t.Fatalf("artifact round-trip = %d body=%q", drec.Code, drec.Body.String())
+	}
+}
+
+type deniedEmbeddingExecutor struct{}
+
+func (deniedEmbeddingExecutor) Execute(context.Context, auth.Principal, inference.Request) (*inference.Result, error) {
+	return nil, inference.ErrDenied
+}
+
+func TestRAGSearchEmbeddingGrantDenial(t *testing.T) {
+	f := seedReadableSearchApp(t)
+	f.app.ragSvc = rag.NewService(postgres.NewRAGRepo(f.db), f.vector, deniedEmbeddingExecutor{}, "", nil, nil)
+	for _, mode := range []string{"semantic", "hybrid", "lexical"} {
+		for _, path := range []string{"/api/v1/rag/search", "/api/v1/rag/collections/" + f.collectionID + "/search"} {
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"query":"corpus","mode":"`+mode+`"}`))
+			req.Header.Set("Authorization", "Bearer "+f.memberKey)
+			rec := httptest.NewRecorder()
+			f.app.Handler().ServeHTTP(rec, req)
+			if mode == "lexical" {
+				if rec.Code != http.StatusOK {
+					t.Fatalf("%s %s = %d: %s", path, mode, rec.Code, rec.Body.String())
+				}
+			} else if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "embedding_not_granted") || !strings.Contains(rec.Body.String(), "Semantic search needs an embedding model granted to your role") {
+				t.Fatalf("%s %s = %d: %s", path, mode, rec.Code, rec.Body.String())
+			}
+		}
+	}
+}
+
+func TestRAGUploadReadableCollectionWithoutWritePermission(t *testing.T) {
+	f := seedUploadApp(t)
+	other := testdb.SeedUser(t, f.db, f.tenant, "upload-reader-manager@example.test", nil)
+	key, _ := testdb.SeedAPIKey(t, f.db, f.tenant, testdb.SeedKeySpec{
+		Name: "upload-reader-manager", OwnerUserID: other.ID, Scopes: []string{"rag", "rag.manage"},
+	})
+	rec := uploadMultipart(t, f, key, "file", "read-only.txt", "content", 0)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "write access to this collection") {
+		t.Fatalf("read-only upload = %d: %s", rec.Code, rec.Body.String())
 	}
 }

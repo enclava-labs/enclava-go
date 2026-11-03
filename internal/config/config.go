@@ -89,6 +89,11 @@ type Config struct {
 	// (INFERENCE_DEFAULT_MAX_OUTPUT_TOKENS, 0 = inject nothing and hold
 	// the operation bound).
 	InferenceDefaultMaxOutputTokens int64
+	// ExtractMaxOutputTokens is the fallback generation cap for extraction
+	// templates that declare no max_output_tokens
+	// (EXTRACT_MAX_OUTPUT_TOKENS, 0 = send no explicit cap and let the
+	// gateway default injection and model-limit clamp apply).
+	ExtractMaxOutputTokens int64
 }
 
 func Load() (Config, error) {
@@ -151,6 +156,7 @@ func Load() (Config, error) {
 		InferenceMaxHTTPQueue:           getEnvInt("INFERENCE_MAX_HTTP_QUEUE", 128),
 		InferenceMaxBodyBytes:           getEnvInt64("INFERENCE_MAX_BODY_BYTES", 256<<20),
 		InferenceDefaultMaxOutputTokens: getEnvInt64("INFERENCE_DEFAULT_MAX_OUTPUT_TOKENS", 16384),
+		ExtractMaxOutputTokens:          getEnvInt64("EXTRACT_MAX_OUTPUT_TOKENS", 0),
 	}
 	for name, target := range map[string]*time.Duration{
 		"SOURCE_ACCESS_MAX_STALE": &cfg.SourceAccessMaxStale,
@@ -189,6 +195,9 @@ func Load() (Config, error) {
 		cfg.InferencePerTenant < 0 || cfg.InferenceMaxBodyBytes < 0 ||
 		cfg.InferenceDefaultMaxOutputTokens < 0 {
 		return Config{}, fmt.Errorf("INFERENCE_* queue/byte/tenant limits must be >= 0")
+	}
+	if cfg.ExtractMaxOutputTokens < 0 || cfg.ExtractMaxOutputTokens > 32768 {
+		return Config{}, fmt.Errorf("EXTRACT_MAX_OUTPUT_TOKENS must be 0 or between 1 and 32768")
 	}
 	if cfg.Port <= 0 {
 		return Config{}, fmt.Errorf("APP_PORT must be > 0")

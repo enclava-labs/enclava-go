@@ -45,13 +45,15 @@ type Instance struct {
 }
 
 // Conversation is the tenant-scoped conversations row. OwnerActorID carries
-// the initiating actor's identity — resume is owner-or-admin only.
+// the initiating actor's identity — resume is owner-only. Title is the
+// member-set name (PATCH); empty falls back to the derived preview.
 type Conversation struct {
 	TenantID       string    `json:"-"`
 	ID             string    `json:"id"`
 	ChatbotID      string    `json:"chatbot_id"`
 	OwnerActorID   string    `json:"-"`
 	ExternalUserID string    `json:"external_user_id,omitempty"`
+	Title          string    `json:"title,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 }
 
@@ -86,10 +88,9 @@ type ConversationView struct {
 	Messages     []Message    `json:"messages"`
 }
 
-// ConversationSummary is one own-conversation list row (OA-13). Title and
-// UpdatedAt are server-derived from the first VISIBLE user message and the
-// last message timestamp — never stored on the conversation row and never
-// taken from client input.
+// ConversationSummary is one own-conversation list row (OA-13). Title is the
+// member-set name when one exists, else the derived preview of the first
+// VISIBLE user message; UpdatedAt is the last message timestamp.
 type ConversationSummary struct {
 	ID            string    `json:"id"`
 	ChatbotID     string    `json:"assistant_id"`

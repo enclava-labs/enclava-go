@@ -119,8 +119,8 @@
   });
 
   // Deactivate is a DELETE against the same budget row behind the shared
-  // two-click confirm (app.js re-arms and fires enclava:confirm on the
-  // second click); the row stays listed as inactive and admission stops
+  // confirm group (app.js arms the group and fires enclava:confirm on the
+  // trigger's Confirm); the row stays listed as inactive and admission stops
   // checking it.
   document.addEventListener('enclava:confirm', (e) => {
     const btn = e.target instanceof Element ? e.target.closest('[data-budget-id]') : null;

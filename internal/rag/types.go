@@ -140,6 +140,15 @@ type StoredResult struct {
 	ResultRef string
 }
 
+// ImportResultInput names one durable job whose stored result artifact is
+// imported. AcknowledgeValidation must be set to import an extraction
+// result the worker flagged with validation errors.
+type ImportResultInput struct {
+	CollectionID          string `json:"collection_id"`
+	ResultJobID           string `json:"result_job_id"`
+	AcknowledgeValidation bool   `json:"acknowledge_validation,omitempty"`
+}
+
 type CreateCollectionInput struct {
 	Name                  string         `json:"name"`
 	Description           string         `json:"description,omitempty"`

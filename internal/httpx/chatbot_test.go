@@ -849,3 +849,104 @@ func TestConversationsRouteSessionAuth(t *testing.T) {
 		t.Fatalf("session summary = %#v", payload.Conversations[0])
 	}
 }
+
+// TestConversationByIDPatchDeleteOwnerScoped proves the AST-I03 surface:
+// PATCH/DELETE act on the caller's OWN conversation only (another owner's
+// id is a uniform 404), the title is trimmed and bounded, and DELETE
+// removes the row AND its messages.
+func TestConversationByIDPatchDeleteOwnerScoped(t *testing.T) {
+	ctx := context.Background()
+	db := testdb.New(t)
+	tenantID := testdb.SeedTenant(t, db, "conversations-mutate")
+	chatRepo := postgres.NewChatbotRepo(db)
+	chatSvc := chatbot.NewService(chatRepo, postgres.NewPromptsRepo(db), nil, nil)
+	app := &App{chatbotSvc: chatSvc}
+
+	creator := openChatPrincipal(tenantID)
+	bot, err := chatSvc.Create(ctx, creator, chatbot.CreateChatbotInput{
+		Name: "Mutable Bot", Model: "chat-test-model", Audience: []string{"member_actor", "other_actor"},
+	})
+	if err != nil {
+		t.Fatalf("create bot: %v", err)
+	}
+	member := auth.Principal{TenantID: tenantID, ActorID: "member_actor",
+		AllowedChatbots: map[string]struct{}{bot.ID: {}}}
+	other := auth.Principal{TenantID: tenantID, ActorID: "other_actor",
+		AllowedChatbots: map[string]struct{}{bot.ID: {}}}
+
+	seed := func(id, owner, content string) {
+		t.Helper()
+		if err := chatRepo.CreateConversation(ctx, chatbot.Conversation{
+			TenantID: tenantID, ID: id, ChatbotID: bot.ID, OwnerActorID: owner,
+		}); err != nil {
+			t.Fatalf("seed conversation %s: %v", id, err)
+		}
+		if err := chatRepo.AddMessage(ctx, chatbot.Message{
+			TenantID: tenantID, ID: id + "_msg", ConversationID: id,
+			Role: "user", Content: content, OwnerActorID: owner,
+		}); err != nil {
+			t.Fatalf("seed message %s: %v", id, err)
+		}
+	}
+	seed("conv_mine", "member_actor", "rename me")
+	seed("conv_theirs", "other_actor", "not mine")
+
+	do := func(p auth.Principal, method, id, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		var r *http.Request
+		if body != "" {
+			r = httptest.NewRequest(method, "/api/v1/conversations/"+id, strings.NewReader(body))
+		} else {
+			r = httptest.NewRequest(method, "/api/v1/conversations/"+id, nil)
+		}
+		rec := httptest.NewRecorder()
+		app.handleConversationByID(rec, r, p)
+		return rec
+	}
+
+	// Rename: trimmed title persists and flows into the list summary.
+	rec := do(member, http.MethodPatch, "conv_mine", `{"title":"  Renewal review  "}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner PATCH = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var renamed chatbot.Conversation
+	if err := json.Unmarshal(rec.Body.Bytes(), &renamed); err != nil || renamed.Title != "Renewal review" {
+		t.Fatalf("PATCH payload = %s err=%v", rec.Body.String(), err)
+	}
+	summaries, _, err := chatSvc.ListConversations(ctx, member, 10, "")
+	if err != nil || len(summaries) != 1 || summaries[0].Title != "Renewal review" {
+		t.Fatalf("renamed title not surfaced in list: %v %#v", err, summaries)
+	}
+
+	// Title validation: empty/whitespace and >200 chars are 400, never stored.
+	for _, body := range []string{`{"title":"   "}`, `{"title":"` + strings.Repeat("a", 201) + `"}`} {
+		if rec := do(member, http.MethodPatch, "conv_mine", body); rec.Code != http.StatusBadRequest {
+			t.Fatalf("PATCH %q = %d, want 400", body, rec.Code)
+		}
+	}
+
+	// Another owner's conversation is a uniform 404 for both mutations.
+	if rec := do(member, http.MethodPatch, "conv_theirs", `{"title":"hijack"}`); rec.Code != http.StatusNotFound {
+		t.Fatalf("foreign PATCH = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(member, http.MethodDelete, "conv_theirs", ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("foreign DELETE = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if view, err := chatSvc.ListConversation(ctx, other, "conv_theirs"); err != nil || len(view.Messages) != 1 {
+		t.Fatalf("foreign conversation touched: %v %#v", err, view)
+	}
+
+	// DELETE own removes the conversation AND its messages; GET 404s after.
+	if rec := do(member, http.MethodDelete, "conv_mine", ""); rec.Code != http.StatusOK {
+		t.Fatalf("owner DELETE = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(member, http.MethodGet, "conv_mine", ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("GET after delete = %d", rec.Code)
+	}
+	if msgs, err := chatRepo.ListMessages(ctx, tenantID, "conv_mine"); err != nil || len(msgs) != 0 {
+		t.Fatalf("messages after delete = %v %#v", err, msgs)
+	}
+	if rec := do(member, http.MethodPost, "conv_theirs", `{}`); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST = %d, want 405", rec.Code)
+	}
+}

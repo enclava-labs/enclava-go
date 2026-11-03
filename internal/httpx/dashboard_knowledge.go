@@ -63,6 +63,7 @@ type knowledgeCollectionRow struct {
 // knowledgeCollectionData is the collection page AND tab-fragment model.
 type knowledgeCollectionData struct {
 	Header           dashboardHeader
+	Writable         bool // CollectionWritable — owner/admin write gate for upload+actions
 	Collection       rag.Collection
 	Tabs             []dashboardTab
 	Tab              string // documents|sources|search|settings
@@ -249,7 +250,8 @@ func (a *App) handleDashboardKnowledgeCollection(w http.ResponseWriter, r *http.
 		Tabs:       knowledgeTabs(c.ID, tab, caps),
 		Everyone:   knowledgeAccessLabel(c) == "Everyone",
 	}
-	data.Empty = knowledgeDocumentsEmpty(knowledgeDocumentStatus(r.URL.Query().Get("status")), caps)
+	data.Writable = caps.KnowledgeManage && rag.CollectionWritable(c, p)
+	data.Empty = knowledgeDocumentsEmpty(knowledgeDocumentStatus(r.URL.Query().Get("status")), caps, data.Writable)
 	data.SourcesEmpty = knowledgeSourcesEmpty(c.ID, caps)
 	ctx := r.Context()
 	pending, total, err := a.ragSvc.ReembedProgress(ctx, p, c.ID)
@@ -373,9 +375,9 @@ func knowledgeAnyProcessing(docs []rag.Document) bool {
 	return false
 }
 
-func knowledgeDocumentsEmpty(status string, caps dashboardCaps) dashboardEmpty {
+func knowledgeDocumentsEmpty(status string, caps dashboardCaps, writable bool) dashboardEmpty {
 	empty := dashboardEmpty{Icon: "knowledge", Text: "No documents match this filter."}
-	if status == rag.DocumentStatusAll && caps.KnowledgeManage {
+	if status == rag.DocumentStatusAll && caps.KnowledgeManage && writable {
 		empty.Text = "No documents yet."
 		empty.ActionLabel, empty.ActionHref = "Upload document", "#knowledge-upload-file"
 	}
@@ -462,6 +464,17 @@ func (a *App) handleDashboardKnowledgeDocuments(w http.ResponseWriter, r *http.R
 	caps, _ := capsFromContext(r.Context())
 	collectionID := strings.TrimSpace(r.URL.Query().Get("collection"))
 	status := knowledgeDocumentStatus(r.URL.Query().Get("status"))
+	c, err := a.ragSvc.GetCollection(r.Context(), p, collectionID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, source.ErrDenied) {
+			a.sessionAuth.renderDashboardNotFound(w, r)
+		} else {
+			log.Printf("dashboard knowledge collection: %v", err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+		}
+		return
+	}
+	writable := caps.KnowledgeManage && rag.CollectionWritable(c, p)
 	docs, more, ok := a.knowledgeDocuments(w, r.Context(), p, collectionID, status)
 	if !ok {
 		return
@@ -473,14 +486,15 @@ func (a *App) handleDashboardKnowledgeDocuments(w http.ResponseWriter, r *http.R
 		return
 	}
 	data := knowledgeCollectionData{
-		Collection:     rag.Collection{ID: collectionID},
+		Collection:     c,
+		Writable:       writable,
 		Status:         status,
 		Docs:           docs,
 		DocMore:        more,
 		AnyProcessing:  knowledgeAnyProcessing(docs),
 		ReembedPending: pending,
 		ReembedTotal:   total,
-		Empty:          knowledgeDocumentsEmpty(status, caps),
+		Empty:          knowledgeDocumentsEmpty(status, caps, writable),
 	}
 	a.renderDashboardFragment(w, r, "knowledge_collection", "knowledge-documents", data)
 }

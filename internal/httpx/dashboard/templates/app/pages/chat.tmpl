@@ -17,10 +17,11 @@
 </header>
 
 <div class="thread-layout">
-  <aside class="history" aria-label="Chat history">
+  <nav class="history" aria-label="Chats">
+    <h2 class="visually-hidden">Chats</h2>
     <input class="field" type="search" placeholder="Search chats" aria-label="Search chats" data-chat-search>
     {{template "frag-chat-history" .}}
-  </aside>
+  </nav>
 
   <section class="thread" aria-label="Conversation">
     <div class="thread-head">
@@ -42,20 +43,27 @@
 
     {{template "frag-chat-thread" .}}
 
-    <div class="composer" id="chatComposer"{{if .Data.EvidenceIDsAttr}} data-evidence="{{.Data.EvidenceIDsAttr}}"{{end}}>
+    {{if or .Data.NoAssistants .Data.SelectedDisabled}}
+      <div class="composer-note muted">
+        {{if .Data.NoAssistants}}{{.Data.AssistantsEmpty.Text}}{{else}}This assistant is no longer available. Pick another assistant to start a new conversation.{{end}}
+      </div>
+    {{else}}
+    <div class="composer" id="chatComposer"{{if .Data.EvidenceIDsAttr}} data-evidence="{{.Data.EvidenceIDsAttr}}"{{end}}{{if and .Data.ConversationID .Data.SelectedAssistant}} data-assistant="{{.Data.SelectedAssistant}}"{{end}}>
       <textarea class="field" id="composer" rows="2" placeholder="Ask a follow-up…" aria-label="Message"></textarea>
       <div class="compose-foot">
         <span class="muted" id="evidenceChip"{{if not .Data.EvidenceIDsAttr}} hidden{{end}}>Answering from the saved passages you attached.</span>
-        <button type="button" class="btn primary" data-action="chat:send"{{if not .Data.Assistants}} disabled data-locked="1"{{end}}>{{icon "send"}} Send</button>
+        <button type="button" class="btn primary" data-action="chat:send">{{icon "send"}} Send</button>
       </div>
     </div>
+    {{end}}
   </section>
 
   <aside id="evidence" class="evidence-panel" aria-label="Evidence"></aside>
 </div>
 
 <div class="mobile-chats-list" id="mobileChats">
+  <h2 class="visually-hidden">Chats</h2>
   <button type="button" class="btn mobile-chats" aria-expanded="false" aria-controls="mobileChats">Close chats</button>
-  {{$conv := .Data.ConversationID}}{{range .Data.History.Groups}}<h3>{{.Label}}</h3>{{range .Items}}<a class="history-item{{if eq .ID $conv}} selected{{end}}" href="/dashboard/chat/{{.ID}}">{{.Title}}<span class="subline">{{relTime .UpdatedAt}}</span></a>{{end}}{{end}}
+  {{template "chat-history-items" .}}
 </div>
 {{end}}

@@ -402,3 +402,17 @@ func TestDashboardSearchGuards(t *testing.T) {
 		t.Fatalf("/dashboard/search/extra = %d, want 404", got.Code)
 	}
 }
+
+func TestDashboardSearchEmbeddingDenialInline(t *testing.T) {
+	f := newSearchFixture(t)
+	sess, csrf, memberID := f.member(t, "search-no-embedding@example.test")
+	col := f.collection(t, "Contracts", []string{memberID})
+	f.stageSearchDoc(t, col, "obj_denied", "Agreement.pdf", "renewal contract", `{"kind":"upload"}`, []string{memberID})
+	f.app.ragSvc = rag.NewService(postgres.NewRAGRepo(f.db), f.vector, deniedEmbeddingExecutor{}, "embed-test", nil, nil)
+	for _, path := range []string{"/dashboard/search", "/dashboard/partials/search/results"} {
+		got := f.get(t, sess, csrf, path+"?q=renewal&mode=semantic")
+		if got.Code != http.StatusOK || !strings.Contains(got.Body.String(), "Semantic search needs an embedding model granted to your role") || !strings.Contains(got.Body.String(), "Keyword search still works.") {
+			t.Fatalf("%s = %d: %s", path, got.Code, got.Body.String())
+		}
+	}
+}

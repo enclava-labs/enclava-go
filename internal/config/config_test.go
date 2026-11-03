@@ -375,3 +375,48 @@ func clearConfigEnv(t *testing.T) {
 	// can override with their own t.Setenv.
 	t.Setenv("DATABASE_URL", "postgres://enclava:enclava@localhost:5432/enclava_test")
 }
+
+func TestLoadExtractMaxOutputTokens(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/enclava")
+	t.Setenv("PRIVATEMODE_API_KEY", "pm_test_key")
+	t.Setenv("PRIVATEMODE_BASE_URL", "https://example.invalid/v1")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ExtractMaxOutputTokens != 0 {
+		t.Fatalf("unset EXTRACT_MAX_OUTPUT_TOKENS = %d, want 0 (no explicit cap)", cfg.ExtractMaxOutputTokens)
+	}
+
+	for _, tt := range []struct {
+		raw  string
+		want int64
+		fail bool
+	}{
+		{"1024", 1024, false},
+		{"1", 1, false},
+		{"32768", 32768, false},
+		{"0", 0, false},
+		{"-1", 0, true},
+		{"32769", 0, true},
+	} {
+		t.Run(tt.raw, func(t *testing.T) {
+			t.Setenv("EXTRACT_MAX_OUTPUT_TOKENS", tt.raw)
+			cfg, err := Load()
+			if tt.fail {
+				if err == nil || !strings.Contains(err.Error(), "EXTRACT_MAX_OUTPUT_TOKENS") {
+					t.Fatalf("EXTRACT_MAX_OUTPUT_TOKENS=%q: %v, want range error", tt.raw, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("EXTRACT_MAX_OUTPUT_TOKENS=%q: %v", tt.raw, err)
+			}
+			if cfg.ExtractMaxOutputTokens != tt.want {
+				t.Fatalf("EXTRACT_MAX_OUTPUT_TOKENS=%q = %d, want %d", tt.raw, cfg.ExtractMaxOutputTokens, tt.want)
+			}
+		})
+	}
+}

@@ -27,7 +27,7 @@ var _ extract.TemplatesRepo = (*ExtractRepo)(nil)
 var _ extract.SettingsRepo = (*ExtractRepo)(nil)
 
 const extractTemplateCols = `id, name, description, system_prompt, user_prompt,
-	variables_schema, output_schema, default_model, enabled, owner_actor_id,
+	variables_schema, output_schema, default_model, max_output_tokens, enabled, owner_actor_id,
 	is_default, created_at`
 
 func (r *ExtractRepo) ListTemplates(ctx context.Context, tenantID string) ([]extract.Template, error) {
@@ -75,9 +75,9 @@ func (r *ExtractRepo) UpsertTemplate(ctx context.Context, tenantID string, t ext
 	_, err = r.db.SQL.ExecContext(ctx, `
 		INSERT INTO extract_templates
 			(tenant_id, id, name, description, system_prompt, user_prompt,
-			 variables_schema, output_schema, default_model, enabled,
+			 variables_schema, output_schema, default_model, max_output_tokens, enabled,
 			 owner_actor_id, is_default)
-		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT (tenant_id, id) DO UPDATE SET
 			name             = excluded.name,
 			description      = excluded.description,
@@ -86,11 +86,12 @@ func (r *ExtractRepo) UpsertTemplate(ctx context.Context, tenantID string, t ext
 			variables_schema = excluded.variables_schema,
 			output_schema    = excluded.output_schema,
 			default_model    = excluded.default_model,
+			max_output_tokens = excluded.max_output_tokens,
 			enabled          = excluded.enabled,
 			owner_actor_id   = excluded.owner_actor_id,
 			is_default       = excluded.is_default`,
 		tenantID, t.ID, t.Name, t.Description, t.SystemPrompt, t.UserPrompt,
-		ctxSchema, outSchema, t.DefaultModel, t.Enabled,
+		ctxSchema, outSchema, t.DefaultModel, t.MaxOutputTokens, t.Enabled,
 		nullString(t.OwnerActorID), t.IsDefault)
 	if err != nil {
 		return fmt.Errorf("upsert extract template: %w", err)
@@ -132,9 +133,9 @@ func (r *ExtractRepo) ReplaceDefaultTemplates(ctx context.Context, tenantID stri
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO extract_templates
 					(tenant_id, id, name, description, system_prompt, user_prompt,
-					 variables_schema, output_schema, default_model, enabled,
+					 variables_schema, output_schema, default_model, max_output_tokens, enabled,
 					 owner_actor_id, is_default)
-				VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11)
+				VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, $12)
 				ON CONFLICT (tenant_id, id) DO UPDATE SET
 					name             = excluded.name,
 					description      = excluded.description,
@@ -143,10 +144,11 @@ func (r *ExtractRepo) ReplaceDefaultTemplates(ctx context.Context, tenantID stri
 					variables_schema = excluded.variables_schema,
 					output_schema    = excluded.output_schema,
 					default_model    = excluded.default_model,
+					max_output_tokens = excluded.max_output_tokens,
 					enabled          = excluded.enabled,
 					is_default       = excluded.is_default`,
 				tenantID, t.ID, t.Name, t.Description, t.SystemPrompt, t.UserPrompt,
-				ctxSchema, outSchema, t.DefaultModel, t.Enabled, t.IsDefault); err != nil {
+				ctxSchema, outSchema, t.DefaultModel, t.MaxOutputTokens, t.Enabled, t.IsDefault); err != nil {
 				return fmt.Errorf("insert default template %s: %w", t.ID, err)
 			}
 		}
@@ -196,7 +198,7 @@ func scanExtractTemplate(row interface{ Scan(dest ...any) error }) (extract.Temp
 	var ctxRaw, outRaw []byte
 	if err := row.Scan(
 		&t.ID, &t.Name, &t.Description, &t.SystemPrompt, &t.UserPrompt,
-		&ctxRaw, &outRaw, &t.DefaultModel, &t.Enabled, &owner,
+		&ctxRaw, &outRaw, &t.DefaultModel, &t.MaxOutputTokens, &t.Enabled, &owner,
 		&t.IsDefault, &t.CreatedAt,
 	); err != nil {
 		return extract.Template{}, err

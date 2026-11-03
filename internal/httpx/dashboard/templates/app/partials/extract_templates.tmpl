@@ -12,7 +12,7 @@
       <div class="card-title">Templates</div>
       <div class="card-sub">Prompts and output contracts every member's process tab can be granted on.</div>
       {{if .Data.Manage}}
-      <div class="tablewrap" style="margin-top:10px">
+      <div class="tablewrap" role="region" tabindex="0" aria-label="Templates" style="margin-top:10px">
         <table>
           <thead>
             <tr>
@@ -94,6 +94,11 @@
           {{range .Data.Models}}<option value="{{.}}">{{.}}</option>{{end}}
         </select>
       </div>
+      <div>
+        <label class="label" for="extract-tpl-maxtokens">Max output tokens</label>
+        <input class="field" id="extract-tpl-maxtokens" data-editor-field="max_output_tokens" type="number" min="1" max="32768" inputmode="numeric" placeholder="Gateway default">
+        <p class="help">Optional cap on generated tokens (1–32768). Empty sends no explicit cap.</p>
+      </div>
       <label><input type="checkbox" data-editor-field="is_active" checked> Active</label>
       <label><input type="checkbox" data-editor-field="is_default"> Default template</label>
       <h3>Output fields</h3>
@@ -122,6 +127,7 @@
               <option>string</option><option>number</option><option>boolean</option>
             </select></label>
           </div>
+          <div><label class="label">Description<input class="field" data-row-description placeholder="What this hint is for"></label></div>
           <button type="button" class="btn danger" data-row-remove>Remove hint</button>
         </div>
       </div>

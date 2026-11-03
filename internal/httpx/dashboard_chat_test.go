@@ -396,7 +396,8 @@ func TestDashboardChatComposerStates(t *testing.T) {
 	}
 
 	// Grantless member (scopes only, stored grants deny): empty picker, help
-	// text, disabled Send — and the server still refuses their run.
+	// text, ONE empty state over the thread and the composer-note in place
+	// of the composer (UX-M04) — and the server still refuses their run.
 	gsess, gcsrf, _ := f.memberSession(t, "grantless@example.com", "", "")
 	rec = f.chatGet(t, gsess, gcsrf, "/dashboard/chat")
 	if rec.Code != http.StatusOK {
@@ -409,8 +410,8 @@ func TestDashboardChatComposerStates(t *testing.T) {
 	if !strings.Contains(body, "ask an admin to grant access") {
 		t.Fatalf("grant-needed help text missing: %s", body)
 	}
-	if !strings.Contains(body, `data-action="chat:send" disabled data-locked="1"`) {
-		t.Fatalf("Send not disabled+locked for grantless member: %s", body)
+	if strings.Contains(body, `data-action="chat:send"`) || !strings.Contains(body, "composer-note") {
+		t.Fatalf("grantless member still saw the composer instead of the note: %s", body)
 	}
 
 	// Server re-check: an ungranted assistant id is agent_run_denied 403.
@@ -584,5 +585,50 @@ func TestDashboardChatCursorPagination(t *testing.T) {
 	rec = f.chatGet(t, sess, csrf, "/dashboard/partials/chat/history?cursor=not-a-cursor")
 	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "conv_c") {
 		t.Fatalf("malformed cursor must render an empty page, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestDashboardChatConversationSelectsItsAssistant proves AST-I02: a
+// deep-linked conversation renders the picker on ITS OWN assistant, not the
+// list's first row — chat.js then posts the thread's real assistant id on
+// follow-ups.
+func TestDashboardChatConversationSelectsItsAssistant(t *testing.T) {
+	f := newChatFixture(t)
+	bot := f.seedAssistant(t)
+	other, err := f.chatSvc.Create(context.Background(), f.adminAuth, chatbot.CreateChatbotInput{
+		Name: "Second Reviewer", Model: "chat-model-1", Audience: []string{"*"},
+	})
+	if err != nil {
+		t.Fatalf("seed second assistant: %v", err)
+	}
+	sess, csrf := loginUserWithGrants(t, f.identityFixture, "select-member@example.com",
+		[]string{"chatbot", "rag"},
+		auth.ResourceGrants{
+			Models:     auth.Allowlist{Items: []string{"chat-model-1"}},
+			Assistants: auth.Allowlist{Items: []string{bot.ID, other.ID}},
+		}, "chat-pass")
+	var memberID string
+	if err := f.db.SQL.QueryRowContext(context.Background(),
+		`SELECT id::text FROM users WHERE tenant_id = $1::uuid AND email = $2`,
+		f.tenant, "select-member@example.com").Scan(&memberID); err != nil {
+		t.Fatalf("read member id: %v", err)
+	}
+	f.seedConversation(t, "conv_second", memberID, other.ID, "follow-up here")
+
+	rec := f.chatGet(t, sess, csrf, "/dashboard/chat/conv_second")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("conversation page = %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// bot sorts first in the picker but conv_second's assistant must be the
+	// selected option and the composer's pinned data-assistant.
+	if !strings.Contains(body, `<option value="`+other.ID+`" selected>`) {
+		t.Fatalf("conversation's assistant not selected: %s", body)
+	}
+	if strings.Contains(body, `<option value="`+bot.ID+`" selected>`) {
+		t.Fatal("the first assistant in the list was selected instead")
+	}
+	if !strings.Contains(body, `data-assistant="`+other.ID+`"`) {
+		t.Fatalf("composer missing pinned data-assistant: %s", body)
 	}
 }

@@ -23,6 +23,7 @@ func TestStatusVocabulary(t *testing.T) {
 		"processing":   {"Processing", "warn"},
 		"warning":      {"Needs attention", "warn"},
 		"review":       {"Needs attention", "warn"},
+		"needs_review": {"Needs review", "warn"},
 		"pending":      {"Awaiting approval", "warn"},
 		"degraded":     {"Degraded", "warn"},
 		"unverified":   {"Unverified", "warn"},

@@ -301,8 +301,8 @@ test.describe('API Keys management', () => {
     await expect(row).toBeVisible();
     const revoke = row.locator('button[data-access-confirm="key-revoke"]');
     await revoke.click();
-    // Two-step confirm: the button arms, the second click revokes.
-    await revoke.click();
+    // Untimed confirm group: the first click arms, Confirm revokes.
+    await page.locator('.confirm-group').getByRole('button', { name: 'Confirm' }).click();
     await expect(page.locator(`tr:has-text("${keyName}")`)).not.toBeVisible();
   });
 

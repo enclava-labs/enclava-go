@@ -11,7 +11,7 @@
   <div class="card">
     {{if .Data.Error}}<div class="attention">{{icon "alert"}}<p>{{.Data.Error}}</p></div>{{end}}
     {{if .Data.Rows}}
-    <div class="tablewrap">
+    <div class="tablewrap" role="region" tabindex="0" aria-label="Pricing">
       <table>
         <thead>
           <tr>

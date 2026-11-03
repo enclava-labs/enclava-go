@@ -5,7 +5,7 @@
      Enclava.refresh() so drawer saves re-render the real rows. */}}
 <div class="section" id="usage-budgets" hx-get="/dashboard/partials/usage/budgets" hx-trigger="refresh from:body" hx-swap="outerHTML">
 {{if .Data.Budgets}}  <div class="card">
-    <div class="tablewrap"><table>
+    <div class="tablewrap" role="region" tabindex="0" aria-label="Budgets"><table>
       <thead><tr><th scope="col">Budget</th><th scope="col">Limit</th><th scope="col">Usage</th><th scope="col">Progress</th><th scope="col">Actions</th></tr></thead>
       <tbody>
 {{range .Data.Budgets}}        <tr>

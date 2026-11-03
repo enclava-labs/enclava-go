@@ -25,9 +25,11 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/extract"
+	"enclava-go/internal/inference"
 )
 
 // extractCollectionOption is one writable knowledge collection in the result
@@ -61,6 +63,11 @@ type extractView struct {
 	Fields      []extractFieldRow
 	Writable    []extractCollectionOption
 	MaxUploadMB int64
+	// Highlight is the job id the Jobs tab marks (the confirmation band's
+	// View job deep-link); Unpriced names template ids whose resolvable
+	// route is not fully priced — the page module warns before submitting.
+	Highlight string
+	Unpriced  map[string]bool
 	// Shared empty states (capability-gated in buildExtractView).
 	ProcessEmpty   dashboardEmpty
 	JobsEmpty      dashboardEmpty
@@ -98,7 +105,9 @@ func (a *App) handleDashboardExtractPage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	p, _ := auth.PrincipalFromContext(r.Context())
-	a.renderDashboard(w, r, "extract", a.buildExtractView(r.Context(), tab, p, caps))
+	v := a.buildExtractView(r.Context(), tab, p, caps)
+	v.Highlight = r.URL.Query().Get("job")
+	a.renderDashboard(w, r, "extract", v)
 }
 
 func (a *App) handleDashboardExtractJobsFragment(w http.ResponseWriter, r *http.Request) {
@@ -108,7 +117,9 @@ func (a *App) handleDashboardExtractJobsFragment(w http.ResponseWriter, r *http.
 	}
 	p, _ := auth.PrincipalFromContext(r.Context())
 	caps, _ := capsFromContext(r.Context())
-	a.renderDashboardFragment(w, r, "extract", "extract-jobs", a.buildExtractView(r.Context(), "jobs", p, caps))
+	v := a.buildExtractView(r.Context(), "jobs", p, caps)
+	v.Highlight = r.URL.Query().Get("job")
+	a.renderDashboardFragment(w, r, "extract", "extract-jobs", v)
 }
 
 func (a *App) handleDashboardExtractResultFragment(w http.ResponseWriter, r *http.Request) {
@@ -183,6 +194,7 @@ func (a *App) buildExtractView(ctx context.Context, tab string, p auth.Principal
 		if err != nil {
 			log.Printf("dashboard extract: list executable templates: %v", err)
 		}
+		v.Unpriced = a.extractUnpricedTemplates(ctx, p, v.Templates)
 	}
 	return v
 }
@@ -250,6 +262,35 @@ func (a *App) extractModels(ctx context.Context, p auth.Principal) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// extractUnpricedTemplates names the picker options whose resolvable route
+// is not fully priced — the same PriceCoverage the dispatch-refusal path
+// uses, run over each capability an upload could take (documents route
+// chat, images route vision). A template with no resolvable route at all
+// is not priced-checkable here and submits to its own failure path.
+func (a *App) extractUnpricedTemplates(ctx context.Context, p auth.Principal, templates []extract.Template) map[string]bool {
+	if a.executor == nil || len(templates) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	var unpriced map[string]bool
+	for _, t := range templates {
+		for _, capability := range []string{inference.CapabilityChat, inference.CapabilityVision} {
+			model, endpointID, err := a.extractSvc.RouteForTemplate(ctx, p.TenantID, t, capability)
+			if err != nil {
+				continue // unresolvable routes surface their own enqueue error
+			}
+			missing, err := a.executor.PriceCoverage(ctx, p.TenantID, endpointID, model, capability, now)
+			if err == nil && len(missing) > 0 {
+				if unpriced == nil {
+					unpriced = map[string]bool{}
+				}
+				unpriced[t.ID] = true
+			}
+		}
+	}
+	return unpriced
 }
 
 // extractWritableCollections mirrors the writability rule the knowledge

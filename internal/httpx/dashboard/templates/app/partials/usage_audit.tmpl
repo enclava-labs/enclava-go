@@ -5,7 +5,8 @@
 <div class="section" id="usage-audit">
   <form class="filters" method="get" action="/dashboard/usage/audit" aria-label="Audit filters">
     <input type="hidden" name="kind" value="{{.Data.Audit.Filters.Kind}}">
-{{range .Data.Audit.Kinds}}    <a class="chip{{if .Active}} active{{end}}" aria-pressed="{{if .Active}}true{{else}}false{{end}}" href="{{.Href}}">{{.Label}}</a>
+    <a class="chip{{if eq .Data.Audit.Filters.Kind ""}} active{{end}}"{{if eq .Data.Audit.Filters.Kind ""}} aria-current="page"{{end}} href="{{.Data.Audit.AllHref}}">All</a>
+{{range .Data.Audit.Kinds}}    <a class="chip{{if .Active}} active{{end}}"{{if .Active}} aria-current="page"{{end}} href="{{.Href}}">{{.Label}}</a>
 {{end}}    <select class="field" name="subject_type" aria-label="Subject type">
 {{range .Data.Audit.SubjectTypes}}      <option value="{{.Value}}"{{if .Active}} selected{{end}}>{{.Label}}</option>
 {{end}}    </select>
@@ -17,7 +18,7 @@
     <a class="chip" href="{{.Data.Audit.ResetHref}}">Clear</a>
   </form>
 {{if .Data.Audit.Rows}}  <div class="card">
-    <div class="tablewrap"><table>
+    <div class="tablewrap" role="region" tabindex="0" aria-label="Billing and pricing events"><table>
       <thead><tr><th scope="col">When</th><th scope="col">Event</th><th scope="col">Actor</th><th scope="col">Subject</th><th scope="col">Amount</th></tr></thead>
       <tbody>
 {{range .Data.Audit.Rows}}        <tr>

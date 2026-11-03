@@ -8,7 +8,7 @@
 </div>
 {{if .Data.Job}}
 <p class="muted">{{.Data.Job.FileName}}{{if .Data.Job.TemplateID}} · {{.Data.Job.TemplateID}}{{end}}</p>
-<p>{{statusPill "job" .Data.Job.Status}}</p>
+<p>{{if eq .Data.Job.ValidationStatus "needs_review"}}{{statusPill "job" "needs_review"}}{{else}}{{statusPill "job" .Data.Job.Status}}{{end}}</p>
 {{if eq .Data.Job.Status "failed"}}{{with dashboardErrorAction .Data.Job.ErrorMessage $.Can}}<p class="subline bad">{{.Text}}{{if .Href}} <a href="{{.Href}}">{{.Label}}</a>{{end}}</p>{{end}}{{end}}
 {{if .Data.Result}}
   {{if or .Data.Result.ValidationErrors .Data.Result.ValidationWarnings}}
@@ -18,7 +18,7 @@
   </div>
   {{end}}
   {{if .Data.Fields}}
-  <div class="tablewrap">
+  <div class="tablewrap" role="region" tabindex="0" aria-label="Extracted fields">
     <table>
       <thead>
         <tr>
@@ -51,8 +51,12 @@
     <select class="field" id="extract-import-collection">
       {{range .Data.Writable}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
     </select>
+    {{if .Data.Result.ValidationErrors}}
+    <label class="row extract-ack"><input type="checkbox" data-extract-ack>
+      <span>I reviewed the {{count (len .Data.Result.ValidationErrors)}} validation {{if eq (len .Data.Result.ValidationErrors) 1}}error{{else}}errors{{end}} above — import anyway.</span></label>
+    {{end}}
     <div class="row">
-      <button type="button" class="btn primary" data-action="extract:import" data-job-id="{{.Data.Job.ID}}">{{icon "knowledge"}}Add to knowledge</button>
+      <button type="button" class="btn primary" data-action="extract:import" data-job-id="{{.Data.Job.ID}}"{{if .Data.Result.ValidationErrors}} disabled{{end}}>{{icon "knowledge"}}Add to knowledge</button>
     </div>
     <p class="help">Imports this extraction result as a document in the selected collection.</p>
   </div>

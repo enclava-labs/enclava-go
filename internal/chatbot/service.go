@@ -34,6 +34,11 @@ type Repository interface {
 	Delete(ctx context.Context, tenantID, id string) error
 	CreateConversation(ctx context.Context, c Conversation) error
 	GetConversation(ctx context.Context, tenantID, id string) (Conversation, error)
+	// UpdateConversationTitle/DeleteConversation carry the owner predicate
+	// unconditionally — a miss reads as sql.ErrNoRows, so cross-owner reads
+	// share the unknown outcome.
+	UpdateConversationTitle(ctx context.Context, tenantID, ownerActorID, id, title string) error
+	DeleteConversation(ctx context.Context, tenantID, ownerActorID, id string) error
 	AddMessage(ctx context.Context, m Message) error
 	FinalizeMessage(ctx context.Context, tenantID, id, content, status string) error
 	ListMessages(ctx context.Context, tenantID, conversationID string) ([]Message, error)
@@ -675,6 +680,36 @@ func (s *Service) terminalProjection(ctx context.Context, p auth.Principal, conv
 	}, true
 }
 
+// maxConversationTitleRunes bounds the member-set conversation name (PATCH).
+const maxConversationTitleRunes = 200
+
+// RenameConversation sets the caller's OWN conversation title — the repo's
+// owner predicate makes another member's id a uniform sql.ErrNoRows.
+func (s *Service) RenameConversation(ctx context.Context, p auth.Principal, conversationID, title string) (Conversation, error) {
+	if err := requireTenant(p); err != nil {
+		return Conversation{}, err
+	}
+	title = strings.TrimSpace(title)
+	if n := utf8.RuneCountInString(title); n == 0 || n > maxConversationTitleRunes {
+		return Conversation{}, invalidInput(fmt.Errorf("title must be 1-%d characters", maxConversationTitleRunes))
+	}
+	id := strings.TrimSpace(conversationID)
+	if err := s.repo.UpdateConversationTitle(ctx, p.TenantID, actorKey(p), id, title); err != nil {
+		return Conversation{}, err
+	}
+	return s.repo.GetConversation(ctx, p.TenantID, id)
+}
+
+// DeleteConversation removes the caller's OWN conversation; messages and
+// runs cascade at the schema level while usage/billing records stay.
+// Another member's id is a uniform sql.ErrNoRows via the owner predicate.
+func (s *Service) DeleteConversation(ctx context.Context, p auth.Principal, conversationID string) error {
+	if err := requireTenant(p); err != nil {
+		return err
+	}
+	return s.repo.DeleteConversation(ctx, p.TenantID, actorKey(p), strings.TrimSpace(conversationID))
+}
+
 // ListAssistantToolBindings answers "which assistants use this tool"
 // (OA-26): each requested tool ID maps to the names of assistants whose
 // stored tool configuration references it, restricted to assistants the
@@ -753,7 +788,9 @@ func (s *Service) ListConversations(ctx context.Context, p auth.Principal, limit
 			if !chatbotAllowed(p, bot) {
 				continue
 			}
-			summary.Title = s.conversationTitle(ctx, p, summary.ID)
+			if summary.Title == "" {
+				summary.Title = s.conversationTitle(ctx, p, summary.ID)
+			}
 			out = append(out, summary)
 		}
 		if batchNext == "" {

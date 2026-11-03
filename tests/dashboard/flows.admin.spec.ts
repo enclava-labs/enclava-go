@@ -14,7 +14,7 @@ declare global {
 // flows.admin.spec.ts — admin §9.2 flows 7–8 plus the migrated
 // inventories (see 12-04 SUMMARY case map):
 //   tests/dashboard.spec.ts — API key create (one-time display, never in
-//   localStorage), revoke via two-step confirm, CSRF-required mutation;
+//   localStorage), revoke via the untimed confirm group, CSRF-required mutation;
 //   theme toggle; home sections + running partial; page-render matrix
 //   lives in nav.spec.ts.
 //   tests/access.spec.ts — session-actor scope deny, platform.adminless
@@ -44,13 +44,15 @@ test.describe('Access — API keys (flow 8)', () => {
     const stored = await page.evaluate(() => Object.values({ ...window.localStorage }).join(' '));
     expect(stored).not.toContain(shown.trim());
 
-    // Revoke through the shared two-step confirm.
+    // Revoke through the shared untimed confirm group.
     await page.goto(`${BASE}/dashboard/access/api-keys`);
     const row = page.locator('#access-api-keys tr', { hasText: keyName });
     await expect(row).toBeVisible({ timeout: 15_000 });
     const revoke = row.locator('button[data-access-confirm="key-revoke"]');
     await revoke.click();
-    await revoke.click();
+    const group = page.locator('.confirm-group');
+    await expect(group).toBeVisible();
+    await group.getByRole('button', { name: 'Confirm' }).click();
     await expect(page.locator(`#access-api-keys tr:has-text("${keyName}")`)).toHaveCount(0, { timeout: 15_000 });
   });
 

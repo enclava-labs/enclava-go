@@ -67,10 +67,13 @@ type Template struct {
 	ContextSchema map[string]any `json:"context_schema,omitempty"`
 	OutputSchema  map[string]any `json:"output_schema,omitempty"`
 	DefaultModel  string         `json:"model,omitempty"`
-	Enabled       bool           `json:"is_active"`
-	IsDefault     bool           `json:"is_default"`
-	OwnerActorID  string         `json:"owner_actor_id,omitempty"`
-	CreatedAt     time.Time      `json:"created_at"`
+	// MaxOutputTokens caps the attempt's provider generation (max_tokens);
+	// 0 sends no explicit cap so the gateway default injection applies.
+	MaxOutputTokens int       `json:"max_output_tokens,omitempty"`
+	Enabled         bool      `json:"is_active"`
+	IsDefault       bool      `json:"is_default"`
+	OwnerActorID    string    `json:"owner_actor_id,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // Settings is the tenant's extract_settings row (one 'default' row).
@@ -84,21 +87,26 @@ type Settings struct {
 // JobView is the consumer projection over jobs.Job — JSON field names match
 // the legacy extract_jobs surface consumers already render.
 type JobView struct {
-	ID            string         `json:"id"`
-	JobID         string         `json:"job_id"`
-	TemplateID    string         `json:"template_id"`
-	Status        string         `json:"status"`
-	FileName      string         `json:"file_name"`
-	FileMimeType  string         `json:"file_mime_type"`
-	FileSizeBytes int64          `json:"file_size_bytes"`
-	ModelUsed     string         `json:"model_used,omitempty"`
-	ErrorMessage  string         `json:"error_message,omitempty"`
-	InputRef      string         `json:"input_ref,omitempty"`
-	ResultRef     string         `json:"result_ref,omitempty"`
-	CreatedAt     time.Time      `json:"created_at"`
-	UpdatedAt     time.Time      `json:"updated_at"`
-	CompletedAt   *time.Time     `json:"completed_at"`
-	Policy        map[string]any `json:"-"`
+	ID            string `json:"id"`
+	JobID         string `json:"job_id"`
+	TemplateID    string `json:"template_id"`
+	Status        string `json:"status"`
+	FileName      string `json:"file_name"`
+	FileMimeType  string `json:"file_mime_type"`
+	FileSizeBytes int64  `json:"file_size_bytes"`
+	ModelUsed     string `json:"model_used,omitempty"`
+	ErrorMessage  string `json:"error_message,omitempty"`
+	// ValidationStatus is "needs_review" when the terminal result carries
+	// schema/parse errors, "valid" once the result decodes clean; empty on
+	// non-terminal or pre-marker jobs — the row still completed.
+	ValidationStatus     string         `json:"validation_status,omitempty"`
+	ValidationErrorCount int            `json:"validation_error_count,omitempty"`
+	InputRef             string         `json:"input_ref,omitempty"`
+	ResultRef            string         `json:"result_ref,omitempty"`
+	CreatedAt            time.Time      `json:"created_at"`
+	UpdatedAt            time.Time      `json:"updated_at"`
+	CompletedAt          *time.Time     `json:"completed_at"`
+	Policy               map[string]any `json:"-"`
 }
 
 // ResultView is the decoded result artifact payload, projected with the JSON
@@ -133,4 +141,8 @@ const (
 	StatusCompleted           = "completed"
 	StatusCompletedWithErrors = "completed_with_errors"
 	StatusFailed              = "failed"
+	// ValidationNeedsReview marks a terminal job whose stored result failed
+	// output validation — terminal, but import needs explicit acknowledgement.
+	ValidationNeedsReview = "needs_review"
+	ValidationPassed      = "valid"
 )

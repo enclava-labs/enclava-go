@@ -58,7 +58,7 @@
   <label><input type="checkbox" name="is_enabled"{{if or (not .Data.Assistant) .Data.Assistant.IsEnabled}} checked{{end}}> Enabled</label>
 {{range .Data.Preserved}}  <input type="hidden" data-setting-key="{{.Key}}" value="{{.JSON}}">
 {{end}}  <div class="drawer-actions">
-{{if .Data.Assistant}}    <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete this assistant?" data-assistant-delete="{{.Data.Assistant.ID}}">{{icon "x"}}Delete</button>
+{{if .Data.Assistant}}    <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete this assistant? It is removed for every member and role that uses it." data-assistant-delete="{{.Data.Assistant.ID}}">{{icon "x"}}Delete</button>
 {{end}}    <button type="button" class="btn ghost" data-action="close-drawer">Cancel</button>
     <button type="button" class="btn primary" data-action="assistants:save">{{icon "check"}}Save assistant</button>
   </div>

@@ -759,6 +759,7 @@ type usageAuditData struct {
 	PrevHref     string
 	NextHref     string
 	ResetHref    string
+	AllHref      string // kind-cleared href keeping the other filters (the "All" chip)
 	Filters      usageAuditFilters
 	Empty        dashboardEmpty
 }
@@ -912,6 +913,11 @@ func (a *App) usageAuditData(ctx context.Context, tenantID string, f usageAuditF
 			Href: usageAuditHref(chipFilters, limit, 0),
 		})
 	}
+	// "All" keeps the active field filters and clears only the kind — the
+	// same "back to the default view" link the other pages' All chips are.
+	allFilters := f
+	allFilters.Kind = ""
+	out.AllHref = usageAuditHref(allFilters, limit, 0)
 	out.SubjectTypes = append(out.SubjectTypes, usageSelectOption{Label: "Any subject type"})
 	for _, st := range usageAuditSubjectTypes {
 		st.Active = st.Value == f.SubjectType

@@ -34,16 +34,49 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "bootstrap" {
-		if err := runBootstrap(context.Background(), os.Args[2:]); err != nil {
-			log.Fatalf("bootstrap error: %v", err)
-		}
-		return
-	}
+	os.Exit(run(os.Args[1:]))
+}
 
+// run dispatches argv so tests can exercise it. Help paths return before any
+// configuration loading (OPS-I01): `enclava --help|-h|help` prints usage and
+// `enclava bootstrap -h` surfaces flag.ErrHelp as success.
+func run(args []string) int {
+	if len(args) > 0 {
+		switch args[0] {
+		case "-h", "--help", "help":
+			printUsage()
+			return 0
+		case "bootstrap":
+			if err := runBootstrap(context.Background(), args[1:]); err != nil {
+				log.Printf("bootstrap error: %v", err)
+				return 1
+			}
+			return 0
+		}
+	}
+	if err := serve(); err != nil {
+		log.Printf("%v", err)
+		return 1
+	}
+	return 0
+}
+
+func printUsage() {
+	fmt.Fprint(os.Stderr, `Usage: enclava [command]
+
+Commands:
+  (none)      start the server
+  bootstrap   create the first tenant and admin user
+
+Options:
+  -h, --help  show this help
+`)
+}
+
+func serve() error {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config error: %v", err)
+		return fmt.Errorf("config error: %w", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -53,7 +86,7 @@ func main() {
 	// SQLite path anywhere in the composition root.
 	pgDB, err := postgres.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
-		log.Fatalf("postgres init error: %v", err)
+		return fmt.Errorf("postgres init error: %w", err)
 	}
 	defer func() {
 		if err := pgDB.Close(); err != nil {
@@ -62,7 +95,7 @@ func main() {
 	}()
 
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
-		log.Fatalf("data dir init error: %v", err)
+		return fmt.Errorf("data dir init error: %w", err)
 	}
 
 	identityRepo := postgres.NewIdentityRepo(pgDB)
@@ -84,12 +117,12 @@ func main() {
 	// sibling roots, since the store rejects nested disjoint roots.
 	artifactStore, err := artifacts.NewStore(cfg.DataDir+"/artifacts", cfg.DataDir+"/scratch", artifactRepo)
 	if err != nil {
-		log.Fatalf("artifact store init error: %v", err)
+		return fmt.Errorf("artifact store init error: %w", err)
 	}
 	// D-10: reconcile crash leftovers before serving; a reconcile failure
 	// fails startup rather than serving over a suspect durable root.
 	if err := artifactStore.Reconcile(ctx); err != nil {
-		log.Fatalf("artifact reconcile error: %v", err)
+		return fmt.Errorf("artifact reconcile error: %w", err)
 	}
 	native := extract.ProbeNative()
 	log.Printf("native document processing capabilities: PDF=%t OCR=%t languages=%v reason=%s", native.PDF, native.OCR, native.Languages, native.Reason)
@@ -99,7 +132,7 @@ func main() {
 
 	provider, err := buildProvider(cfg)
 	if err != nil {
-		log.Fatalf("provider init error: %v", err)
+		return fmt.Errorf("provider init error: %w", err)
 	}
 	prober := llm.NewProber(provider, cfg.ProviderProbeInterval, cfg.ProviderProbeTimeout)
 	go prober.Start(ctx)
@@ -109,7 +142,7 @@ func main() {
 	// extraction, and a credential_ref backed by the operator bindings only.
 	envBinding, err := ensureEnvEndpoint(ctx, identityRepo, endpointsRepo, cfg, provider)
 	if err != nil {
-		log.Fatalf("provider config seed error: %v", err)
+		return fmt.Errorf("provider config seed error: %w", err)
 	}
 
 	// The shared executor is the ONLY priced model-dispatch boundary (INF-02):
@@ -133,7 +166,7 @@ func main() {
 	}
 	secretResolver, err := auth.NewSecretResolver(secretBindings)
 	if err != nil {
-		log.Fatalf("secret binding error: %v", err)
+		return fmt.Errorf("secret binding error: %w", err)
 	}
 	mcpTransport := &mcp.StreamableHTTP{Credential: secretResolver, ClientName: "enclava", ClientVersion: "1"}
 	mcpExecutor := &mcp.Executor{Repository: mcpRepo, Caller: chatbot.MCPCaller{}, Transport: mcpTransport}
@@ -162,7 +195,7 @@ func main() {
 		Conversations: postgres.NewChatbotConversationStore(chatbotRepo),
 	}, inference.WithAdmission(admission), inference.WithDefaultMaxOutputTokens(cfg.InferenceDefaultMaxOutputTokens))
 	if err != nil {
-		log.Fatalf("inference service init error: %v", err)
+		return fmt.Errorf("inference service init error: %w", err)
 	}
 	defer func() {
 		if err := inferenceSvc.Close(); err != nil {
@@ -183,21 +216,22 @@ func main() {
 		cfg.MaxUploadSizeMB,
 	)
 	extractSvc.SetSourceRepository(sourceRepo)
+	extractSvc.SetDefaultMaxOutputTokens(cfg.ExtractMaxOutputTokens)
 	if err := extractSvc.ReconcileDeletedJobs(ctx); err != nil {
-		log.Fatalf("extract deletion recovery error: %v", err)
+		return fmt.Errorf("extract deletion recovery error: %w", err)
 	}
 	// Seed the bootstrap tenant's default extract templates and settings row
 	// through the owned service.
 	bootstrapTenantID, err := identityRepo.GetTenantBySlug(ctx, "bootstrap")
 	if err != nil {
-		log.Fatalf("bootstrap tenant lookup error: %v", err)
+		return fmt.Errorf("bootstrap tenant lookup error: %w", err)
 	}
 	bootstrapPrincipal := auth.Principal{TenantID: bootstrapTenantID, ActorID: "bootstrap"}
 	if err := extractSvc.SeedDefaults(ctx, bootstrapPrincipal); err != nil {
-		log.Fatalf("extract template seed error: %v", err)
+		return fmt.Errorf("extract template seed error: %w", err)
 	}
 	if _, err := extractSvc.GetSettings(ctx, bootstrapPrincipal); err != nil {
-		log.Fatalf("extract settings seed error: %v", err)
+		return fmt.Errorf("extract settings seed error: %w", err)
 	}
 
 	qdrantClient := rag.NewQdrantClient(cfg.QdrantURL, cfg.UpstreamTimeout)
@@ -368,6 +402,7 @@ func main() {
 		}
 	}
 	log.Printf("shutdown complete")
+	return nil
 }
 
 // runtimeProviderConfig translates the env provider settings into the

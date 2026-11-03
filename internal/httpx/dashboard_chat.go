@@ -45,9 +45,15 @@ type chatViewData struct {
 	ConversationID    string
 	Assistants        []chatbot.Instance
 	SelectedAssistant string
-	EvidenceIDsAttr   string
-	History           chatHistoryData
-	Thread            *chatThreadData
+	// SelectedDisabled marks the open conversation's assistant as present
+	// but not runnable (disabled): the notice replaces the composer.
+	SelectedDisabled bool
+	// NoAssistants renders ONE empty state over the thread and hides the
+	// picker/composer (UX-M04).
+	NoAssistants    bool
+	EvidenceIDsAttr string
+	History         chatHistoryData
+	Thread          *chatThreadData
 	// Shared empty states (caller-gated in fillEmptyStates).
 	HistoryEmpty    dashboardEmpty
 	AssistantsEmpty dashboardEmpty
@@ -87,6 +93,7 @@ type chatThreadData struct {
 	ConfWarn       bool
 	Messages       []chatThreadMessage
 	Live           bool // any non-terminal run → the thread fragment polls
+	HasKnowledge   bool // assistant carries collections → turns cite sources
 }
 
 type chatThreadMessage struct {
@@ -107,7 +114,9 @@ const chatHistoryPageSize = 20
 
 // fillEmptyStates sets the shared dashboardEmpty values; the start-a-chat
 // assistant picker distinguishes "none exist" (manager cap) from "none
-// granted to you" (member, D-25) via the caller's caps.
+// granted to you" (member, D-25) via the caller's caps. With zero usable
+// assistants the caller swaps ThreadEmpty to the assistants copy so ONE
+// empty state covers the thread (UX-M04).
 func (d *chatViewData) fillEmptyStates(caps dashboardCaps) {
 	// No action: the page header's New chat button is directly above.
 	d.HistoryEmpty = dashboardEmpty{Icon: "chat", Text: "No conversations yet."}
@@ -186,6 +195,9 @@ func (a *App) handleDashboardChatPage(w http.ResponseWriter, r *http.Request) {
 		History:           a.buildChatHistory(r.Context(), p, "", ""),
 	}
 	data.fillEmptyStates(caps)
+	if data.NoAssistants = len(data.Assistants) == 0; data.NoAssistants {
+		data.ThreadEmpty = data.AssistantsEmpty
+	}
 	a.renderDashboard(w, r, "chat", data)
 }
 
@@ -202,6 +214,7 @@ func (a *App) handleDashboardChatConversation(w http.ResponseWriter, r *http.Req
 		History:        a.buildChatHistory(r.Context(), p, "", id),
 	}
 	data.fillEmptyStates(caps)
+	data.NoAssistants = len(data.Assistants) == 0
 	if !a.appendChatThread(w, r, &data) {
 		return // the 404/500 response is already committed
 	}
@@ -226,9 +239,16 @@ func (a *App) handleDashboardChatHistory(w http.ResponseWriter, r *http.Request)
 // handleDashboardChatThread re-renders the thread body for ?c={id}; without
 // a conversation id it renders the empty state the composer resets into.
 func (a *App) handleDashboardChatThread(w http.ResponseWriter, r *http.Request) {
+	p, _ := auth.PrincipalFromContext(r.Context())
 	caps, _ := capsFromContext(r.Context())
 	data := chatViewData{ConversationID: strings.TrimSpace(r.URL.Query().Get("c"))}
 	data.fillEmptyStates(caps)
+	// The same deny-state truth as the page: zero usable assistants swaps the
+	// thread empty state to the assistants copy (UX-M04).
+	data.Assistants = a.listAssistants(r.Context(), p)
+	if data.NoAssistants = len(data.Assistants) == 0; data.NoAssistants {
+		data.ThreadEmpty = data.AssistantsEmpty
+	}
 	if data.ConversationID != "" && !a.appendChatThread(w, r, &data) {
 		return
 	}
@@ -254,6 +274,17 @@ func (a *App) appendChatThread(w http.ResponseWriter, r *http.Request, data *cha
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return false
 	}
+	// The open thread always posts its own assistant id (AST-I02): a
+	// different selection starts a new conversation client-side. A
+	// still-visible but disabled assistant locks the composer behind the
+	// thread-head notice instead of failing on send.
+	data.SelectedAssistant = view.Conversation.ChatbotID
+	for _, bot := range a.listAssistants(r.Context(), p) {
+		if bot.ID == view.Conversation.ChatbotID {
+			data.SelectedDisabled = !bot.IsEnabled
+			break
+		}
+	}
 	data.Thread = a.buildChatThreadData(r.Context(), p, view)
 	return true
 }
@@ -268,6 +299,7 @@ func (a *App) buildChatThreadData(ctx context.Context, p auth.Principal, view ch
 	for _, bot := range a.listAssistants(ctx, p) {
 		if bot.ID == view.Conversation.ChatbotID {
 			assistantName = bot.Name
+			t.HasKnowledge = len(bot.RAGCollectionIDs) > 0
 			break
 		}
 	}

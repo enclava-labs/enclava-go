@@ -83,6 +83,9 @@ func runBootstrap(ctx context.Context, args []string) error {
 	passwordFlag := fs.String("password", "", "fixed admin password (default: generated, printed once)")
 	issueKey := fs.Bool("issue-key", false, "also issue a bootstrap API key (printed once)")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) { // `-h`/`--help` is a clean exit (OPS-I01)
+			return nil
+		}
 		return err
 	}
 	*tenantSlug = strings.TrimSpace(*tenantSlug)

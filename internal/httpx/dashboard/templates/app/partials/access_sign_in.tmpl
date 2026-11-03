@@ -4,7 +4,7 @@
      controls by design. */}}
 <div id="access-sign-in" hx-get="/dashboard/partials/access/sign-in" hx-trigger="refresh from:body" hx-target="this" hx-swap="outerHTML">
 {{if .Data.Providers}}  <div class="card">
-    <div class="tablewrap">
+    <div class="tablewrap" role="region" tabindex="0" aria-label="Sign-in providers">
       <table>
         <thead>
           <tr>

@@ -16,11 +16,11 @@
     {{if .Data.Templates}}
     <div class="card-title">Process a document</div>
     <div class="card-sub">The result lands in your Jobs list; completed results can be added to knowledge.</div>
-    <div class="stack" style="margin-top:12px">
+    <div class="stack" style="margin-top:12px" data-extract-form>
       <div>
         <label class="label" for="extract-template">Extraction template</label>
         <select class="field" id="extract-template" data-extract-template-select>
-          {{range .Data.Templates}}<option value="{{.ID}}">{{.Name}}{{if .IsDefault}} · default{{end}}</option>{{end}}
+          {{range .Data.Templates}}<option value="{{.ID}}"{{if index $.Data.Unpriced .ID}} data-unpriced{{end}}>{{.Name}}{{if .IsDefault}} · default{{end}}</option>{{end}}
         </select>
       </div>
       {{/* Real visually-hidden file input behind the styled zone (§6.5). */}}
@@ -35,6 +35,17 @@
       <div class="row">
         <button type="button" class="btn primary" data-action="extract:submit">{{icon "sparkles"}}Run extraction</button>
       </div>
+    </div>
+    {{/* Post-submit confirmation band (P-03/UX-M02/UX-H09): replaces the form
+         with the queued job's identity plus a live status strip the page
+         module polls on the shared 3s cadence. */}}
+    <div class="extract-band" data-extract-band hidden>
+      <p class="extract-band-title">{{icon "check"}} Extraction queued · <span data-extract-band-file></span> · <span class="mono" data-extract-band-id></span></p>
+      <div class="row">
+        <a class="btn" data-extract-band-view href="#">View job</a>
+        <button type="button" class="btn ghost" data-action="extract:another">Run another</button>
+      </div>
+      <div class="extract-strip" data-extract-strip hidden></div>
     </div>
     {{else}}
     {{template "empty" .Data.ProcessEmpty}}

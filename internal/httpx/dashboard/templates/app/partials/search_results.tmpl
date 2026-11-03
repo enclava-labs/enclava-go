@@ -5,7 +5,7 @@
      payload; snippets render through the phase-7 escape-then-mark func. */}}
 {{if .Data.Results}}
   {{with .Data.Results}}
-    {{if .Error}}<p class="field-error">{{.Error}}</p>{{end}}
+    {{if .Error}}<p class="field-error">{{.Error}}</p>{{if .Hint}}<p class="muted">{{.Hint}}</p>{{end}}{{end}}
     {{if .Facets}}<div class="filters" role="group" aria-label="Filter by source">
       <button type="button" class="chip active" data-facet="" aria-pressed="true">All</button>
       {{range .Facets}}<button type="button" class="chip" data-facet="{{.SourceKind}}" aria-pressed="false">{{term .SourceKind}} · {{count .Count}}</button>{{end}}

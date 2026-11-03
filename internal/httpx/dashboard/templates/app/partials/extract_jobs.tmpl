@@ -1,12 +1,12 @@
 {{define "frag-extract-jobs"}}{{/* Own extraction jobs (OA-25). Live:
      hx-trigger carries `every 3s` only while a queued/running job exists —
      the server omits it when everything is terminal. */}}
-<div id="extract-jobs" hx-get="/dashboard/partials/extract/jobs" hx-trigger="refresh from:body{{if .Data.Live}}, every 3s{{end}}" hx-swap="outerHTML">
+<div id="extract-jobs" hx-get="/dashboard/partials/extract/jobs{{if .Data.Highlight}}?job={{.Data.Highlight}}{{end}}" hx-trigger="refresh from:body{{if .Data.Live}}, every 3s{{end}}" hx-swap="outerHTML">
   {{if .Data.Jobs}}
   <div class="card">
     <div class="card-title">Extractions <span class="muted">· {{count .Data.Total}}</span></div>
     <div class="card-sub">Your own extraction jobs{{if .Data.Live}} — statuses update while work runs{{end}}.</div>
-    <div class="tablewrap" style="margin-top:10px">
+    <div class="tablewrap" role="region" tabindex="0" aria-label="Extraction jobs" style="margin-top:10px">
       <table>
         <thead>
           <tr>
@@ -19,10 +19,10 @@
         </thead>
         <tbody>
           {{range .Data.Jobs}}
-          <tr>
+          <tr data-job-id="{{.ID}}"{{if eq $.Data.Highlight .ID}} class="job-highlight"{{end}}>
             <td data-label="File"><b>{{.FileName}}</b><span class="subline">{{.FileMimeType}}</span></td>
             <td data-label="Template">{{.TemplateID}}</td>
-            <td data-label="Status">{{if or (eq .Status "queued") (eq .Status "running")}}<span class="pulse" aria-hidden="true"></span>{{end}}{{statusPill "job" .Status}}{{if eq .Status "failed"}}{{$fix := dashboardErrorAction .ErrorMessage $.Can}}<span class="subline bad">{{$fix.Text}}{{if $fix.Href}} <a href="{{$fix.Href}}">{{$fix.Label}}</a>{{end}}</span>{{else if .ErrorMessage}}<span class="subline bad">{{.ErrorMessage}}</span>{{end}}</td>
+            <td data-label="Status">{{if or (eq .Status "queued") (eq .Status "running")}}<span class="pulse" aria-hidden="true"></span>{{end}}{{if and (eq .Status "succeeded") (eq .ValidationStatus "needs_review")}}{{statusPill "job" "needs_review"}}<span class="subline warn">{{.ValidationErrorCount}} validation {{if eq .ValidationErrorCount 1}}error{{else}}errors{{end}}</span>{{else}}{{statusPill "job" .Status}}{{end}}{{if eq .Status "failed"}}{{$fix := dashboardErrorAction .ErrorMessage $.Can}}<span class="subline bad">{{$fix.Text}}{{if $fix.Href}} <a href="{{$fix.Href}}">{{$fix.Label}}</a>{{end}}</span>{{else if .ErrorMessage}}<span class="subline bad">{{.ErrorMessage}}</span>{{end}}</td>
             <td data-label="Created">{{relTime .CreatedAt}}</td>
             <td data-label="Actions">
               <div class="row">

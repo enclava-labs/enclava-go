@@ -7,7 +7,7 @@
 </div>
 <p class="help">{{.Data.Model}} @ {{.Data.EndpointID}} · {{.Data.Capability}} · newest effective first</p>
 {{if .Data.Rows}}
-<div class="tablewrap">
+<div class="tablewrap" role="region" tabindex="0" aria-label="Price history">
   <table>
     <thead>
       <tr>

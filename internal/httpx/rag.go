@@ -220,6 +220,17 @@ func (a *App) handleRAGCollectionDocumentsUpload(w http.ResponseWriter, r *http.
 			WriteOpenAIError(w, http.StatusRequestEntityTooLarge, "file size is outside the allowed limit", "invalid_request_error", "file_too_large")
 			return
 		}
+		if errors.Is(err, source.ErrDenied) {
+			c, lookupErr := a.ragSvc.GetCollection(r.Context(), principal, collectionID)
+			if lookupErr != nil {
+				a.writeRAGNotFoundOrBadRequest(w, lookupErr, "rag_document_upload_failed")
+				return
+			}
+			if !rag.CollectionWritable(c, principal) {
+				WriteForbidden(w, "Missing permission: write access to this collection")
+				return
+			}
+		}
 		a.writeRAGNotFoundOrBadRequest(w, err, "rag_document_upload_failed")
 		return
 	}
@@ -367,6 +378,9 @@ func (a *App) handleRAGImports(w http.ResponseWriter, r *http.Request, principal
 		// extract.vision) despite its wire name — the completed result
 		// artifact of that owned job is imported, preserving its provenance.
 		ResultRef string `json:"result_ref"`
+		// AcknowledgeValidation is the explicit sign-off the result drawer's
+		// checkbox sends before a needs-review extraction can be imported.
+		AcknowledgeValidation bool `json:"acknowledge_validation"`
 	}
 	if err := DecodeJSON(r, &input); err != nil {
 		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
@@ -382,7 +396,7 @@ func (a *App) handleRAGImports(w http.ResponseWriter, r *http.Request, principal
 		return
 	}
 	if input.ResultRef != "" && input.ArtifactRef == "" {
-		out, err := a.ragSvc.ImportStoredResult(r.Context(), principal, rag.ImportResultInput{CollectionID: input.CollectionID, ResultJobID: input.ResultRef})
+		out, err := a.ragSvc.ImportStoredResult(r.Context(), principal, rag.ImportResultInput{CollectionID: input.CollectionID, ResultJobID: input.ResultRef, AcknowledgeValidation: input.AcknowledgeValidation})
 		if err != nil {
 			a.writeRAGNotFoundOrBadRequest(w, err, "rag_import_failed")
 			return
@@ -477,12 +491,24 @@ func (a *App) writeRAGNotFoundOrBadRequest(w http.ResponseWriter, err error, cod
 		WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "search_scope_too_large")
 		return
 	}
+	if errors.Is(err, rag.ErrSearchBindingDenied) {
+		// No embedding binding resolves for this caller — a grant problem,
+		// not a server fault; keyword (lexical) search still works.
+		WriteOpenAIError(w, http.StatusForbidden,
+			"Semantic search needs an embedding model granted to your role",
+			"permission_error", "embedding_not_granted")
+		return
+	}
 	if errors.Is(err, rag.ErrProfileNotFound) {
 		WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "unknown_chunk_profile_version")
 		return
 	}
 	if errors.Is(err, sql.ErrNoRows) || errors.Is(err, source.ErrDenied) {
 		WriteOpenAIError(w, http.StatusNotFound, "not found", "invalid_request_error", "not_found")
+		return
+	}
+	if errors.Is(err, rag.ErrValidationAckRequired) {
+		WriteOpenAIError(w, http.StatusUnprocessableEntity, err.Error(), "invalid_request_error", "validation_ack_required")
 		return
 	}
 	if errors.Is(err, rag.ErrInvalidInput) {

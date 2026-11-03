@@ -16,7 +16,7 @@ import {
 // flows.chat-search.spec.ts — member-project §9.2 flows 1–2 plus the
 // migrated case inventories (see 12-04 SUMMARY case map):
 //   tests/chat-search.spec.ts — two-turn adoption + citations + evidence
-//   card + reload, Stop two-step, mid-run reload resumed polling, New chat
+//   card + reload, Stop confirm-group, mid-run reload resumed polling, New chat
 //   reset, mobile history/evidence sheet <760px, member grant isolation +
 //   grantless empty state, fused search + facet chips + restricted leak
 //   denial, evidence drawer + Ask-about-this + revocation denial, recents
@@ -111,9 +111,10 @@ test.describe('Chat run flow (member)', () => {
     const stop = page.locator('[data-run-id][data-action="confirm"]');
     await expect(stop).toBeVisible();
     await stop.click();
-    await expect(stop).toHaveText(/Stop run\?/);
+    const group = page.locator('.confirm-group');
+    await expect(group).toBeVisible();
     const deleteRun = page.waitForRequest((r) => r.method() === 'DELETE' && /\/api\/v1\/agent-runs\/.+/.test(r.url()));
-    await stop.click();
+    await group.getByRole('button', { name: 'Confirm' }).click();
     await deleteRun;
     await expect(page.locator('.thread-body')).toContainText('Stopped by you', { timeout: 30_000 });
   });
@@ -213,7 +214,7 @@ test.describe('Chat surfaces and grants (member)', () => {
     await expect(page.locator('#assistantSelect')).toBeDisabled();
     await expect(page.locator('#assistantSelect option')).toHaveCount(0);
     await expect(page.locator('.thread-head')).toContainText('ask an admin to grant access');
-    await expect(page.locator('[data-action="chat:send"]')).toBeDisabled();
+    await expect(page.locator('[data-action="chat:send"]')).toHaveCount(0); // composer is hidden for a grantless member
     // Grantless login replaced this context's session — restore member.
     await login(page, MEMBER_EMAIL, MEMBER_PASSWORD);
   });

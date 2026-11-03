@@ -4,7 +4,7 @@
      hx-get/hx-trigger/hx-swap triple and is its own swap target. */}}
 <div class="card" id="account-sessions-card" hx-get="/dashboard/partials/account/sessions" hx-trigger="refresh from:body" hx-swap="outerHTML">
 {{if .Data.SessionsErr}}  <p class="muted">Could not load sessions.</p>
-{{else if .Data.Sessions}}  <div class="tablewrap">
+{{else if .Data.Sessions}}  <div class="tablewrap" role="region" tabindex="0" aria-label="Sessions">
     <table>
       <thead>
         <tr>
@@ -19,7 +19,7 @@
 {{range .Data.Sessions}}        <tr>
           <td data-label="Session">{{if .Current}}This session {{statusPill "session" "current"}}{{else}}Other session{{end}}</td>
           <td data-label="Signed in">{{relTime .CreatedAt}}</td>
-          <td data-label="Idle expiry">{{relTime .IdleExpiresAt}}</td>
+          <td data-label="Idle expiry">{{relTime .IdleExpiresAt}}<span class="subline">{{absTime .IdleExpiresAt}} UTC</span></td>
           <td data-label="Status">{{if .Revoked}}{{statusPill "session" "stopped"}}{{if .Reason}}<span class="subline">{{.Reason}}</span>{{end}}{{else}}—{{end}}</td>
           <td data-label="Actions">{{if not .Revoked}}<button type="button" class="btn danger" data-action="confirm" data-confirm="Revoke this session? That device signs out immediately." data-account-revoke="{{.ID}}"{{if .Current}} data-account-current="1"{{end}}>{{if .Current}}Sign out{{else}}Revoke{{end}}</button>{{end}}</td>
         </tr>

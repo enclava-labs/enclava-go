@@ -4,13 +4,13 @@
      only while any row is Syncing (server omits it when all-terminal). */}}
 <div id="sources-table" hx-get="/dashboard/partials/sources/table?status={{.Data.Status}}" hx-swap="outerHTML" hx-trigger="{{if .Data.AnySyncing}}refresh from:body, every 3s{{else}}refresh from:body{{end}}">
   <div class="filters" role="group" aria-label="Filter sources by status">
-    <a class="chip{{if eq .Data.Status ""}} active{{end}}" aria-pressed="{{if eq .Data.Status ""}}true{{else}}false{{end}}" href="/dashboard/sources">All</a>
-    <a class="chip{{if eq .Data.Status "syncing"}} active{{end}}" aria-pressed="{{if eq .Data.Status "syncing"}}true{{else}}false{{end}}" href="/dashboard/sources?status=syncing">{{statusLabel "source" "syncing"}}</a>
-    <a class="chip{{if eq .Data.Status "healthy"}} active{{end}}" aria-pressed="{{if eq .Data.Status "healthy"}}true{{else}}false{{end}}" href="/dashboard/sources?status=healthy">{{statusLabel "source" "healthy"}}</a>
-    <a class="chip{{if eq .Data.Status "attention"}} active{{end}}" aria-pressed="{{if eq .Data.Status "attention"}}true{{else}}false{{end}}" href="/dashboard/sources?status=attention">{{statusLabel "source" "warning"}}</a>
-    <a class="chip{{if eq .Data.Status "paused"}} active{{end}}" aria-pressed="{{if eq .Data.Status "paused"}}true{{else}}false{{end}}" href="/dashboard/sources?status=paused">{{statusLabel "source" "paused"}}</a>
+    <a class="chip{{if eq .Data.Status ""}} active{{end}}"{{if eq .Data.Status ""}} aria-current="page"{{end}} href="/dashboard/sources">All</a>
+    <a class="chip{{if eq .Data.Status "syncing"}} active{{end}}"{{if eq .Data.Status "syncing"}} aria-current="page"{{end}} href="/dashboard/sources?status=syncing">{{statusLabel "source" "syncing"}}</a>
+    <a class="chip{{if eq .Data.Status "healthy"}} active{{end}}"{{if eq .Data.Status "healthy"}} aria-current="page"{{end}} href="/dashboard/sources?status=healthy">{{statusLabel "source" "healthy"}}</a>
+    <a class="chip{{if eq .Data.Status "attention"}} active{{end}}"{{if eq .Data.Status "attention"}} aria-current="page"{{end}} href="/dashboard/sources?status=attention">{{statusLabel "source" "warning"}}</a>
+    <a class="chip{{if eq .Data.Status "paused"}} active{{end}}"{{if eq .Data.Status "paused"}} aria-current="page"{{end}} href="/dashboard/sources?status=paused">{{statusLabel "source" "paused"}}</a>
   </div>
-{{if .Data.Rows}}  <div class="tablewrap">
+{{if .Data.Rows}}  <div class="tablewrap" role="region" tabindex="0" aria-label="Sources">
     <table>
       <thead>
         <tr>

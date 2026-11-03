@@ -1150,3 +1150,118 @@ func TestTemplateListingGrantAuthority(t *testing.T) {
 		t.Fatalf("ungranted member process = %v, want ErrForbidden", err)
 	}
 }
+
+// TestAttemptHonorsTemplateOutputCap: a template's max_output_tokens lands
+// in the provider payload verbatim, and a template without one sends no
+// explicit cap (the executor's default injection decides the hold).
+func TestAttemptHonorsTemplateOutputCap(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract")
+	f.putPrice(t, "priced-extract", billing.UnitInput, 1000)
+	f.putPrice(t, "priced-extract", billing.UnitOutput, 2000)
+	f.svc.SetDefaultMaxOutputTokens(6000)
+	f.seedTemplate(t, extract.Template{
+		ID: "capped", Name: "Capped", SystemPrompt: "s", UserPrompt: "u",
+		DefaultModel: "priced-extract", Enabled: true, MaxOutputTokens: 2048,
+	})
+	f.seedTemplate(t, extract.Template{
+		ID: "uncapped", Name: "Uncapped", SystemPrompt: "s", UserPrompt: "u",
+		DefaultModel: "priced-extract", Enabled: true,
+	})
+
+	if _, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
+		TemplateID: "capped", FileName: "a.txt", MimeType: "text/plain", Bytes: []byte("x"),
+	}); err != nil {
+		t.Fatalf("process capped: %v", err)
+	}
+	claim := f.leaseClaim(t)
+	if _, err := f.svc.JobHandler()(ctx, claim, inputOpener(f, claim)); err != nil {
+		t.Fatalf("capped attempt: %v", err)
+	}
+	var sent struct {
+		MaxTokens *int `json:"max_tokens"`
+	}
+	if err := json.Unmarshal(f.upstream.bodies[len(f.upstream.bodies)-1], &sent); err != nil {
+		t.Fatalf("decode sent body: %v", err)
+	}
+	if sent.MaxTokens == nil || *sent.MaxTokens != 2048 {
+		t.Fatalf("template cap not sent: %v", sent.MaxTokens)
+	}
+	// The snapshot freezes the cap — a later template raise never reaches
+	// the already-queued attempt's payload.
+
+	if _, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
+		TemplateID: "uncapped", FileName: "b.txt", MimeType: "text/plain", Bytes: []byte("y"),
+	}); err != nil {
+		t.Fatalf("process uncapped: %v", err)
+	}
+	claim2 := f.leaseClaim(t)
+	if _, err := f.svc.JobHandler()(ctx, claim2, inputOpener(f, claim2)); err != nil {
+		t.Fatalf("uncapped attempt: %v", err)
+	}
+	sent.MaxTokens = nil
+	if err := json.Unmarshal(f.upstream.bodies[len(f.upstream.bodies)-1], &sent); err != nil {
+		t.Fatalf("decode sent body: %v", err)
+	}
+	// The env default fills templates that declare none.
+	if sent.MaxTokens == nil || *sent.MaxTokens != 6000 {
+		t.Fatalf("env default not sent: %v", sent.MaxTokens)
+	}
+}
+
+// TestAttemptInvalidOutputFlagsNeedsReview: schema-invalid model output is
+// still stored and terminal, but the job row's validation marker projects
+// needs_review with the error count and the detail carries the errors.
+func TestAttemptInvalidOutputFlagsNeedsReview(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract")
+	f.putPrice(t, "priced-extract", billing.UnitInput, 1000)
+	f.putPrice(t, "priced-extract", billing.UnitOutput, 2000)
+	f.upstream.response = []byte(`{"usage":{"prompt_tokens":4,"completion_tokens":3},"choices":[{"message":{"content":"{\"amount\":\"not-a-number\"}"}}]}`)
+	f.seedTemplate(t, extract.Template{
+		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u",
+		DefaultModel: "priced-extract", Enabled: true,
+		OutputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"amount": map[string]any{"type": "number"}},
+			"required":   []any{"amount"},
+		},
+	})
+	out, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
+		TemplateID: "invoice", FileName: "invoice.txt", MimeType: "text/plain", Bytes: []byte("x"),
+	})
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	claim := f.leaseClaim(t)
+	resultRef, err := f.svc.JobHandler()(ctx, claim, inputOpener(f, claim))
+	if err != nil {
+		t.Fatalf("attempt with invalid output must still publish: %v", err)
+	}
+	if _, err := claim.Complete(ctx, resultRef); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	detail, err := f.svc.GetJob(ctx, f.principal, out.JobID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if detail.Job.Status != jobs.StatusSucceeded {
+		t.Fatalf("invalid output must stay terminal-succeeded, got %s", detail.Job.Status)
+	}
+	if detail.Job.ValidationStatus != extract.ValidationNeedsReview || detail.Job.ValidationErrorCount == 0 {
+		t.Fatalf("validation = %q/%d, want needs_review with errors", detail.Job.ValidationStatus, detail.Job.ValidationErrorCount)
+	}
+	if detail.Result == nil || len(detail.Result.ValidationErrors) == 0 {
+		t.Fatalf("result lost its validation errors: %+v", detail.Result)
+	}
+	// The owner-facing list carries the same verdict from the row marker.
+	list, _, err := f.svc.ListJobs(ctx, f.principal, "", 20, 0)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list: %v len=%d", err, len(list))
+	}
+	if list[0].ValidationStatus != extract.ValidationNeedsReview || list[0].ValidationErrorCount == 0 {
+		t.Fatalf("list row = %q/%d, want needs_review", list[0].ValidationStatus, list[0].ValidationErrorCount)
+	}
+}

@@ -119,11 +119,10 @@ func isFocusable(n *html.Node) bool {
 
 // TestA11yShellLandmarks asserts the focus-order/landmark contract on the
 // rendered shell: skip link first, #content inside <main>, exactly one h1 in
-// .headcopy, aria-current on exactly the active navlink, the drawer dialog
-// semantics, the single polite live region and the labeled mobile status dot.
+// .headcopy, aria-current on exactly the active navlink, the closed drawer's
+// absent dialog semantics, the single polite live region and the labeled
 func TestA11yShellLandmarks(t *testing.T) {
 	doc := renderA11yPage(t, adminCaps)
-	empty := map[string]string{}
 
 	// First focusable element in DOM order is the skip link to #content.
 	var focusables []*html.Node
@@ -171,14 +170,15 @@ func TestA11yShellLandmarks(t *testing.T) {
 		t.Fatalf("aria-current landed on %q, want the active chat navlink", attrVal(currents[0], "href"))
 	}
 
-	// The shared drawer is a labeled modal dialog; the toast is one polite
-	// live region (error toasts escalate to role=alert from app.js at runtime).
+	// The shared drawer is a plain hidden aside while closed — app.js stamps
+	// role=dialog/aria-modal/aria-labelledby on it only for the duration of an
+	// open (UX-H05: a closed off-canvas aside is not a dialog landmark).
 	drawer := elementByID(doc, "drawer")
-	if drawer == nil || attrVal(drawer, "role") != "dialog" || attrVal(drawer, "aria-modal") != "true" {
-		t.Fatal("#drawer must render role=dialog aria-modal=true")
+	if drawer == nil || attrVal(drawer, "role") != "" || attrVal(drawer, "aria-modal") != "" {
+		t.Fatal("closed #drawer must render without dialog semantics (app.js assigns them on open)")
 	}
-	if accessibleName(drawer, empty, empty) == "" {
-		t.Fatal("#drawer must carry an accessible name (aria-label fallback or aria-labelledby)")
+	if _, hidden := attr(drawer, "hidden"); !hidden {
+		t.Fatal("closed #drawer must render hidden")
 	}
 	toast := elementByID(doc, "toast")
 	if toast == nil || attrVal(toast, "aria-live") != "polite" {

@@ -3,10 +3,11 @@
 // template set on populated fixtures, and the RENDERED DOM is audited for
 // the accessible-name contract — controls named (visible .label text counts;
 // aria-label where no visible label exists), td[data-label] on every cell,
-// toolsteps as native disclosure, chips/tiles carrying aria-pressed, named
-// icon-only buttons, real <button> data-confirm controls and steppers that
-// stay presentational. Source text and attribute presence alone earn no
-// credit — every assertion runs on executed output.
+// toolsteps as native disclosure, link chips navigating with aria-current,
+// toggle chips and tiles carrying aria-pressed, named icon-only buttons,
+// real <button> data-confirm controls and steppers that stay presentational.
+// Source text and attribute presence alone earn no credit — every
+// assertion runs on executed output.
 package httpx
 
 import (
@@ -234,11 +235,17 @@ func a11yAuditHTML(rendered string) []string {
 				fail(".toolstep <details> renders without a <summary>")
 			}
 		}
-		// Chips that express toggle/filter state inside a group must expose
-		// pressed state in both positions. label.chip rows wrap a checkbox —
-		// the native checked state IS the toggle semantics.
+		// Chips that express toggle state inside a group must expose pressed
+		// state in both positions. label.chip rows wrap a checkbox — the
+		// native checked state IS the toggle semantics. Link chips navigate
+		// instead: they mark the active view with aria-current="page" and
+		// never carry pressed state.
 		if hasClass(n, "chip") && inRoleGroup(n) && n.Data != "label" {
-			if _, ok := attr(n, "aria-pressed"); !ok {
+			if n.Data == "a" {
+				if _, ok := attr(n, "aria-pressed"); ok {
+					fail("a.chip inside role=group carries aria-pressed — links use aria-current")
+				}
+			} else if _, ok := attr(n, "aria-pressed"); !ok {
 				fail("%s.chip inside role=group renders without aria-pressed", n.Data)
 			}
 		}

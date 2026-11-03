@@ -1,15 +1,15 @@
 {{define "frag-chat-history"}}{{/* One keyset page of the caller's own
-     conversations, newest first, grouped Today/Earlier. The root re-fetches
-     itself on `refresh from:body`; "Show earlier" follows the cursor. */}}
+     conversations, newest first, grouped Today/Earlier under the page h1
+     and the nav's hidden "Chats" h2. The root re-fetches itself on
+     `refresh from:body`; "Show earlier" follows the cursor. Rename edits
+     inline; Delete goes through the shared data-confirm arm then
+     PATCH/DELETE /api/v1/conversations/{id} in chat.js. */}}
 {{$conv := .Data.ConversationID}}
 <div class="history-list" id="chatHistory"
   hx-get="/dashboard/partials/chat/history{{if $conv}}?c={{$conv}}{{end}}"
   hx-trigger="refresh from:body" hx-target="this" hx-swap="outerHTML">
   {{if .Data.History.Groups}}
-    {{range .Data.History.Groups}}<h3>{{.Label}}</h3>
-      {{range .Items}}<a class="history-item{{if .Selected}} selected{{end}}" href="/dashboard/chat/{{.ID}}">{{.Title}}<span class="subline">{{relTime .UpdatedAt}}</span></a>
-      {{end}}
-    {{end}}
+    {{template "chat-history-items" .}}
     {{if .Data.History.NextCursor}}<button type="button" class="btn"
       hx-get="/dashboard/partials/chat/history?cursor={{urlquery .Data.History.NextCursor}}{{if $conv}}&c={{$conv}}{{end}}"
       hx-target="#chatHistory" hx-swap="outerHTML">Show earlier</button>{{end}}
@@ -17,4 +17,17 @@
     {{template "empty" .Data.HistoryEmpty}}
   {{end}}
 </div>
+{{end}}
+
+{{define "chat-history-items"}}{{/* The row markup shared by the desktop
+     history nav and the mobile chats sheet: group h3s sit under the page
+     h1 → h2 "Chats". */}}
+{{$conv := .Data.ConversationID}}{{range .Data.History.Groups}}<h3>{{.Label}}</h3>{{range .Items}}
+    <div class="h-item{{if .Selected}} selected{{end}}" data-conv-id="{{.ID}}">
+      <a class="history-item" href="/dashboard/chat/{{.ID}}"><span class="h-title">{{.Title}}</span><span class="subline">{{relTime .UpdatedAt}}</span></a>
+      <span class="h-ctl">
+        <button type="button" class="btn ghost" data-action="conv:rename">Rename</button>
+        <button type="button" class="btn ghost" data-action="confirm" data-confirm="Delete this conversation? Its messages are removed; usage records stay." data-conv-delete>Delete</button>
+      </span>
+    </div>{{end}}{{end}}
 {{end}}

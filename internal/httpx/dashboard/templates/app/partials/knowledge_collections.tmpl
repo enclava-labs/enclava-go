@@ -4,7 +4,7 @@
      Health, Sources and Access cell is behind .Can.KnowledgeManage so member
      markup cannot contain them. */}}
 <div id="knowledge-collections" hx-get="/dashboard/partials/knowledge/collections" hx-swap="outerHTML" hx-trigger="refresh from:body">
-{{if .Data.Rows}}  <div class="tablewrap">
+{{if .Data.Rows}}  <div class="tablewrap" role="region" tabindex="0" aria-label="Collections">
     <table>
       <thead>
         <tr>

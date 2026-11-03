@@ -14,14 +14,14 @@
   <a class="skip" href="#content">Skip to content</a>
   <div class="mobilebar">
     <button type="button" class="iconbtn mobile-menu" data-action="toggle-nav" aria-label="Open menu" aria-expanded="false" aria-controls="sidebar">{{icon "menu"}}</button>
-    <span class="brand-mark">E</span>
+    <span class="brand-mark" aria-hidden="true">E</span>
     <b>{{.Org}}</b>
     <span class="mobile-status {{.Conf.MobileTone}}" title="{{.Conf.StatusTitle}}"></span>
     <span class="avatar">{{.User.Initials}}</span>
   </div>
   <aside class="sidebar" id="sidebar">
-    <button type="button" class="org" aria-label="{{.Org}}"><span class="brand-mark">E</span><span class="orgname">{{.Org}}</span><span class="chev">⌄</span></button>
-    <nav class="navgroups" id="nav">
+    <button type="button" class="org"><span class="brand-mark" aria-hidden="true">E</span><span class="orgname">{{.Org}}</span><span class="chev" aria-hidden="true">⌄</span></button>
+    <nav class="navgroups" id="nav" aria-label="Primary">
 {{range .Nav}}{{if .Items}}      <div class="group">
         <div class="group-title">{{.Title}}</div>
 {{range .Items}}        <a class="navlink{{if .Active}} active{{end}}" href="{{.Href}}"{{if .Active}} aria-current="page"{{end}}>{{icon .Icon}}<span class="navlabel">{{.Label}}</span>{{if .Admin}}<span class="lockhint" title="Visible to admins">{{icon "lock" 11}}</span>{{end}}</a>

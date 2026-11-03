@@ -467,7 +467,7 @@
     }
   });
 
-  // Two-step destructive confirm (shared `confirm` action) → delete source.
+  // Destructive confirm (shared `confirm` action group) → delete source.
   document.addEventListener('enclava:confirm', function (e) {
     if (!(e.target instanceof Element)) return;
     if (e.target.dataset.sourceDel === '1' && e.target.dataset.sourceId) {

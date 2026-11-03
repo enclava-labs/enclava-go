@@ -114,7 +114,7 @@ func TestDashboardUsageOverviewRanges(t *testing.T) {
 	}
 
 	default30 := render("")
-	if !strings.Contains(default30, `href="/dashboard/usage?range=30" aria-pressed="true"`) {
+	if !strings.Contains(default30, `href="/dashboard/usage?range=30" aria-current="page"`) {
 		t.Fatalf("default range must be 30: %s", default30)
 	}
 	if got := strings.Count(default30, "<rect"); got != 2 {
@@ -125,7 +125,7 @@ func TestDashboardUsageOverviewRanges(t *testing.T) {
 	}
 
 	seven := render("?range=7")
-	if !strings.Contains(seven, `href="/dashboard/usage?range=7" aria-pressed="true"`) {
+	if !strings.Contains(seven, `href="/dashboard/usage?range=7" aria-current="page"`) {
 		t.Fatalf("range=7 chip must be active: %s", seven)
 	}
 	if got := strings.Count(seven, "<rect"); got != 1 {

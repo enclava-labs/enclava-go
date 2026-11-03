@@ -621,8 +621,9 @@ mark{background:var(--accentbg);color:var(--accent-fg)}
   border-radius:9px;
   transition:.2s;
   max-width:min(560px,calc(100vw - 24px));
+  pointer-events:none;
 }
-.toast.show{transform:translate(-50%,0);opacity:1}
+.toast.show{transform:translate(-50%,0);opacity:1;pointer-events:auto}
 .toast a{color:var(--accent-fg);font-weight:600}
 .pop{
   position:fixed;
@@ -829,3 +830,116 @@ mark{background:var(--accentbg);color:var(--accent-fg)}
   .pulse{animation:none}
   .sidebar,.main,.drawer,.toast,.skip{transition:none}
 }
+
+/* --- 2D knowledge --- */
+.pill.readonly{border:1px solid var(--border);color:var(--muted)}
+.readonly-note{align-items:center;gap:8px;margin:0}
+#knowledge-documents-error{margin:8px 0 0}
+/* --- end 2D knowledge --- */
+
+/* --- 2C shell a11y --- */
+/* Explicit, untimed destructive confirm (P-08): replaces the timed label
+   swap — consequence + Confirm/Cancel inline where the trigger sat. */
+.confirm-group{display:inline-flex;gap:10px;align-items:center;flex-wrap:wrap}
+.confirm-text{font-size:12px;color:var(--muted);max-width:34em;overflow-wrap:anywhere}
+/* Visually-hidden file inputs get focus, not their label: mirror the shared
+   focus ring on the label for sibling and wrapping arrangements (UX-H14). */
+input[type="file"].visually-hidden:focus-visible+label,
+label[for]:has(>input[type="file"].visually-hidden):focus-within{
+  outline:2px solid var(--accent);
+  outline-offset:2px;
+}
+/* Scroll regions keep a visible ring too — they are focusable landmarks. */
+.tablewrap:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+/* Models tables stack before they can overflow at tablet widths (P-07):
+   the labeled-card layout applied to all tables <760 runs here at ≤1023. */
+@media (min-width:760px) and (max-width:1023px){
+  #models-endpoints .tablewrap,#models-pricing .tablewrap{border:0;background:none;overflow:visible}
+  #models-endpoints table,#models-endpoints tbody,
+  #models-pricing table,#models-pricing tbody{display:block}
+  #models-endpoints thead,#models-pricing thead{
+    position:absolute;width:1px;height:1px;margin:-1px;padding:0;border:0;
+    clip:rect(0 0 0 0);clip-path:inset(50%);overflow:hidden;white-space:nowrap;
+  }
+  #models-endpoints tr,#models-pricing tr{
+    display:block;border:1px solid var(--border);background:var(--panel);
+    border-radius:9px;margin-bottom:9px;padding:6px 12px;
+  }
+  #models-endpoints td,#models-pricing td{
+    display:grid;grid-template-columns:minmax(76px,34%) minmax(0,1fr);
+    column-gap:12px;align-items:start;padding:8px 0;text-align:right;
+  }
+  #models-endpoints td>*,#models-pricing td>*{grid-column:2;justify-self:end;max-width:100%}
+  #models-endpoints td .row,#models-pricing td .row{flex-wrap:wrap;min-width:0;justify-content:flex-end}
+  #models-endpoints td::before,#models-pricing td::before{
+    content:attr(data-label);grid-column:1;grid-row:1;color:var(--muted);font-size:10px;text-align:left;
+  }
+}
+@media (max-width:759px){
+  /* 390px: identifiers and filter controls wrap; the document never widens
+     (UX-H04) — the table region alone may scroll. */
+  #usage-audit td{overflow-wrap:anywhere}
+  #usage-audit .filters .field{min-width:0;flex:1 1 140px}
+  #usage-audit .tablewrap{overflow-x:auto}
+}
+/* --- end 2C shell a11y --- */
+
+/* --- 2A chat --- */
+/* History rows with inline Rename/Delete controls; the selected state moved
+   from the link to its row so the buttons share the highlight. */
+.h-item{display:flex;align-items:center;gap:2px;border-radius:7px}
+.h-item .history-item{flex:1;min-width:0;border-radius:0}
+.h-item:hover,.h-item.selected{background:var(--raised)}
+.h-item .h-ctl{display:inline-flex;flex:none;gap:0;padding-right:4px}
+.h-item .h-ctl .btn{padding:4px 6px;font-size:11px;color:var(--muted)}
+.h-rename{
+  flex:1;min-width:0;margin:4px;
+  padding:6px 9px;font-size:13px;font-family:inherit;color:var(--text);
+  background:var(--raised);border:1px solid var(--accent);border-radius:7px;
+}
+/* Disabled-assistant notice replaces the composer (AST-I02/UX-M04). */
+.composer-note{padding:14px 15px;border-top:1px solid var(--border);font-size:13px}
+/* Markdown subset inside assistant bubbles. */
+.bubble p{margin:0 0 9px}
+.bubble p:last-child{margin-bottom:0}
+.bubble h3,.bubble h4,.bubble h5,.bubble h6{margin:11px 0 5px;font-size:15px}
+.bubble h3:first-child,.bubble h4:first-child,.bubble h5:first-child,.bubble h6:first-child{margin-top:0}
+.bubble ul,.bubble ol{margin:6px 0;padding-left:21px}
+.bubble code{background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:0 4px;font-size:.9em}
+.bubble pre{
+  background:var(--panel);border:1px solid var(--border);border-radius:8px;
+  padding:10px 12px;overflow-x:auto;font-size:13px;margin:8px 0;
+}
+.bubble pre code{background:none;border:0;padding:0}
+.bubble a{color:var(--accent-fg);text-decoration:underline}
+.citation.muted{cursor:default;color:var(--muted);background:var(--raised)}
+.no-sources{margin-top:9px;font-size:12px}
+@media (max-width:759px){
+  /* The card sizes to its content with the thread capped, so the composer
+     stays inside an 844px viewport instead of filling a fixed grid row
+     (UX-H12). */
+  .thread-layout{height:auto;min-height:0}
+  .thread{height:auto}
+  .thread-body{max-height:52vh}
+}
+/* --- end 2A chat --- */
+
+/* --- 2B extract --- */
+/* Post-submit confirmation band + live strip (P-03/UX-M02/UX-H09) and the
+   View-job row highlight. */
+.extract-band{margin-top:12px}
+.extract-band-title{display:flex;gap:8px;align-items:center;font-weight:600}
+.extract-band-title svg{color:var(--green)}
+.extract-band .row{margin:8px 0 10px}
+.extract-band a.btn{text-decoration:none}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.extract-strip{
+  display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+  border:1px solid var(--border);border-radius:9px;
+  padding:9px 12px;font-size:12px;color:var(--muted);
+}
+.extract-strip.warn{border-color:var(--amber);color:var(--amber)}
+.extract-strip a{color:var(--accent-fg);font-weight:600}
+tr.job-highlight td{background:var(--accentbg)}
+.extract-ack{align-items:flex-start;gap:8px;color:var(--amber);font-size:12px}
+/* --- end 2B extract --- */

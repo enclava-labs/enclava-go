@@ -27,6 +27,21 @@ func TestRelTime(t *testing.T) {
 		t.Fatalf("relTime(now) = %q, want \"just now\"", got)
 	}
 
+	// AUTH-I03: future instants render "in N units", never a past-only
+	// phrase that made a session's idle expiry read "just now".
+	if got := string(relTime(now.Add(30 * time.Minute))); !strings.Contains(got, "in 30 minutes") {
+		t.Fatalf("relTime(+30m) = %q, want \"in 30 minutes\"", got)
+	}
+	if got := string(relTime(now.Add(2 * time.Hour))); !strings.Contains(got, "in 2 hours") {
+		t.Fatalf("relTime(+2h) = %q, want \"in 2 hours\"", got)
+	}
+	if got := string(relTime(now.Add(30 * time.Second))); !strings.Contains(got, "just now") {
+		t.Fatalf("relTime(+30s) = %q, want \"just now\" within a minute either way", got)
+	}
+	if got := string(relTime(now.Add(3 * 24 * time.Hour))); !strings.Contains(got, "in 3 days") {
+		t.Fatalf("relTime(+3d) = %q, want \"in 3 days\"", got)
+	}
+
 	// RFC3339 string input, *time.Time input, nil.
 	if got := string(relTime(now.Add(-30 * time.Second).UTC().Format(time.RFC3339))); !strings.Contains(got, "just now") {
 		t.Fatalf("relTime(RFC3339 string) = %q", got)

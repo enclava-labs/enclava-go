@@ -51,7 +51,7 @@ func TestRenderDashboardShell(t *testing.T) {
 		`data-caps="`, // caps projection present; exact serialization is the client contract, not this test's subject
 		`&#34;chat&#34;:true`,
 		`<aside class="sidebar" id="sidebar">`,
-		`<nav class="navgroups" id="nav">`,
+		`<nav class="navgroups" id="nav" aria-label="Primary">`,
 		`class="navlink active" href="/dashboard/knowledge"`,
 		`aria-current="page"`,
 		`class="conf-card none"`,

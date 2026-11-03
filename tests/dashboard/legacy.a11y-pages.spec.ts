@@ -340,14 +340,16 @@ test.describe('Page-surface keyboard flows (OA-38 / 11-05)', () => {
     const stop = page.locator('[data-run-id][data-action="confirm"]');
     await expect(stop).toBeVisible();
 
-    // Keyboard-only: focus, Enter arms (visible armed text — no tooltip),
-    // second Enter fires enclava:confirm → DELETE.
+    // Keyboard-only: Enter arms the untimed confirm group — consequence text
+    // + Confirm/Cancel, focus lands on Cancel (the safe default) — and Enter
+    // on Confirm fires enclava:confirm → DELETE.
     await stop.focus();
     await stop.press('Enter');
-    await expect(stop).toHaveText(/Stop run\?/);
-    await expect(stop).toBeFocused();
+    const group = page.locator('.confirm-group');
+    await expect(group).toBeVisible();
+    await expect(group.getByRole('button', { name: 'Cancel' })).toBeFocused();
     const deleteRun = page.waitForRequest((r) => r.method() === 'DELETE' && /\/api\/v1\/agent-runs\/.+/.test(r.url()));
-    await stop.press('Enter');
+    await group.getByRole('button', { name: 'Confirm' }).press('Enter');
     await deleteRun;
     await expect(page.locator('.thread-body')).toContainText('Stopped by you', { timeout: 30_000 });
   });

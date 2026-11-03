@@ -226,7 +226,7 @@ func TestDashboardAccessTabs(t *testing.T) {
 		body := rec.Body.String()
 		// aria-current appears once in the sidebar nav and once inside the
 		// page's tabs nav — assert exactly one within the tabs region.
-		start := strings.Index(body, `<nav class="tabs">`)
+		start := strings.Index(body, `<nav class="tabs"`)
 		if start < 0 {
 			t.Fatalf("GET /dashboard/access%s: tabs nav missing", tab)
 		}

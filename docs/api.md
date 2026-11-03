@@ -181,16 +181,31 @@ curl -s -H "authorization: Bearer $KEY" $BASE/api/v1/extract/templates | jq '.te
 # run a job: multipart, same formats as knowledge upload
 curl -s -H "authorization: Bearer $KEY" \
   -F "template_id=detailed_invoice" -F "file=@invoice.epub" \
-  $BASE/api/v1/extract/jobs | jq .job.id
+  $BASE/api/v1/extract/jobs | jq .job_id
 
 # poll, then read the typed result
 curl -s -H "authorization: Bearer $KEY" $BASE/api/v1/extract/jobs | jq '.jobs[0]'
 curl -s -H "authorization: Bearer $KEY" \
-  $BASE/api/v1/extract/jobs/JOB_ID/result | jq .result
+  $BASE/api/v1/extract/jobs/JOB_ID/result | jq .
 ```
 
+Template fields: `id`, `name`, `description`, `system_prompt`, `user_prompt`,
+`context_schema` (object definitions `{type, description, …}` — bare type
+strings are rejected), `output_schema` (JSON Schema 2020-12), `model`,
+`max_output_tokens` (optional 1–32768 generation cap; `0`/unset sends no
+explicit cap so `INFERENCE_DEFAULT_MAX_OUTPUT_TOKENS` and the routed model's
+limits apply; `EXTRACT_MAX_OUTPUT_TOKENS` sets the server-side fallback for
+templates that declare none), `is_active`, `is_default`.
+
+Job list rows carry `validation_status` (`needs_review` when the stored
+result failed schema/parse validation, `valid` otherwise) and
+`validation_error_count`; the job still completes terminally. The result
+payload itself carries `validation_errors`/`validation_warnings`.
+
 Completed results can be copied into knowledge with
-`POST /api/v1/knowledge/imports` `{"collection_id":…,"result_job_id":JOB_ID}`.
+`POST /api/v1/knowledge/imports` `{"collection_id":…,"result_ref":JOB_ID}`.
+A result with `validation_errors` is refused (422 `validation_ack_required`)
+until the request adds `"acknowledge_validation": true`.
 
 ## 5. Chat (OpenAI-compatible)
 
@@ -200,7 +215,25 @@ curl -s -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"model":"dsv41","messages":[{"role":"user","content":"hi"}]}' | jq .choices[0].message
 ```
 
-## 6. Endpoints and capability discovery
+## 6. Own conversations
+
+`GET /api/v1/conversations` lists the caller's own conversations,
+newest-first (`?limit=` ≤50, `?cursor=` opaque keyset), and
+`GET /api/v1/conversations/{id}` returns one conversation with its
+authorized messages (revoked-evidence turns are suppressed). Two mutations
+round out the dashboard's history controls — both are owner-only, so
+another member's id is one indistinguishable 404:
+
+```bash
+# rename (title is trimmed, 1–200 chars; 400 invalid_conversation otherwise)
+curl -s -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -X PATCH $BASE/api/v1/conversations/CONV_ID -d '{"title":"Renewal review"}'
+
+# delete: removes the conversation and its messages; usage/billing records stay
+curl -s -H "authorization: Bearer $KEY" -X DELETE $BASE/api/v1/conversations/CONV_ID
+```
+
+## 7. Endpoints and capability discovery
 
 Endpoint capabilities and model lists are read from the model server
 itself — `POST /api/v1/providers/discover` (scope `pricing.manage`)
@@ -221,7 +254,7 @@ MCP) have no cheap probe and stay operator judgment. The Models drawer's
 endpoint with `POST /api/v1/providers` using the discovered values
 (`capabilities` includes `model:<alias>=<upstream-id>` bindings).
 
-## 7. Security and operations
+## 8. Security and operations
 
 - Sign-in is throttled per process: 10 attempts/minute per IP and
   5 attempts per 15 minutes per account (the account limiter is capped at
@@ -241,7 +274,7 @@ endpoint with `POST /api/v1/providers` using the discovered values
   `Authorization: Bearer $METRICS_TOKEN`. With no token configured the
   endpoint fails closed (401) unless `METRICS_AUTH_DISABLED=true` is set.
 
-## 8. Billing reconciliation
+## 9. Billing reconciliation
 
 `POST /api/v1/admin/reservations/{id}/resolve` (scope `platform.admin`)
 settles a reservation stuck in the `unknown` state — or writes the hold off

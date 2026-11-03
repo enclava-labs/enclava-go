@@ -3,9 +3,10 @@
      terminal run lines. The root re-fetches on `refresh from:body` and
      adds `every 3s` only while a run is non-terminal; chat.js's run
      poller (Enclava.POLL_MS) calls Enclava.refresh() at terminal.
-     Citation [n] text stays literal here — chat.js binds the buttons from
-     data-evidence-ids (text-node splitting, never innerHTML). */}}
-<div class="thread-body" id="chatThread" data-scroll-latest
+     Assistant bubbles carry plain text — chat.js renders the safe
+     Markdown subset and binds [n]/evidence_<id> citation buttons from
+     data-evidence-ids (DOM nodes only, never innerHTML). */}}
+<div class="thread-body" id="chatThread" data-scroll-latest{{if and .Data.Thread .Data.Thread.HasKnowledge}} data-has-knowledge="1"{{end}}
   {{if .Data.ConversationID}}hx-get="/dashboard/partials/chat/thread?c={{urlquery .Data.ConversationID}}"
      hx-trigger="refresh from:body{{if and .Data.Thread .Data.Thread.Live}}, every 3s{{end}}" hx-target="this" hx-swap="outerHTML"{{end}}>
   {{if .Data.Thread}}
@@ -24,7 +25,7 @@
         {{end}}
       {{end}}
       {{if and .Pending (eq .Role "user")}}
-        <div class="runline"><span class="pulse">●</span>{{statusPill "job" .RunStatus}}
+        <div class="runline"><span class="pulse" aria-hidden="true">●</span>{{statusPill "job" .RunStatus}}
           <button type="button" class="btn danger" data-action="confirm" data-confirm="Stop run?" data-run-id="{{.RunID}}">{{icon "stop"}} Stop</button>
         </div>
       {{end}}

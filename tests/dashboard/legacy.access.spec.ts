@@ -126,11 +126,15 @@ test.describe('Access roles editor', () => {
         expectedAssistant = { mode: 'list', items: [await assistantItems.first().getAttribute('value')] };
       }
 
-      const patchPromise = page.waitForRequest(
-        (r) => r.method() === 'PATCH' && r.url().includes(`/api/v1/identities/roles/${roleID}`),
+      // Wait for the RESPONSE (not the request): the read-back below must
+      // see the committed write, and a response can only arrive post-commit.
+      const patchPromise = page.waitForResponse(
+        (r) => r.request().method() === 'PATCH' &&
+          r.url().includes(`/api/v1/identities/roles/${roleID}`) &&
+          r.status() === 200,
       );
       await form.getByRole('button', { name: 'Save role' }).click();
-      const patch = await patchPromise;
+      const patch = (await patchPromise).request();
       const body = patch.postDataJSON() as {
         name?: unknown; scopes?: unknown; grants?: Record<string, unknown>;
       };
@@ -196,13 +200,14 @@ test.describe('Access people roles', () => {
       await expect(form).toBeVisible();
       await form.locator(`input[name="role"][value="${roleID}"]`).check();
 
-      const putPromise = page.waitForRequest(
-        (r) => r.method() === 'PUT' &&
-          r.url().includes(`/api/v1/identities/users/${userID}/roles/${roleID}`),
+      const putPromise = page.waitForResponse(
+        (r) => r.request().method() === 'PUT' &&
+          r.url().includes(`/api/v1/identities/users/${userID}/roles/${roleID}`) &&
+          r.status() === 200,
       );
       await form.getByRole('button', { name: 'Save roles' }).click();
       const put = await putPromise;
-      expect(put.method()).toBe('PUT');
+      expect(put.request().method()).toBe('PUT');
 
       // Persisted outcome: the user's roles list carries the assignment.
       const stored = (await api(page, 'GET', `/api/v1/identities/users/${userID}`)) as {

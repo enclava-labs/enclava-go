@@ -501,22 +501,58 @@ func (a *App) handleAgentRunByID(w http.ResponseWriter, r *http.Request, p auth.
 	}
 }
 
+// writeConversationError maps PATCH/DELETE outcomes for one conversation:
+// an owner-miss (sql.ErrNoRows) is the uniform 404 - the response never
+// names the chatbot resource a conversation mutation actually touched.
+func writeConversationError(w http.ResponseWriter, err error, code string) {
+	if errors.Is(err, sql.ErrNoRows) {
+		WriteOpenAIError(w, http.StatusNotFound, "conversation not found", "invalid_request_error", "not_found")
+		return
+	}
+	writeChatbotNotFoundOrError(w, err, code)
+}
+
 func (a *App) handleConversationByID(w http.ResponseWriter, r *http.Request, p auth.Principal) {
 	if a.chatbotSvc == nil {
 		WriteOpenAIError(w, http.StatusNotImplemented, "chatbot service is not configured", "server_error", "not_configured")
 		return
 	}
 	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/conversations/"), "/")
-	if r.Method != http.MethodGet {
+	switch r.Method {
+	case http.MethodGet:
+		view, err := a.chatbotSvc.ListConversation(r.Context(), p, id)
+		if err != nil {
+			writeChatbotNotFoundOrError(w, err, "conversation_fetch_failed")
+			return
+		}
+		WriteJSON(w, http.StatusOK, view)
+	case http.MethodPatch:
+		var input struct {
+			Title string `json:"title"`
+		}
+		if err := DecodeJSON(r, &input); err != nil {
+			WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
+			return
+		}
+		conversation, err := a.chatbotSvc.RenameConversation(r.Context(), p, id, input.Title)
+		if err != nil {
+			if errors.Is(err, chatbot.ErrInvalidInput) {
+				WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_conversation")
+				return
+			}
+			writeConversationError(w, err, "conversation_rename_failed")
+			return
+		}
+		WriteJSON(w, http.StatusOK, conversation)
+	case http.MethodDelete:
+		if err := a.chatbotSvc.DeleteConversation(r.Context(), p, id); err != nil {
+			writeConversationError(w, err, "conversation_delete_failed")
+			return
+		}
+		WriteJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
+	default:
 		WriteMethodNotAllowed(w)
-		return
 	}
-	view, err := a.chatbotSvc.ListConversation(r.Context(), p, id)
-	if err != nil {
-		writeChatbotNotFoundOrError(w, err, "conversation_fetch_failed")
-		return
-	}
-	WriteJSON(w, http.StatusOK, view)
 }
 
 // handleConversations serves GET /api/v1/conversations (OA-13): the

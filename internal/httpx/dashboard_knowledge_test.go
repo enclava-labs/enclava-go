@@ -223,10 +223,19 @@ func TestDashboardKnowledgeCollectionTabs(t *testing.T) {
 		t.Fatalf("manager collection page = %d body=%s", mgrPage.Code, mgrPage.Body.String())
 	}
 	mbody := mgrPage.Body.String()
-	for _, want := range []string{base + "/sources", base + "/settings", "knowledge:retry", "knowledge-upload-file"} {
+	for _, want := range []string{base + "/sources", base + "/settings", "Read-only", "Ask a knowledge manager to grant write access"} {
 		if !strings.Contains(mbody, want) {
 			t.Fatalf("manager collection page missing %q", want)
 		}
+	}
+	for _, banned := range []string{"knowledge:retry", "knowledge-upload-file", `data-label="Actions"`} {
+		if strings.Contains(mbody, banned) {
+			t.Fatalf("read-only manager collection page contains %q", banned)
+		}
+	}
+	partial := f.get(t, mgr, mgrCSRF, "/dashboard/partials/knowledge/documents?collection="+col.ID)
+	if partial.Code != http.StatusOK || !strings.Contains(partial.Body.String(), "Read-only") || strings.Contains(partial.Body.String(), "knowledge-upload-file") {
+		t.Fatalf("read-only manager fragment = %d body=%s", partial.Code, partial.Body.String())
 	}
 	for _, path := range []string{base + "/sources", base + "/settings"} {
 		if got := f.get(t, mgr, mgrCSRF, path); got.Code != http.StatusOK {

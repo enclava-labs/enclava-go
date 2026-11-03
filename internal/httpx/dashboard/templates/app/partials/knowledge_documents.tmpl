@@ -2,24 +2,28 @@
      by GET /dashboard/partials/knowledge/documents?collection=&status= and
      rendered inline. Rows are the caller's authorized set (OA-21); the 3s
      poll trigger renders only while a non-terminal status exists. Upload /
-     Retry / Delete are manager-only — member markup has no action cell. */}}
+     Retry / Delete render only when .Data.Writable — a readable collection
+     the caller cannot write gets the Read-only pill instead, and upload
+     failures land in the persistent #knowledge-documents-error slot. The
+     status chips are navigation links (aria-current), never toggles. */}}
 <div id="knowledge-documents" hx-get="/dashboard/partials/knowledge/documents?collection={{.Data.Collection.ID}}&status={{.Data.Status}}" hx-swap="outerHTML" hx-trigger="{{if .Data.AnyProcessing}}refresh from:body, every 3s{{else}}refresh from:body{{end}}">
   {{template "knowledge-reembed-progress" .}}
   <div class="filters" role="group" aria-label="Filter documents by status">
-    <a class="chip{{if eq .Data.Status "all"}} active{{end}}" aria-pressed="{{if eq .Data.Status "all"}}true{{else}}false{{end}}" href="/dashboard/knowledge/{{.Data.Collection.ID}}/documents">All</a>
-    <a class="chip{{if eq .Data.Status "ready"}} active{{end}}" aria-pressed="{{if eq .Data.Status "ready"}}true{{else}}false{{end}}" href="/dashboard/knowledge/{{.Data.Collection.ID}}/documents?status=ready">{{statusLabel "document" "ready"}}</a>
-    <a class="chip{{if eq .Data.Status "processing"}} active{{end}}" aria-pressed="{{if eq .Data.Status "processing"}}true{{else}}false{{end}}" href="/dashboard/knowledge/{{.Data.Collection.ID}}/documents?status=processing">{{statusLabel "document" "processing"}}</a>
-    <a class="chip{{if eq .Data.Status "failed"}} active{{end}}" aria-pressed="{{if eq .Data.Status "failed"}}true{{else}}false{{end}}" href="/dashboard/knowledge/{{.Data.Collection.ID}}/documents?status=failed">{{statusLabel "document" "failed"}}</a>
-    <a class="chip{{if eq .Data.Status "removed"}} active{{end}}" aria-pressed="{{if eq .Data.Status "removed"}}true{{else}}false{{end}}" href="/dashboard/knowledge/{{.Data.Collection.ID}}/documents?status=removed">{{statusLabel "document" "removed"}}</a>
+    <a class="chip{{if eq .Data.Status "all"}} active{{end}}"{{if eq .Data.Status "all"}} aria-current="true"{{end}} href="/dashboard/knowledge/{{.Data.Collection.ID}}/documents">All</a>
+    <a class="chip{{if eq .Data.Status "ready"}} active{{end}}"{{if eq .Data.Status "ready"}} aria-current="true"{{end}} href="/dashboard/knowledge/{{.Data.Collection.ID}}/documents?status=ready">{{statusLabel "document" "ready"}}</a>
+    <a class="chip{{if eq .Data.Status "processing"}} active{{end}}"{{if eq .Data.Status "processing"}} aria-current="true"{{end}} href="/dashboard/knowledge/{{.Data.Collection.ID}}/documents?status=processing">{{statusLabel "document" "processing"}}</a>
+    <a class="chip{{if eq .Data.Status "failed"}} active{{end}}"{{if eq .Data.Status "failed"}} aria-current="true"{{end}} href="/dashboard/knowledge/{{.Data.Collection.ID}}/documents?status=failed">{{statusLabel "document" "failed"}}</a>
+    <a class="chip{{if eq .Data.Status "removed"}} active{{end}}"{{if eq .Data.Status "removed"}} aria-current="true"{{end}} href="/dashboard/knowledge/{{.Data.Collection.ID}}/documents?status=removed">{{statusLabel "document" "removed"}}</a>
   </div>
-{{if .Data.Docs}}  <div class="tablewrap">
+  <p id="knowledge-documents-error" class="field-error" role="alert" hidden></p>
+{{if .Data.Docs}}  <div class="tablewrap" role="region" tabindex="0" aria-label="Documents">
     <table>
       <thead>
         <tr>
           <th scope="col">Document</th>
           <th scope="col">Status</th>
           <th scope="col">Updated</th>
-{{if $.Can.KnowledgeManage}}          <th scope="col">Actions</th>
+{{if .Data.Writable}}          <th scope="col">Actions</th>
 {{end}}        </tr>
       </thead>
       <tbody>
@@ -27,7 +31,7 @@
           <td data-label="Document"><b>{{.FileName}}</b>{{if .SourceURI}}<span class="subline">{{.SourceURI}}</span>{{end}}</td>
           <td data-label="Status">{{if dashboardNonTerminal .Status}}<span class="pulse" aria-hidden="true">●</span>{{end}}{{statusPill "document" .Status}}{{if .Warnings}} {{statusPill "document" "warning"}}{{range .Warnings}}<span class="subline">{{.}}</span>{{end}}{{end}}{{if .ErrorMessage}}{{$action := dashboardErrorAction .ErrorMessage $.Can}}<span class="subline">{{$action.Text}}{{if $action.Href}} <a href="{{$action.Href}}">{{if eq $action.Href "/dashboard/models/pricing"}}Set price{{else}}View details{{end}}</a>{{end}}</span>{{end}}</td>
           <td data-label="Updated">{{relTime .UpdatedAt}}</td>
-{{if $.Can.KnowledgeManage}}          <td data-label="Actions">
+{{if $.Data.Writable}}          <td data-label="Actions">
             <span class="row">
               <button type="button" class="btn" data-action="knowledge:retry" data-document-id="{{.ID}}">{{icon "refresh"}}Retry</button>
               <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete document {{.FileName}}?" data-knowledge-doc-del="1" data-document-id="{{.ID}}">Delete</button>
@@ -38,10 +42,11 @@
     </table>
   </div>
 {{else}}{{template "empty" .Data.Empty}}
-{{end}}{{if $.Can.KnowledgeManage}}  <div class="row" style="margin-top:12px">
+{{end}}{{if .Data.Writable}}  <div class="row" style="margin-top:12px">
     <input type="file" id="knowledge-upload-file" class="visually-hidden" data-knowledge-upload-input aria-label="Choose a document to upload">
 {{if .Data.Docs}}    <label class="btn primary" for="knowledge-upload-file">{{icon "upload"}}Upload document</label>{{end}}
   </div>
+{{else}}  <p class="row readonly-note" style="margin-top:12px"><span class="pill readonly">Read-only</span><span class="muted">Ask a knowledge manager to grant write access.</span></p>
 {{end}}</div>
 {{end}}
 {{define "knowledge-reembed-progress"}}

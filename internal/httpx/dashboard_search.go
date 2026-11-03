@@ -60,6 +60,7 @@ type searchResultsData struct {
 	Rows   []searchResultRow
 	Facets []rag.SourceFacet
 	Error  string
+	Hint   string // secondary line under Error (e.g. lexical still works)
 }
 
 // searchResultRow is one fused result projected for the template: label,
@@ -173,6 +174,11 @@ func (a *App) buildSearchView(w http.ResponseWriter, r *http.Request) (searchVie
 		case errors.Is(err, rag.ErrSearchWorkExceeded):
 			view.Results = &searchResultsData{Query: view.Query,
 				Error: "That search covered more documents than the allowed scope — narrow the collection or the query."}
+			return view, true
+		case errors.Is(err, rag.ErrSearchBindingDenied):
+			view.Results = &searchResultsData{Query: view.Query,
+				Error: "Semantic search needs an embedding model granted to your role — ask your administrator.",
+				Hint:  "Keyword search still works."}
 			return view, true
 		case errors.Is(err, source.ErrDenied), errors.Is(err, rag.ErrInvalidInput):
 			view.Results = &searchResultsData{Query: view.Query}

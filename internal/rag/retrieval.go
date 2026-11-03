@@ -28,7 +28,10 @@ var ErrSearchWorkExceeded = errors.New("search scope exceeds the request bound")
 
 var ErrUtilityModelNotConfigured = errors.New("utility model is not configured")
 
-var errSearchBindingDenied = errors.New("search embedding binding denied")
+// ErrSearchBindingDenied reports that every index binding's embedding model
+// was denied for the caller (no grant/route). The HTTP layer maps it to 403
+// `embedding_not_granted`; lexical search never produces it.
+var ErrSearchBindingDenied = errors.New("search embedding binding denied")
 
 func (s *Service) SetUtilityModel(model string) {
 	s.utilityModel = strings.TrimSpace(model)
@@ -175,7 +178,7 @@ func (s *Service) searchCollection(ctx context.Context, p auth.Principal, collec
 	for _, b := range bindings {
 		results, err := s.queryIndex(ctx, p, collection, b, query, input, filter, limit, memo, connectionKinds, chunkCache)
 		if err != nil {
-			if errors.Is(err, errSearchBindingDenied) {
+			if errors.Is(err, ErrSearchBindingDenied) {
 				denied = err
 				slog.WarnContext(ctx, "search embedding binding unavailable", "collection", collection.ID, "index", b.QdrantCollection, "model", b.EmbeddingModel)
 				continue
@@ -220,7 +223,7 @@ func (s *Service) queryIndex(ctx context.Context, p auth.Principal, collection C
 			vectors, err := s.embed(ctx, p, b.EmbeddingModel, b.EmbeddingDimensions, []string{b.QueryPrefix + query}, embedScope{})
 			if err != nil {
 				if errors.Is(err, inference.ErrDenied) || errors.Is(err, inference.ErrNoRoute) {
-					return nil, fmt.Errorf("%w: %w", errSearchBindingDenied, err)
+					return nil, fmt.Errorf("%w: %w", ErrSearchBindingDenied, err)
 				}
 				return nil, err
 			}
@@ -466,7 +469,7 @@ func (s *Service) SearchReadableWithOptions(ctx context.Context, p auth.Principa
 	for _, collection := range selected {
 		input.Query, input.Mode, input.Limit = query, mode, perCollection
 		results, err := s.searchCollection(ctx, p, collection, input, memo)
-		if errors.Is(err, errSearchBindingDenied) {
+		if errors.Is(err, ErrSearchBindingDenied) {
 			denied = err
 			continue
 		}

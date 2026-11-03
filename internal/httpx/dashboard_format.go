@@ -5,6 +5,7 @@ package httpx
 import (
 	"fmt"
 	"html/template"
+	"math"
 	"math/big"
 	"strconv"
 	"strings"
@@ -32,19 +33,21 @@ func dashboardAsTime(v any) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// absTime renders the absolute timestamp for title= attributes:
+// absTime renders the absolute timestamp for title= attributes, always UTC:
 // "2 Jan 2006, 15:04". Unset values render "".
 func absTime(v any) string {
 	t, ok := dashboardAsTime(v)
 	if !ok {
 		return ""
 	}
-	return t.Format("2 Jan 2006, 15:04")
+	return t.UTC().Format("2 Jan 2006, 15:04")
 }
 
-// relTime renders <time datetime=… title=absTime>relative</time>: <1m
-// "just now", <60m "N min ago", <48h "N h ago", else the absolute date.
-// nil/unset values render "—".
+// relTime renders <time datetime=… title=absTime>relative</time>: within a
+// minute either way "just now"; past <60m "N min ago", <48h "N h ago", else
+// the absolute date; future instants "in N minute(s)/hour(s)/day(s)" — a
+// session's idle expiry is a future instant where a bare past-only render
+// would read "just now" (AUTH-I03). nil/unset values render "—".
 func relTime(v any) template.HTML {
 	t, ok := dashboardAsTime(v)
 	if !ok {
@@ -52,19 +55,44 @@ func relTime(v any) template.HTML {
 	}
 	var rel string
 	switch d := time.Since(t); {
-	case d < time.Minute:
+	case d > -time.Minute && d < time.Minute:
 		rel = "just now"
-	case d < time.Hour:
-		rel = fmt.Sprintf("%d min ago", int(d.Minutes()))
-	case d < 48*time.Hour:
-		rel = fmt.Sprintf("%d h ago", int(d.Hours()))
+	case d < 0:
+		switch a := -d; {
+		case a < time.Hour:
+			rel = "in " + relUnit(a, time.Minute, "minute")
+		case a < 48*time.Hour:
+			rel = "in " + relUnit(a, time.Hour, "hour")
+		default:
+			rel = "in " + relUnit(a, 24*time.Hour, "day")
+		}
 	default:
-		rel = t.Format("2 Jan 2006")
+		switch {
+		case d < time.Hour:
+			rel = fmt.Sprintf("%d min ago", int(d.Minutes()))
+		case d < 48*time.Hour:
+			rel = fmt.Sprintf("%d h ago", int(d.Hours()))
+		default:
+			rel = t.Format("2 Jan 2006")
+		}
 	}
 	return template.HTML(fmt.Sprintf(`<time datetime="%s" title="%s">%s</time>`,
 		t.Format(time.RFC3339),
 		template.HTMLEscapeString(absTime(v)),
 		template.HTMLEscapeString(rel)))
+}
+
+// relUnit renders a duration in whole units with an English plural:
+// "1 minute", "30 minutes".
+func relUnit(d, unit time.Duration, name string) string {
+	n := int64(math.Round(d.Seconds() / unit.Seconds()))
+	if n < 1 {
+		n = 1
+	}
+	if n == 1 {
+		return fmt.Sprintf("1 %s", name)
+	}
+	return fmt.Sprintf("%d %ss", n, name)
 }
 
 // dashboardMoneySymbols are the currencies shown with a symbol prefix; any

@@ -1533,6 +1533,13 @@ func collectionReadable(c Collection, p auth.Principal) bool {
 	return false
 }
 
+// CollectionWritable reports whether p can mutate collection c (owner or
+// platform admin) — the same rule collectionManageable enforces on every
+// write path, exported for read-only UI affordances.
+func CollectionWritable(c Collection, p auth.Principal) bool {
+	return collectionManageable(c, p)
+}
+
 func collectionManageable(c Collection, p auth.Principal) bool {
 	if auth.HasScope(p, "platform.admin") {
 		return true

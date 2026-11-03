@@ -100,6 +100,27 @@
     return match ? decodeURIComponent(match[1]) : '';
   }
 
+  var uploadError = '';
+
+  function panelError(text) {
+    uploadError = text;
+    var slot = document.getElementById('knowledge-documents-error');
+    if (!slot) return;
+    if (text) {
+      slot.textContent = text;
+      slot.hidden = false;
+    } else {
+      slot.textContent = '';
+      slot.hidden = true;
+    }
+  }
+
+  document.addEventListener('htmx:afterSwap', function (e) {
+    if (e.detail && e.detail.target && e.detail.target.id === 'knowledge-documents') {
+      panelError(uploadError);
+    }
+  });
+
   function uploadDocument(file) {
     if (!file) return;
     var id = collectionID();
@@ -108,10 +129,18 @@
     data.append('file', file);
     Enclava.api('POST', '/api/v1/rag/collections/' + encodeURIComponent(id) + '/documents', data)
       .then(function () {
+        panelError('');
         Enclava.toast('success', 'Document uploaded — processing started');
         Enclava.refresh();
       })
-      .catch(function (e) { writeError(e, 'Upload failed'); });
+      .catch(function (e) {
+        // Upload failures stay inline + persistent in the documents panel —
+        // a toast alone evaporates before a manager reads it.
+        var action = Enclava.errorAction(e);
+        var text = action.text || (e && e.message) || 'Upload failed';
+        panelError(text);
+        Enclava.toast('error', text, { action: action });
+      });
   }
 
   function retryDocument(documentID) {

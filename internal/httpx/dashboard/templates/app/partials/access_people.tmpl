@@ -4,7 +4,7 @@
      identities subroute via pages/access.js. */}}
 <div id="access-people" hx-get="/dashboard/partials/access/people" hx-trigger="refresh from:body" hx-target="this" hx-swap="outerHTML">
 {{if .Data.People}}  <div class="card">
-    <div class="tablewrap">
+    <div class="tablewrap" role="region" tabindex="0" aria-label="People">
       <table>
         <thead>
           <tr>
@@ -95,7 +95,7 @@
     </form>
     <div class="row">
 {{if $d.Disabled}}      <button type="button" class="btn" data-action="confirm" data-confirm="Re-enable this person?" data-access-confirm="user-status" data-user-id="{{$d.ID}}" data-status="active">Enable</button>
-{{else}}      <button type="button" class="btn danger" data-action="confirm" data-confirm="Disable this person and revoke their sessions?" data-access-confirm="user-status" data-user-id="{{$d.ID}}" data-status="disabled">Disable</button>
+{{else}}      <button type="button" class="btn danger" data-action="confirm" data-confirm="Disable this person? Their sessions and API keys are revoked and they can no longer sign in." data-access-confirm="user-status" data-user-id="{{$d.ID}}" data-status="disabled">Disable</button>
 {{end}}    </div>
     <div class="stack">
       <h3>Sessions</h3>

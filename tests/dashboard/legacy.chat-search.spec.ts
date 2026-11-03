@@ -3,7 +3,7 @@ import { test, expect } from './fixtures';
 
 // chat-search.spec.ts — the Chat consumer scenarios (OA-32, plan 10-02):
 // real login, real /api/v1 seeding, two-turn run with conversation adoption,
-// Stop two-step, mid-run reload resume-polling without a time bail, the three
+// Stop confirm-group, mid-run reload resume-polling without a time bail, the three
 // evidence surfaces, and grant isolation. Search scenarios (OA-33) are
 // appended here by 10-03.
 //
@@ -269,10 +269,11 @@ test.describe('Chat run flow (OA-32)', () => {
 
     const stop = page.locator('[data-run-id][data-action="confirm"]');
     await expect(stop).toBeVisible();
-    await stop.click(); // arm: shared data-confirm rewrites the label
-    await expect(stop).toHaveText(/Stop run\?/);
+    await stop.click(); // arm: the shared data-confirm opens the untimed group
+    const group = page.locator('.confirm-group');
+    await expect(group).toBeVisible();
     const deleteRun = page.waitForRequest((r) => r.method() === 'DELETE' && /\/api\/v1\/agent-runs\/.+/.test(r.url()));
-    await stop.click(); // second click fires enclava:confirm → DELETE
+    await group.getByRole('button', { name: 'Confirm' }).click(); // fires enclava:confirm → DELETE
     await deleteRun;
     await expect(page.locator('.thread-body')).toContainText('Stopped by you', { timeout: 30_000 });
   });
@@ -438,14 +439,14 @@ test.describe('Chat surfaces and grants (OA-32)', () => {
     await expect(page.locator('#assistantSelect option')).toHaveCount(1);
     await expect(page.locator('#assistantSelect')).not.toBeDisabled();
 
-    // Grantless member: empty picker, grant-needed help, disabled Send.
+    // Grantless member: empty picker, grant-needed help, composer hidden.
     await page.context().clearCookies();
     await login(page, gEmail, 'grantless-pass');
     await page.goto(`${BASE}/dashboard/chat`);
     await expect(page.locator('#assistantSelect')).toBeDisabled();
     await expect(page.locator('#assistantSelect option')).toHaveCount(0);
     await expect(page.locator('.thread-head')).toContainText('ask an admin to grant access');
-    await expect(page.locator('[data-action="chat:send"]')).toBeDisabled();
+    await expect(page.locator('[data-action="chat:send"]')).toHaveCount(0); // composer is hidden for a grantless member
   });
 });
 // ── Search scenarios (OA-33, plan 10-03) ─────────────────────────────────

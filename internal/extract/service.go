@@ -10,6 +10,7 @@ import (
 	"io"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -57,16 +58,17 @@ type JobReader interface {
 // shared inference executor alone resolves policy, reserves, dispatches and
 // settles — this service never reserves or records usage itself.
 type Service struct {
-	templatesRepo TemplatesRepo
-	settingsRepo  SettingsRepo
-	jobRows       JobReader
-	jobs          *jobs.Service
-	artifacts     *artifacts.Store
-	executor      Executor
-	endpoints     EndpointsLister
-	sources       source.SourceRepository
-	authorizer    *source.Authorizer
-	maxUploadMB   int64
+	templatesRepo         TemplatesRepo
+	settingsRepo          SettingsRepo
+	jobRows               JobReader
+	jobs                  *jobs.Service
+	artifacts             *artifacts.Store
+	executor              Executor
+	endpoints             EndpointsLister
+	sources               source.SourceRepository
+	authorizer            *source.Authorizer
+	maxUploadMB           int64
+	defaultMaxOutputToken int64
 }
 
 // SetSourceRepository enables current source-grant checks for jobs tied to an
@@ -77,6 +79,20 @@ func (s *Service) SetSourceRepository(repo source.SourceRepository) {
 		s.authorizer = source.NewAuthorizer(repo, 0)
 	}
 }
+
+// SetDefaultMaxOutputTokens sets the fallback generation cap for templates
+// that declare none (EXTRACT_MAX_OUTPUT_TOKENS); 0 sends no explicit cap —
+// the executor injects its own default and clamps to model limits.
+func (s *Service) SetDefaultMaxOutputTokens(n int64) {
+	if n < 0 {
+		n = 0
+	}
+	s.defaultMaxOutputToken = n
+}
+
+// maxExtractOutputBound is the accepted template/env cap range's ceiling;
+// the attempt never requests more output than this through extraction.
+const maxExtractOutputBound = 32768
 
 // Executor is the shared authorized inference boundary the attempt dispatches
 // through; *inference.Service satisfies it.
@@ -111,10 +127,6 @@ func NewService(
 		maxUploadMB:   maxUploadMB,
 	}
 }
-
-// maxExtractOutputTokens caps generation per attempt and sizes the
-// reservation's output-side hold.
-const maxExtractOutputTokens = 8192
 
 // writeLeaseTTL covers the input upload stream; the attempt's own writes
 // get a fresh lease.
@@ -269,6 +281,12 @@ func (s *Service) ProcessReader(ctx context.Context, p auth.Principal, input Pro
 		"file_size": ref.ByteSize, "input_version": int64(ref.Version),
 		"output_schema_json": string(outputSchemaJSON), "schema_version": outputSchemaVersion,
 		"context": input.Context,
+	}
+	// Freeze the effective generation cap into the job snapshot — template
+	// edits after enqueue can never change a queued attempt's bound. Zero
+	// stays out of the policy so the executor's default injection applies.
+	if cap := s.effectiveMaxOutput(template); cap > 0 {
+		policy["max_output_tokens"] = cap
 	}
 	existing, replay, err := s.existingSubmission(ctx, p, input.Operation, idem, ref.SHA256, policy)
 	if err != nil {
@@ -449,7 +467,11 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 	if err := claim.MarkDispatched(ctx); err != nil {
 		return "", err
 	}
-	request := s.buildProviderRequest(model, template, promptSystem, promptUser, inInput)
+	var maxOutput int64
+	if v, ok := job.Policy["max_output_tokens"].(float64); ok && v > 0 {
+		maxOutput = int64(v)
+	}
+	request := s.buildProviderRequest(model, template, promptSystem, promptUser, inInput, maxOutput)
 	payload, err := json.Marshal(request)
 	if err != nil {
 		return "", fmt.Errorf("marshal provider request: %w", err)
@@ -560,6 +582,12 @@ func (s *Service) attempt(ctx context.Context, claim *jobs.Claim, input jobs.Inp
 	}
 	rref = rw.Ref()
 
+	// Flag needs-review on the row itself: the fenced progress marker lets
+	// the jobs list show the validation verdict without decoding each result
+	// artifact. The job stays terminal-succeeded; import still acks errors.
+	if err := claim.Progress(ctx, 100, validationMarker+strconv.Itoa(len(validationErrors))); err != nil {
+		return "", fmt.Errorf("record validation marker: %w", err)
+	}
 	return rref.ID, nil
 }
 
@@ -669,6 +697,13 @@ func (s *Service) GetJob(ctx context.Context, p auth.Principal, jobID string) (J
 		return JobDetail{}, fmt.Errorf("decode extract result artifact: %w", err)
 	}
 	detail.Result = &res
+	// The decoded result is the authoritative validation verdict — it also
+	// covers rows completed before the list marker existed.
+	detail.Job.ValidationStatus = ValidationPassed
+	detail.Job.ValidationErrorCount = len(res.ValidationErrors)
+	if len(res.ValidationErrors) > 0 {
+		detail.Job.ValidationStatus = ValidationNeedsReview
+	}
 	return detail, nil
 }
 
@@ -741,7 +776,9 @@ func (s *Service) UpsertTemplate(ctx context.Context, p auth.Principal, t Templa
 		if _, err := compileOutputSchema(t.OutputSchema); err != nil {
 			return fmt.Errorf("invalid output_schema: %w", err)
 		}
-		t.OutputSchema["$schema"] = outputSchemaVersion
+	}
+	if t.MaxOutputTokens < 0 || t.MaxOutputTokens > maxExtractOutputBound {
+		return fmt.Errorf("max_output_tokens must be between 1 and %d (or omitted)", maxExtractOutputBound)
 	}
 	if t.OwnerActorID == "" {
 		t.OwnerActorID = p.ActorID
@@ -874,6 +911,32 @@ func (s *Service) resolveModel(ctx context.Context, tenantID string, t Template)
 	}
 	return "", errors.New("no models available")
 }
+
+// RouteForTemplate resolves the model alias and the enabled endpoint one
+// capability would dispatch through — the Process picker's price-coverage
+// probe reuses the exact submit-time route, never a separate guess.
+func (s *Service) RouteForTemplate(ctx context.Context, tenantID string, t Template, capability string) (model, endpointID string, err error) {
+	model, err = s.resolveModel(ctx, tenantID, t)
+	if err != nil {
+		return "", "", err
+	}
+	endpointID, err = s.resolveEndpoint(ctx, tenantID, model, capability)
+	if err != nil {
+		return "", "", err
+	}
+	return model, endpointID, nil
+}
+
+// effectiveMaxOutput picks the generation cap: the template's own
+// max_output_tokens wins, the service default (EXTRACT_MAX_OUTPUT_TOKENS)
+// fills in, and zero sends no explicit cap at all.
+func (s *Service) effectiveMaxOutput(t Template) int64 {
+	if t.MaxOutputTokens > 0 {
+		return int64(t.MaxOutputTokens)
+	}
+	return s.defaultMaxOutputToken
+}
+
 func (s *Service) resolveEndpoint(ctx context.Context, tenantID, model, capability string) (string, error) {
 	endpoints, err := s.endpoints.ListCapabilities(ctx, tenantID, capability)
 	if err != nil {
@@ -906,7 +969,7 @@ func refusesResponseFormat(err error) bool {
 	return strings.Contains(msg, "response_format") || strings.Contains(msg, "guided_")
 }
 
-func (s *Service) buildProviderRequest(model string, template Template, systemPrompt, userPrompt string, input ProcessInput) map[string]any {
+func (s *Service) buildProviderRequest(model string, template Template, systemPrompt, userPrompt string, input ProcessInput, maxOutput int64) map[string]any {
 	content := []map[string]any{}
 	mime := strings.ToLower(input.MimeType)
 	if strings.HasPrefix(mime, "image/") {
@@ -937,16 +1000,22 @@ func (s *Service) buildProviderRequest(model string, template Template, systemPr
 		}
 	}
 
-	return map[string]any{
+	request := map[string]any{
 		"model": model,
 		"messages": []map[string]any{
 			{"role": "system", "content": systemPrompt},
 			{"role": "user", "content": content},
 		},
 		"response_format": responseFormat,
-		"max_tokens":      maxExtractOutputTokens,
 		"temperature":     0,
 	}
+	// No caller cap → no explicit max_tokens: the executor injects its
+	// configured default and clamps to the routed model's catalog limits,
+	// and the reservation follows whatever cap lands in the payload.
+	if maxOutput > 0 {
+		request["max_tokens"] = maxOutput
+	}
+	return request
 }
 
 func interpolate(systemPrompt, userPrompt string, context map[string]any) (string, string) {
@@ -1135,6 +1204,11 @@ func providerUsageCount(value any) int {
 	return int(count)
 }
 
+// validationMarker prefixes the fenced progress message the attempt writes
+// after its result artifact lands: "extract-validation:<error count>" — the
+// list projection reads the verdict without decoding each result artifact.
+const validationMarker = "extract-validation:"
+
 // jobView projects a durable job row onto the consumer shape; request fields
 // come from the immutable policy document.
 func jobView(row jobs.JobRow) JobView {
@@ -1155,6 +1229,22 @@ func jobView(row jobs.JobRow) JobView {
 	v.FileMimeType = stringValue(row.Policy["mime_type"])
 	if n, ok := row.Policy["file_size"].(float64); ok {
 		v.FileSizeBytes = int64(n)
+	}
+	if len(row.Progress) > 0 {
+		var doc struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(row.Progress, &doc) == nil {
+			if raw, ok := strings.CutPrefix(doc.Message, validationMarker); ok {
+				if n, err := strconv.Atoi(raw); err == nil {
+					v.ValidationErrorCount = n
+					v.ValidationStatus = ValidationPassed
+					if n > 0 {
+						v.ValidationStatus = ValidationNeedsReview
+					}
+				}
+			}
+		}
 	}
 	return v
 }

@@ -4,7 +4,7 @@
      AllowedIPs controls exist anywhere on this surface. */}}
 <div id="access-api-keys" hx-get="/dashboard/partials/access/api-keys" hx-trigger="refresh from:body" hx-target="this" hx-swap="outerHTML">
 {{if .Data.Keys}}  <div class="card">
-    <div class="tablewrap">
+    <div class="tablewrap" role="region" tabindex="0" aria-label="API keys">
       <table>
         <thead>
           <tr>
@@ -26,7 +26,7 @@
             <td data-label="Actions">
               <div class="row">
                 <button type="button" class="btn" data-action="confirm" data-confirm="Rotate this key? The old secret stops working." data-access-confirm="key-rotate" data-key-id="{{.ID}}">Rotate</button>
-                <button type="button" class="btn danger" data-action="confirm" data-confirm="Revoke this key?" data-access-confirm="key-revoke" data-key-id="{{.ID}}">Revoke</button>
+                <button type="button" class="btn danger" data-action="confirm" data-confirm="Revoke this key? Every caller using it stops working immediately." data-access-confirm="key-revoke" data-key-id="{{.ID}}">Revoke</button>
               </div>
             </td>
           </tr>

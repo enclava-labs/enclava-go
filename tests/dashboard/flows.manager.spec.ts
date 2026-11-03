@@ -95,7 +95,7 @@ test.describe('Knowledge — collection documents (flow 3)', () => {
     await row.locator('[data-action="knowledge:retry"]').click();
     await reprocess;
 
-    // Delete through the shared two-step confirm.
+    // Delete through the shared untimed confirm group.
     await expect
       .poll(async () => row.locator('.pill').textContent(), { timeout: 90_000 })
       .toMatch(/Ready/);
@@ -103,7 +103,7 @@ test.describe('Knowledge — collection documents (flow 3)', () => {
     const deleteReq = page.waitForRequest(
       (r) => r.method() === 'DELETE' && /\/api\/v1\/rag\/documents\/.+/.test(r.url()));
     await del.click();
-    await del.click();
+    await page.locator('.confirm-group').getByRole('button', { name: 'Confirm' }).click();
     await deleteReq;
     await expect(row).toHaveCount(0, { timeout: 15_000 });
   });

@@ -175,12 +175,12 @@ func (r *ChatbotRepo) Delete(ctx context.Context, tenantID, id string) error {
 // Conversations + messages
 
 const conversationSelect = `
-	SELECT tenant_id::text, id, chatbot_id, owner_actor_id, COALESCE(external_id, ''), created_at
+	SELECT tenant_id::text, id, chatbot_id, owner_actor_id, COALESCE(external_id, ''), COALESCE(title, ''), created_at
 	FROM conversations`
 
 func scanConversation(s chatbotScanner) (chatbot.Conversation, error) {
 	var c chatbot.Conversation
-	if err := s.Scan(&c.TenantID, &c.ID, &c.ChatbotID, &c.OwnerActorID, &c.ExternalUserID, &c.CreatedAt); err != nil {
+	if err := s.Scan(&c.TenantID, &c.ID, &c.ChatbotID, &c.OwnerActorID, &c.ExternalUserID, &c.Title, &c.CreatedAt); err != nil {
 		return chatbot.Conversation{}, err
 	}
 	return c, nil
@@ -207,6 +207,37 @@ func (r *ChatbotRepo) GetConversation(ctx context.Context, tenantID, id string) 
 		return chatbot.Conversation{}, fmt.Errorf("get conversation: %w", err)
 	}
 	return c, nil
+}
+
+// UpdateConversationTitle sets one owner's member-chosen title; the owner
+// predicate is unconditional, so another member's row is a miss.
+func (r *ChatbotRepo) UpdateConversationTitle(ctx context.Context, tenantID, ownerActorID, id, title string) error {
+	res, err := r.db.SQL.ExecContext(ctx,
+		`UPDATE conversations SET title = $4 WHERE tenant_id = $1 AND id = $2 AND owner_actor_id = $3`,
+		tenantID, id, ownerActorID, title)
+	if err != nil {
+		return fmt.Errorf("rename conversation: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// DeleteConversation removes one owner's conversation row; messages and
+// runs cascade at the schema level (031). The owner predicate is
+// unconditional, so another member's row is a miss.
+func (r *ChatbotRepo) DeleteConversation(ctx context.Context, tenantID, ownerActorID, id string) error {
+	res, err := r.db.SQL.ExecContext(ctx,
+		`DELETE FROM conversations WHERE tenant_id = $1 AND id = $2 AND owner_actor_id = $3`,
+		tenantID, id, ownerActorID)
+	if err != nil {
+		return fmt.Errorf("delete conversation: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (r *ChatbotRepo) AddMessage(ctx context.Context, m chatbot.Message) error {
@@ -364,7 +395,7 @@ func (r *ChatbotRepo) ListConversations(ctx context.Context, tenantID, ownerActo
 		limit = 50
 	}
 	query := `
-		SELECT c.id, c.chatbot_id, COALESCE(cb.name, ''), c.created_at,
+		SELECT c.id, c.chatbot_id, COALESCE(cb.name, ''), COALESCE(c.title, ''), c.created_at,
 		       COALESCE(last_msg.last_at, c.created_at)
 		FROM conversations c
 		LEFT JOIN chatbots cb ON cb.tenant_id = c.tenant_id AND cb.id = c.chatbot_id
@@ -395,7 +426,7 @@ func (r *ChatbotRepo) ListConversations(ctx context.Context, tenantID, ownerActo
 	out := []chatbot.ConversationSummary{}
 	for rows.Next() {
 		var s chatbot.ConversationSummary
-		if err := rows.Scan(&s.ID, &s.ChatbotID, &s.AssistantName, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.ChatbotID, &s.AssistantName, &s.Title, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, "", err
 		}
 		out = append(out, s)

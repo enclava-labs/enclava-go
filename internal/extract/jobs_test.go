@@ -23,7 +23,7 @@ func TestWorkerPayloadUsesSupportedTextAndImageParts(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			payload, err := json.Marshal(svc.buildProviderRequest("model", base, "system", tc.text, ProcessInput{
 				MimeType: tc.mime, Bytes: tc.data, DocumentText: tc.text,
-			}))
+			}, 0))
 			if err != nil {
 				t.Fatal(err)
 			}

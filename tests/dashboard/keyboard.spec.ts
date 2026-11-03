@@ -203,11 +203,14 @@ test.describe('page-surface keyboard flows (member)', () => {
     await expect(stop).toBeVisible();
     await stop.focus();
     await stop.press('Enter');
-    await expect(stop).toHaveText(/Stop run\?/);
-    await expect(stop).toBeFocused();
+    // Enter arms: the untimed confirm group takes focus onto Cancel (the
+    // safe default); activating Confirm by keyboard fires the DELETE.
+    const group = page.locator('.confirm-group');
+    await expect(group).toBeVisible();
+    await expect(group.getByRole('button', { name: 'Cancel' })).toBeFocused();
     const deleteRun = page.waitForRequest(
       (r) => r.method() === 'DELETE' && /\/api\/v1\/agent-runs\/.+/.test(r.url()));
-    await stop.press('Enter');
+    await group.getByRole('button', { name: 'Confirm' }).press('Enter');
     await deleteRun;
     await expect(page.locator('.thread-body')).toContainText('Stopped by you', { timeout: 30_000 });
   });

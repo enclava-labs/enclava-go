@@ -37,6 +37,7 @@ var dashboardStatusLabels = map[string]dashboardStatusRow{
 	"processing":   {Label: "Processing", Tone: "warn", NonTerminal: true},
 	"warning":      {Label: "Needs attention", Tone: "warn"},
 	"review":       {Label: "Needs attention", Tone: "warn"},
+	"needs_review": {Label: "Needs review", Tone: "warn"},
 	"pending":      {Label: "Awaiting approval", Tone: "warn", NonTerminal: true},
 	"degraded":     {Label: "Degraded", Tone: "warn"},
 	"unverified":   {Label: "Unverified", Tone: "warn"},

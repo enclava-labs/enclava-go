@@ -483,5 +483,13 @@ func mergeTemplate(existing extract.Template, patch map[string]any) extract.Temp
 	if v, ok := patch["output_schema"].(map[string]any); ok {
 		existing.OutputSchema = v
 	}
+	if raw, present := patch["max_output_tokens"]; present {
+		switch v := raw.(type) {
+		case nil:
+			existing.MaxOutputTokens = 0 // explicit clear → no explicit cap
+		case float64:
+			existing.MaxOutputTokens = int(v) // service validates the range
+		}
+	}
 	return existing
 }

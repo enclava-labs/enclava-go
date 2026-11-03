@@ -328,6 +328,9 @@
     closeMobileNav(false);
     closeMobileChats(false);
     drawer.innerHTML = html;
+    // role=dialog + aria-modal exist only while the drawer is open (UX-H05):
+    // a closed, off-canvas aside is not a dialog landmark.
+    drawer.hidden = false;
     drawer.setAttribute('role', 'dialog');
     drawer.setAttribute('aria-modal', 'true');
     const title = drawer.querySelector('h2');
@@ -339,7 +342,9 @@
     }
     drawer.setAttribute('tabindex', '-1');
     drawer.classList.toggle('modal', !!modal);
-    drawer.classList.add('open');
+    // A frame must pass before 'open' lands or the transform transition is
+    // lost on the first paint after unhiding.
+    requestAnimationFrame(() => { if (!drawer.hidden) drawer.classList.add('open'); });
     const backdrop = el('backdrop');
     if (backdrop) backdrop.classList.add('open');
     overlayOpener = document.activeElement instanceof Element ? document.activeElement : null;
@@ -352,6 +357,12 @@
     if (!drawer || !drawer.classList.contains('open')) return;
     drawer.classList.remove('open', 'modal');
     drawer.innerHTML = '';
+    drawer.removeAttribute('role');
+    drawer.removeAttribute('aria-modal');
+    drawer.removeAttribute('aria-labelledby');
+    // hidden lands after the slide-out transition; a reopen inside the
+    // window un-hides the drawer and this guard leaves it alone.
+    setTimeout(() => { if (!drawer.classList.contains('open')) drawer.hidden = true; }, 250);
     const backdrop = el('backdrop');
     if (backdrop) backdrop.classList.remove('open');
     if (overlayOpener && document.contains(overlayOpener)) overlayOpener.focus();
@@ -550,24 +561,73 @@
   // ── Delegated data-action dispatch (shared actions; page modules namespace ──
   // their own listeners — evidence:* stays shared here for phase-10 producers).
 
-  function armConfirm(trigger) {
-    if (trigger.dataset.armed) {
-      clearTimeout(Number(trigger.dataset.confirmTimer));
-      delete trigger.dataset.armed;
-      if (trigger.dataset.confirmLabel !== undefined) trigger.textContent = trigger.dataset.confirmLabel;
-      const href = trigger.dataset.confirmHref || '';
-      trigger.dispatchEvent(new CustomEvent('enclava:confirm', { bubbles: true, detail: { href: href } }));
-      if (href) location.assign(href);
-      return;
+  // ── Destructive confirm group (P-08): a data-confirm click swaps the ──
+  // trigger for an untimed consequence + Confirm/Cancel group — no label
+  // swap, no timer. Confirm dispatches enclava:confirm on the trigger (the
+  // contract every page module consumes) and honors data-confirm-href;
+  // Cancel/Escape restore the trigger and its focus.
+  let armedTrigger = null;
+
+  function disarmConfirm(restore) {
+    const trigger = armedTrigger;
+    if (!trigger) return;
+    armedTrigger = null;
+    const group = trigger.nextElementSibling;
+    const heldFocus = !!(group && group.contains(document.activeElement));
+    if (group && group.classList.contains('confirm-group')) group.remove();
+    trigger.removeAttribute('aria-expanded');
+    trigger.removeAttribute('aria-controls');
+    trigger.hidden = false;
+    if (restore !== false && document.contains(trigger) &&
+        (heldFocus || document.activeElement === document.body)) {
+      trigger.focus();
     }
-    trigger.dataset.armed = '1';
-    trigger.dataset.confirmLabel = trigger.textContent;
-    trigger.textContent = trigger.dataset.confirm || 'Confirm?';
-    trigger.dataset.confirmTimer = String(setTimeout(() => {
-      if (!trigger.dataset.armed) return;
-      delete trigger.dataset.armed;
-      if (trigger.dataset.confirmLabel !== undefined) trigger.textContent = trigger.dataset.confirmLabel;
-    }, 3000));
+  }
+
+  function commitConfirm() {
+    const trigger = armedTrigger;
+    if (!trigger) return;
+    disarmConfirm(false);
+    const href = trigger.dataset.confirmHref || '';
+    trigger.dispatchEvent(new CustomEvent('enclava:confirm', { bubbles: true, detail: { href: href } }));
+    if (href) location.assign(href);
+    // Keyboard continuity: the trigger lost focus when the group armed and
+    // nothing else claimed it — put it back. The dispatched listener may
+    // already have moved focus (drawer close, navigation).
+    if (document.contains(trigger) && document.activeElement === document.body) trigger.focus();
+  }
+
+  function armConfirm(trigger) {
+    if (trigger === armedTrigger) { disarmConfirm(); return; }
+    disarmConfirm();
+    armedTrigger = trigger;
+    const group = document.createElement('span');
+    group.className = 'confirm-group';
+    const text = trigger.dataset.confirm || 'Confirm?';
+    group.id = 'confirm-group';
+    group.setAttribute('role', 'group');
+    group.setAttribute('aria-label', text);
+    const consequence = document.createElement('span');
+    consequence.className = 'confirm-text';
+    consequence.textContent = text;
+    const yes = document.createElement('button');
+    yes.type = 'button';
+    yes.className = 'btn danger';
+    yes.dataset.action = 'confirm-commit';
+    yes.textContent = 'Confirm';
+    const no = document.createElement('button');
+    no.type = 'button';
+    no.className = 'btn';
+    no.dataset.action = 'confirm-cancel';
+    no.textContent = 'Cancel';
+    group.appendChild(consequence);
+    group.appendChild(yes);
+    group.appendChild(no);
+    trigger.hidden = true;
+    trigger.setAttribute('aria-expanded', 'true');
+    trigger.setAttribute('aria-controls', group.id);
+    trigger.insertAdjacentElement('afterend', group);
+    no.focus();
   }
 
   document.addEventListener('click', (e) => {
@@ -630,6 +690,12 @@
       case 'confirm':
         armConfirm(trigger);
         break;
+      case 'confirm-commit':
+        commitConfirm();
+        break;
+      case 'confirm-cancel':
+        disarmConfirm();
+        break;
       case 'evidence:open':
         openEvidence(trigger.dataset.evidenceId);
         break;
@@ -641,6 +707,7 @@
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
+      if (armedTrigger) { disarmConfirm(); return; }
       if (popoverOpen()) { closePopover(); return; }
       if (mobileChatsOpen()) { closeMobileChats(); return; }
       if (mobileNavOpen()) { closeMobileNav(); return; }

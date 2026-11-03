@@ -16,6 +16,7 @@
 
   let editorTemplateId = '';
   let editorOriginalSchema = null;
+  let editorOriginalContext = null;
 
   const E = () => window.Enclava;
   const q = (sel, root) => (root || document).querySelector(sel);
@@ -65,6 +66,82 @@
     });
   }
 
+  let stripTimer = null;
+
+  function renderStrip(el, job) {
+    const status = job && job.status ? job.status : 'queued';
+    if (status === 'failed') {
+      const act = E().errorAction({ message: job.error_message || '' });
+      el.className = 'extract-strip warn';
+      el.innerHTML = '';
+      const span = document.createElement('span');
+      span.textContent = 'Extraction failed — ' + ((act && act.text) || job.error_message || 'see the job for details');
+      el.appendChild(span);
+      const a = document.createElement('a');
+      a.href = '/dashboard/extract?tab=jobs&job=' + encodeURIComponent(el.dataset.jobId);
+      a.textContent = 'Open job';
+      el.appendChild(a);
+      return false;
+    }
+    if (status === 'succeeded') {
+      el.className = 'extract-strip';
+      el.innerHTML = '';
+      const needs = job.validation_status === 'needs_review';
+      const span = document.createElement('span');
+      span.textContent = needs ? 'Needs review — ' + job.validation_error_count + ' validation error(s)' : 'Extraction ready';
+      el.appendChild(span);
+      const a = document.createElement('a');
+      a.href = '/dashboard/extract?tab=jobs&job=' + encodeURIComponent(el.dataset.jobId);
+      a.textContent = 'Open job';
+      el.appendChild(a);
+      return false;
+    }
+    if (status === 'cancelled' || status === 'unknown') {
+      el.className = 'extract-strip warn';
+      el.textContent = 'Extraction ' + status;
+      return false;
+    }
+    el.className = 'extract-strip';
+    el.textContent = status === 'queued' ? 'Queued — waiting for a worker' : 'Processing…';
+    return true;
+  }
+
+  function pollJobStrip(jobId) {
+    clearInterval(stripTimer);
+    stripTimer = setInterval(async () => {
+      const el = q('[data-extract-strip]');
+      if (!el || el.dataset.jobId !== jobId) { clearInterval(stripTimer); stripTimer = null; return; }
+      try {
+        const detail = await E().api('GET', '/api/v1/extract/jobs/' + encodeURIComponent(jobId));
+        if (!renderStrip(el, detail && detail.job)) { clearInterval(stripTimer); stripTimer = null; }
+      } catch (err) { /* transient poll miss — keep the same 3s cadence */ }
+    }, 3000);
+  }
+
+  function showQueuedBand(fileName, jobId) {
+    const form = q('[data-extract-form]');
+    const band = q('[data-extract-band]');
+    if (!form || !band) return;
+    form.hidden = true;
+    band.hidden = false;
+    q('[data-extract-band-file]', band).textContent = fileName;
+    q('[data-extract-band-id]', band).textContent = jobId;
+    q('[data-extract-band-view]', band).href = '/dashboard/extract?tab=jobs&job=' + encodeURIComponent(jobId);
+    const strip = q('[data-extract-strip]', band);
+    strip.hidden = false;
+    strip.dataset.jobId = jobId;
+    renderStrip(strip, { status: 'queued' });
+    pollJobStrip(jobId);
+  }
+
+  function resetProcessForm() {
+    const form = q('[data-extract-form]');
+    const band = q('[data-extract-band]');
+    if (stripTimer) { clearInterval(stripTimer); stripTimer = null; }
+    if (band) band.hidden = true;
+    if (form) form.hidden = false;
+  }
+
   async function submitJob() {
     const Enclava = E();
     const input = q('[data-extract-file]');
@@ -73,15 +150,22 @@
     const file = input.files && input.files[0];
     if (!file) { Enclava.toast('error', 'Choose a document to extract'); return; }
     if (!select.value) { Enclava.toast('error', 'Choose an extraction template'); return; }
+    // Pricing preflight: the server marks picker options whose route is not
+    // fully priced — warn through the shared refusal mapping, then submit.
+    const option = select.selectedOptions && select.selectedOptions[0];
+    if (option && option.hasAttribute('data-unpriced')) {
+      const act = Enclava.errorAction ? Enclava.errorAction({ code: 'price_missing' }) : null;
+      Enclava.toast('error', 'This template’s model isn’t fully priced — the job may fail.',
+        act && act.href ? { action: { label: act.label, href: act.href } } : {});
+    }
     const fd = new FormData();
     fd.append('template_id', select.value);
     fd.append('file', file);
     try {
-      await Enclava.api('POST', '/api/v1/extract/jobs', fd);
-      Enclava.toast('success', 'Extraction queued');
+      const out = await Enclava.api('POST', '/api/v1/extract/jobs', fd);
       input.value = '';
       showFileName(null);
-      Enclava.refresh();
+      showQueuedBand(file.name, out && out.job_id ? out.job_id : '');
     } catch (err) {
       failAction(err, submitJob); // price/file-size/template-denied → mapped next step
     }
@@ -151,12 +235,14 @@
     const drawer = btn.closest('#drawer');
     const select = drawer && q('#extract-import-collection', drawer);
     if (!select || !select.value) { Enclava.toast('error', 'Choose a collection'); return; }
+    const ack = drawer && q('[data-extract-ack]', drawer);
     try {
       // result_ref is the job id — the import resolves the stored result
       // artifact server-side (never a client-controlled artifact path).
       await Enclava.api('POST', '/api/v1/knowledge/imports', {
         collection_id: select.value,
         result_ref: btn.dataset.jobId,
+        acknowledge_validation: !!(ack && ack.checked),
       });
       Enclava.toast('success', 'Added to knowledge');
       Enclava.closeDrawer();
@@ -199,12 +285,21 @@
     });
   }
 
+  // Context definitions are objects ({type, description, …}); pre-fix
+  // templates may carry bare type strings — read either shape and keep
+  // the whole def so save preserves metadata the rows don't show.
   function contextRowsFrom(schema) {
     if (!schema || typeof schema !== 'object') return [];
-    return Object.keys(schema).map((name) => ({
-      name,
-      type: CONTEXT_TYPES.includes(schema[name]) ? schema[name] : 'string',
-    }));
+    return Object.keys(schema).map((name) => {
+      const raw = schema[name];
+      const def = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+      return {
+        name,
+        type: CONTEXT_TYPES.includes(def.type) ? def.type : (CONTEXT_TYPES.includes(raw) ? raw : 'string'),
+        description: typeof def.description === 'string' ? def.description : '',
+        def,
+      };
+    });
   }
 
   // Constraints the labeled editor cannot represent: every root key outside
@@ -247,9 +342,20 @@
     return schema;
   }
 
-  function buildContextSchema(rows) {
+  // Context definitions serialize as objects — the flat {name: type} shape
+  // the old editor wrote is rejected by template validation. The prior def
+  // object is merged so metadata rows can't represent (required, …) survives.
+  function buildContextSchema(original, rows) {
     const schema = {};
-    for (const row of rows) schema[row.name] = row.type;
+    for (const row of rows) {
+      const prev = original && typeof original[row.name] === 'object' && original[row.name] !== null && !Array.isArray(original[row.name])
+        ? original[row.name] : {};
+      const def = Object.assign({}, prev);
+      def.type = row.type;
+      if (row.description) def.description = row.description;
+      else delete def.description;
+      schema[row.name] = def;
+    }
     return schema;
   }
 
@@ -264,6 +370,9 @@
     return wrap;
   }
 
+  // Values go on ATTRIBUTES, not properties: the editor serializes through
+  // innerHTML before openDrawer, and property-only values never survive
+  // that round trip (saving an unchanged template wiped its schemas).
   function makeSchemaRow(kind, row) {
     const holder = document.createElement('div');
     holder.className = 'grid two';
@@ -273,7 +382,7 @@
     name.className = 'field';
     name.dataset.rowName = '1';
     name.placeholder = kind === 'output' ? 'field_name' : 'hint_name';
-    if (row && row.name) name.value = row.name;
+    if (row && row.name) name.setAttribute('value', row.name);
     holder.appendChild(labeled('Field name', name));
 
     const type = document.createElement('select');
@@ -283,25 +392,25 @@
       const opt = document.createElement('option');
       opt.value = t;
       opt.textContent = t;
+      if (row && row.type === t) opt.setAttribute('selected', '');
       type.appendChild(opt);
     });
-    if (row && row.type) type.value = row.type;
     holder.appendChild(labeled('Type', type));
 
     if (kind === 'output') {
       const req = document.createElement('input');
       req.type = 'checkbox';
       req.dataset.rowRequired = '1';
-      if (row && row.required) req.checked = true;
+      if (row && row.required) req.setAttribute('checked', '');
       holder.appendChild(labeled('Required', req));
-
-      const desc = document.createElement('input');
-      desc.className = 'field';
-      desc.dataset.rowDescription = '1';
-      desc.placeholder = 'Shown to reviewers';
-      if (row && row.description) desc.value = row.description;
-      holder.appendChild(labeled('Description', desc));
     }
+
+    const desc = document.createElement('input');
+    desc.className = 'field';
+    desc.dataset.rowDescription = '1';
+    desc.placeholder = kind === 'output' ? 'Shown to reviewers' : 'What this hint is for';
+    if (row && row.description) desc.setAttribute('value', row.description);
+    holder.appendChild(labeled('Description', desc));
 
     const rm = document.createElement('button');
     rm.type = 'button';
@@ -370,7 +479,7 @@
     }
     editorTemplateId = templateId || '';
     editorOriginalSchema = (t && t.output_schema) || null;
-
+    editorOriginalContext = (t && t.context_schema) || null;
     const holder = document.createElement('div');
     holder.appendChild(tpl.content.cloneNode(true));
     q('[data-editor-title]', holder).textContent = templateId ? 'Edit template' : 'New template';
@@ -395,7 +504,8 @@
     if (!ctxRows.length) ctxBox.appendChild(makeSchemaRow('context', null));
 
     await Enclava.openDrawer(holder.innerHTML);
-    // Values don't serialize with innerHTML — fill the live drawer instead.
+    // Static template fields fill the live drawer; schema-row values already
+    // serialized correctly because makeSchemaRow sets attributes.
     const drawer = document.getElementById('drawer');
     if (!drawer) return;
     setEditorField(drawer, 'name', (t && t.name) || '');
@@ -404,6 +514,7 @@
     setEditorField(drawer, 'user_prompt', (t && t.user_prompt) || '');
     setEditorField(drawer, 'model', (t && t.model) || '');
     setEditorField(drawer, 'is_active', t ? !!t.is_active : true);
+    setEditorField(drawer, 'max_output_tokens', t && t.max_output_tokens ? String(t.max_output_tokens) : '');
     setEditorField(drawer, 'is_default', t ? !!t.is_default : false);
   }
 
@@ -418,15 +529,21 @@
       Enclava.toast('error', 'Name and both prompts are required');
       return;
     }
+    const maxTokRaw = (editorField(drawer, 'max_output_tokens') || '').trim();
+    if (maxTokRaw && (!/^\d+$/.test(maxTokRaw) || +maxTokRaw < 1 || +maxTokRaw > 32768)) {
+      Enclava.toast('error', 'Max output tokens must be between 1 and 32768 (or blank)');
+      return;
+    }
     const payload = {
       name,
       description: editorField(drawer, 'description') || '',
       system_prompt: system,
       user_prompt: user,
       model: editorField(drawer, 'model') || '',
+      max_output_tokens: maxTokRaw ? parseInt(maxTokRaw, 10) : 0,
       is_active: !!editorField(drawer, 'is_active'),
       is_default: !!editorField(drawer, 'is_default'),
-      context_schema: buildContextSchema(readRows(q('[data-editor-schema="context"]', drawer), 'context')),
+      context_schema: buildContextSchema(editorOriginalContext, readRows(q('[data-editor-schema="context"]', drawer), 'context')),
       output_schema: buildOutputSchema(editorOriginalSchema, readRows(q('[data-editor-schema="output"]', drawer), 'output')),
     };
     try {
@@ -441,6 +558,13 @@
       Enclava.closeDrawer();
       Enclava.refresh();
     } catch (err) {
+      // Schema errors are template-validation feedback — the shared mapper
+      // would mislabel them as a tool-schema change; show the server's words.
+      const msg = err && err.message ? err.message : '';
+      if (msg.toLowerCase().indexOf('schema') !== -1 || msg.indexOf('max_output') !== -1) {
+        Enclava.toast('error', msg || 'Template validation failed');
+        return;
+      }
       failAction(err, saveTemplate);
     }
   }
@@ -494,7 +618,31 @@
       case 'extract:edit-template':
         openTemplateEditor(trigger.dataset.templateId || '');
         break;
+      case 'extract:another':
+        resetProcessForm();
+        break;
     }
+  });
+
+  // The needs-review import button stays disabled until the acknowledgement
+  // checkbox is ticked; the server re-checks the flag either way.
+  document.addEventListener('change', (e) => {
+    const ack = e.target instanceof Element && e.target.closest('[data-extract-ack]');
+    if (!ack) return;
+    const drawer = ack.closest('#drawer');
+    const btn = drawer && q('[data-action="extract:import"]', drawer);
+    if (btn) btn.disabled = !ack.checked;
+  });
+
+  // The band's View job deep-links mark the row; scroll it into view when
+  // the jobs fragment lands (initial render and each htmx refresh).
+  function scrollJobHighlight() {
+    const row = q('#extract-jobs tr.job-highlight');
+    if (row && row.scrollIntoView) row.scrollIntoView({ block: 'center' });
+  }
+  scrollJobHighlight();
+  document.addEventListener('htmx:afterSwap', (e) => {
+    if (e.target && e.target.id === 'extract-jobs') scrollJobHighlight();
   });
 
   // Shared two-step confirm (app.js arms the button, this module performs).

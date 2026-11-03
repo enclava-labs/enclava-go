@@ -169,8 +169,8 @@ func TestAPIWriteMatrix(t *testing.T) {
 			rawBody: func(*matrixFixture) (string, *bytes.Buffer) {
 				return multipartBody(t, nil, "upload.txt", "member upload content")
 			},
-			allowed: roles(roleAdmin), deny404: true, // rag.manage gate + owner-bound manage: admin bypasses, manager is a foreign non-owner
-			verify: statusIs(http.StatusAccepted, http.StatusOK)},
+			allowed: roles(roleAdmin), // memberColl is org-readable: the manager can read but not write → the new 403 write-denial contract (not 404)
+			verify:  statusIs(http.StatusAccepted, http.StatusOK)},
 		{name: "rag reprocess document", method: http.MethodPost,
 			path:    func(*matrixFixture) string { return "/api/v1/rag/documents/" + reprocDoc.Document.ID + "/reprocess" },
 			allowed: roles(roleManager), deny404: true, // owner-bound: CanRead on the object's audience excludes the platform admin too

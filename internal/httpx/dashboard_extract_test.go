@@ -438,3 +438,98 @@ func TestDashboardExtractTemplates(t *testing.T) {
 		t.Errorf("expected exactly the two prompt textareas, got %d", n)
 	}
 }
+
+// TestDashboardExtractNeedsReviewRows: a succeeded extraction whose stored
+// progress carries the validation marker renders the "Needs review" pill
+// with the error count, and the ?job= deep-link highlights the row.
+func TestDashboardExtractNeedsReviewRows(t *testing.T) {
+	f := newExtractFixture(t)
+
+	sess, csrf, user := extractLogin(t, f, "reviewer@example.com", []string{"extract"}, auth.ResourceGrants{})
+	p := extractSessionPrincipal(t, f, user.ID)
+
+	seedExtractJob(t, f, p, "job-clean", jobs.StatusSucceeded, "", map[string]any{
+		"template_id": "detailed_invoice", "file_name": "clean.pdf", "mime_type": "application/pdf", "file_size": 10,
+	})
+	seedExtractJob(t, f, p, "job-review", jobs.StatusSucceeded, "", map[string]any{
+		"template_id": "detailed_invoice", "file_name": "invalid.pdf", "mime_type": "application/pdf", "file_size": 10,
+	})
+	if _, err := f.db.SQL.ExecContext(context.Background(),
+		`UPDATE jobs SET progress = '{"percent":100,"message":"extract-validation:2"}'::jsonb WHERE id = 'job-review'`); err != nil {
+		t.Fatalf("seed validation marker: %v", err)
+	}
+
+	rec := extractGet(t, f, "/dashboard/partials/extract/jobs", sess, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("jobs fragment: expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Needs review") || !strings.Contains(body, "2 validation errors") {
+		t.Errorf("needs-review row missing its pill/count: %s", body)
+	}
+
+	rec = extractGet(t, f, "/dashboard/partials/extract/jobs?job=job-review", sess, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("highlighted jobs fragment: expected 200, got %d", rec.Code)
+	}
+	body = rec.Body.String()
+	if !strings.Contains(body, `data-job-id="job-review" class="job-highlight"`) {
+		t.Errorf("highlighted row missing job-highlight class: %s", body)
+	}
+	if !strings.Contains(body, `job=job-review`) {
+		t.Errorf("poll URL dropped the highlight param")
+	}
+}
+
+// TestDashboardExtractResultNeedsReviewGate: a needs-review result drawer
+// lists the stored validation errors and renders the disabled import gate;
+// the acknowledgement checkbox is the only unlock.
+func TestDashboardExtractResultNeedsReviewGate(t *testing.T) {
+	f := newExtractFixture(t)
+	ctx := context.Background()
+
+	sess, csrf, user := extractLogin(t, f, "gate@example.com", []string{"extract", "rag"}, auth.ResourceGrants{})
+	p := extractSessionPrincipal(t, f, user.ID)
+	if _, err := f.ragSvc.CreateCollection(ctx, p, rag.CreateCollectionInput{Name: "Contracts"}); err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	doc, err := json.Marshal(extract.ResultView{ID: "res_job-bad", JobID: "job-bad",
+		Data:             map[string]any{"invoice_number": "INV-9"},
+		ValidationErrors: []string{"schema validation failed at /amount"}})
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	w, ref, err := f.store.Begin(ctx, artifacts.Meta{
+		Ref: artifacts.Ref{TenantID: p.TenantID, Kind: artifacts.KindResult}, MimeType: "application/json",
+	}, time.Minute, int64(len(doc))+4096)
+	if err != nil {
+		t.Fatalf("begin result artifact: %v", err)
+	}
+	if _, err := w.Write(doc); err != nil {
+		t.Fatalf("write result artifact: %v", err)
+	}
+	if err := w.Finalize(ctx); err != nil {
+		t.Fatalf("finalize result artifact: %v", err)
+	}
+	seedExtractJob(t, f, p, "job-bad", jobs.StatusSucceeded, ref.ID, map[string]any{
+		"template_id": "detailed_invoice", "file_name": "invalid.pdf", "mime_type": "application/pdf", "file_size": 10,
+	})
+
+	rec := extractGet(t, f, "/dashboard/partials/extract/result?job=job-bad", sess, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("result drawer: expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"Needs review",
+		"schema validation failed at /amount",
+		`data-extract-ack`,
+		"import anyway",
+		`data-action="extract:import" data-job-id="job-bad" disabled`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("needs-review drawer missing %q", want)
+		}
+	}
+}
