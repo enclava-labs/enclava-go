@@ -103,6 +103,8 @@ type JobView struct {
 	ValidationErrorCount int            `json:"validation_error_count,omitempty"`
 	InputRef             string         `json:"input_ref,omitempty"`
 	ResultRef            string         `json:"result_ref,omitempty"`
+	OutcomeReason        string         `json:"outcome_reason,omitempty"`
+	ReservationID        string         `json:"reservation_id,omitempty"`
 	CreatedAt            time.Time      `json:"created_at"`
 	UpdatedAt            time.Time      `json:"updated_at"`
 	CompletedAt          *time.Time     `json:"completed_at"`

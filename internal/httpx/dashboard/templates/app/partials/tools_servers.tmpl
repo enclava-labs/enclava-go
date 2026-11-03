@@ -23,7 +23,7 @@
             <td data-label="Server"><b>{{.ID}}</b><span class="subline">{{.EndpointPath}}</span></td>
             <td data-label="Origin">{{.Origin}}</td>
             <td data-label="Credential">{{if .CredentialRef}}{{.CredentialRef}}{{else}}—{{end}}</td>
-            <td data-label="Status">{{if .Enabled}}{{statusPill "server" "connected"}}{{else}}{{statusPill "server" "disabled"}}{{end}}{{if .DiscoveredAt}}<span class="subline">Discovered {{relTime .DiscoveredAt}}</span>{{end}}</td>
+            <td data-label="Status">{{if not .Enabled}}{{statusPill "server" "disabled"}}{{else if not .DiscoveredAt}}{{statusPill "server" "enabled"}}{{else if .DiscoveryError}}{{statusPill "server" "unreachable"}}<span class="subline">{{.DiscoveryError}} · {{relTime .DiscoveredAt}}</span>{{else}}{{statusPill "server" "connected"}}<span class="subline">Discovered {{relTime .DiscoveredAt}}</span>{{end}}</td>
             <td data-label="Approved tools">{{if .Total}}{{count .Approved}} of {{count .Total}}{{else}}—{{end}}</td>
             <td data-label="Actions">
 {{if $.Can.ToolsManage}}              <div class="row">

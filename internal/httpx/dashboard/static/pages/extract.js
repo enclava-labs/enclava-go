@@ -652,7 +652,12 @@
     const Enclava = E();
     if (!Enclava) return;
     try {
-      if (t.dataset.extractDelete) {
+      if (t.dataset.extractRetry) {
+        const out = await Enclava.api('POST', '/api/v1/extract/jobs/' + encodeURIComponent(t.dataset.extractRetry) + '/retry');
+        Enclava.toast('success', out && out.job_id
+          ? 'Retry queued as job ' + out.job_id
+          : 'Retry queued — a new job was created');
+      } else if (t.dataset.extractDelete) {
         const out = await Enclava.api('DELETE', '/api/v1/extract/jobs/' + encodeURIComponent(t.dataset.extractDelete));
         Enclava.toast('success', out && out.status === 'cancellation_requested'
           ? 'Cancellation requested — the job is removed once it stops'

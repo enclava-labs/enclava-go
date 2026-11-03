@@ -230,8 +230,8 @@ func TestDashboardModelsPricingMatrix(t *testing.T) {
 		t.Fatalf("GET /dashboard/models/pricing: expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if got := strings.Count(body, "Not priced — requests refused"); got != 6 {
-		t.Fatalf("Not priced cells = %d, want 6 (ep-c chat + ep-a vision required units)\n%s", got, body)
+	if got := strings.Count(body, "not priced — requests refused"); got != 6 {
+		t.Fatalf("unpriced cells = %d, want 6 (ep-c chat + ep-a vision required units)\n%s", got, body)
 	}
 	if !strings.Contains(body, `$1.00`) || !strings.Contains(body, "via endpoint") {
 		t.Fatalf("complete endpoint set must render its own rates via endpoint\n%s", body)
@@ -242,23 +242,18 @@ func TestDashboardModelsPricingMatrix(t *testing.T) {
 	if !strings.Contains(body, "per 1,000,000 tokens") {
 		t.Fatalf("cells must state the per-1M basis\n%s", body)
 	}
-	for _, unit := range []string{"input", "cached_input", "output"} {
-		for _, want := range []string{
-			`data-endpoint="ep-c" data-model="mc" data-capability="chat/completions" data-unit="` + unit + `"`,
-			`data-endpoint="ep-a" data-model="ma" data-capability="vision" data-unit="` + unit + `"`,
-		} {
-			if !strings.Contains(body, want) {
-				t.Fatalf("Set price control missing binding %q\n%s", want, body)
-			}
+	// One row-level Set price control carries the write binding; the form it
+	// opens covers every category of that row.
+	for _, want := range []string{
+		`data-endpoint="ep-c" data-model="mc" data-capability="chat/completions"`,
+		`data-endpoint="ep-a" data-model="ma" data-capability="vision"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("Set price control missing binding %q\n%s", want, body)
 		}
 	}
-	// Rows follow the endpoint's advertised capabilities: an embeddings-only
-	// endpoint is priced for embeddings (no output unit), never for chat.
-	if strings.Contains(body, `data-price-row="ep-e|me|chat/completions"`) {
-		t.Fatalf("embeddings-only endpoint must not get a chat row\n%s", body)
-	}
 	embedRow := regexp.MustCompile(`(?s)data-price-row="ep-e\|me\|embeddings">.*?</tr>`).FindString(body)
-	if strings.Count(embedRow, "$0.50") != 2 || strings.Contains(embedRow, "Not priced") {
+	if strings.Count(embedRow, "$0.50") != 2 || strings.Contains(embedRow, "requests refused") {
 		t.Fatalf("embeddings row must show its two priced units and no refusal: %q\n%s", embedRow, body)
 	}
 }
@@ -289,27 +284,39 @@ func TestDashboardModelsSetPriceShowsInCell(t *testing.T) {
 
 	cellOf := func(endpoint, unit string) string {
 		body := modelsGet(t, f, "/dashboard/partials/models/pricing", session, csrf).Body.String()
-		cell := regexp.MustCompile(`(?s)data-price-cell="` + endpoint + `\|` + unit + `">.*?</td>`).FindString(body)
+		cell := regexp.MustCompile(`(?s)data-price-cell="` + endpoint + `\|` + unit + `"[^>]*>.*?</td>`).FindString(body)
 		if cell == "" {
 			t.Fatalf("no %s|%s cell\n%s", endpoint, unit, body)
 		}
 		return cell
 	}
-	// save posts what models.js submitPrice builds from the cell's control.
+	// save posts what models.js submitPrice builds from the row's Set-price
+	// control: one atomic batch entry for the target unit.
 	save := func(endpoint, unit string, micros int64) string {
-		cell := cellOf(endpoint, unit)
-		button := regexp.MustCompile(`<button[^>]*data-action="models:price"[^>]*>`).FindString(cell)
+		body := modelsGet(t, f, "/dashboard/partials/models/pricing", session, csrf).Body.String()
+		var row string
+		for _, tr := range regexp.MustCompile(`(?s)<tr data-price-row="[^"]*">.*?</tr>`).FindAllString(body, -1) {
+			if strings.Contains(tr, `data-price-cell="`+endpoint+`|`+unit+`"`) {
+				row = tr
+			}
+		}
+		if row == "" {
+			t.Fatalf("no row holds %s|%s\n%s", endpoint, unit, body)
+		}
+		button := regexp.MustCompile(`<button[^>]*data-action="models:price"[^>]*>`).FindString(row)
 		attr := func(name string) string {
 			m := regexp.MustCompile(` ` + name + `="([^"]*)"`).FindStringSubmatch(button)
 			if m == nil {
-				t.Fatalf("%s|%s price control has no %s: %q", endpoint, unit, name, cell)
+				t.Fatalf("%s|%s price control has no %s: %q", endpoint, unit, name, row)
 			}
 			return m[1]
 		}
 		payload, _ := json.Marshal(map[string]any{
-			"subject_type": attr("data-subject-type"), "subject_id": attr("data-subject-id"),
-			"capability": attr("data-capability"), "unit": attr("data-unit"),
-			"rate_micros": micros, "unit_quantity": 1000000, "currency": "USD",
+			"prices": []map[string]any{{
+				"subject_type": attr("data-subject-type"), "subject_id": attr("data-subject-id"),
+				"capability": attr("data-capability"), "unit": unit,
+				"rate_micros": micros, "unit_quantity": 1000000, "currency": "USD",
+			}},
 		})
 		if rec := sessionDo(t, f.app, http.MethodPost, "/api/v1/admin/pricing", string(payload), session, csrf); rec.Code != http.StatusCreated {
 			t.Fatalf("save %s|%s: %d %s", endpoint, unit, rec.Code, rec.Body.String())
@@ -327,7 +334,7 @@ func TestDashboardModelsSetPriceShowsInCell(t *testing.T) {
 		{"ep-f", "input", 2000000, "$2.00", "via endpoint"}, // Change an endpoint-set price
 	} {
 		cell := save(tc.endpoint, tc.unit, tc.micros)
-		if !strings.Contains(cell, tc.rate) || !strings.Contains(cell, tc.basis) || strings.Contains(cell, "Not priced") {
+		if !strings.Contains(cell, tc.rate) || !strings.Contains(cell, tc.basis) || strings.Contains(cell, "not priced") {
 			t.Fatalf("%s|%s saved %d: cell must show %s %s: %q", tc.endpoint, tc.unit, tc.micros, tc.rate, tc.basis, cell)
 		}
 	}

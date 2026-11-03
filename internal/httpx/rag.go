@@ -234,6 +234,13 @@ func (a *App) handleRAGCollectionDocumentsUpload(w http.ResponseWriter, r *http.
 		a.writeRAGNotFoundOrBadRequest(w, err, "rag_document_upload_failed")
 		return
 	}
+	if out.Deduplicated {
+		// Identical bytes already live in this collection — the documented
+		// dedupe contract returns the existing document with 200, not the
+		// 202 a fresh ingest gets.
+		WriteJSON(w, http.StatusOK, out)
+		return
+	}
 	WriteJSON(w, http.StatusAccepted, out)
 }
 
@@ -253,6 +260,7 @@ func (a *App) handleRAGSearchReadable(w http.ResponseWriter, r *http.Request, pr
 		Mode           rag.QueryMode `json:"mode"`
 		CollectionIDs  []string      `json:"collection_ids"`
 		Limit          int           `json:"limit"`
+		Cursor         string        `json:"cursor"`
 		Rewrite        bool          `json:"rewrite"`
 		SelectSections bool          `json:"select_sections"`
 	}
@@ -260,7 +268,7 @@ func (a *App) handleRAGSearchReadable(w http.ResponseWriter, r *http.Request, pr
 		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 		return
 	}
-	result, err := a.ragSvc.SearchReadableWithOptions(r.Context(), principal, request.Query, request.Mode, request.CollectionIDs, request.Limit, rag.SearchReadableOptions{Rewrite: request.Rewrite, SelectSections: request.SelectSections})
+	result, err := a.ragSvc.SearchReadableWithOptions(r.Context(), principal, request.Query, request.Mode, request.CollectionIDs, request.Limit, rag.SearchReadableOptions{Rewrite: request.Rewrite, SelectSections: request.SelectSections, Cursor: request.Cursor})
 	if err != nil {
 		a.writeRAGNotFoundOrBadRequest(w, err, "rag_search_failed")
 		return

@@ -14,6 +14,7 @@
 {{if $.Can.AssistantsManage}}        <button type="button" class="btn" data-action="open-drawer" data-drawer-url="/dashboard/partials/assistants/instructions/editor?id={{.ID}}">{{icon "settings"}}Edit</button>
         <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete instructions “{{.Name}}”?" data-template-delete="{{.ID}}">{{icon "x"}}Delete</button>{{end}}
       </div>
+      <p class="field-error" role="alert" data-template-delete-error hidden></p>
     </div>
 {{end}}  </div>
 {{else}}  {{template "empty" .Data.Empty}}

@@ -23,10 +23,11 @@ type GitHubAdapter struct {
 	client                        *http.Client
 }
 type ghCursor struct {
-	Phase string `json:"phase"`
-	Page  int    `json:"page"`
-	Index int    `json:"index"`
-	SHA   string `json:"tree_sha"`
+	Phase  string `json:"phase"`
+	Page   int    `json:"page"`
+	Index  int    `json:"index"`
+	Offset int    `json:"offset,omitempty"`
+	SHA    string `json:"tree_sha"`
 }
 type ghTreeEntry struct {
 	Path string `json:"path"`
@@ -236,28 +237,45 @@ func (g *GitHubAdapter) discussionPage(ctx context.Context, c source.Connection,
 	if e := g.request(ctx, endpoint, &rows); e != nil {
 		return ContentPage{}, e
 	}
-	items := make([]ContentItem, 0, len(rows))
-	for _, r := range rows {
+	items := make([]ContentItem, 0, limit)
+	for s.Index < len(rows) {
+		r := rows[s.Index]
 		if kind == "issues" && r.PullRequest != nil {
+			s.Index++
 			continue
 		}
 		id := fmt.Sprintf("github:%s:%s:%s:%d", c.ID, g.owner+"/"+g.repo, kind, r.ID)
-		items = append(items, ContentItem{NativeID: id, ParentNativeID: "github:" + c.ID + ":" + g.owner + "/" + g.repo, ParentKind: "repository", Kind: kind, NativeRevision: r.UpdatedAt, Title: r.Title, Filename: r.Title, Text: r.Body, URL: r.HTMLURL})
+		parent := []ContentItem{{NativeID: id, ParentNativeID: "github:" + c.ID + ":" + g.owner + "/" + g.repo, ParentKind: "repository", Kind: kind, NativeRevision: r.UpdatedAt, Title: r.Title, Filename: r.Title, Text: r.Body, URL: r.HTMLURL}}
 		comments, e := g.comments(ctx, c, fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments", g.base, url.PathEscape(g.owner), url.PathEscape(g.repo), r.Number), id, kind, r.Title, "comment")
 		if e != nil {
 			return ContentPage{}, e
 		}
-		items = append(items, comments...)
+		parent = append(parent, comments...)
 		if kind == "pulls" {
 			comments, e = g.comments(ctx, c, fmt.Sprintf("%s/repos/%s/%s/pulls/%d/comments", g.base, url.PathEscape(g.owner), url.PathEscape(g.repo), r.Number), id, kind, r.Title, "review_comment")
 			if e != nil {
 				return ContentPage{}, e
 			}
-			items = append(items, comments...)
+			parent = append(parent, comments...)
+		}
+		if s.Offset < 0 || s.Offset > len(parent) {
+			return ContentPage{}, errors.New("invalid github discussion cursor")
+		}
+		end := min(len(parent), s.Offset+limit-len(items))
+		items = append(items, parent[s.Offset:end]...)
+		if end < len(parent) {
+			s.Offset = end
+			return ghPage(items, s), nil
+		}
+		s.Index++
+		s.Offset = 0
+		if len(items) == limit && s.Index < len(rows) {
+			return ghPage(items, s), nil
 		}
 	}
 	if len(rows) == limit {
 		s.Page++
+		s.Index = 0
 		return ghPage(items, s), nil
 	}
 	if kind == "issues" {
@@ -346,7 +364,7 @@ func (g *GitHubAdapter) collaborators(ctx context.Context, c source.Connection, 
 		if id == "" {
 			id = strconv.FormatInt(u.ID, 10)
 		}
-		out = append(out, AccessGrant{NativeObjectID: "github:" + c.ID + ":" + g.owner + "/" + g.repo, NativeObjectKind: "repository", NativePrincipalID: id, NativeGroupID: g.owner + "/" + g.repo, Scope: "read", Effect: "allow"})
+		out = append(out, AccessGrant{NativeObjectID: "github:" + c.ID + ":" + g.owner + "/" + g.repo, NativeObjectKind: "repository", NativePrincipalID: id, NativePrincipalName: u.Login, NativeGroupID: g.owner + "/" + g.repo, Scope: "read", Effect: "allow"})
 	}
 	next := ""
 	if len(users) == limit {

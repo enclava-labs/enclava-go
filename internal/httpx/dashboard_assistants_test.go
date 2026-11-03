@@ -278,7 +278,8 @@ func TestDashboardAssistantsTableColumns(t *testing.T) {
 	if !strings.Contains(body, `<td data-label="Audience">Everyone</td>`) {
 		t.Fatalf("expected the wildcard audience in plain words, got %s", body)
 	}
-	if !strings.Contains(body, "Ready") || !strings.Contains(body, "Disabled") {
+	if !strings.Contains(body, `<td data-label="Status"><span class="pill good"><i class="dot"></i>Enabled</span>`) ||
+		!strings.Contains(body, `<td data-label="Status"><span class="pill neutral"><i class="dot"></i>Disabled</span>`) {
 		t.Fatalf("expected status pills for enabled and disabled assistants, got %s", body)
 	}
 }

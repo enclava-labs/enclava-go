@@ -609,6 +609,66 @@ func TestRAGReadableSearchRoute(t *testing.T) {
 	if ok.Code != http.StatusOK || len(ok.Body.String()) == 0 {
 		t.Fatalf("restored bound search = %d", ok.Code)
 	}
+
+	// KC-I08: cursor paging — invalid cursors are 400, pages are disjoint
+	// and the pool end carries no next_cursor.
+	if bad := searchReadable(f, f.ownerKey, `{"query":"corpus","mode":"lexical","cursor":"bogus"}`); bad.Code != http.StatusBadRequest {
+		t.Fatalf("invalid cursor = %d body=%s, want 400", bad.Code, bad.Body.String())
+	}
+	ownerP := auth.Principal{TenantID: f.tenant, ActorID: f.ownerID, UserID: f.ownerID, ActorKind: auth.ActorKindUser}
+	readable, err := f.svc.ListCollections(context.Background(), ownerP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, col := range readable {
+		if col.Name != "first" {
+			continue
+		}
+		for i := range 3 {
+			stageReadableDoc(t, f.db, f.vector, f.svc, f.tenant, f.ownerID, col,
+				fmt.Sprintf("obj_page_%d", i), fmt.Sprintf("paged corpus %d", i), `{"kind":"upload"}`)
+		}
+	}
+	type pagedPayload struct {
+		Results    []rag.SearchResult `json:"results"`
+		NextCursor string             `json:"next_cursor"`
+	}
+	seen := map[string]struct{}{}
+	cursor := ""
+	pages := 0
+	for {
+		body := `{"query":"corpus","mode":"lexical","limit":2}`
+		if cursor != "" {
+			raw, _ := json.Marshal(map[string]any{"query": "corpus", "mode": "lexical", "limit": 2, "cursor": cursor})
+			body = string(raw)
+		}
+		resp := searchReadable(f, f.ownerKey, body)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("paged search = %d body=%s", resp.Code, resp.Body.String())
+		}
+		var page pagedPayload
+		if err := json.Unmarshal(resp.Body.Bytes(), &page); err != nil {
+			t.Fatal(err)
+		}
+		for _, res := range page.Results {
+			key := res.DocumentID + "/" + res.ChunkID
+			if _, dup := seen[key]; dup {
+				t.Fatalf("result %s repeated across pages", key)
+			}
+			seen[key] = struct{}{}
+		}
+		pages++
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
+		if pages > 5 {
+			t.Fatal("pagination did not converge")
+		}
+	}
+	if len(seen) != 5 {
+		t.Fatalf("pages must cover the 5 readable results, got %d", len(seen))
+	}
 }
 
 // uploadFixture is the 08-08 multipart upload fixture: real artifact store +
@@ -780,6 +840,32 @@ func TestRAGCollectionDocumentsUploadRoute(t *testing.T) {
 	list.ServeHTTP(drec, download)
 	if drec.Code != http.StatusOK || drec.Body.String() != content {
 		t.Fatalf("artifact round-trip = %d body=%q", drec.Code, drec.Body.String())
+	}
+
+	// KC-I04: identical bytes in the same collection return the existing
+	// document — 200 with the dedupe flag, never a second ingest.
+	dup := uploadMultipart(t, f, f.managerKey, "file", "copy.txt", content, 0)
+	if dup.Code != http.StatusOK {
+		t.Fatalf("deduped upload = %d body=%s, want 200", dup.Code, dup.Body.String())
+	}
+	var dupOut struct {
+		Document     rag.Document `json:"document"`
+		Deduplicated bool         `json:"deduplicated"`
+	}
+	if err := json.Unmarshal(dup.Body.Bytes(), &dupOut); err != nil {
+		t.Fatal(err)
+	}
+	if !dupOut.Deduplicated || dupOut.Document.ID != out.Document.ID {
+		t.Fatalf("deduped upload must return the existing document: %s", dup.Body.String())
+	}
+	var embedJobs int
+	if err := f.db.SQL.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM jobs WHERE tenant_id=$1 AND operation='rag.embed'`,
+		f.tenant).Scan(&embedJobs); err != nil {
+		t.Fatal(err)
+	}
+	if embedJobs != 1 {
+		t.Fatalf("deduped upload enqueued a job: jobs=%d, want 1", embedJobs)
 	}
 }
 

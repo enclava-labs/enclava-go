@@ -9,7 +9,9 @@
 package httpx
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -17,6 +19,7 @@ import (
 	"time"
 
 	"enclava-go/internal/auth"
+	"enclava-go/internal/store/postgres"
 )
 
 func init() { registerDashboardPage((*App).registerDashboardAccountRoutes) }
@@ -62,17 +65,36 @@ type accountData struct {
 	Providers       []auth.OIDCProvider
 	LinkToken       string // ?link_token= → the link confirm form renders
 	OIDCReady       bool   // OIDC configured; gates the link-start actions
+	Dev             accountDev
+}
+
+// accountDev is the developer-card model (P-12/UX-M03). Visible is decided
+// server-side; the template renders branches only. Keys are strictly the
+// caller's own rows — never a tenant-wide list — and carry tokens, never
+// cost.
+type accountDev struct {
+	Visible        bool
+	CanManageKeys  bool // access.manage → key management link; else the request affordance
+	BaseURL        string
+	Keys           []postgres.APIKeyUsage
+	KeysErr        bool
+	RequestPending bool
+	RequestedAt    *time.Time
 }
 
 func (d accountData) DashboardTitle() string  { return "Account" }
 func (d accountData) DashboardModule() string { return "account" }
 
-// registerDashboardAccountRoutes mounts the Account page and its sessions
-// fragment behind capSession — session-required, no feature capability
-// (T-09-09-02: reads are strictly the caller's own records).
+// registerDashboardAccountRoutes mounts the Account page, its sessions
+// fragment, the in-app API reference and the two developer-card mutations —
+// every route behind the session+CSRF chain; access-request dismiss adds
+// the access.manage gate.
 func (a *App) registerDashboardAccountRoutes() {
 	a.mux.HandleFunc("/dashboard/account", a.sessionAuth.capSession(a.handleDashboardAccountPage))
 	a.mux.HandleFunc("/dashboard/partials/account/sessions", a.sessionAuth.capSession(a.handleDashboardAccountSessions))
+	a.mux.HandleFunc("/dashboard/api", a.sessionAuth.requireCap(capAPI, a.handleDashboardAPIReference))
+	a.mux.HandleFunc("/dashboard/account/api-access-request", a.sessionAuth.capSession(a.handleDashboardAPIAccessRequest))
+	a.mux.HandleFunc("/dashboard/access-requests/{requestID}/dismiss", a.sessionAuth.requireCap(capAccessManage, a.handleDashboardAPIAccessDismiss))
 }
 
 // handleDashboardAccountPage renders the four §6.13 sections in order:
@@ -168,7 +190,129 @@ func (a *App) accountDataFor(r *http.Request, p auth.Principal, user auth.User) 
 			data.Providers = providers
 		}
 	}
+	data.Dev = a.accountDevFor(r, p, user)
 	return data
+}
+
+// accountDevFor composes the developer card: the caller's own keys with
+// settlement-derived token totals, the pending-request state and the
+// key-management affordance. The card shows to API callers, key managers
+// and anyone who owns a key or already asked for one — a member with no
+// API relationship never sees it.
+func (a *App) accountDevFor(r *http.Request, p auth.Principal, user auth.User) accountDev {
+	caps, _ := capsFromContext(r.Context())
+	dev := accountDev{BaseURL: requestOrigin(r, a.trustProxy), CanManageKeys: caps.AccessManage}
+	if a.identity == nil {
+		dev.KeysErr = true
+		dev.Visible = caps.API || dev.CanManageKeys
+		return dev
+	}
+	keys, err := a.identity.ListAPIKeyUsageForOwner(r.Context(), p.TenantID, user.ID)
+	if err != nil {
+		log.Printf("account own keys for %s: %v", user.ID, err)
+		dev.KeysErr = true
+	} else {
+		dev.Keys = keys
+	}
+	if req, err := a.identity.OpenAPIAccessRequest(r.Context(), p.TenantID, user.ID); err == nil {
+		dev.RequestPending = true
+		dev.RequestedAt = &req.CreatedAt
+	} else if !errors.Is(err, auth.ErrNotFound) {
+		log.Printf("account api access request for %s: %v", user.ID, err)
+	}
+	dev.Visible = caps.API || dev.CanManageKeys || len(dev.Keys) > 0 || dev.RequestPending
+	return dev
+}
+
+// apiReferenceData backs the in-app API reference — a curated, static page;
+// the only live value is the deployment's own base URL.
+type apiReferenceData struct {
+	BaseURL string
+}
+
+func (d apiReferenceData) DashboardTitle() string  { return "API reference" }
+func (d apiReferenceData) DashboardModule() string { return "" }
+
+// handleDashboardAPIReference renders the curated reference behind the same
+// capability the nav entry and developer card use — no API scope, no docs.
+func (a *App) handleDashboardAPIReference(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	a.renderDashboard(w, r, "api", apiReferenceData{BaseURL: requestOrigin(r, a.trustProxy)})
+}
+
+// apiAccessRequestBody is the request card's JSON payload.
+type apiAccessRequestBody struct {
+	Note string `json:"note"`
+}
+
+// handleDashboardAPIAccessRequest records the caller's request for an API
+// key. Any signed-in user may ask; the store enforces one open request per
+// user and nothing is granted — an administrator issues keys only.
+func (a *App) handleDashboardAPIAccessRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	if a.identity == nil {
+		WriteOpenAIError(w, http.StatusNotImplemented, "identity management not configured", "server_error", "not_configured")
+		return
+	}
+	p, _ := auth.PrincipalFromContext(r.Context())
+	user, err := a.accountUser(r, p)
+	if err != nil {
+		if errors.Is(err, auth.ErrNotFound) {
+			WriteOpenAIError(w, http.StatusForbidden, "a user identity is required", "authentication_error", "forbidden")
+			return
+		}
+		log.Printf("api access request user lookup: %v", err)
+		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "access_request_failed")
+		return
+	}
+	var body apiAccessRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		WriteOpenAIError(w, http.StatusBadRequest, "invalid request body", "invalid_request_error", "invalid_request")
+		return
+	}
+	note := strings.TrimSpace(body.Note)
+	if len([]rune(note)) > 500 {
+		WriteOpenAIError(w, http.StatusBadRequest, "note must be at most 500 characters", "invalid_request_error", "invalid_request")
+		return
+	}
+	created, err := a.identity.RequestAPIAccess(r.Context(), p.TenantID, NewID("req"), user.ID, note, time.Now().UTC())
+	if err != nil {
+		log.Printf("api access request insert for %s: %v", user.ID, err)
+		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "access_request_failed")
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{"status": "open", "created": created})
+}
+
+// handleDashboardAPIAccessDismiss closes an open request without granting
+// anything — the admin's "seen it" path from the Home attention row.
+func (a *App) handleDashboardAPIAccessDismiss(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	if a.identity == nil {
+		WriteOpenAIError(w, http.StatusNotImplemented, "identity management not configured", "server_error", "not_configured")
+		return
+	}
+	p, _ := auth.PrincipalFromContext(r.Context())
+	err := a.identity.DismissAPIAccessRequest(r.Context(), p.TenantID, r.PathValue("requestID"), p.ActorID, time.Now().UTC())
+	if err != nil {
+		if errors.Is(err, auth.ErrNotFound) {
+			WriteOpenAIError(w, http.StatusNotFound, "request not found", "invalid_request_error", "not_found")
+			return
+		}
+		log.Printf("api access request dismiss: %v", err)
+		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "access_request_dismiss_failed")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // accountUser resolves the session principal's stored user record — the read

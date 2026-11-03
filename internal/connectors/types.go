@@ -52,8 +52,11 @@ type ContentItem struct {
 // AccessGrant identifies provider-native principals until a binding resolves.
 type AccessGrant struct {
 	NativeObjectID, NativeObjectKind, NativePrincipalID, NativeGroupID string
-	Scope, Effect                                                      string
-	Inherited                                                          bool
+	// NativePrincipalName is the provider-visible login/display name for
+	// NativePrincipalID, recorded on the observed identity when known.
+	NativePrincipalName string
+	Scope, Effect       string
+	Inherited           bool
 }
 
 type ContentPage struct {

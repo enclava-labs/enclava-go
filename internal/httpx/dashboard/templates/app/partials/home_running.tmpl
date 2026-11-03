@@ -32,6 +32,7 @@
       <span class="activity-icon">{{icon "bell"}}</span>
       <div class="activity-copy"><div>{{.Text}}</div>{{if .FixText}}<span class="subline">{{.FixText}}</span>{{end}}</div>
       {{if .FixHref}}<a class="btn ghost" href="{{.FixHref}}">{{.FixLabel}}</a>{{else if .ActionHref}}<a class="btn ghost" href="{{.ActionHref}}">{{.ActionLabel}}</a>{{end}}
+      {{if .DismissURL}}<button type="button" class="btn ghost" data-action="confirm" data-confirm="Dismiss this API access request? No access will be granted." data-dismiss-url="{{.DismissURL}}">Dismiss</button>{{end}}
     </div>
   {{end}}
   </div>

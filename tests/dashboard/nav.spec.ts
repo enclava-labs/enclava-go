@@ -22,6 +22,7 @@ const PAGES: Record<string, { label: string; href: string; h1: RegExp }[]> = {
     { label: 'Search', href: '/dashboard/search', h1: /search/i },
     { label: 'Extract', href: '/dashboard/extract', h1: /extract/i },
     { label: 'Knowledge', href: '/dashboard/knowledge', h1: /knowledge/i },
+    { label: 'API reference', href: '/dashboard/api', h1: /api reference/i },
   ],
   manager: [
     { label: 'Home', href: '/dashboard', h1: /home|good (morning|afternoon|evening)/i },
@@ -31,6 +32,7 @@ const PAGES: Record<string, { label: string; href: string; h1: RegExp }[]> = {
     { label: 'Assistants', href: '/dashboard/assistants', h1: /assistants/i },
     { label: 'Knowledge', href: '/dashboard/knowledge', h1: /knowledge/i },
     { label: 'Sources', href: '/dashboard/sources', h1: /sources/i },
+    { label: 'API reference', href: '/dashboard/api', h1: /api reference/i },
   ],
   admin: [
     { label: 'Home', href: '/dashboard', h1: /home|good (morning|afternoon|evening)/i },
@@ -40,6 +42,7 @@ const PAGES: Record<string, { label: string; href: string; h1: RegExp }[]> = {
     { label: 'Assistants', href: '/dashboard/assistants', h1: /assistants/i },
     { label: 'Knowledge', href: '/dashboard/knowledge', h1: /knowledge/i },
     { label: 'Sources', href: '/dashboard/sources', h1: /sources/i },
+    { label: 'API reference', href: '/dashboard/api', h1: /api reference/i },
     { label: 'Tools', href: '/dashboard/tools', h1: /tools/i },
     { label: 'Models', href: '/dashboard/models', h1: /models/i },
     { label: 'Access', href: '/dashboard/access', h1: /access/i },

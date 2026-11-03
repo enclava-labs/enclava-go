@@ -177,10 +177,19 @@
 
   // The editor always sends every grant kind explicitly: an explicit empty
   // list clears (deny), an omitted field would leave the stored grant alone.
+  // Two sections may share one kind (Models + Embedding models both write
+  // grants.models): merge — "all" wins, items union — never last-wins.
+  function mergeGrantDoc(doc, incoming) {
+    if (!doc || incoming.mode === 'all') return incoming;
+    if (doc.mode === 'all') return doc;
+    return { mode: 'list', items: Array.from(new Set(doc.items.concat(incoming.items))) };
+  }
+
   function submitRole(form) {
     const grants = {};
     Array.prototype.slice.call(form.querySelectorAll('fieldset[data-grant]')).forEach((section) => {
-      grants[section.dataset.grant] = grantDoc(section);
+      const kind = section.dataset.grant;
+      grants[kind] = mergeGrantDoc(grants[kind], grantDoc(section));
     });
     const body = {
       name: form.elements.name.value.trim(),

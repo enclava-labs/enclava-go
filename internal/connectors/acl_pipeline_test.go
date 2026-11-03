@@ -44,6 +44,7 @@ func newACLPipelineFixture(t *testing.T, kind, credential string, config map[str
 	svc.setAllowPrivateBaseURL(true)
 	obs := postgres.NewConnectorObservationsRepo(db)
 	svc.SetSyncDependencies(AdapterFactories{SourceKind(kind): func(source.Connection) (Adapter, error) { return adapter, nil }}, obs, store, repo)
+	svc.SetPrincipalResolver(auth.NewService(postgres.NewIdentityRepo(db), "").PrincipalForActor)
 	return &connectorFixture{db: db, svc: svc, jobs: jobService, jobRows: jobRows, sourceRepo: repo, principal: p, tenant: tenant, connection: conn}
 }
 

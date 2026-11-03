@@ -317,7 +317,9 @@ func (p *TinfoilProvider) doStream(ctx context.Context, method, path string, bod
 		upstreamBody, _ := readBoundedBody(stream, maxErrorBodyBytes)
 		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: upstreamBody}
 	}
-	return stream, nil
+	// Same stream-open contract as the plain adapter: a 2xx that is not an
+	// event stream fails the open instead of relaying verbatim.
+	return openStreamBody(resp, stream)
 }
 
 func (p *TinfoilProvider) ensureVerified(ctx context.Context) error {

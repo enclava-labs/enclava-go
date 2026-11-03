@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -58,8 +59,26 @@ type assistantRow struct {
 	Knowledge             []string
 	Tools                 []string
 	Audience              string // the stored audience rendered verbatim
+	Availability          []availabilityGroup
 	StatusState           string // "active" | "disabled"
 	Conversations         int64
+}
+
+// availabilityGroup renders one Availability cell line: a role group label
+// ("member", "manager", "other") and the worst coverage status of the
+// non-admin roles in it — "reachable" | "not_granted" | "no_audience".
+type availabilityGroup struct {
+	Label, Status string
+}
+
+// assistantRoleCoverage is one non-admin role's reachability detail for the
+// drawer's Coverage section; CanFix opens the role editor pre-selected with
+// the missing grant items.
+type assistantRoleCoverage struct {
+	RoleID, Name, Status string
+	Checks               []chatbot.AccessCheck
+	CanFix               bool
+	FixURL               string
 }
 
 type instructionsPageData struct {
@@ -99,6 +118,11 @@ type assistantDrawerData struct {
 	Preserved []assistantSetting
 
 	AudienceAll bool
+
+	// Coverage is the per-role reachability detail (edit only): each
+	// non-admin role's checks and the missing grant items its "Fix" link
+	// pre-selects in the role editor.
+	Coverage []assistantRoleCoverage
 }
 
 type assistantModelOption struct {
@@ -332,6 +356,9 @@ func (a *App) assistantsTableData(ctx context.Context, p auth.Principal) (assist
 		}
 	}
 	states, endpoints := a.assistantEndpointAssurance(ctx, p)
+	// Availability: the tenant's non-admin roles are read once, the
+	// endpoint/embedding facts computed per assistant.
+	roles := a.assistantRoles(ctx, p.TenantID)
 	data.Table.Rows = make([]assistantRow, 0, len(bots))
 	for _, b := range bots {
 		knowledge := make([]string, 0, len(b.RAGCollectionIDs))
@@ -370,6 +397,13 @@ func (a *App) assistantsTableData(ctx context.Context, p auth.Principal) (assist
 			} else {
 				row.Endpoint = "Unavailable endpoint"
 			}
+		}
+		if len(roles) > 0 {
+			serving := a.assistantServingEndpoints(ctx, p.TenantID, b)
+			embedModels := a.assistantEmbeddingModels(ctx, p, b)
+			row.Availability = assistantAvailability(roles, func(r assistantRoleInput) assistantRoleCoverage {
+				return a.assistantRoleCoverage(b, r, serving, embedModels)
+			})
 		}
 		data.Table.Rows = append(data.Table.Rows, row)
 	}
@@ -512,6 +546,15 @@ func (a *App) assistantDrawerData(ctx context.Context, p auth.Principal, id stri
 			data.Preserved = append(data.Preserved, assistantSetting{Key: k, JSON: string(raw)})
 		}
 		sort.Slice(data.Preserved, func(i, j int) bool { return data.Preserved[i].Key < data.Preserved[j].Key })
+
+		// Coverage section: the same per-role resolution the table's
+		// Availability cell summarizes, with each role's missing grant
+		// items linked into the role editor.
+		serving := a.assistantServingEndpoints(ctx, p.TenantID, bot)
+		embedModels := a.assistantEmbeddingModels(ctx, p, bot)
+		for _, role := range a.assistantRoles(ctx, p.TenantID) {
+			data.Coverage = append(data.Coverage, a.assistantRoleCoverage(bot, role, serving, embedModels))
+		}
 	}
 	return data, nil
 }
@@ -614,6 +657,192 @@ func (a *App) assistantEndpointAssurance(ctx context.Context, p auth.Principal) 
 		states[o.EndpointID] = o.State
 	}
 	return states, endpoints
+}
+
+// --- availability coverage (UX-A01/A02) -------------------------------------
+// Per-role reachability mirrors the real resolution: audience ∩ the
+// assistant/model/endpoint/embedding allowlists (chatbot.RoleAccessCoverage
+// owns the term list; this layer supplies the endpoint and embedding
+// facts). platform.admin roles are omitted — their authority is never in
+// doubt and the cell is about roles an admin can actually fix.
+
+type assistantRoleInput struct {
+	role    auth.Role
+	members []string
+}
+
+// assistantRoles loads every non-admin role plus its member user ids; the
+// tenant's roles are read once and fanned out per assistant.
+func (a *App) assistantRoles(ctx context.Context, tenantID string) []assistantRoleInput {
+	if a.identity == nil {
+		return nil
+	}
+	roles, err := a.identity.ListRoles(ctx, tenantID)
+	if err != nil {
+		log.Printf("dashboard assistants: roles: %v", err)
+		return nil
+	}
+	out := make([]assistantRoleInput, 0, len(roles))
+	for _, role := range roles {
+		admin := false
+		for _, s := range role.Scopes {
+			if s == auth.ScopePlatformAdmin {
+				admin = true
+				break
+			}
+		}
+		if admin {
+			continue
+		}
+		members, err := a.identity.RoleUsers(ctx, tenantID, role.ID)
+		if err != nil {
+			log.Printf("dashboard assistants: role %s members: %v", role.ID, err)
+		}
+		out = append(out, assistantRoleInput{role: role, members: members})
+	}
+	return out
+}
+
+// assistantServingEndpoints returns the enabled endpoints able to serve
+// bot.Model — the same eligibility the dispatcher's route loop applies
+// (advertised chat capability + a bound model alias). A pinned assistant
+// narrows the answer to its endpoint when that endpoint qualifies.
+func (a *App) assistantServingEndpoints(ctx context.Context, tenantID string, bot chatbot.Instance) []string {
+	if a.endpoints == nil {
+		return nil
+	}
+	var candidates []inference.Endpoint
+	if pinned := strings.TrimSpace(bot.ProviderID); pinned != "" {
+		e, err := a.endpoints.Get(ctx, tenantID, pinned)
+		if err != nil {
+			return nil
+		}
+		candidates = []inference.Endpoint{e}
+	} else {
+		list, err := a.endpoints.ListCapabilities(ctx, tenantID, inference.CapabilityChat)
+		if err != nil {
+			log.Printf("dashboard assistants: serving endpoints: %v", err)
+			return nil
+		}
+		candidates = list
+	}
+	serving := make([]string, 0, len(candidates))
+	for _, e := range candidates {
+		if !e.Enabled {
+			continue
+		}
+		chat, bound := false, false
+		for _, cap := range e.Capabilities {
+			if cap == inference.CapabilityChat {
+				chat = true
+			}
+			if _, alias, _, isModel := modelsBindingParts(cap); isModel && alias == bot.Model {
+				bound = true
+			}
+		}
+		if chat && bound {
+			serving = append(serving, e.ID)
+		}
+	}
+	return serving
+}
+
+// assistantEmbeddingModels resolves the distinct embedding models of the
+// assistant's attached collections — retrieval embeds under the caller's
+// model allowlist, so knowledge silently fails without the grant.
+func (a *App) assistantEmbeddingModels(ctx context.Context, p auth.Principal, bot chatbot.Instance) []string {
+	if a.ragSvc == nil || len(bot.RAGCollectionIDs) == 0 {
+		return nil
+	}
+	collections, err := a.ragSvc.ListCollections(ctx, p)
+	if err != nil {
+		log.Printf("dashboard assistants: embedding models: %v", err)
+		return nil
+	}
+	byID := make(map[string]string, len(collections))
+	for _, c := range collections {
+		byID[c.ID] = c.EmbeddingModel
+	}
+	seen := map[string]bool{}
+	var models []string
+	for _, id := range bot.RAGCollectionIDs {
+		if m := strings.TrimSpace(byID[id]); m != "" && !seen[m] {
+			seen[m] = true
+			models = append(models, m)
+		}
+	}
+	sort.Strings(models)
+	return models
+}
+
+// assistantRoleCoverage computes one role's reachability for bot; nil
+// servingEndpoints keeps the endpoint check truthful as "nothing to grant"
+// only when no endpoint can serve — the caller supplies configuration facts.
+func (a *App) assistantRoleCoverage(bot chatbot.Instance, role assistantRoleInput, servingEndpoints, embedModels []string) assistantRoleCoverage {
+	checks := chatbot.RoleAccessCoverage(bot, role.role.Grants, role.members, servingEndpoints, embedModels)
+	cov := assistantRoleCoverage{
+		RoleID: role.role.ID,
+		Name:   role.role.Name,
+		Status: chatbot.AccessCoverageStatus(checks),
+		Checks: checks,
+	}
+	for _, c := range checks {
+		if len(c.Missing) > 0 {
+			cov.CanFix = true
+			break
+		}
+	}
+	if cov.CanFix {
+		cov.FixURL = "/dashboard/partials/access/role-editor?id=" + url.QueryEscape(role.role.ID) +
+			"&fix=" + url.QueryEscape(bot.ID)
+	}
+	return cov
+}
+
+// assistantAvailability groups the non-admin roles into member / manager /
+// other and reports each group's worst status — a group stays "reachable"
+// only when every role in it is. Grouping by the seeded role ids' names
+// keeps the cell to three lines on tenants that grow extra roles.
+func assistantAvailability(roles []assistantRoleInput, coverageFor func(assistantRoleInput) assistantRoleCoverage) []availabilityGroup {
+	groupOf := func(role auth.Role) string {
+		name := strings.ToLower(role.Name)
+		if role.ID == "role_member" || strings.Contains(name, "member") {
+			return "member"
+		}
+		if strings.Contains(name, "manager") {
+			return "manager"
+		}
+		return "other"
+	}
+	order := []string{"member", "manager", "other"}
+	worst := map[string]string{}
+	for _, r := range roles {
+		g := groupOf(r.role)
+		status := coverageFor(r).Status
+		if worst[g] == "" || statusRank(status) < statusRank(worst[g]) {
+			worst[g] = status
+		}
+	}
+	groups := make([]availabilityGroup, 0, len(order))
+	for _, g := range order {
+		if status, ok := worst[g]; ok {
+			groups = append(groups, availabilityGroup{Label: g, Status: status})
+		}
+	}
+	return groups
+}
+
+// statusRank orders coverage states worst-first: a no-audience role is a
+// harder problem than a missing grant (grants can't fix it).
+func statusRank(status string) int {
+	switch status {
+	case "no_audience":
+		return 0
+	case "not_granted":
+		return 1
+	default:
+		return 2
+	}
 }
 
 // --- helpers -----------------------------------------------------------------

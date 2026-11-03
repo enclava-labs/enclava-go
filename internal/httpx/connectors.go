@@ -60,9 +60,15 @@ func (a *App) handleConnectorSourceByID(w http.ResponseWriter, r *http.Request, 
 	sourceID := parts[0]
 	if len(parts) > 1 {
 		if parts[1] == "sync" && len(parts) == 2 && r.Method == http.MethodPost {
-			job, err := a.connectorSvc.SyncSource(r.Context(), principal, sourceID)
+			job, err := a.connectorSvc.SyncSourceKeyed(r.Context(), principal, sourceID, r.Header.Get("Idempotency-Key"))
 			if err != nil {
-				writeConnectorNotFoundOrError(w, err, "connector_sync_invalid")
+				if errors.Is(err, connectors.ErrSourceDisabled) {
+					WriteOpenAIError(w, http.StatusConflict, err.Error(), "invalid_request_error", "connector_source_disabled")
+				} else if errors.Is(err, connectors.ErrInvalidSource) {
+					WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "connector_source_invalid")
+				} else {
+					writeConnectorNotFoundOrError(w, err, "connector_sync_invalid")
+				}
 				return
 			}
 			WriteJSON(w, http.StatusAccepted, job)

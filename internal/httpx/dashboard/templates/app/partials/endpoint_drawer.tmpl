@@ -46,6 +46,11 @@
       <span class="help">Bare https origin.</span>
     </div>
     <div>
+      <label class="label" for="mep-enclave-repo">Enclave repo</label>
+      <input class="field" id="mep-enclave-repo" name="enclave_repo" value="{{.Data.Endpoint.EnclaveRepo}}" placeholder="owner/name@sha256:…">
+      <span class="help">Tinfoil dedicated enclaves only — required when the origin is not the shared router.</span>
+    </div>
+    <div>
       <label class="label" for="mep-credential">Credential reference</label>
       <input class="field" id="mep-credential" name="credential_ref" value="{{.Data.Endpoint.CredentialRef}}">
       <span class="help">Server-approved secret reference — never a raw key.</span>
@@ -65,7 +70,8 @@
       {{range .Data.Checks}}<span class="chip{{if .Checked}} active{{end}}" data-capability-chip="{{.Value}}">{{.Label}}{{if .Checked}} ✓{{end}}</span>{{end}}
     </div>
     <input type="hidden" name="capabilities" value="{{range .Data.Checks}}{{if .Checked}}{{.Value}},{{end}}{{end}}">
-    <span class="help">Observed by probing the endpoint's server — run Discover after changing origin or credential. Unconfirmed capabilities are not saved.</span>
+    <div data-models-probe-results></div>
+    <span class="help">Observed by probing the endpoint's server — run Discover after changing origin or credential. A confirmed capability is added; an inconclusive one keeps its saved state.</span>
   </fieldset>
   <button type="button" class="btn ghost" data-models-discover>Discover from server</button>
   <span class="help">Fills capabilities and model aliases from the endpoint's own model list and 1-token probes.</span>

@@ -244,6 +244,7 @@ func serve() error {
 	previewSvc.SetSourceAccessMaxStale(cfg.SourceAccessMaxStale)
 	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG)
 	connectorSvc.SetCredentialResolver(secretResolver)
+	connectorSvc.SetPrincipalResolver(authSvc.PrincipalForActor)
 	adapterFactories := connectors.AdapterFactories{
 		connectors.SourceKindGitHub: func(c source.Connection) (connectors.Adapter, error) {
 			return connectors.NewGitHubAdapter(c, secretResolver)
@@ -365,6 +366,7 @@ func serve() error {
 	app.ConfigureMCP(mcpRepo, mcpTransport)
 	app.ConfigureActivity(jobsSvc)
 	app.SetSecurityAudit(auditRepo)
+	app.ConfigureVectorStoreProbe(httpx.ProbeHTTP(cfg.QdrantURL + "/collections"))
 	app.ConfigureMetrics(cfg.MetricsToken, cfg.MetricsAuthDisabled, jobsRepoPG, admission)
 
 	// The extract module mounts its API routes on the app's mux — every
@@ -427,6 +429,7 @@ func runtimeProviderConfig(cfg config.Config) inference.Endpoint {
 		endpoint.BaseOrigin = "https://inference.tinfoil.sh"
 		if cfg.TinfoilEnclave != "" {
 			endpoint.BaseOrigin = "https://" + cfg.TinfoilEnclave
+			endpoint.EnclaveRepo = cfg.TinfoilRepo
 		}
 	}
 	// Env-configured private origins (http) must be explicitly authorized.

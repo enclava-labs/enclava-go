@@ -5,7 +5,10 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/prompts"
@@ -92,6 +95,29 @@ func (a *App) handlePromptTemplateByID(w http.ResponseWriter, r *http.Request, p
 			return
 		}
 		if err := a.promptSvc.Delete(r.Context(), principal, id); err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+				var names []string
+				if a.chatbotSvc != nil {
+					bots, listErr := a.chatbotSvc.List(r.Context(), principal)
+					if listErr != nil {
+						writePromptNotFoundOrError(w, listErr, "prompt_template_delete_failed")
+						return
+					}
+					for _, bot := range bots {
+						if bot.PromptTemplateID == id {
+							names = append(names, bot.Name)
+						}
+					}
+				}
+				sort.Strings(names)
+				message := "Instructions are used by an assistant"
+				if len(names) > 0 {
+					message = "Instructions are used by: " + strings.Join(names, ", ")
+				}
+				WriteOpenAIError(w, http.StatusConflict, message, "invalid_request_error", "template_in_use")
+				return
+			}
 			writePromptNotFoundOrError(w, err, "prompt_template_delete_failed")
 			return
 		}

@@ -210,7 +210,7 @@ func TestDashboardSourcesTableStateProjection(t *testing.T) {
 		`style="width:42%"`,                 // width matches the reported percent
 		`class="dot pulse"`,                 // counts-less syncing → indeterminate pulse
 		"Needs attention",                   // failed last sync label from the vocabulary
-		"credentials were rejected",         // raw credential errors render through the actionable map
+		"credential refused",                // the concrete failure is visible beside its next step
 		`href="/dashboard/sources?edit=s3"`, // Reconnect deep-links the failing row
 		"every 3s",                          // poll rides along with any syncing row
 		"User bindings",                     // AccessManage gate open in this view
@@ -352,8 +352,13 @@ func TestDashboardSourcesDrawerProviders(t *testing.T) {
 			t.Fatalf("drawer missing the %s credential empty state", provider)
 		}
 	}
-	if !strings.Contains(drawer, "Optional for public repositories.") {
-		t.Fatal("drawer missing the GitHub optional-credential help")
+	for _, want := range []string{
+		"Collaborator and membership lookup still requires a CONNECTOR_GITHUB_* credential binding with push access",
+		"without it only content syncs",
+	} {
+		if !strings.Contains(drawer, want) {
+			t.Fatalf("drawer missing GitHub credential guidance %q", want)
+		}
 	}
 	if !strings.Contains(drawer, `data-action="sources:audience-add"`) {
 		t.Fatal("drawer missing the Notion published-audiences editor")

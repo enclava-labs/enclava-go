@@ -26,7 +26,12 @@ type Server struct {
 	TenantID, ID, Origin, EndpointPath, CredentialRef string
 	AuthorizedPrivate, Enabled                        bool
 	AudienceScopes                                    []string
-	CreatedAt, UpdatedAt                              time.Time
+	// DiscoveryAt/DiscoveryError are the persisted outcome of the LAST tool
+	// discovery against this server: a zero DiscoveryAt means never probed,
+	// an empty DiscoveryError means the last probe succeeded.
+	DiscoveryAt          time.Time
+	DiscoveryError       string
+	CreatedAt, UpdatedAt time.Time
 }
 type Approval struct {
 	TenantID, ServerID, ToolID, ModelName, RemoteName string

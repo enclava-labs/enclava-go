@@ -73,6 +73,7 @@ type Repository interface {
 	CountDocuments(ctx context.Context, tenantID string, excludeRemoved bool) (int64, error)
 	LiveCollectionSourceIDs(ctx context.Context, tenantID, collectionID string) (map[string]struct{}, error)
 	GetDocument(ctx context.Context, tenantID, objectID string) (Document, error)
+	CreateUploadIfNew(ctx context.Context, collectionID, actorID string, object source.Object, version source.ObjectVersion, excludedIDs []string) (string, error)
 	ListBlockLocators(ctx context.Context, tenantID string, blockIDs []string) (map[string]source.Locator, error)
 	ListPublishedGenerations(ctx context.Context, tenantID, collectionID string) ([]IndexGeneration, error)
 	// ListPublishedGenerationsBounded is the deterministic, LIMIT-bounded
@@ -1014,6 +1015,76 @@ func (s *Service) processNewDocument(ctx context.Context, p auth.Principal, c Co
 		_ = s.artifacts.Delete(ctx, ref)
 		return UploadDocumentOutput{}, fmt.Errorf("%w: document is empty", ErrInvalidInput)
 	}
+	if input.ObjectID == "" && strings.TrimSpace(input.SourceID) == "" {
+		return s.persistUpload(ctx, p, c, input, ref, sourceType, sourceID)
+	}
+	return s.persistDocumentArtifact(ctx, p, c, input, ref, sourceType, sourceID)
+}
+
+func (s *Service) persistUpload(ctx context.Context, p auth.Principal, c Collection, input UploadDocumentInput, ref artifacts.Ref, sourceType, sourceID string) (UploadDocumentOutput, error) {
+	audience := append([]string{p.ActorID}, c.Audience...)
+	if len(input.Audience) > 0 {
+		audience = input.Audience
+	}
+	obj := source.Object{
+		TenantID: p.TenantID, ID: newID("ragdoc"), Kind: sourceType, NativeID: sourceID,
+		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: p.ActorID, Audience: audience,
+	}
+	kind := input.ProvenanceKind
+	if kind == "" {
+		kind = "upload"
+	}
+	prov, _ := json.Marshal(map[string]any{
+		"kind": kind, "input_artifact_ref": input.InputArtifact,
+		"result_job_id": input.ResultJobID, "result_artifact_ref": input.ResultArtifact,
+		"source_uri": strings.TrimSpace(input.SourceURI), "metadata": nonNilMap(input.Metadata),
+	})
+	ver := source.ObjectVersion{
+		ObjectID: obj.ID, ObservedSeq: 1, ArtifactRef: ref.ID, SHA256: ref.SHA256,
+		ByteSize: ref.ByteSize, MimeType: input.MimeType, OriginalFilename: input.FileName,
+		Provenance: string(prov), Restrictions: input.Restrictions,
+	}
+	var excludedIDs []string
+	for {
+		existingID, err := s.repo.CreateUploadIfNew(ctx, c.ID, p.ActorID, obj, ver, excludedIDs)
+		if err != nil {
+			_ = s.artifacts.Delete(context.WithoutCancel(ctx), ref)
+			return UploadDocumentOutput{}, err
+		}
+		if existingID == "" {
+			break
+		}
+		doc, err := s.repo.GetDocument(ctx, p.TenantID, existingID)
+		if err == nil {
+			err = s.authorizeDocumentRead(ctx, p, doc)
+		}
+		if err == nil {
+			_ = s.artifacts.Delete(context.WithoutCancel(ctx), ref)
+			return UploadDocumentOutput{Document: doc, Chunks: []DocumentChunk{}, Deduplicated: true}, nil
+		}
+		if !errors.Is(err, source.ErrDenied) {
+			_ = s.artifacts.Delete(context.WithoutCancel(ctx), ref)
+			return UploadDocumentOutput{}, err
+		}
+		excludedIDs = append(excludedIDs, existingID)
+	}
+	versionID := versionRowID(ver)
+	gen, err := s.repo.NextGeneration(ctx, p.TenantID, c.ID, versionID)
+	if err != nil {
+		return UploadDocumentOutput{}, err
+	}
+	if err := s.enqueueEmbed(ctx, p, c, obj.ID, versionID, ver.ObservedSeq, gen); err != nil {
+		return UploadDocumentOutput{}, err
+	}
+	doc, err := s.repo.GetDocument(ctx, p.TenantID, obj.ID)
+	if err != nil {
+		return UploadDocumentOutput{}, err
+	}
+	return UploadDocumentOutput{Document: doc, Chunks: []DocumentChunk{}}, nil
+}
+
+func (s *Service) persistDocumentArtifact(ctx context.Context, p auth.Principal, c Collection, input UploadDocumentInput, ref artifacts.Ref, sourceType, sourceID string) (UploadDocumentOutput, error) {
+	// Imports and source-identity updates retain their existing versioning path.
 
 	// Audience-mode object: the uploader plus the collection's audience can
 	// read; collection manage rights gate mutation.

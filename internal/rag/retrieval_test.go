@@ -155,10 +155,14 @@ func TestFuseRankedResultsDeterministic(t *testing.T) {
 	if len(first) != 4 || len(second) != 4 {
 		t.Fatalf("fused sizes %d/%d, want all four", len(first), len(second))
 	}
-	// Equal RRF contributions tie-break by list order then rank — the fused
-	// order never depends on map iteration or raw cross-collection scores.
+	// Rank-0 entries win the fused score; equal contributions tie-break on
+	// the stable result identity (collection, version, chunk), never on
+	// list order — the pagination cursor needs a list-independent order.
 	if first[0].DocumentID != "a" || second[0].DocumentID != "b" {
-		t.Fatalf("top rank must follow list order tie-break: %s / %s", first[0].DocumentID, second[0].DocumentID)
+		t.Fatalf("top rank must be a rank-0 entry: %s / %s", first[0].DocumentID, second[0].DocumentID)
+	}
+	if first[1].DocumentID != "c" || first[2].DocumentID != "b" || second[1].DocumentID != "d" || second[2].DocumentID != "a" {
+		t.Fatalf("tied entries must sort by stable identity: %#v / %#v", first, second)
 	}
 	if capped := fuseRankedResults([]rankedSearchList{makeList("a", "b", "c")}, 2); len(capped) != 2 {
 		t.Fatalf("fused set must honor the limit, got %d", len(capped))

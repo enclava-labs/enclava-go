@@ -3,6 +3,7 @@ package httpx
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"enclava-go/internal/auth"
@@ -52,5 +53,37 @@ func TestConnectorSourceSyncSubRoute(t *testing.T) {
 		if got := request(withScope, tc.method, tc.path); got.Code == http.StatusAccepted {
 			t.Fatalf("%s %s must never dispatch a sync", tc.method, tc.path)
 		}
+	}
+}
+
+func TestConnectorSourceValidationAndDisabledSync(t *testing.T) {
+	f := newIdentityFixture(t)
+	sess, csrf := loginUser(t, f, "connector-validation@example.com", []string{"connectors.manage"}, "password")
+	for _, tc := range []struct{ body, field string }{
+		{`{"type":"github","name":"missing repo","config":{"owner":"acme"}}`, "config.repo"},
+		{`{"type":"github","name":"missing owner","config":{"repo":"docs"}}`, "config.owner"},
+		{`{"type":"github","name":"bad ref","config":{"owner":"acme","repo":"docs"},"credential_ref":"GITHUB_TOKEN"}`, "CONNECTOR_GITHUB_"},
+	} {
+		rec := sessionDo(t, f.app, http.MethodPost, "/api/v1/connectors/sources", tc.body, sess, csrf)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), tc.field) {
+			t.Fatalf("invalid source: status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	}
+	rec := sessionDo(t, f.app, http.MethodPost, "/api/v1/connectors/sources", `{"type":"github","name":"paused","config":{"owner":"acme","repo":"docs"},"is_enabled":false}`, sess, csrf)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create paused source: %d %s", rec.Code, rec.Body.String())
+	}
+	created := decodeJSON(t, rec)
+	if created["created_at"] == nil || strings.HasPrefix(created["created_at"].(string), "0001-") || strings.HasPrefix(created["updated_at"].(string), "0001-") {
+		t.Fatalf("invalid timestamps: %v", created)
+	}
+	id := created["id"].(string)
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/connectors/sources/"+id+"/sync", "", sess, csrf)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "disabled") {
+		t.Fatalf("disabled sync: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = sessionDo(t, f.app, http.MethodPut, "/api/v1/connectors/sources/"+id, `{"config":{"owner":"acme"}}`, sess, csrf)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "config.repo") {
+		t.Fatalf("invalid update: %d %s", rec.Code, rec.Body.String())
 	}
 }

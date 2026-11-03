@@ -55,6 +55,43 @@
     wrap.hidden = false;
   });
 
+  // Save guard: an enabled assistant with a "specific members" audience
+  // and nobody picked warns inline instead of silently becoming
+  // unreachable; a new assistant must get a deliberate choice. The
+  // confirmed state rides the form's data attribute, never the DOM warning.
+  function audienceWarn(form, text, allowAnyway) {
+    const note = form.querySelector('[data-audience-warn]');
+    if (!note) return;
+    note.querySelector('[data-audience-warn-text]').textContent = text;
+    const anyway = note.querySelector('[data-audience-save-anyway]');
+    if (anyway) anyway.hidden = !allowAnyway;
+    note.hidden = false;
+  }
+
+  document.addEventListener('click', (e) => {
+    if (!(e.target instanceof Element)) return;
+    const anyway = e.target.closest('[data-audience-save-anyway]');
+    if (!anyway) return;
+    const form = anyway.closest('form');
+    if (!form) return;
+    form.dataset.audienceConfirmed = 'yes';
+    const note = form.querySelector('[data-audience-warn]');
+    if (note) note.hidden = true;
+    saveAssistant(form.querySelector('[data-action="assistants:save"]'));
+  });
+
+  // Editing the audience after a warning re-arms the guard: the choice has
+  // to mean what the save will store.
+  document.addEventListener('change', (e) => {
+    if (!(e.target instanceof Element)) return;
+    if (e.target.name !== 'audience-mode' && e.target.name !== 'audience-member') return;
+    const form = e.target.closest('form');
+    if (!form) return;
+    const note = form.querySelector('[data-audience-warn]');
+    if (note) note.hidden = true;
+    delete form.dataset.audienceConfirmed;
+  });
+
   document.addEventListener('click', (e) => {
     if (!(e.target instanceof Element)) return;
     const trigger = e.target.closest('[data-action^="assistants:"]');
@@ -146,8 +183,17 @@
     }
     const audience = [];
     const mode = form.querySelector('input[name="audience-mode"]:checked');
-    if (mode && mode.value === 'all') audience.push('*');
+    if (!mode) {
+      audienceWarn(form, 'Choose who can use this assistant.', false);
+      return;
+    }
+    if (mode.value === 'all') audience.push('*');
     else audience.push(...checkedValues(form, 'audience-member'));
+    if (field(form, 'is_enabled').checked && mode.value !== 'all' &&
+        audience.length === 0 && form.dataset.audienceConfirmed !== 'yes') {
+      audienceWarn(form, 'Nobody can use this assistant yet', true);
+      return;
+    }
     const body = {
       name: name.value.trim(),
       description: field(form, 'description').value.trim(),
@@ -198,6 +244,61 @@
     }
   }
 
+  // The Coverage drawer's "Fix for <role>" opens the access role editor
+  // inside this page's drawer — access.js never loads on this page, so
+  // this module serializes and submits the role form identically: every
+  // grant section emits its canonical document and sections sharing a
+  // kind (Models + Embedding models → grants.models) merge items.
+  function roleGrantDoc(section) {
+    const all = section.querySelector('[data-grant-all]');
+    if (all && all.checked) return { mode: 'all' };
+    return {
+      mode: 'list',
+      items: Array.from(section.querySelectorAll('[data-grant-item]:checked')).map((i) => i.value),
+    };
+  }
+
+  function mergeGrantDoc(doc, incoming) {
+    if (!doc || incoming.mode === 'all') return incoming;
+    if (doc.mode === 'all') return doc;
+    return { mode: 'list', items: Array.from(new Set(doc.items.concat(incoming.items))) };
+  }
+
+  document.addEventListener('submit', (e) => {
+    const form = e.target;
+    if (!(form instanceof HTMLFormElement) || form.dataset.form !== 'access-role') return;
+    e.preventDefault();
+    const grants = {};
+    form.querySelectorAll('fieldset[data-grant]').forEach((section) => {
+      const kind = section.dataset.grant;
+      grants[kind] = mergeGrantDoc(grants[kind], roleGrantDoc(section));
+    });
+    const body = {
+      name: form.elements.name.value.trim(),
+      scopes: checkedValues(form, 'scope'),
+      grants: grants,
+    };
+    const roleID = form.dataset.roleId;
+    const request = roleID
+      ? E.api('PATCH', '/api/v1/identities/roles/' + encodeURIComponent(roleID), body)
+      : E.api('POST', '/api/v1/identities/roles', body);
+    request.then(() => {
+      E.toast('success', roleID ? 'Role saved' : 'Role created');
+      E.closeDrawer();
+      E.refresh();
+    }).catch(fail);
+  });
+
+  // Toggling a section's All disables its items — the rendered state never
+  // disagrees with the serialized one (mirrors access.js).
+  document.addEventListener('change', (e) => {
+    const input = e.target;
+    if (!(input instanceof HTMLInputElement) || !input.hasAttribute('data-grant-all')) return;
+    const section = input.closest('fieldset[data-grant]');
+    if (!section) return;
+    section.querySelectorAll('[data-grant-item]').forEach((item) => { item.disabled = input.checked; });
+  });
+
   // Deletes ride the shared two-step confirm: the armed trigger fires
   // enclava:confirm and this module performs the API DELETE.
   document.addEventListener('enclava:confirm', async (e) => {
@@ -216,7 +317,15 @@
         E.toast('success', 'Instructions deleted');
         E.closeDrawer();
         E.refresh();
-      } catch (err) { fail(err); }
+      } catch (err) {
+        const message = trigger.closest('.card').querySelector('[data-template-delete-error]');
+        if (err && err.status === 409 && message) {
+          message.textContent = err.message;
+          message.hidden = false;
+        } else {
+          fail(err);
+        }
+      }
     }
   });
 })();

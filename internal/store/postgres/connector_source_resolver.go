@@ -36,7 +36,7 @@ func (r *SourceRepo) ObjectForNativeIDCrossKind(ctx context.Context, tenantID, c
 func (r *SourceRepo) SourceIdentityForNativeID(ctx context.Context, tenantID, connectionID, nativeID string) (source.SourceIdentity, error) {
 	var out source.SourceIdentity
 	var mapped sql.NullString
-	err := r.db.SQL.QueryRowContext(ctx, `SELECT tenant_id::text,id,connection_id,source_user_native_id,mapped_user_id FROM source_identities WHERE tenant_id=$1 AND connection_id=$2 AND source_user_native_id=$3`, tenantID, connectionID, nativeID).Scan(&out.TenantID, &out.ID, &out.ConnectionID, &out.NativeID, &mapped)
+	err := r.db.SQL.QueryRowContext(ctx, `SELECT tenant_id::text,id,connection_id,source_user_native_id,display_name,mapped_user_id FROM source_identities WHERE tenant_id=$1 AND connection_id=$2 AND source_user_native_id=$3`, tenantID, connectionID, nativeID).Scan(&out.TenantID, &out.ID, &out.ConnectionID, &out.NativeID, &out.DisplayName, &mapped)
 	if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
 		return source.SourceIdentity{}, source.ErrDenied
 	}
@@ -53,7 +53,7 @@ func (r *SourceRepo) SourceIdentityForNativeID(ctx context.Context, tenantID, co
 func (r *SourceRepo) ObservedSourceIdentity(ctx context.Context, tenantID, connectionID, nativeID string) (source.SourceIdentity, error) {
 	var out source.SourceIdentity
 	var mapped sql.NullString
-	err := r.db.SQL.QueryRowContext(ctx, `SELECT tenant_id::text,id,connection_id,source_user_native_id,mapped_user_id FROM source_identities WHERE tenant_id=$1 AND connection_id=$2 AND source_user_native_id=$3`, tenantID, connectionID, nativeID).Scan(&out.TenantID, &out.ID, &out.ConnectionID, &out.NativeID, &mapped)
+	err := r.db.SQL.QueryRowContext(ctx, `SELECT tenant_id::text,id,connection_id,source_user_native_id,display_name,mapped_user_id FROM source_identities WHERE tenant_id=$1 AND connection_id=$2 AND source_user_native_id=$3`, tenantID, connectionID, nativeID).Scan(&out.TenantID, &out.ID, &out.ConnectionID, &out.NativeID, &out.DisplayName, &mapped)
 	if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
 		return source.SourceIdentity{}, source.ErrDenied
 	}

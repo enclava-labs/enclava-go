@@ -42,6 +42,8 @@ type Connection struct {
 	SyncedAt           *time.Time
 	SyncStatus         string
 	SyncError          string
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // Object is a canonical source object. Source identity is
@@ -92,6 +94,7 @@ type SourceIdentity struct {
 	SourceKind   string
 	ID           string
 	NativeID     string
+	DisplayName  string // provider login/display name, when the adapter reports one
 	MappedUserID string
 }
 

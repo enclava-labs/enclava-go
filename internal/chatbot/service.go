@@ -172,6 +172,138 @@ func chatbotOwnerAllowed(p auth.Principal, bot Instance) bool {
 	return auth.HasScope(p, "platform.admin") || bot.OwnerActorID != "" && bot.OwnerActorID == actorKey(p)
 }
 
+// --- role access coverage (UX-A01/A02) --------------------------------------
+//
+// RoleAccessCoverage reports, for one stored role, whether its members can
+// reach bot through the same resolution chatbotAllowed (audience ∩
+// assistant grant) plus the dispatch-time terms (chat model grant, a
+// granted endpoint that can serve the model, and every attached
+// collection's embedding model grant — embeddings run under AllowedModels).
+// It never mutates: the dashboard renders the checks and pre-selects
+// Missing items as suggested fixes; the role API still validates saves.
+
+const (
+	AccessAudience  = "audience"
+	AccessAssistant = "assistants"
+	AccessModel     = "models"
+	AccessEndpoint  = "endpoints"
+	AccessEmbedding = "embedding_models" // covered by the models allowlist
+)
+
+// AccessCheck is one coverage term. Missing carries the exact grant items a
+// fix would add (endpoint fixes grant the first endpoint the route would
+// pick); Note explains a failure no grant can repair.
+type AccessCheck struct {
+	Kind    string
+	Label   string
+	OK      bool
+	Missing []string
+	Note    string
+}
+
+// grantCovered mirrors auth allowlist resolution for a stored role grant:
+// mode:"all" or a "*" item means unrestricted, an empty list denies, and any
+// matching id covers. (The "*" arm keeps legacy stored lists truthful until
+// the mode-row cutover reaches them.)
+func grantCovered(g auth.Allowlist, ids ...string) bool {
+	if g.All {
+		return true
+	}
+	for _, id := range ids {
+		for _, item := range g.Items {
+			if item == "*" || item == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// RoleAccessCoverage computes bot's coverage for a role. roleMembers are
+// the role's user IDs (audience needs one named actor); servingEndpoints
+// are the enabled endpoints able to serve bot.Model (pinned: just the
+// pinned row when it qualifies); embedModels are the distinct embedding
+// models of bot's attached collections.
+func RoleAccessCoverage(bot Instance, grants auth.ResourceGrants, roleMembers, servingEndpoints, embedModels []string) []AccessCheck {
+	checks := make([]AccessCheck, 0, 5)
+	inAudience := contains(bot.Audience, "*")
+	if !inAudience {
+		for _, m := range roleMembers {
+			if contains(bot.Audience, m) {
+				inAudience = true
+				break
+			}
+		}
+	}
+	checks = append(checks, AccessCheck{
+		Kind: AccessAudience, Label: "Audience", OK: inAudience,
+	})
+	assistant := AccessCheck{Kind: AccessAssistant, Label: "Assistant grant", OK: grantCovered(grants.Assistants, bot.ID, bot.ExternalID)}
+	if !assistant.OK {
+		assistant.Missing = []string{bot.ID}
+	}
+	checks = append(checks, assistant)
+	model := AccessCheck{Kind: AccessModel, Label: "Chat model", OK: grantCovered(grants.Models, bot.Model)}
+	if !model.OK {
+		model.Missing = []string{bot.Model}
+	}
+	checks = append(checks, model)
+	endpoint := AccessCheck{Kind: AccessEndpoint, Label: "Endpoint"}
+	if pinned := strings.TrimSpace(bot.ProviderID); pinned != "" {
+		if !contains(servingEndpoints, pinned) {
+			endpoint.Note = "The pinned endpoint can't serve this model — check the assistant's endpoint, not the role."
+		} else if grantCovered(grants.Endpoints, pinned) {
+			endpoint.OK = true
+		} else {
+			endpoint.Missing = []string{pinned}
+		}
+	} else {
+		switch len(servingEndpoints) {
+		case 0:
+			endpoint.Note = "No enabled endpoint can serve this model — check the assistant's model, not the role."
+		default:
+			if grantCovered(grants.Endpoints, servingEndpoints...) {
+				endpoint.OK = true
+			} else {
+				endpoint.Missing = []string{servingEndpoints[0]}
+			}
+		}
+	}
+	checks = append(checks, endpoint)
+	var embedMissing []string
+	for _, m := range embedModels {
+		if !grantCovered(grants.Models, m) {
+			embedMissing = append(embedMissing, m)
+		}
+	}
+	if len(embedModels) > 0 {
+		checks = append(checks, AccessCheck{
+			Kind: AccessEmbedding, Label: "Embedding model", OK: len(embedMissing) == 0, Missing: embedMissing,
+		})
+	}
+	return checks
+}
+
+// AccessCoverageStatus folds the checks into the three dashboard states:
+// "no_audience" when no role member is in the audience, "not_granted" when
+// any grant term fails, "reachable" otherwise.
+func AccessCoverageStatus(checks []AccessCheck) string {
+	notGranted := false
+	for _, c := range checks {
+		if c.OK {
+			continue
+		}
+		if c.Kind == AccessAudience {
+			return "no_audience"
+		}
+		notGranted = true
+	}
+	if notGranted {
+		return "not_granted"
+	}
+	return "reachable"
+}
+
 func (s *Service) ownerPrincipal(ctx context.Context, p auth.Principal, bot Instance) (auth.Principal, error) {
 	if auth.HasScope(p, "platform.admin") || actorKey(p) == bot.OwnerActorID {
 		return p, nil

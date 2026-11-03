@@ -189,6 +189,10 @@ func (r *Runner) execute(ctx context.Context, claim *Claim) {
 
 	resultRef, err := handler(jobCtx, claim, open)
 	if errors.Is(jobCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			r.translate(ctx, claim, resultRef, err)
+			return
+		}
 		err = context.DeadlineExceeded
 		if wanted, checkErr := claim.CancelRequested(context.WithoutCancel(ctx)); checkErr == nil && wanted {
 			r.translate(ctx, claim, resultRef, err)
@@ -226,7 +230,7 @@ func (r *Runner) translate(ctx context.Context, claim *Claim, resultRef string, 
 			return
 		}
 		if claim.Dispatched() {
-			_ = claim.MarkUnknown(ctx, "worker context cancelled after dispatch")
+			_ = claim.MarkUnknown(ctx, "interrupted after the request was sent; usage may have been billed")
 			return
 		}
 		_ = claim.Release(ctx)

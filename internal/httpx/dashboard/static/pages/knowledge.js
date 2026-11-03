@@ -213,6 +213,20 @@
       if (input) { e.preventDefault(); input.click(); }
       return;
     }
+    // Search tab mode chips carry only data-mode (never a data-action
+    // ancestor) — they must switch the hidden mode input BEFORE the
+    // action dispatch below returns early (KC-I02). The search module is
+    // not loaded on this page, so the toggle lives here.
+    var chip = e.target.closest('.chip[data-mode]');
+    if (chip && document.getElementById('knowledgeSearchMode')) {
+      var modeInput = document.getElementById('knowledgeSearchMode');
+      modeInput.value = chip.dataset.mode;
+      chip.parentElement.querySelectorAll('.chip[data-mode]').forEach(function (c) {
+        c.classList.toggle('active', c === chip);
+        c.setAttribute('aria-pressed', c === chip ? 'true' : 'false');
+      });
+      return;
+    }
     var trigger = e.target.closest('[data-action]');
     if (!trigger) return;
     switch (trigger.dataset.action) {
@@ -225,16 +239,12 @@
       case 'knowledge:filter':
         break; // chips are plain links — this hook exists for future grouping
     }
-    // Search tab mode chips: toggle like search.js does (the search module
-    // is not loaded on this page).
-    var chip = e.target.closest('.chip[data-mode]');
-    if (chip && document.getElementById('knowledgeSearchMode')) {
-      var input = document.getElementById('knowledgeSearchMode');
-      input.value = chip.dataset.mode;
-      chip.parentElement.querySelectorAll('.chip[data-mode]').forEach(function (c) {
-        c.classList.toggle('active', c === chip);
-        c.setAttribute('aria-pressed', c === chip ? 'true' : 'false');
-      });
+  });
+
+  document.addEventListener('htmx:afterRequest', function (e) {
+    var elt = e.detail && e.detail.elt;
+    if (elt && elt.hasAttribute && elt.hasAttribute('data-search-more') && e.detail.successful) {
+      elt.closest('#searchMoreRow').remove();
     }
   });
 

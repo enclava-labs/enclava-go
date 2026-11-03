@@ -1,8 +1,9 @@
-{{define "content"}}{{/* Account (OA-30, source §6.13): profile, change
-     password, own sessions, linked sign-ins. The one session-only page —
-     every signed-in role; no access.manage-only content anywhere. Writes are
-     the page module's fetches to /api/v1/identities (D-17); the sessions
-     fragment re-renders through the shared refresh event. */}}
+{{define "content"}}{{/* Account (OA-30, source §6.13): profile, the
+     developer card (P-12/UX-M03 — API base URL, own keys, request access),
+     change password, own sessions, linked sign-ins. The one session-only
+     page — every signed-in role; no access.manage-only content anywhere.
+     Writes are the page module's fetches (D-17); the sessions fragment
+     re-renders through the shared refresh event. */}}
 <header class="head">
   <div class="headcopy">
     <div class="crumb">{{.Org}} / Account</div>
@@ -26,6 +27,59 @@
 {{else}}    <p class="muted">No roles assigned.</p>
 {{end}}  </div>
 </div>
+
+{{if .Data.Dev.Visible}}
+<div class="section" id="account-dev">
+  <div class="section-head"><h2>Developer</h2></div>
+  <div class="card">
+{{if .Can.API}}
+    <span class="label">Base URL</span>
+    <div class="row"><code class="dev-base-url">{{.Data.Dev.BaseURL}}</code><button type="button" class="btn" data-action="copy" data-copy="{{.Data.Dev.BaseURL}}">{{icon "copy"}}Copy</button></div>
+    <span class="label">Authorization</span>
+    <p class="muted">Send <code>Authorization: Bearer enc_…</code> — a personal access token issued for you.</p>
+    <span class="label">Endpoints</span>
+    <ul class="dev-endpoints">
+      <li><code>POST /v1/chat/completions</code></li>
+      <li><code>POST /v1/embeddings</code></li>
+      <li><code>GET /v1/models</code></li>
+      <li><code>POST /api/v1/rag/search</code></li>
+    </ul>
+    <div class="row"><a class="btn" href="/dashboard/api">{{icon "external"}}API reference</a></div>
+{{end}}
+{{if .Data.Dev.Keys}}
+    <span class="label">Your keys</span>
+    <div class="tablewrap" role="region" tabindex="0" aria-label="Your API keys">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Key</th>
+            <th scope="col">Last used</th>
+            <th scope="col">Tokens</th>
+          </tr>
+        </thead>
+        <tbody>
+{{range .Data.Dev.Keys}}          <tr>
+            <td data-label="Key"><b>{{if .Name}}{{.Name}}{{else}}API key{{end}}</b><span class="subline">{{.KeyPrefix}}…</span></td>
+            <td data-label="Last used">{{if .LastUsedAt}}{{relTime .LastUsedAt}}{{else}}—{{end}}</td>
+            <td data-label="Tokens">{{count .TotalTokens}}<span class="subline">{{count .InputTokens}} in · {{count .OutputTokens}} out</span></td>
+          </tr>
+{{end}}        </tbody>
+      </table>
+    </div>
+{{else if .Data.Dev.KeysErr}}    <p class="muted">Could not load your keys.</p>
+{{end}}
+{{if .Data.Dev.CanManageKeys}}    <div class="row"><a class="btn" href="/dashboard/access/api-keys?new=1">{{icon "key"}}Manage API keys</a></div>
+{{else}}    <p class="muted">API keys and spend are managed by an administrator.</p>
+{{if .Data.Dev.RequestPending}}    <p class="muted">Your request is waiting for an administrator{{if .Data.Dev.RequestedAt}} · asked {{relTime .Data.Dev.RequestedAt}}{{end}}.</p>
+{{else}}    <form id="account-api-access-form" autocomplete="off" novalidate>
+      <label class="label" for="account-api-access-note">What are you building? <span class="muted">(optional)</span></label>
+      <input class="field" type="text" id="account-api-access-note" name="note" maxlength="500" autocomplete="off">
+      <div class="row"><button class="btn primary" type="submit">{{icon "key"}}Request API access</button></div>
+    </form>
+{{end}}
+{{end}}  </div>
+</div>
+{{end}}
 
 <div class="section" id="account-password">
   <div class="section-head"><h2>Change password</h2></div>

@@ -43,5 +43,11 @@ to `{}` for compatibility with older exports.
 
 Connector sources imported with `config.sync_interval_seconds` can participate
 in scheduled sync when the process is started with `CONNECTOR_SYNC_INTERVAL`
-greater than zero. Source credentials should be represented as `credential_ref`
-values that point to environment variables available to the Go process.
+greater than zero. Connector `credential_ref` values name operator-approved
+`SECRET_BINDINGS`, not environment variables directly. Set `SECRET_BINDINGS`
+to semicolon-separated `ref_id|tenant_id|purpose|origins|env_name` entries;
+origins are comma-separated approved origins and `env_name` supplies the secret.
+GitHub connector references must be named `CONNECTOR_GITHUB_*` (uppercase
+letters, digits and underscores), with purpose `connector` and the exact API
+origin, for example
+`CONNECTOR_GITHUB_DOCS|TENANT_ID|connector|https://api.github.com|GITHUB_TOKEN`.

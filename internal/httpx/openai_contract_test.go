@@ -637,3 +637,14 @@ func TestChatCompletionCurrencyMismatchIs409(t *testing.T) {
 		t.Fatal("unpriceable request dispatched")
 	}
 }
+
+func TestStreamProtocolErrorIsSanitized(t *testing.T) {
+	rec := httptest.NewRecorder()
+	(&App{}).writeInferenceError(rec, &llm.StreamProtocolError{Body: []byte(`{"error":{"message":"secret upstream body"}}`)})
+	if rec.Code != http.StatusBadGateway || strings.Contains(rec.Body.String(), "secret upstream body") {
+		t.Fatalf("response %d: %s", rec.Code, rec.Body.String())
+	}
+	if env := decodeErr(t, rec); env.Error.Code != "upstream_protocol_error" {
+		t.Fatalf("error code = %q", env.Error.Code)
+	}
+}

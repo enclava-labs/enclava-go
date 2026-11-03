@@ -437,6 +437,8 @@ type usageBudgetRow struct {
 	Timezone         string
 	Status           string // scheduled|active|ended|inactive
 	LimitDisplay     string
+	LimitRaw         string // stored integer limit — the tooltip behind LimitDisplay
+	PeriodSuffix     string // "/ day" | "/ week" | "/ month" | ""
 	CountedDisplay   string
 	Unlimited        bool
 	Pct              int
@@ -444,6 +446,20 @@ type usageBudgetRow struct {
 	LiabilitySummary string
 	StartsAt         time.Time
 	EndsAt           *time.Time
+}
+
+// budgetPeriodSuffix renders the limit's recurrence in plain words after the
+// human amount ("$10.00 / month"); unknown periods carry no suffix.
+func budgetPeriodSuffix(period string) string {
+	switch period {
+	case billing.PeriodDaily:
+		return " / day"
+	case billing.PeriodWeekly:
+		return " / week"
+	case billing.PeriodMonthly:
+		return " / month"
+	}
+	return ""
 }
 
 // usageBudgetTone maps counted/limit to the threshold tones at exactly the
@@ -545,14 +561,16 @@ func (a *App) usageBudgetRows(ctx context.Context, tenantID string) ([]usageBudg
 			SubjectType: b.Subject.Type, SubjectID: b.Subject.ID,
 			SubjectLabel: subjectLabel(labels, b.Subject),
 			Kind:         b.Kind, Period: b.Period,
-			Timezone: budgetTimezoneName(b.Timezone),
-			Status:   budgetStatus(b, rb.Active, now),
-			StartsAt: b.StartsAt, EndsAt: b.EndsAt,
+			Timezone:     budgetTimezoneName(b.Timezone),
+			Status:       budgetStatus(b, rb.Active, now),
+			PeriodSuffix: budgetPeriodSuffix(b.Period),
+			StartsAt:     b.StartsAt, EndsAt: b.EndsAt,
 		}
 		if progress.LimitValue <= 0 {
 			row.Unlimited = true
 		} else {
 			row.LimitDisplay = usageValueDisplay(progress.LimitValue, progress.Currency, progress.Kind)
+			row.LimitRaw = strconv.FormatInt(progress.LimitValue, 10)
 			row.CountedDisplay = usageValueDisplay(progress.Counted, progress.Currency, progress.Kind)
 			row.Pct = usageBudgetPct(progress.Counted, progress.LimitValue)
 			row.Tone = usageBudgetTone(progress.Counted, progress.LimitValue)
@@ -616,13 +634,46 @@ type usageBudgetDrawer struct {
 	Kind                                 string
 	KindLabel                            string
 	PeriodLabel                          string
-	LimitValue                           string
+	LimitValue                           string // amount budgets: decimal currency ("10.00"); tokens: integer units
+	LimitRaw                             string
+	Currency                             string
+	Symbol                               string // the currency's display symbol for the amount field prefix
 	Keys                                 []usageSubjectOption
 	Users                                []usageSubjectOption
 	Services                             []usageSubjectOption
 	KeysEmpty, UsersEmpty, ServicesEmpty dashboardEmpty
 	OrgName                              string
 	Today                                string
+}
+
+// microsDecimal renders stored micros as the decimal amount the drawer
+// field accepts — exact, so the edit prefill never rounds the stored limit.
+func microsDecimal(micros int64) string {
+	neg := micros < 0
+	if neg {
+		micros = -micros
+	}
+	s := strconv.FormatInt(micros, 10)
+	if len(s) <= 6 {
+		s = strings.Repeat("0", 6-len(s)+1) + s
+	}
+	out := s[:len(s)-6] + "." + strings.TrimRight(s[len(s)-6:], "0")
+	if strings.HasSuffix(out, ".") {
+		out += "00"
+	}
+	if neg {
+		out = "-" + out
+	}
+	return out
+}
+
+// moneySymbol is the display prefix for the amount field — the same set
+// money() uses; an unlisted currency falls back to its code.
+func moneySymbol(currency string) string {
+	if sym, ok := dashboardMoneySymbols[currency]; ok {
+		return sym
+	}
+	return currency
 }
 
 func (a *App) handleDashboardUsageBudgetDrawer(w http.ResponseWriter, r *http.Request) {
@@ -707,7 +758,14 @@ func (a *App) usageBudgetDrawerData(ctx context.Context, tenantID, budgetID stri
 	drawer.Kind = b.Kind
 	drawer.KindLabel = budgetKindLabel(b.Kind)
 	drawer.PeriodLabel = b.Period
-	drawer.LimitValue = strconv.FormatInt(b.LimitAmountMicros, 10)
+	drawer.LimitRaw = strconv.FormatInt(b.LimitAmountMicros, 10)
+	drawer.Currency = b.Currency
+	drawer.Symbol = moneySymbol(b.Currency)
+	if b.Kind == billing.BudgetKindTokens {
+		drawer.LimitValue = strconv.FormatInt(b.LimitAmountMicros, 10)
+	} else {
+		drawer.LimitValue = microsDecimal(b.LimitAmountMicros)
+	}
 	return drawer, nil
 }
 

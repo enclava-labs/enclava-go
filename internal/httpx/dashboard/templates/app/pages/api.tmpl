@@ -1,0 +1,71 @@
+{{define "content"}}{{/* API reference (P-12/UX-M03): the in-app, curated
+     mirror of docs/api.md's calling surface — auth shape, the headline
+     endpoints and one real request/response per family. Visible only to
+     principals holding an API-calling scope (cap api); the page is read-only
+     and mints nothing. */}}
+<header class="head">
+  <div class="headcopy">
+    <div class="crumb">{{.Org}} / API reference</div>
+    <h1>API reference</h1>
+    <p class="desc">Everything the dashboard does is available as JSON — these are the endpoints most integrations start from.</p>
+  </div>
+</header>
+
+<div class="section" id="api-auth">
+  <div class="section-head"><h2>Authentication</h2></div>
+  <div class="card">
+    <span class="label">Base URL</span>
+    <div class="row"><code class="dev-base-url">{{.Data.BaseURL}}</code><button type="button" class="btn" data-action="copy" data-copy="{{.Data.BaseURL}}">{{icon "copy"}}Copy</button></div>
+    <p>Send every request with an API key in the Authorization header:</p>
+    <pre class="code"><code>Authorization: Bearer enc_…</code></pre>
+    <p class="muted">Keys are issued by an administrator under Access → API keys and carry scopes — a key can call only the endpoints its scopes allow, plus optional model, endpoint, IP and expiry restrictions.</p>
+  </div>
+</div>
+
+<div class="section" id="api-chat">
+  <div class="section-head"><h2>Chat completions</h2><span class="muted">scope <code>chat.completions</code></span></div>
+  <div class="card">
+    <p class="muted">OpenAI-compatible chat against a tenant model alias.</p>
+    <pre class="code"><code>curl {{.Data.BaseURL}}/v1/chat/completions \
+  -H "authorization: Bearer enc_…" -H "content-type: application/json" \
+  -d '{"model":"&lt;model&gt;","messages":[{"role":"user","content":"hi"}]}'</code></pre>
+    <pre class="code"><code>{"id":"chatcmpl_…","choices":[{"message":{"role":"assistant","content":"…"},"finish_reason":"stop"}],
+ "usage":{"prompt_tokens":4,"completion_tokens":9,"total_tokens":13}}</code></pre>
+    <p class="muted"><code>GET /v1/models</code> (scope <code>models.list</code>) lists the model aliases your key may call.</p>
+    <pre class="code"><code>curl {{.Data.BaseURL}}/v1/models -H "authorization: Bearer enc_…"</code></pre>
+    <pre class="code"><code>{"object":"list","data":[{"id":"model-alias","object":"model"}]}</code></pre>
+  </div>
+</div>
+
+<div class="section" id="api-embeddings">
+  <div class="section-head"><h2>Embeddings</h2><span class="muted">scope <code>embeddings.create</code></span></div>
+  <div class="card">
+    <p class="muted">OpenAI-compatible embeddings for indexing and search pipelines.</p>
+    <pre class="code"><code>curl {{.Data.BaseURL}}/v1/embeddings \
+  -H "authorization: Bearer enc_…" -H "content-type: application/json" \
+  -d '{"model":"&lt;embedding-model&gt;","input":"text to embed"}'</code></pre>
+    <pre class="code"><code>{"object":"list","data":[{"index":0,"embedding":[0.01,…]}],
+ "usage":{"prompt_tokens":3,"total_tokens":3}}</code></pre>
+  </div>
+</div>
+
+<div class="section" id="api-search">
+  <div class="section-head"><h2>Knowledge search</h2><span class="muted">scope <code>rag</code></span></div>
+  <div class="card">
+    <p class="muted">Search the collections your identity can read — results carry evidence references back to the source documents.</p>
+    <pre class="code"><code>curl {{.Data.BaseURL}}/api/v1/rag/search \
+  -H "authorization: Bearer enc_…" -H "content-type: application/json" \
+  -d '{"collection_ids":["&lt;collection&gt;"],"query":"invoice total","limit":5}'</code></pre>
+    <pre class="code"><code>{"results":[{"content":"…","score":0.82,"document_id":"doc_…"}]}</code></pre>
+    <p class="muted">Omitting <code>collection_ids</code> searches every readable collection; more than 20 returns <code>search_scope_too_large</code>.</p>
+  </div>
+</div>
+
+<div class="section" id="api-errors">
+  <div class="section-head"><h2>Errors</h2></div>
+  <div class="card">
+    <p>Failures return an OpenAI-style envelope — <code>{"error":{"message","type","code"}}</code>. A missing scope is one indistinguishable 403; a budget refusal is <code>budget_exceeded</code>; a model with missing prices is 422 <code>price_missing</code>.</p>
+    <p class="muted">Responses (<code>POST /v1/responses</code>, scope <code>responses</code>), extraction (<code>/api/v1/extract/*</code>, scope <code>extract</code>) and the admin surface (<code>/api/v1/admin/*</code>, scope <code>platform.admin</code>) follow the same shape.</p>
+  </div>
+</div>
+{{end}}

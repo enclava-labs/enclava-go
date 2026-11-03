@@ -26,6 +26,7 @@ const (
 	capModelsManage     dashboardCap = "models.manage"
 	capAccessManage     dashboardCap = "access.manage"
 	capBillingView      dashboardCap = "billing.view"
+	capAPI              dashboardCap = "api"
 )
 
 // dashboardCaps is the per-request capability set the nav model, page
@@ -42,6 +43,10 @@ type dashboardCaps struct {
 	ModelsManage     bool
 	AccessManage     bool
 	BillingView      bool
+	// API is the developer surface (developer card, API reference): granted
+	// when the principal holds any scope that calls the platform API —
+	// platform.admin alone grants none of them.
+	API bool
 }
 
 // grants resolves a capability name to its flag — the single cap→bool table
@@ -70,6 +75,8 @@ func (c dashboardCaps) grants(cap dashboardCap) bool {
 		return c.AccessManage
 	case capBillingView:
 		return c.BillingView
+	case capAPI:
+		return c.API
 	}
 	return false
 }
@@ -90,7 +97,25 @@ func dashboardCapabilities(p auth.Principal) dashboardCaps {
 		ModelsManage:     auth.HasScope(p, "pricing.manage"),
 		AccessManage:     auth.HasScope(p, auth.ScopePlatformAdmin),
 		BillingView:      auth.HasScope(p, auth.ScopePlatformAdmin),
+		API:              principalHasAPIScope(p),
 	}
+}
+
+// apiCallerScopes are the stored scopes that authorize calling the platform
+// API — the developer surface shows only to principals holding at least one.
+var apiCallerScopes = []string{
+	"models.list", "chat.completions", "embeddings.create", "responses",
+	"openai.proxy", "extract", "extract.manage", "rag", "rag.manage",
+	"chatbot", "chatbot.manage", "connectors.manage", "pricing.manage", "mcp.use",
+}
+
+func principalHasAPIScope(p auth.Principal) bool {
+	for _, s := range apiCallerScopes {
+		if auth.HasScope(p, s) {
+			return true
+		}
+	}
+	return false
 }
 
 type capsContextKey struct{}

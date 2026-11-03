@@ -292,6 +292,75 @@ func TestProcessPersistsInputArtifactAndJobRow(t *testing.T) {
 	}
 	_ = rc.Close()
 }
+
+// TestRetryInterruptedJobCreatesFreshJob drives the explicit user retry: an
+// interrupted (dispatched-then-unknown) extraction job enqueues a NEW job
+// reusing the same input artifact — never an auto-replay of the old row.
+func TestRetryInterruptedJobCreatesFreshJob(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedEndpoint(t, "priced-extract")
+	f.putPrice(t, "priced-extract", billing.UnitInput, 1000)
+	f.putPrice(t, "priced-extract", billing.UnitOutput, 1000)
+	f.seedTemplate(t, extract.Template{
+		ID: "invoice", Name: "Invoice", SystemPrompt: "s", UserPrompt: "u",
+		DefaultModel: "priced-extract", Enabled: true,
+	})
+
+	out, err := f.svc.Process(ctx, f.principal, extract.ProcessInput{
+		TemplateID: "invoice", FileName: "invoice.txt", MimeType: "text/plain",
+		Bytes: []byte("invoice text"),
+	})
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	claim := f.leaseClaim(t)
+	if claim.JobID != out.JobID {
+		t.Fatalf("leased %s, want %s", claim.JobID, out.JobID)
+	}
+	if err := claim.MarkDispatched(ctx); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if err := claim.MarkUnknown(ctx, "interrupted after the request was sent; usage may have been billed"); err != nil {
+		t.Fatalf("mark unknown: %v", err)
+	}
+
+	// Detail exposes the outcome reason and billing hold for the retry warning.
+	detail, err := f.svc.GetJob(ctx, f.principal, out.JobID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if detail.Job.OutcomeReason != jobs.ReasonInterrupted {
+		t.Fatalf("outcome reason = %q, want %q", detail.Job.OutcomeReason, jobs.ReasonInterrupted)
+	}
+
+	view, err := f.svc.RetryInterruptedJob(ctx, f.principal, out.JobID)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if view.JobID == out.JobID || view.Status != jobs.StatusQueued {
+		t.Fatalf("retry must enqueue a fresh queued job, got %+v", view)
+	}
+
+	// The retried job is real work: it leases and completes end-to-end.
+	retryClaim := f.leaseClaim(t)
+	if retryClaim.JobID != view.JobID {
+		t.Fatalf("leased %s, want retried %s", retryClaim.JobID, view.JobID)
+	}
+	resultRef, err := f.svc.JobHandler()(ctx, retryClaim, inputOpener(f, retryClaim))
+	if err != nil {
+		t.Fatalf("run retried job: %v", err)
+	}
+	if _, err := retryClaim.Complete(ctx, resultRef); err != nil {
+		t.Fatalf("complete retried job: %v", err)
+	}
+
+	// Retry is status-gated: a completed job is not retriable.
+	if _, err := f.svc.RetryInterruptedJob(ctx, f.principal, view.JobID); !errors.Is(err, extract.ErrNotFound) {
+		t.Fatalf("retry of succeeded job = %v, want ErrNotFound", err)
+	}
+}
+
 func TestProcessIdempotencyReplaysAndRejectsChangedInput(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()

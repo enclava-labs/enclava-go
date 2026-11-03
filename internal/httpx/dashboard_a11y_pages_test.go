@@ -684,11 +684,11 @@ func TestA11yAdminPages(t *testing.T) {
 	pricing := modelsData{
 		Tab: "pricing",
 		Rows: []modelsPriceRow{{
-			EndpointID: "ep1", Model: "gpt-4o", Capability: "chat",
+			EndpointID: "ep1", Model: "gpt-4o", Capability: "chat", Basis: "model", SubjectID: "gpt-4o", Unpriced: true,
 			Cells: []modelsPriceCell{
-				{Unit: "input", UnitLabel: "Input", Required: true, Priced: true, RateMicros: 500000, UnitQuantity: 1000000, Currency: "USD", Basis: "endpoint"},
+				{Unit: "input", UnitLabel: "Input", Required: true, Priced: true, RateMicros: 500000, UnitQuantity: 1000000, Currency: "USD"},
 				{Unit: "cached_input", UnitLabel: "Cached input", Required: true, Priced: false},
-				{Unit: "output", UnitLabel: "Output", Required: true, Priced: true, RateMicros: 1500000, UnitQuantity: 1000000, Currency: "USD", Basis: "model"},
+				{Unit: "output", UnitLabel: "Output", Required: true, Priced: true, RateMicros: 1500000, UnitQuantity: 1000000, Currency: "USD"},
 			},
 		}},
 		Empty: dashboardEmpty{Icon: "models", Text: "No priced models."},

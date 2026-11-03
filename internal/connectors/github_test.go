@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -148,5 +149,61 @@ func TestGitHubTruncatedTreeFetchesSubtrees(t *testing.T) {
 func TestGitHubRejectsMissingRepository(t *testing.T) {
 	if _, err := NewGitHubAdapter(source.Connection{Config: map[string]any{}}, nil); err == nil {
 		t.Fatal("expected configuration error")
+	}
+}
+
+func TestGitHubDiscussionPagesBoundedWithoutLosingComments(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/acme/docs/issues", func(w http.ResponseWriter, r *http.Request) {
+		rows := []any{}
+		if r.URL.Query().Get("page") == "1" {
+			for i := 1; i <= 100; i++ {
+				rows = append(rows, map[string]any{"id": i, "number": i, "title": fmt.Sprint(i)})
+			}
+		}
+		_ = json.NewEncoder(w).Encode(rows)
+	})
+	mux.HandleFunc("/repos/acme/docs/issues/", func(w http.ResponseWriter, r *http.Request) {
+		var n int
+		_, _ = fmt.Sscanf(r.URL.Path, "/repos/acme/docs/issues/%d/comments", &n)
+		rows := []any{}
+		if n == 1 && r.URL.Query().Get("page") == "1" {
+			for i := range 100 {
+				rows = append(rows, map[string]any{"id": 10000 + i, "body": "comment"})
+			}
+		} else if n == 1 && r.URL.Query().Get("page") == "2" {
+			rows = append(rows, map[string]any{"id": 10100, "body": "comment"})
+		} else if n != 1 && r.URL.Query().Get("page") == "1" {
+			rows = append(rows, map[string]any{"id": 1000 + n, "body": "comment"})
+		}
+		_ = json.NewEncoder(w).Encode(rows)
+	})
+	mux.HandleFunc("/repos/acme/docs/pulls", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]any{})
+	})
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+	g := &GitHubAdapter{owner: "acme", repo: "docs", base: srv.URL, client: srv.Client()}
+	conn := source.Connection{ID: "conn"}
+	cursor := Cursor(`{"phase":"issues","page":1}`)
+	seen := map[string]bool{}
+	for cursor != "" {
+		page, err := g.Content(context.Background(), conn, cursor, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Items) > 100 {
+			t.Fatalf("page has %d items", len(page.Items))
+		}
+		for _, item := range page.Items {
+			if seen[item.NativeID] {
+				t.Fatalf("duplicate %s", item.NativeID)
+			}
+			seen[item.NativeID] = true
+		}
+		cursor = page.NextCursor
+	}
+	if len(seen) != 300 {
+		t.Fatalf("got %d items, want 300", len(seen))
 	}
 }

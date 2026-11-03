@@ -135,8 +135,15 @@
 
   // pushState only for user-initiated, successful requests.
   document.addEventListener('htmx:afterRequest', (e) => {
+    const elt = e.detail && e.detail.elt;
+    // The "More results" page appended its next-page control inside
+    // #searchResultRows already; the clicked control is spent either way.
+    if (elt && elt.hasAttribute && elt.hasAttribute('data-search-more')) {
+      if (e.detail.successful) elt.closest('#searchMoreRow').remove();
+      return;
+    }
     const f = form();
-    if (!f || !e.detail || e.detail.elt !== f) return;
+    if (!f || elt !== f) return;
     if (restoring) { restoring = false; return; }
     if (!e.detail.successful) return;
     const url = stateURL();

@@ -40,6 +40,10 @@ type AttentionItem struct {
 	// Live marks a row whose underlying work is still non-terminal (a
 	// syncing source); the attention fragment polls while any hold.
 	Live bool `json:"-"`
+	// DismissURL, when set, renders a Dismiss button whose click POSTs the
+	// URL through the shared data-action="dismiss" dispatch (CSRF-covered)
+	// and refreshes the fragment — for advisory rows that need no fix page.
+	DismissURL string `json:"-"`
 }
 
 const (
@@ -61,7 +65,38 @@ func (a *App) dashboardAttention(ctx context.Context, p auth.Principal, caps das
 	a.attentionToolSchemas(ctx, p, caps, &items)
 	a.attentionOwnFailedExtractions(ctx, p, caps, &items)
 	a.attentionOwnFailedRuns(ctx, p, caps, &items)
+	a.attentionAPIAccessRequests(ctx, p, caps, &items)
 	return items, nil
+}
+
+// attentionAPIAccessRequests: access.manage → open "Request API access"
+// submissions. The row links straight to the key-minting drawer on Access
+// and carries a dismiss action that closes the request without granting
+// anything.
+func (a *App) attentionAPIAccessRequests(ctx context.Context, p auth.Principal, caps dashboardCaps, items *[]AttentionItem) {
+	if !caps.AccessManage || a.identity == nil {
+		return
+	}
+	requests, err := a.identity.ListOpenAPIAccessRequests(ctx, p.TenantID)
+	if err != nil {
+		log.Printf("dashboard attention: api access requests: %v", err)
+		return
+	}
+	for _, req := range requests {
+		item := AttentionItem{
+			Kind:       "api_access_request",
+			Severity:   "info",
+			Text:       fmt.Sprintf("%s requested API access", req.UserName),
+			FixText:    "API keys and scopes stay administrator-managed.",
+			FixLabel:   "Create a key",
+			FixHref:    "/dashboard/access/api-keys?new=1",
+			DismissURL: "/dashboard/access-requests/" + req.ID + "/dismiss",
+		}
+		if req.Note != "" {
+			item.FixText = "Note: " + truncateAttention(req.Note, 140)
+		}
+		*items = append(*items, item)
+	}
 }
 
 // attentionFailedDocuments: knowledge.manage → the source-authorized service

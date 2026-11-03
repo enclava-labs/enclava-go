@@ -22,12 +22,13 @@
           <tr data-job-id="{{.ID}}"{{if eq $.Data.Highlight .ID}} class="job-highlight"{{end}}>
             <td data-label="File"><b>{{.FileName}}</b><span class="subline">{{.FileMimeType}}</span></td>
             <td data-label="Template">{{.TemplateID}}</td>
-            <td data-label="Status">{{if or (eq .Status "queued") (eq .Status "running")}}<span class="pulse" aria-hidden="true"></span>{{end}}{{if and (eq .Status "succeeded") (eq .ValidationStatus "needs_review")}}{{statusPill "job" "needs_review"}}<span class="subline warn">{{.ValidationErrorCount}} validation {{if eq .ValidationErrorCount 1}}error{{else}}errors{{end}}</span>{{else}}{{statusPill "job" .Status}}{{end}}{{if eq .Status "failed"}}{{$fix := dashboardErrorAction .ErrorMessage $.Can}}<span class="subline bad">{{$fix.Text}}{{if $fix.Href}} <a href="{{$fix.Href}}">{{$fix.Label}}</a>{{end}}</span>{{else if .ErrorMessage}}<span class="subline bad">{{.ErrorMessage}}</span>{{end}}</td>
+            <td data-label="Status">{{if or (eq .Status "queued") (eq .Status "running")}}<span class="pulse" aria-hidden="true"></span>{{end}}{{if and (eq .Status "succeeded") (eq .ValidationStatus "needs_review")}}{{statusPill "job" "needs_review"}}<span class="subline warn">{{.ValidationErrorCount}} validation {{if eq .ValidationErrorCount 1}}error{{else}}errors{{end}}</span>{{else}}{{statusPill "job" .Status}}{{end}}{{if eq .Status "failed"}}{{$fix := dashboardErrorAction .ErrorMessage $.Can}}<span class="subline bad">{{$fix.Text}}{{if $fix.Href}} <a href="{{$fix.Href}}">{{$fix.Label}}</a>{{end}}</span>{{else if .ErrorMessage}}<span class="subline bad">{{.ErrorMessage}}</span>{{end}}{{if .ReservationID}}<span class="subline muted">reservation {{.ReservationID}}</span>{{end}}</td>
             <td data-label="Created">{{relTime .CreatedAt}}</td>
             <td data-label="Actions">
               <div class="row">
                 {{if .ResultRef}}<button type="button" class="btn" data-action="extract:result" data-job-id="{{.ID}}">{{icon "external"}}Result</button>{{end}}
                 {{if or (eq .Status "queued") (eq .Status "running")}}<button type="button" class="btn" data-action="extract:cancel" data-job-id="{{.ID}}">{{icon "stop"}}Cancel</button>{{end}}
+                {{if eq .Status "unknown"}}<button type="button" class="btn" data-action="confirm" data-confirm="Retry this interrupted extraction? The previous attempt may already have been billed — retrying can bill again." data-extract-retry="{{.ID}}">{{icon "refresh"}}Retry</button>{{end}}
                 <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete this extraction job?" data-extract-delete="{{.ID}}">{{icon "x"}}Delete</button>
               </div>
             </td>

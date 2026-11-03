@@ -32,6 +32,7 @@ var dashboardNavGroups = []dashboardNavGroup{
 		{ID: "assistants", Label: "Assistants", Icon: "assistant", Href: "/dashboard/assistants", Cap: capAssistantsManage},
 		{ID: "knowledge", Label: "Knowledge", Icon: "knowledge", Href: "/dashboard/knowledge", Cap: capSearch},
 		{ID: "sources", Label: "Sources", Icon: "sources", Href: "/dashboard/sources", Cap: capSourcesManage},
+		{ID: "api", Label: "API reference", Icon: "key", Href: "/dashboard/api", Cap: capAPI},
 	}},
 	{Title: "ADMIN", Items: []dashboardNavItem{
 		{ID: "tools", Label: "Tools", Icon: "tools", Href: "/dashboard/tools", Cap: capToolsManage, Admin: true},

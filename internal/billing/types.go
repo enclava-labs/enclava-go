@@ -45,6 +45,16 @@ type SnapshotRate struct {
 	UnitQuantity int64    `json:"unit_quantity"`
 }
 
+// PriceWrite is one entry of an atomic multi-price insert: ID and
+// EffectiveFrom travel beside the rate because Price rows are immutable —
+// a change is a new row, never a rewrite.
+type PriceWrite struct {
+	ID            string
+	Price         Price
+	ActorID       string
+	EffectiveFrom time.Time
+}
+
 // Rounding rules. Ceil is the documented rule for charge.
 const (
 	RoundingCeil  = "ceil"

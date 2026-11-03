@@ -502,6 +502,114 @@ func TestServiceUploadIndexSearchDelete(t *testing.T) {
 	}
 }
 
+// TestUploadDeduplicatesIdenticalBytes (KC-I04): a re-upload of the same
+// bytes into the SAME collection returns the existing document with the
+// dedupe flag — no second version row, no second embed job — while the
+// same bytes in another collection ingest independently, and a delete
+// frees the hash again.
+func TestUploadDeduplicatesIdenticalBytes(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	other, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{
+		Name: "Other", ACL: map[string]any{"public": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := rag.UploadDocumentInput{FileName: "note.txt", MimeType: "text/plain", Bytes: []byte("identical upload bytes")}
+	first, err := f.svc.UploadDocument(ctx, f.principal, c.ID, input)
+	if err != nil {
+		t.Fatalf("first upload: %v", err)
+	}
+	if first.Deduplicated {
+		t.Fatal("first upload must not report dedupe")
+	}
+
+	// Same bytes, same collection, different name — the existing document.
+	again, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		FileName: "copy.txt", MimeType: "text/plain", Bytes: []byte("identical upload bytes"),
+	})
+	if err != nil {
+		t.Fatalf("deduped upload: %v", err)
+	}
+	if !again.Deduplicated || again.Document.ID != first.Document.ID {
+		t.Fatalf("dedupe must return the existing document, got %+v", again)
+	}
+	var versions, embedJobs int
+	if err := f.db.SQL.QueryRowContext(ctx,
+		`SELECT count(*) FROM source_object_versions WHERE tenant_id=$1`, f.tenant).Scan(&versions); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.SQL.QueryRowContext(ctx,
+		`SELECT count(*) FROM jobs WHERE tenant_id=$1 AND operation='rag.embed'`, f.tenant).Scan(&embedJobs); err != nil {
+		t.Fatal(err)
+	}
+	if versions != 1 || embedJobs != 1 {
+		t.Fatalf("deduped upload must add no version/job: versions=%d embed=%d", versions, embedJobs)
+	}
+
+	// A different collection stays independent — the bytes ingest there.
+	independent, err := f.svc.UploadDocument(ctx, f.principal, other.ID, input)
+	if err != nil {
+		t.Fatalf("cross-collection upload: %v", err)
+	}
+	if independent.Deduplicated || independent.Document.ID == first.Document.ID {
+		t.Fatalf("different collection must ingest its own document: %+v", independent)
+	}
+
+	// Deleting the first document frees the hash in its collection.
+	if err := f.svc.DeleteDocument(ctx, f.principal, first.Document.ID); err != nil {
+		t.Fatal(err)
+	}
+	replaced, err := f.svc.UploadDocument(ctx, f.principal, c.ID, input)
+	if err != nil {
+		t.Fatalf("re-upload after delete: %v", err)
+	}
+	if replaced.Deduplicated || replaced.Document.ID == first.Document.ID {
+		t.Fatalf("re-upload after delete must create a new document: %+v", replaced)
+	}
+}
+
+func TestConcurrentUploadsDeduplicate(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	start := make(chan struct{})
+	type result struct {
+		out rag.UploadDocumentOutput
+		err error
+	}
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			out, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+				FileName: "same.txt", MimeType: "text/plain", Bytes: []byte("same concurrent upload"),
+			})
+			results <- result{out: out, err: err}
+		}()
+	}
+	close(start)
+	a, b := <-results, <-results
+	if a.err != nil || b.err != nil {
+		t.Fatalf("uploads failed: %v, %v", a.err, b.err)
+	}
+	if a.out.Document.ID != b.out.Document.ID || a.out.Deduplicated == b.out.Deduplicated {
+		t.Fatalf("expected one document and one deduplication: %+v %+v", a.out, b.out)
+	}
+	var documents, jobs int
+	if err := f.db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM collection_items WHERE tenant_id=$1 AND collection_id=$2 AND removed_at IS NULL`, f.tenant, c.ID).Scan(&documents); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM jobs WHERE tenant_id=$1 AND operation='rag.embed'`, f.tenant).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if documents != 1 || jobs != 1 {
+		t.Fatalf("documents=%d jobs=%d, want one of each", documents, jobs)
+	}
+}
+
 // TestCollectionEmbeddingDimensions: a collection on the default model gets
 // the deployment vector size, documents and queries are both cut to it, and
 // a size the model cannot produce is refused when it is configured.
@@ -921,7 +1029,7 @@ func TestIndexTitleAndMetadataBoundaries(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
-				FileName: tc.name + ".txt", MimeType: "text/plain", Bytes: []byte("metadata body"),
+				FileName: tc.name + ".txt", MimeType: "text/plain", Bytes: []byte("metadata body " + tc.name),
 				Metadata: map[string]any{"k": tc.value},
 			}); err != nil {
 				t.Fatal(err)
@@ -1934,7 +2042,7 @@ func TestServiceFailedDocumentsAndCountAreAuthorized(t *testing.T) {
 		t.Fatalf("upload restricted failure: %v", err)
 	}
 	sharedDoc, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
-		FileName: "shared-fail.txt", MimeType: "text/plain", Bytes: []byte("   \n"),
+		FileName: "shared-fail.txt", MimeType: "text/plain", Bytes: []byte("  \t\n"),
 		Audience: []string{f.principal.ActorID, member.ActorID},
 	})
 	if err != nil {
@@ -2139,6 +2247,61 @@ func TestSearchReadableLimitBoundsFacets(t *testing.T) {
 	}
 	if len(result.Results) != 2 || len(result.Facets) != 1 || result.Facets[0].Count != 2 || result.Facets[0].SourceKind != "upload" {
 		t.Fatalf("bounded results=%d facets=%#v, want 2 results and one upload facet of 2", len(result.Results), result.Facets)
+	}
+}
+
+// TestSearchReadableCursorPagination (KC-I08): a bounded search walks the
+// fused pool through opaque cursors — pages are disjoint and stable, each
+// next_cursor resumes exactly where the previous page ended, and the pool
+// end reports no continuation.
+func TestSearchReadableCursorPagination(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	collection, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{Name: "paged", ACL: map[string]any{"public": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 5 {
+		f.stageSearchDoc(t, collection, fmt.Sprintf("obj_page_%d", i), fmt.Sprintf("paged content %d", i), `{"kind":"upload"}`)
+	}
+
+	page1, err := f.svc.SearchReadableWithOptions(ctx, f.principal, "paged content", rag.QueryLexical, nil, 2, rag.SearchReadableOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page1.Results) != 2 || page1.NextCursor == "" {
+		t.Fatalf("page1 = %d results cursor=%q, want 2 results and a continuation", len(page1.Results), page1.NextCursor)
+	}
+	page2, err := f.svc.SearchReadableWithOptions(ctx, f.principal, "paged content", rag.QueryLexical, nil, 2, rag.SearchReadableOptions{Cursor: page1.NextCursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page2.Results) != 2 || page2.NextCursor == "" {
+		t.Fatalf("page2 = %d results cursor=%q, want 2 results and a continuation", len(page2.Results), page2.NextCursor)
+	}
+	page3, err := f.svc.SearchReadableWithOptions(ctx, f.principal, "paged content", rag.QueryLexical, nil, 2, rag.SearchReadableOptions{Cursor: page2.NextCursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page3.Results) != 1 || page3.NextCursor != "" {
+		t.Fatalf("page3 = %d results cursor=%q, want the last result and no continuation", len(page3.Results), page3.NextCursor)
+	}
+	seen := map[string]struct{}{}
+	for _, res := range append(append(page1.Results, page2.Results...), page3.Results...) {
+		key := res.DocumentID + "/" + res.ChunkID
+		if _, dup := seen[key]; dup {
+			t.Fatalf("result %s repeated across pages", key)
+		}
+		seen[key] = struct{}{}
+	}
+	if len(seen) != 5 {
+		t.Fatalf("pages must cover all 5 staged results, got %d", len(seen))
+	}
+
+	for _, raw := range []string{"bogus", "!!!", "aGVsbG8"} {
+		if _, err := f.svc.SearchReadableWithOptions(ctx, f.principal, "paged content", rag.QueryLexical, nil, 2, rag.SearchReadableOptions{Cursor: raw}); !errors.Is(err, rag.ErrInvalidInput) {
+			t.Fatalf("cursor %q = %v, want ErrInvalidInput", raw, err)
+		}
 	}
 }
 

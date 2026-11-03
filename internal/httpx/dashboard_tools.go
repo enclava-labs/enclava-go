@@ -79,6 +79,7 @@ type toolsServerRow struct {
 	ID, Origin, EndpointPath, CredentialRef string
 	Enabled                                 bool
 	DiscoveredAt                            *time.Time
+	DiscoveryError                          string
 	Approved, Total                         int
 }
 
@@ -231,13 +232,9 @@ func (a *App) dashboardToolsData(ctx context.Context, p auth.Principal) (toolsDa
 		origins[s.ID] = s.Origin
 	}
 	approvedByServer, totalByServer := map[string]int{}, map[string]int{}
-	lastSeen := map[string]time.Time{}
 	approvedIDs := make([]string, 0, len(rows))
 	for _, row := range rows {
 		totalByServer[row.ServerID]++
-		if t, ok := lastSeen[row.ServerID]; !ok || row.LastSeenAt.After(t) {
-			lastSeen[row.ServerID] = row.LastSeenAt
-		}
 		if row.State == "approved" {
 			approvedByServer[row.ServerID]++
 			approvedIDs = append(approvedIDs, row.ToolID)
@@ -278,9 +275,10 @@ func (a *App) dashboardToolsData(ctx context.Context, p auth.Principal) (toolsDa
 			CredentialRef: s.CredentialRef, Enabled: s.Enabled,
 			Approved: approvedByServer[s.ID], Total: totalByServer[s.ID],
 		}
-		if t, ok := lastSeen[s.ID]; ok {
-			discovered := t
+		if !s.DiscoveryAt.IsZero() {
+			discovered := s.DiscoveryAt
 			row.DiscoveredAt = &discovered
+			row.DiscoveryError = s.DiscoveryError
 		}
 		data.Servers = append(data.Servers, row)
 	}

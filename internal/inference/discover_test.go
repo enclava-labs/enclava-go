@@ -32,14 +32,43 @@ func TestDiscoverListsModelsSortedAndClassifiesProbes(t *testing.T) {
 	}
 	want := map[string]string{
 		inference.CapabilityChat:       "yes",
-		inference.CapabilityEmbeddings: "no",
+		inference.CapabilityEmbeddings: "unknown",
 		inference.CapabilityResponses:  "unknown",
-		inference.CapabilityVision:     "no",
-		inference.CapabilityCompact:    "no",
+		inference.CapabilityVision:     "unknown",
+		inference.CapabilityCompact:    "unknown",
 
 		inference.CapabilityMCP: "unknown",
 	}
 	if !reflect.DeepEqual(report.Capabilities, want) {
 		t.Fatalf("capabilities = %v", report.Capabilities)
+	}
+}
+
+func TestDiscoverProbesSuitableModels(t *testing.T) {
+	f := newFx(t)
+	f.upstream.models = []llm.Model{{ID: "z-vision"}, {ID: "a-embedding"}, {ID: "b-chat"}}
+	f.upstream.responsesErr = &llm.UpstreamError{StatusCode: 401}
+	f.build(t)
+	report, err := f.svc.Discover(f.ctx, f.mkEndpoint(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.ProbeModel != "b-chat" {
+		t.Fatalf("chat probe model = %q", report.ProbeModel)
+	}
+	want := map[string]string{
+		inference.CapabilityChat: "b-chat", inference.CapabilityVision: "z-vision",
+		inference.CapabilityEmbeddings: "a-embedding",
+	}
+	for _, p := range report.Probes {
+		if model, ok := want[p.Capability]; ok {
+			if p.Model != model || p.Result != "yes" {
+				t.Fatalf("unexpected probe: %+v", p)
+			}
+			delete(want, p.Capability)
+		}
+	}
+	if len(want) != 0 || report.Capabilities[inference.CapabilityResponses] != "unknown" {
+		t.Fatalf("missing probes %v or wrong capabilities %v", want, report.Capabilities)
 	}
 }

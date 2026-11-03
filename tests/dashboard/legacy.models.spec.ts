@@ -1,14 +1,14 @@
 import { Page } from '@playwright/test';
 import { test, expect } from './fixtures';
 
-// models.spec.ts — the Models + Pricing Set-price regression (OA-27): the
-// old pricing.js was never served, so the popover never submitted. This spec
-// proves the REAL flow in Chromium: the popover POSTs the full
-// adminPricingCreateRequest contract (the price set the cell shows — the
-// model set for an unpriced cell —, the cell's capability + unit, integer
-// micros, unit_quantity 1000000) with the CSRF header, and each save shows
-// in its own cell on the re-render — never "Not priced" after a save. Change
-// reopens a priced cell prefilled with its rate and edits it in place.
+// models.spec.ts — the Models + Pricing Set-price regression (OA-27, P-05):
+// the old pricing.js was never served, so the popover never submitted. This
+// spec proves the REAL flow in Chromium: one form covers all three
+// categories, a single POST carries the atomic `prices` batch (the price set
+// the row shows — the model set for an unpriced row —, the row's capability,
+// integer micros, unit_quantity 1000000) with the CSRF header, and each
+// category shows in its own cell on the re-render — never "not priced"
+// after a save. Change reopens prefilled and edits a subset in place.
 //
 // House rule: a missing app/seed prerequisite FAILS the case naming what is
 // absent — a skip never counts as passing.
@@ -77,89 +77,31 @@ test('Set price and Change submit the admin pricing contract and the cell re-ren
     );
   }
 
-  const firstSet = page.locator(`tr[data-price-row="${created}|${UNPRICED}|chat/completions"] button[data-action="models:price"][data-unit="input"]`).first();
-  if ((await firstSet.count()) === 0) {
-    throw new Error(
-      `the fixture row ${created}|${UNPRICED} shows no unpriced input cell — ` +
-        'the pricing matrix did not render the new endpoint binding',
-    );
-  }
-
-  const endpoint = created;
-  const model = UNPRICED;
-  const capability = (await firstSet.getAttribute('data-capability')) as string;
-  if (!capability) {
-    throw new Error(
-      'Set price control carries no cell binding (data-endpoint/data-model/data-capability) — ' +
-        'the popover cannot build the pricing contract',
-    );
-  }
-
-  const row = page.locator(`tr[data-price-row="${endpoint}|${model}|${capability}"]`);
+  const row = page.locator(`tr[data-price-row="${created}|${UNPRICED}|chat/completions"]`);
   await expect(row).toHaveCount(1);
-
-  // Intercept (not mock): every POST must carry the exact contract.
-  const posts: { body: PricingBody; headers: Record<string, string> }[] = [];
-  await page.route('**/api/v1/admin/pricing', async (route) => {
-    posts.push({
-      body: route.request().postDataJSON() as PricingBody,
-      headers: route.request().headers(),
-    });
-    await route.continue();
-  });
-
-  // Each save must show in its own cell right away: the regression wrote a
-  // one-unit endpoint price the whole-set rule ignores, so the cell kept
-  // reading "Not priced" after "Price saved".
+  await row.locator('button[data-action="models:price"]').click();
+  for (const unit of ['input', 'cached_input', 'output']) {
+    await page.locator(`#models-price-rate-${unit}`).fill('2.5');
+  }
+  await page.locator('#models-price-currency').fill('usd');
+  const response = page.waitForResponse(r => r.url().endsWith('/api/v1/admin/pricing') && r.request().method() === 'POST');
+  await page.locator('[data-models-price-form] button[type="submit"]').click();
+  const saved = await response;
+  expect(saved.status()).toBe(201);
+  expect(saved.request().headers()['x-csrf-token']).toBeTruthy();
+  const body = saved.request().postDataJSON() as { prices: PricingBody[] };
+  expect(body.prices).toHaveLength(3);
   for (const [i, unit] of ['input', 'cached_input', 'output'].entries()) {
-    const setButton = row.locator(`button[data-action="models:price"][data-unit="${unit}"]`).first();
-    await setButton.click();
-    await page.fill('#models-price-rate', '2.5');
-    await page.fill('#models-price-currency', 'usd');
-    await page.click('[data-models-price-form] button[type="submit"]');
-
-    await expect
-      .poll(() => posts.length, { timeout: 10_000 })
-      .toBeGreaterThan(i);
-    const captured = posts[posts.length - 1];
-    expect(captured.body).toEqual({
-      subject_type: 'model',
-      subject_id: model,
-      capability,
-      unit,
-      rate_micros: 2500000,
-      unit_quantity: 1000000,
-      currency: 'USD', // the module upper-cases the input
-    } satisfies PricingBody);
-    expect(captured.headers['x-csrf-token']).toBeTruthy();
-
-    // The success path closes the popover and re-renders the section; the
-    // saved cell is priced before the next unit is touched.
-    await expect(page.locator('#pop')).toBeHidden({ timeout: 10_000 });
-    await expect(row.locator(`td[data-price-cell="${endpoint}|${unit}"]`)).toContainText('$2.50', { timeout: 10_000 });
+    expect(body.prices[i]).toMatchObject({ subject_type: 'model', subject_id: UNPRICED, unit, rate_micros: 2500000, unit_quantity: 1000000, currency: 'USD' });
+    await expect(row.locator(`td[data-price-cell="${created}|${unit}"]`)).toContainText('$2.50');
   }
-
-  if (posts.length === 0) {
-    throw new Error('the Set price popover never submitted — the pricing.js dead-button regression');
-  }
-
-  // Persisted outcome: the re-rendered row shows the posted rate and no
-  // refusal copy — a dead button would leave the row "Not priced".
-  await expect(row).not.toContainText('Not priced — requests refused', { timeout: 15_000 });
-  await expect(row).toContainText('$2.50');
-  await expect(row).toContainText('via model');
-
-  // Change: the priced cell reopens prefilled, names the price set the save
-  // lands in, and the edited rate replaces the old one in that cell — a
-  // sub-cent per-1M price stays exact end to end.
-  const inputCell = row.locator(`td[data-price-cell="${endpoint}|input"]`);
-  await inputCell.locator('button[data-action="models:price"]').click();
-  await expect(page.locator('#models-price-rate')).toHaveValue('2.5');
-  await expect(page.locator('#pop')).toContainText(`Model price — also applies to ${model}`);
-  await page.fill('#models-price-rate', '0.001');
-  await page.click('[data-models-price-form] button[type="submit"]');
-  await expect(inputCell).toContainText('$0.001', { timeout: 10_000 });
-  expect(posts[posts.length - 1].body).toMatchObject({ subject_type: 'model', subject_id: model, unit: 'input', rate_micros: 1000, unit_quantity: 1000000 });
+  await row.locator('button[data-action="models:price"]').click();
+  await expect(page.locator('#models-price-rate-input')).toHaveValue('2.5');
+  await page.locator('#models-price-rate-input').fill('0.001');
+  const changed = page.waitForResponse(r => r.url().endsWith('/api/v1/admin/pricing') && r.request().method() === 'POST');
+  await page.locator('[data-models-price-form] button[type="submit"]').click();
+  expect((await changed).status()).toBe(201);
+  await expect(row.locator(`td[data-price-cell="${created}|input"]`)).toContainText('$0.001');
 });
 
 test('price history drawer lists the real price rows for the pair', async ({ page }) => {

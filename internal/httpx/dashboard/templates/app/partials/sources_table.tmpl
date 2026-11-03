@@ -35,7 +35,7 @@
             <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{.ProgressPct}}" title="{{.ProgressPct}}% reported by the running sync"><i style="width:{{.ProgressPct}}%"></i></div>
 {{else if eq .State "syncing"}}            <span class="pill {{statusTone "syncing"}}"><i class="dot pulse"></i>{{statusLabel "source" "syncing"}}</span>
 {{else}}            {{statusPill "source" .State}}
-{{end}}{{if .LastError}}            {{$fix := dashboardErrorAction .LastError $.Can}}<span class="subline">{{$fix.Text}}{{if $fix.Href}} {{if eq $fix.Href "/dashboard/sources"}}<a href="/dashboard/sources?edit={{.Source.ID}}">{{$fix.Label}}</a>{{else}}<a href="{{$fix.Href}}">{{$fix.Label}}</a>{{end}}{{end}}</span>
+{{end}}{{if .LastError}}            {{$fix := dashboardErrorAction .LastError $.Can}}<span class="subline">Sync failed: {{.LastError}}. {{if $fix.Href}}{{if eq $fix.Href "/dashboard/sources"}}<a href="/dashboard/sources?edit={{.Source.ID}}">{{$fix.Label}}</a>{{else}}<a href="{{$fix.Href}}">{{$fix.Label}}</a>{{end}}{{else}}Check the source configuration and retry the sync.{{end}}</span>
 {{end}}          </td>
           <td data-label="Last sync">{{relTime .Source.LastSyncAt}}</td>
           <td data-label="Next sync">{{if .NextEnabled}}{{relTime .NextAt}}{{else}}—{{end}}</td>

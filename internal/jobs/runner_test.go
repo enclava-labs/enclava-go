@@ -445,3 +445,93 @@ func TestRunnerShutdownReleasesUndispatchedLease(t *testing.T) {
 	}
 	close(block)
 }
+
+func TestRunnerShutdownInterruptedJobRecordsReasonAndReservation(t *testing.T) {
+	svc, db, tenant := runnerSetup(t)
+	ctx := context.Background()
+	p := principal(tenant, "a", "c")
+	job := enqueue(t, svc, p, req(tenant, "k", "op.slow", "h", 1))
+
+	attemptID := make(chan string, 1)
+	r := jobs.NewRunner(svc, stubResolver{}, map[string]jobs.HandlerFunc{
+		"op.slow": func(ctx context.Context, lease *jobs.Claim, _ jobs.InputFunc) (string, error) {
+			if err := lease.MarkDispatched(ctx); err != nil {
+				return "", err
+			}
+			attemptID <- lease.AttemptID()
+			<-ctx.Done() // shutdown cancels the in-flight handler
+			return "", ctx.Err()
+		},
+	}, jobs.RunnerConfig{PollInterval: 10 * time.Millisecond, LeaseTTL: 2 * time.Second})
+
+	rctx, stop := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- r.Run(rctx) }()
+
+	var att string
+	select {
+	case att = <-attemptID:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never dispatched")
+	}
+	// The attempt's billing hold existed when the worker was interrupted —
+	// the job row must carry it for reconciliation and retry warnings.
+	if _, err := db.SQL.ExecContext(ctx, `
+		INSERT INTO reservations (tenant_id, id, job_id, attempt_id, subject_type,
+		                          subject_id, price_snapshot, reserved_units,
+		                          limit_amount_micros, currency, state)
+		VALUES ($1, 'res_interrupted', $2, $3, 'model', 'm1',
+		        '{}'::jsonb, '{}'::jsonb, 0, 'USD', 'held')`,
+		tenant, job.ID, att); err != nil {
+		t.Fatalf("seed reservation: %v", err)
+	}
+	stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runner: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not drain")
+	}
+
+	fin := waitStatus(t, svc, p, job.ID, jobs.StatusUnknown, 3*time.Second)
+	if fin.OutcomeReason != jobs.ReasonInterrupted {
+		t.Fatalf("outcome reason = %q, want %q", fin.OutcomeReason, jobs.ReasonInterrupted)
+	}
+	if fin.OutcomeReservationID != "res_interrupted" {
+		t.Fatalf("outcome reservation = %q, want res_interrupted", fin.OutcomeReservationID)
+	}
+	if !strings.Contains(fin.Error, "usage may have been billed") {
+		t.Fatalf("interrupted error message = %q", fin.Error)
+	}
+	if fin.UpdatedAt.Before(fin.CreatedAt) {
+		t.Fatalf("updated_at %v precedes created_at %v", fin.UpdatedAt, fin.CreatedAt)
+	}
+}
+
+func TestRunnerPreservesHandlerTimeoutOutcome(t *testing.T) {
+	svc, _, tenant := runnerSetup(t)
+	p := principal(tenant, "a", "c")
+	job := enqueue(t, svc, p, req(tenant, "timeout-outcome", "op.timeout-outcome", "h", 1))
+	r := jobs.NewRunner(svc, stubResolver{}, map[string]jobs.HandlerFunc{
+		"op.timeout-outcome": func(ctx context.Context, claim *jobs.Claim, _ jobs.InputFunc) (string, error) {
+			if err := claim.MarkDispatched(ctx); err != nil {
+				return "", err
+			}
+			<-ctx.Done()
+			return "", errors.New("model call timed out")
+		},
+	}, jobs.RunnerConfig{PollInterval: 10 * time.Millisecond, LeaseTTL: time.Second, JobTimeout: 50 * time.Millisecond})
+	ctx, stop := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	fin := waitStatus(t, svc, p, job.ID, jobs.StatusFailed, 3*time.Second)
+	stop()
+	if err := <-done; err != nil {
+		t.Fatalf("runner: %v", err)
+	}
+	if fin.Error != "model call timed out" {
+		t.Fatalf("error = %q, want handler timeout outcome", fin.Error)
+	}
+}

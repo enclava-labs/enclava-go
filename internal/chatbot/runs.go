@@ -176,7 +176,9 @@ func (s *Service) StartRun(ctx context.Context, p auth.Principal, chatbotRef str
 	if err := s.runRepo.UpdateRun(ctx, run); err != nil {
 		return AssistantRun{}, err
 	}
-	return run, nil
+	// The 202 response carries the PERSISTED row: created_at/updated_at are
+	// store-stamped, never zeroed client-side.
+	return s.runRepo.GetRun(ctx, p.TenantID, run.ID)
 }
 
 func (s *Service) GetRun(ctx context.Context, p auth.Principal, id string) (AssistantRun, error) {
@@ -196,9 +198,11 @@ func (s *Service) GetRun(ctx context.Context, p auth.Principal, id string) (Assi
 	}
 	if s.jobSvc != nil && run.JobID != "" {
 		if job, jobErr := s.jobSvc.Get(ctx, p, run.JobID); jobErr == nil {
-			run.Status = job.Status
-			if job.Status == jobs.StatusUnknown {
-				run.Error = "worker outcome unknown; the attempt will not be repeated"
+			if job.Status != jobs.StatusUnknown || run.Status != jobs.StatusFailed || run.Error == "" {
+				run.Status = job.Status
+				if job.Status == jobs.StatusUnknown {
+					run.Error = "worker outcome unknown; the attempt will not be repeated"
+				}
 			}
 		}
 	}
@@ -318,6 +322,10 @@ func (s *Service) JobHandler() jobs.HandlerFunc {
 		// decode errors) would otherwise leave the run row queued while the
 		// durable job fails. A stale lease no-ops the fenced write.
 		failRun := func(cause error) (string, error) {
+			// DeadlineExceeded reaches the runner's translate as UNKNOWN when
+			// returned raw — translate it to an explicit timeout outcome so
+			// the persisted run error and the job outcome stay truthful.
+			cause = timeoutOutcome(cause, false)
 			status := jobs.StatusFailed
 			if errors.Is(cause, context.Canceled) {
 				status = jobs.StatusCancelled
@@ -473,33 +481,47 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 	if err != nil {
 		return "", err
 	}
-	if len(mcpDefinitions) > 0 {
-		approved := make(map[string]struct{}, len(mcpDefinitions))
-		for _, tool := range mcpDefinitions {
-			function, _ := tool["function"].(map[string]any)
-			name, _ := function["name"].(string)
-			approved[name] = struct{}{}
-		}
-		for _, id := range configuredToolIDs(bot) {
-			if _, builtin := builtinSchemas[id]; builtin {
-				continue
-			}
-			if _, ok := approved[id]; !ok {
-				return "", ErrInvalidInput
-			}
-		}
-		definitions, err = builtinToolDefinitions(bot, approved)
-		if err != nil {
-			return "", err
-		}
-		definitions = append(definitions, mcpDefinitions...)
+	// Configured non-builtin tools must be advertised by an enabled approval;
+	// the reason classifier names WHY the run cannot start (pending approval,
+	// rejected, caller scopes missing, server disabled) instead of the old
+	// uniform "unknown built-in tool".
+	approved := make(map[string]struct{}, len(mcpDefinitions))
+	for _, tool := range mcpDefinitions {
+		function, _ := tool["function"].(map[string]any)
+		name, _ := function["name"].(string)
+		approved[name] = struct{}{}
 	}
-	if len(mcpDefinitions) == 0 {
-		definitions, err = builtinToolDefinitions(bot, nil)
-		if err != nil {
-			return "", err
+	for _, id := range configuredToolIDs(bot) {
+		if _, builtin := builtinSchemas[id]; builtin {
+			continue
 		}
+		if _, ok := approved[id]; ok {
+			continue
+		}
+		reason := fmt.Sprintf("unknown tool %q", id)
+		if explainer, ok := s.mcpTools.(interface {
+			UnavailableReason(context.Context, auth.Principal, auth.Principal, Instance, string) error
+		}); ok {
+			if classified := explainer.UnavailableReason(ctx, p, owner, bot, id); classified != nil {
+				reason = classified.Error()
+			}
+		}
+		n, countErr := countRunAttempts(ctx, s.runRepo, p.TenantID, run.ID)
+		if countErr != nil {
+			return "", countErr
+		}
+		now := time.Now().UTC()
+		attempt := AssistantRunAttempt{TenantID: p.TenantID, RunID: run.ID, Number: n + 1, Kind: "tool", Name: id, Status: "failed", Error: reason, StartedAt: now, EndedAt: now}
+		if writeErr := s.runRepo.AddRunAttempt(ctx, attempt, claim.Owner, claim.FenceToken); writeErr != nil {
+			return "", writeErr
+		}
+		return "", invalidInput(errors.New(reason))
 	}
+	definitions, err = builtinToolDefinitions(bot, approved)
+	if err != nil {
+		return "", err
+	}
+	definitions = append(definitions, mcpDefinitions...)
 	toolNames := modelToolNames(definitions)
 	toolSchemas := make(map[string]any, len(definitions))
 	for _, definition := range definitions {
@@ -546,6 +568,7 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 	}
 	dispatched := false
 	fail := func(cause error) (string, error) {
+		cause = timeoutOutcome(cause, false)
 		if errors.Is(cause, context.Canceled) {
 			run.Status = jobs.StatusCancelled
 		} else {
@@ -583,12 +606,22 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 		// summary only — the assembled request body (system prompt, history,
 		// attached passages) never reaches a step row. Tool attempts keep
 		// their tool-level arguments.
-		attempt := AssistantRunAttempt{TenantID: p.TenantID, RunID: run.ID, Number: attemptNumber, Kind: "model", Name: bot.Model, Status: "running", Input: modelAttemptSummary(bot.Model, len(messages), len(definitions)), StartedAt: time.Now().UTC()}
+		attempt := AssistantRunAttempt{TenantID: p.TenantID, RunID: run.ID, Number: attemptNumber, Kind: "model", Name: bot.Model, Status: "running", Input: modelAttemptSummary(bot.Model, run.JobID, claim.AttemptID(), len(messages), len(definitions)), StartedAt: time.Now().UTC()}
 		if err := s.runRepo.AddRunAttempt(ctx, attempt, claim.Owner, claim.FenceToken); err != nil {
 			return fail(err)
 		}
 		if !dispatched {
 			if err := claim.MarkDispatched(ctx); err != nil {
+				attempt.Status, attempt.Error, attempt.EndedAt = "failed", err.Error(), time.Now().UTC()
+				if errors.Is(err, context.Canceled) {
+					attempt.Status = "cancelled"
+				}
+				finalCtx, finalCancel := detachedRunCtx(ctx)
+				writeErr := s.runRepo.UpdateRunAttempt(finalCtx, attempt, claim.Owner, claim.FenceToken)
+				finalCancel()
+				if writeErr != nil {
+					return fail(writeErr)
+				}
 				return fail(err)
 			}
 			dispatched = true
@@ -596,12 +629,22 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 		result, err := s.executor.Execute(ctx, p, inference.Request{
 			Capability: inference.CapabilityChat, Model: bot.Model, EndpointID: strings.TrimSpace(bot.ProviderID),
 			Payload: body, Inputs: inputRefs, Estimate: completionEstimate(body),
+			JobID: run.JobID, AttemptID: claim.AttemptID(),
 		})
 		if err != nil {
 			attempt.Status = "failed"
+			if errors.Is(err, context.Canceled) {
+				attempt.Status = "cancelled"
+			}
+			err = timeoutOutcome(err, true)
 			attempt.Error = err.Error()
 			attempt.EndedAt = time.Now().UTC()
-			_ = s.runRepo.UpdateRunAttempt(ctx, attempt, claim.Owner, claim.FenceToken)
+			finalCtx, finalCancel := detachedRunCtx(ctx)
+			writeErr := s.runRepo.UpdateRunAttempt(finalCtx, attempt, claim.Owner, claim.FenceToken)
+			finalCancel()
+			if writeErr != nil {
+				return fail(writeErr)
+			}
 			return fail(err)
 		}
 		// Observed route: persist the endpoint/model actually dispatched —
@@ -625,16 +668,28 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 		}
 		if err != nil {
 			attempt.Status = "failed"
+			if errors.Is(err, context.Canceled) {
+				attempt.Status = "cancelled"
+			}
+			err = timeoutOutcome(err, true)
 			attempt.Error = err.Error()
 			attempt.EndedAt = time.Now().UTC()
-			_ = s.runRepo.UpdateRunAttempt(ctx, attempt, claim.Owner, claim.FenceToken)
+			finalCtx, finalCancel := detachedRunCtx(ctx)
+			writeErr := s.runRepo.UpdateRunAttempt(finalCtx, attempt, claim.Owner, claim.FenceToken)
+			finalCancel()
+			if writeErr != nil {
+				return fail(writeErr)
+			}
 			return fail(err)
 		}
 		attempt.Status = "succeeded"
 		attempt.Output = string(response)
 		attempt.EndedAt = time.Now().UTC()
-		if err := s.runRepo.UpdateRunAttempt(ctx, attempt, claim.Owner, claim.FenceToken); err != nil {
-			return fail(err)
+		finalCtx, finalCancel := detachedRunCtx(ctx)
+		writeErr := s.runRepo.UpdateRunAttempt(finalCtx, attempt, claim.Owner, claim.FenceToken)
+		finalCancel()
+		if writeErr != nil {
+			return fail(writeErr)
 		}
 		turnResult, err := parseRunModelResponse(response)
 		if err != nil {
@@ -726,8 +781,11 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 				toolAttempt.Status = "failed"
 				toolAttempt.Error = invokeErr.Error()
 				toolAttempt.EndedAt = time.Now().UTC()
-				if err := s.runRepo.UpdateRunAttempt(ctx, toolAttempt, claim.Owner, claim.FenceToken); err != nil {
-					return fail(err)
+				finalCtx, finalCancel := detachedRunCtx(ctx)
+				writeErr := s.runRepo.UpdateRunAttempt(finalCtx, toolAttempt, claim.Owner, claim.FenceToken)
+				finalCancel()
+				if writeErr != nil {
+					return fail(writeErr)
 				}
 				if ctx.Err() != nil {
 					return fail(ctx.Err())
@@ -788,10 +846,31 @@ func countRunAttempts(ctx context.Context, repo RunRepository, tenantID, runID s
 	return len(attempts), nil
 }
 
+// timeoutOutcome translates a wall-clock/context deadline into an explicit,
+// persistable outcome. Raw context.DeadlineExceeded returned to the jobs
+// runner becomes "worker outcome unknown" — the run's OWN timeout must read
+// as an ordinary failed outcome instead.
+func timeoutOutcome(err error, modelCall bool) error {
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	if modelCall {
+		return fmt.Errorf("model call timed out after %s", maxRunWallTime)
+	}
+	return fmt.Errorf("agent run timed out after %s", maxRunWallTime)
+}
+
+// detachedRunCtx is the bounded, cancel-detached context terminal step writes
+// take: a cancelled upstream call must never strand a step row in 'running'.
+func detachedRunCtx(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), 15*time.Second)
+}
+
 // modelAttemptSummary is the tool-safe model-attempt input summary persisted
-// on step rows: route shape only, never the assembled request body.
-func modelAttemptSummary(model string, messages, tools int) string {
-	return fmt.Sprintf(`{"model":%q,"messages":%d,"tools":%d}`, model, messages, tools)
+// on step rows: route shape plus the job/attempt identity the step's model
+// reservation carried, never the assembled request body.
+func modelAttemptSummary(model, jobID, attemptID string, messages, tools int) string {
+	return fmt.Sprintf(`{"model":%q,"job_id":%q,"attempt_id":%q,"messages":%d,"tools":%d}`, model, jobID, attemptID, messages, tools)
 }
 
 // attachedEvidence re-reads every attached evidence ID through the narrow

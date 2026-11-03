@@ -53,7 +53,8 @@ func (r *SourceRepo) UpdateConnection(ctx context.Context, c source.Connection) 
 	}
 	res, err := r.db.SQL.ExecContext(ctx, `
 		UPDATE connections SET name = $3, credential_ref = $4, config = $5::jsonb,
-		       target_collection_id = $6, audience_default = $7::jsonb, status = $8
+		       target_collection_id = $6, audience_default = $7::jsonb, status = $8,
+		       updated_at = now()
 		WHERE tenant_id = $1 AND id = $2`,
 		c.TenantID, c.ID, c.Name, c.CredentialRef, config,
 		nullableText(c.TargetCollectionID), audience, c.Status)
@@ -860,6 +861,62 @@ func (r *RAGRepo) GetDocument(ctx context.Context, tenantID, objectID string) (r
 	}
 	d.TenantID = tenantID
 	return d, nil
+}
+
+// CreateUploadIfNew serializes hash lookup and document creation without
+// holding a pool connection across calls to other repositories.
+func (r *RAGRepo) CreateUploadIfNew(ctx context.Context, collectionID, actorID string, object source.Object, version source.ObjectVersion, excludedIDs []string) (string, error) {
+	var existingID string
+	err := WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
+		key := fmt.Sprintf("rag-upload:%q:%q:%q", object.TenantID, collectionID, version.SHA256)
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key); err != nil {
+			return fmt.Errorf("lock document upload: %w", err)
+		}
+		err := tx.QueryRowContext(ctx, `
+			SELECT o.id FROM collection_items ci
+			JOIN source_objects o ON o.tenant_id=ci.tenant_id AND o.id=ci.object_id
+			JOIN source_object_versions v ON v.tenant_id=o.tenant_id AND v.object_id=o.id AND v.observed_seq=o.observed_seq
+			WHERE ci.tenant_id=$1 AND ci.collection_id=$2 AND ci.removed_at IS NULL
+			  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL AND v.content_sha256=$3
+			  AND NOT (o.id = ANY(COALESCE($4::text[], '{}'::text[])))
+			ORDER BY o.first_seen_at, o.id LIMIT 1`, object.TenantID, collectionID, version.SHA256, excludedIDs).Scan(&existingID)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("find document by content hash: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO source_objects
+			    (tenant_id, id, kind, native_id, authorization_mode, owner_actor_id, audience, observed_seq)
+			VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,1)`,
+			object.TenantID, object.ID, object.Kind, object.NativeID, object.AuthorizationMode,
+			nullableText(object.OwnerActorID), mustJSONList(object.Audience)); err != nil {
+			return fmt.Errorf("insert upload object: %w", err)
+		}
+		restrictions, err := json.Marshal(version.Restrictions)
+		if err != nil {
+			return fmt.Errorf("marshal version restrictions: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO source_object_versions
+			    (tenant_id, id, object_id, observed_seq, artifact_ref, content_sha256,
+			     byte_size, mime_type, original_filename, provenance, restrictions)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)`,
+			object.TenantID, versionRowID(version), object.ID, version.ObservedSeq, version.ArtifactRef,
+			version.SHA256, version.ByteSize, version.MimeType, version.OriginalFilename,
+			version.Provenance, restrictions); err != nil {
+			return fmt.Errorf("insert upload version: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO collection_items (tenant_id, id, collection_id, object_id, added_by)
+			VALUES ($1,$2,$3,$4,$5)`,
+			object.TenantID, newPGID("citem"), collectionID, object.ID, nullableText(actorID)); err != nil {
+			return fmt.Errorf("add upload to collection: %w", err)
+		}
+		return nil
+	})
+	return existingID, err
 }
 
 func (r *RAGRepo) ListDocuments(ctx context.Context, tenantID, collectionID, status string, limit, offset int) ([]rag.Document, error) {

@@ -943,3 +943,56 @@ label[for]:has(>input[type="file"].visually-hidden):focus-within{
 tr.job-highlight td{background:var(--accentbg)}
 .extract-ack{align-items:flex-start;gap:8px;color:var(--amber);font-size:12px}
 /* --- end 2B extract --- */
+
+/* --- 3G developer --- */
+/* Developer card + API reference (P-12/UX-M03): code blocks, the base-URL
+   row and the endpoint list — the shared .card/.row/.subline pieces do the
+   rest. */
+pre.code{
+  background:var(--panel);border:1px solid var(--border);border-radius:8px;
+  padding:10px 12px;overflow-x:auto;font-size:13px;margin:8px 0;
+}
+pre.code code{background:none;border:0;padding:0}
+.dev-base-url{
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;
+  background:var(--panel);border:1px solid var(--border);border-radius:6px;
+  padding:4px 8px;
+}
+ul.dev-endpoints{list-style:none;margin:4px 0 12px;padding:0}
+ul.dev-endpoints li{padding:3px 0;font-size:12px}
+/* --- end 3G developer --- */
+
+/* --- 3F access --- */
+/* Assistants Availability cell, drawer Coverage section, the audience
+   save-guard note, and role-editor "suggested" grant items (UX-A01/A02/A08). */
+.avail-line{display:flex;align-items:center;gap:6px;margin:2px 0}
+.avail-group{color:var(--muted);font-size:11px;min-width:44px}
+.coverage-role{border:1px solid var(--border);border-radius:9px;padding:8px 10px}
+.coverage-role-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.coverage-role-head .btn{margin-left:auto}
+.coverage-checks{list-style:none;margin:6px 0 0;padding:0}
+.coverage-checks li{padding:2px 0;font-size:12px;color:var(--muted)}
+.coverage-checks code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
+.coverage-ok{color:var(--green)}
+.coverage-ok svg,.coverage-miss svg{vertical-align:-2px}
+.coverage-miss{color:var(--red)}
+.warn-note{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  border:1px solid var(--amber);border-radius:9px;padding:8px 12px;
+  font-size:12px;color:var(--amber)}
+.warn-note[hidden]{display:none}
+.grant-suggested-tag{margin-left:6px;padding:1px 6px;border:1px solid var(--accent-fg);
+  border-radius:99px;font-size:10px;color:var(--accent-fg)}
+/* --- end 3F access --- */
+
+/* --- 3H pricing --- */
+/* Price drawer, discovery probe results and budget currency prefix. */
+.price-pop{width:100%}
+.price-pop .field{margin-bottom:8px}
+.probe-results{list-style:none;margin:8px 0 0;padding:0;font-size:11px;color:var(--muted)}
+.probe-results li{padding:2px 0}
+.probe-results .probe-yes{color:var(--green)}
+.probe-results .probe-no{color:var(--red)}
+.probe-results .probe-unknown{color:var(--muted)}
+.moneysign{align-self:center;color:var(--muted);font-size:13px;min-width:14px}
+.field-warn{color:var(--amber)}
+/* --- end 3H pricing --- */

@@ -250,7 +250,12 @@ func TestDashboardHomeAttentionKindsAndFixLinks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create collection: %v", err)
 	}
-	f.uploadFailedDocument(t, kmg, "broken-doc.txt", owner.ID, nil)
+	restricted, err := f.ragSvc.UploadDocument(f.ctx, kmg, owner.ID, rag.UploadDocumentInput{
+		FileName: "broken-doc.txt", MimeType: "text/plain", Bytes: []byte("   \n"),
+	})
+	if err != nil {
+		t.Fatalf("upload restricted document: %v", err)
+	}
 	f.runNextEmbedFailure(t)
 	f.seedSource(t, "src-home", "Home Source")
 	f.failSync(t, kmg, "sync-home", "src-home", "authentication failed")
@@ -271,7 +276,12 @@ func TestDashboardHomeAttentionKindsAndFixLinks(t *testing.T) {
 	// ActionHref fix link.
 	adminScopes := []string{auth.ScopePlatformAdmin, "pricing.manage", "rag", "connectors.manage", "rag.manage"}
 	admin, adminSess := homeUser(t, f, "home-admin2@example.com", adminScopes, auth.ResourceGrants{}, "admin-pass")
-	f.uploadFailedDocument(t, admin, "admin-broken.txt", owner.ID, nil)
+	adminUpload, err := f.ragSvc.UploadDocument(f.ctx, admin, owner.ID, rag.UploadDocumentInput{
+		FileName: "admin-broken.txt", MimeType: "text/plain", Bytes: []byte("   \n"),
+	})
+	if err != nil || adminUpload.Deduplicated || adminUpload.Document.ID == restricted.Document.ID {
+		t.Fatalf("admin upload must create a new document without disclosing the restricted match: %+v err=%v", adminUpload, err)
+	}
 	f.runNextEmbedFailure(t)
 	f.failSync(t, admin, "sync-home-2", "src-home", "authentication failed")
 	f.seedConfidentialEndpoint(t) // unverified_endpoint (+ unpriced_units)

@@ -42,6 +42,13 @@ func TestPreviewJobPublishesCanonicalBlocksAndChunks(t *testing.T) {
 	if _, err := claim.Complete(ctx, resultRef); err != nil {
 		t.Fatalf("publish preview: %v", err)
 	}
+	status, err := preview.Get(ctx, f.principal, job.ID)
+	if err != nil {
+		t.Fatalf("preview status: %v", err)
+	}
+	if status.Status != jobs.StatusSucceeded || status.UpdatedAt.IsZero() {
+		t.Fatalf("completed preview status=%q updated_at=%v — updated_at must be populated", status.Status, status.UpdatedAt)
+	}
 	result, err := preview.Result(ctx, f.principal, job.ID)
 	if err != nil {
 		t.Fatalf("read preview result: %v", err)

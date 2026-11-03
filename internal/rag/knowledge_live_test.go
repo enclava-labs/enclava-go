@@ -19,15 +19,19 @@ import (
 
 const liveCorpus = "legal exception orchid chat transcript retention memorandum"
 
-type corpusAdapter struct{ granted bool }
+type corpusAdapter struct {
+	granted  bool
+	content  string
+	revision string
+}
 
 func (a *corpusAdapter) Capabilities() connectors.AdapterCapabilities {
 	return connectors.AdapterCapabilities{Content: true, Access: true, Membership: true}
 }
-func (*corpusAdapter) Content(context.Context, source.Connection, connectors.Cursor, int) (connectors.ContentPage, error) {
+func (a *corpusAdapter) Content(context.Context, source.Connection, connectors.Cursor, int) (connectors.ContentPage, error) {
 	return connectors.ContentPage{Items: []connectors.ContentItem{{
-		NativeID: "corpus-document", Kind: "document", NativeRevision: "fixture-v1",
-		Filename: "corpus.txt", MIMEType: "text/plain", Content: []byte(liveCorpus),
+		NativeID: "corpus-document", Kind: "document", NativeRevision: a.revision,
+		Filename: "corpus.txt", MIMEType: "text/plain", Content: []byte(a.content),
 		URL: "https://fixture.invalid/corpus-document",
 	}}, Completeness: connectors.CompletenessComplete, Snapshot: true}, nil
 }
@@ -52,7 +56,9 @@ func TestLiveKnowledgeCorpusSyncPublicationRetrievalAndRevocation(t *testing.T) 
 
 	db := testdb.New(t)
 	tenant := testdb.SeedTenant(t, db, "knowledge-live")
-	user := testdb.SeedUser(t, db, tenant, "knowledge-live@example.test", nil)
+	user := testdb.SeedUserWithGrants(t, db, tenant, "knowledge-live@example.test", []string{"rag", "connectors.manage"}, auth.ResourceGrants{
+		Models: auth.Allowlist{All: true}, Endpoints: auth.Allowlist{All: true},
+	})
 	p := auth.Principal{
 		TenantID: tenant, ActorID: user.ID, ActorKind: auth.ActorKindUser, UserID: user.ID,
 		CredentialID: "knowledge-live-key", CredentialKind: auth.CredentialKindAPIKey,
@@ -97,12 +103,13 @@ func TestLiveKnowledgeCorpusSyncPublicationRetrievalAndRevocation(t *testing.T) 
 		t.Fatalf("bind fixture source principal: %v", err)
 	}
 
-	adapter := &corpusAdapter{granted: true}
+	adapter := &corpusAdapter{granted: true, content: liveCorpus, revision: "fixture-v1"}
 	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepo)
+	connectorSvc.SetPrincipalResolver(auth.NewService(postgres.NewIdentityRepo(db), "").PrincipalForActor)
 	connectorSvc.SetSyncDependencies(connectors.AdapterFactories{
 		connectors.SourceKindSlack: func(source.Connection) (connectors.Adapter, error) { return adapter, nil },
 	}, postgres.NewConnectorObservationsRepo(db), artifactStore, sourceRepo)
-	if _, err := connectorSvc.SyncSourceWindowed(ctx, p, connection.ID, 1); err != nil {
+	if _, err := connectorSvc.SyncSourceWindowed(ctx, auth.Principal{TenantID: tenant, ActorID: user.ID}, connection.ID, 1); err != nil {
 		t.Fatalf("schedule initial fixture sync: %v", err)
 	}
 	runLiveKnowledgeJobs(t, ctx, jobsSvc, connectorSvc, ragSvc)
@@ -131,6 +138,17 @@ func TestLiveKnowledgeCorpusSyncPublicationRetrievalAndRevocation(t *testing.T) 
 	}()
 	if !errors.Is(unknownEvidenceErr, source.ErrDenied) {
 		t.Fatalf("unknown evidence did not use uniform not-found outcome: %v", unknownEvidenceErr)
+	}
+
+	adapter.content = liveCorpus + " sapphire manual revision"
+	adapter.revision = "fixture-v2"
+	if _, err := connectorSvc.SyncSource(ctx, p, connection.ID); err != nil {
+		t.Fatalf("schedule manual fixture sync: %v", err)
+	}
+	runLiveKnowledgeJobs(t, ctx, jobsSvc, connectorSvc, ragSvc)
+	manual, err := ragSvc.Search(ctx, p, rag.SearchInput{CollectionID: collection.ID, Query: "sapphire", Mode: rag.QueryLexical, Limit: 5})
+	if err != nil || len(manual) == 0 || manual[0].DocumentID != hybrid[0].DocumentID || !strings.Contains(manual[0].Content, "sapphire") {
+		t.Fatalf("manual sync did not publish the updated document: %#v err=%v", manual, err)
 	}
 
 	adapter.granted = false

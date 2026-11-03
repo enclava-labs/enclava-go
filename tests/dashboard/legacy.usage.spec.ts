@@ -78,7 +78,7 @@ test('admin creates a budget via the drawer; the POST carries the full 08-07 con
   await drawer.locator('#budget-name').fill(name);
   await drawer.locator('#budget-subject-type').selectOption('tenant');
   await drawer.locator('#budget-kind').selectOption('amount');
-  await drawer.locator('#budget-limit-value').fill(String(limitMicros));
+  await drawer.locator('#budget-limit-value').fill('25.00');
   await drawer.locator('#budget-currency').fill('USD');
   await drawer.locator('#budget-period').selectOption('monthly');
   await drawer.getByRole('button', { name: 'Create budget' }).click();
@@ -152,7 +152,8 @@ test('admin edits a budget limit via the drawer; the PATCH body is exactly {limi
   await expect(drawer).toContainText('Edit budget limit');
   await expect(drawer).toContainText(seedName);
 
-  await drawer.locator('#budget-limit').fill(String(newLimit));
+  await expect(drawer.locator('#budget-limit')).toHaveValue('10.00');
+  await drawer.locator('#budget-limit').fill('50.00');
   await drawer.getByRole('button', { name: 'Save limit' }).click();
 
   // Exactly {limit_value} — a wider body could reset liability or rewrite

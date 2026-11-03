@@ -94,7 +94,7 @@
     <label class="label" for="github-credential">Credential reference</label>
     <input class="field" id="github-credential" data-credential list="cred-github" autocomplete="off">
     <datalist id="cred-github">{{range index .Data.CredentialRefs "github"}}<option value="{{.RefID}}"></option>{{end}}</datalist>
-    <span class="help">Optional for public repositories.</span>
+    <span class="help">Public repository content can sync without a credential. Collaborator and membership lookup still requires a CONNECTOR_GITHUB_* credential binding with push access, even for public repositories; without it only content syncs.</span>
   </div>
 
   <div data-provider-fields="notion" hidden>
@@ -144,7 +144,7 @@
     <p class="muted">Teams sources mirror standard, private and shared channel membership plus the configured chats — readers keep their own Teams access.</p>
   </div>
   <div data-provider-access="github" hidden>
-    <p class="muted">GitHub sources mirror repository collaborator grants — only collaborators can find the repository's content here.</p>
+    <p class="muted">GitHub sources mirror repository collaborator grants. Collaborator and membership lookup requires a credential binding with push access even for public repositories; without it only content syncs.</p>
   </div>
   <div data-provider-access="notion" hidden>
     <p class="muted">Notion sources grant only the <b>published audiences</b> configured below, applied to every selected page. Selecting a page never grants access by itself.</p>

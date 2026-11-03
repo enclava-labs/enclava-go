@@ -134,21 +134,22 @@ func (f fakeConversations) GetConversation(ctx context.Context, tenantID, id str
 }
 
 type fx struct {
-	t             *testing.T
-	ctx           context.Context
-	db            *postgres.DB
-	tenant        string
-	endpoint      *postgres.EndpointsRepo
-	sources       *postgres.SourceRepo
-	artifact      *postgres.ArtifactRepo
-	billing       *billing.Service
-	brepo         *postgres.BillingRepo
-	upstream      *fakeUpstream
-	svc           *inference.Service
-	admission     *inference.Admission
-	principal     auth.Principal
-	factoryErr    error
-	conversations inference.ConversationStore
+	t                *testing.T
+	ctx              context.Context
+	db               *postgres.DB
+	tenant           string
+	endpoint         *postgres.EndpointsRepo
+	sources          *postgres.SourceRepo
+	artifact         *postgres.ArtifactRepo
+	billing          *billing.Service
+	brepo            *postgres.BillingRepo
+	upstream         *fakeUpstream
+	upstreamOverride inference.Upstream
+	svc              *inference.Service
+	admission        *inference.Admission
+	principal        auth.Principal
+	factoryErr       error
+	conversations    inference.ConversationStore
 	// billingOverride swaps the executor's billing seam (tests exercising
 	billingOverride inference.Billing
 	// transportHook runs inside the transport factory before the fake is
@@ -207,6 +208,9 @@ func (f *fx) build(t *testing.T) {
 			}
 			if f.factoryErr != nil {
 				return nil, f.factoryErr
+			}
+			if f.upstreamOverride != nil {
+				return f.upstreamOverride, nil
 			}
 			return f.upstream, nil
 		}), inference.WithAdmission(f.admission))
@@ -1637,15 +1641,19 @@ func TestClientCancelNonStreamStillSettles(t *testing.T) {
 
 	res, err := f.svc.Execute(callCtx, f.principal,
 		f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
-	if err != nil {
-		t.Fatalf("cancelled client context must not abort dispatch: %v", err)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("unexpected dispatch result: %v", err)
 	}
-	defer res.Body.Close()
-	if res.Usage == nil || res.Usage.AmountMicros != 18 {
-		t.Fatalf("cancelled client lost exact usage: %+v", res.Usage)
+	var id string
+	if res != nil {
+		defer func() { _ = res.Body.Close() }()
+		id = res.ReservationID
+	} else if qerr := f.db.SQL.QueryRowContext(f.ctx,
+		`SELECT id FROM reservations WHERE tenant_id = $1 LIMIT 1`, f.tenant).Scan(&id); qerr != nil {
+		t.Fatal(qerr)
 	}
-	if f.reservationState(t, res.ReservationID) != billing.ReservationSettled {
-		t.Fatal("cancelled client's attempt must settle")
+	if got := f.waitReservationState(t, id, billing.ReservationSettled); got != billing.ReservationSettled {
+		t.Fatalf("cancelled client's attempt state = %s", got)
 	}
 }
 
@@ -1878,5 +1886,147 @@ func TestUnsupportedStreamRefusedBeforeReserve(t *testing.T) {
 	}
 	if n := f.reservationCount(t); n != 0 {
 		t.Fatalf("unsupported stream left %d reservations", n)
+	}
+}
+
+func TestDeadlineReturnsBeforeDetachedSettlement(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	f.upstream.onChat = func(ctx context.Context) error {
+		close(started)
+		<-finish
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(f.ctx, time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.svc.Execute(ctx, f.principal, f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+		done <- err
+	}()
+	<-started
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("caller did not return while upstream was blocked")
+	}
+	var id string
+	if err := f.db.SQL.QueryRowContext(f.ctx, `SELECT id FROM reservations WHERE tenant_id = $1`, f.tenant).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	close(finish)
+	if got := f.waitReservationState(t, id, billing.ReservationSettled); got != billing.ReservationSettled {
+		t.Fatalf("reservation state = %s", got)
+	}
+}
+
+type canceledMarkBilling struct {
+	inference.Billing
+	started chan struct{}
+}
+
+func (b *canceledMarkBilling) MarkDispatched(ctx context.Context, p auth.Principal, id string) error {
+	close(b.started)
+	<-ctx.Done()
+	return errors.New("driver: bad connection")
+}
+
+func TestCancelDuringMarkDispatchedReturnsContextError(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+	b := &canceledMarkBilling{Billing: f.billing, started: make(chan struct{})}
+	f.billingOverride = b
+	f.build(t)
+	ctx, cancel := context.WithCancel(f.ctx)
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.svc.Execute(ctx, f.principal, f.streamRequest())
+		done <- err
+	}()
+	<-b.started
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want cancellation", err)
+	}
+	var state string
+	if err := f.db.SQL.QueryRowContext(f.ctx, `SELECT state FROM reservations WHERE tenant_id = $1`, f.tenant).Scan(&state); err != nil || state != billing.ReservationReleased {
+		t.Fatalf("reservation state %q, error %v", state, err)
+	}
+}
+
+func TestNonSSEStreamSettlesReportedUsage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}`))
+	}))
+	defer server.Close()
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.flatPrices(t)
+	f.upstreamOverride = llm.NewOpenAICompatibleAdapter(server.URL, "key", time.Second).WithAllowPrivateEndpoint()
+	f.build(t)
+	_, err := f.svc.Execute(f.ctx, f.principal, f.streamRequest())
+	var protocolErr *llm.StreamProtocolError
+	if !errors.As(err, &protocolErr) {
+		t.Fatalf("got %v, want stream protocol error", err)
+	}
+	var state string
+	if err := f.db.SQL.QueryRowContext(f.ctx, `SELECT state FROM reservations WHERE tenant_id = $1`, f.tenant).Scan(&state); err != nil || state != billing.ReservationSettled {
+		t.Fatalf("reservation state %q, error %v", state, err)
+	}
+}
+
+type canceledReserveBilling struct {
+	inference.Billing
+	started chan struct{}
+	resume  chan struct{}
+	fail    bool
+}
+
+func (b *canceledReserveBilling) Reserve(ctx context.Context, p auth.Principal, req billing.ReserveRequest) (billing.Reservation, error) {
+	close(b.started)
+	<-b.resume
+	if b.fail {
+		return billing.Reservation{}, errors.New("driver: bad connection")
+	}
+	return b.Billing.Reserve(ctx, p, req)
+}
+
+func TestCancelDuringStreamReservation(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("driver_error=%t", fail), func(t *testing.T) {
+			f := newFx(t)
+			f.mkEndpoint(t)
+			f.flatPrices(t)
+			b := &canceledReserveBilling{Billing: f.billing, started: make(chan struct{}), resume: make(chan struct{}), fail: fail}
+			f.billingOverride = b
+			f.build(t)
+			ctx, cancel := context.WithCancel(f.ctx)
+			done := make(chan error, 1)
+			go func() {
+				_, err := f.svc.Execute(ctx, f.principal, f.streamRequest())
+				done <- err
+			}()
+			<-b.started
+			cancel()
+			close(b.resume)
+			if err := <-done; !errors.Is(err, context.Canceled) {
+				t.Fatalf("got %v, want cancellation", err)
+			}
+			var held int
+			if err := f.db.SQL.QueryRowContext(f.ctx, `SELECT count(*) FROM reservations WHERE tenant_id = $1 AND state = $2`, f.tenant, billing.ReservationHeld).Scan(&held); err != nil || held != 0 {
+				t.Fatalf("held reservations %d, error %v", held, err)
+			}
+			if atomic.LoadInt32(&f.upstream.calls) != 0 {
+				t.Fatal("canceled reservation reached upstream")
+			}
+		})
 	}
 }

@@ -27,6 +27,13 @@ var (
 	ErrInvalidRequest = errors.New("jobs: invalid enqueue request")
 )
 
+// ReasonInterrupted is the outcome reason recorded on a job whose attempt
+// was dispatched and then lost (shutdown cancel or lease expiry): the
+// upstream request may have run and its usage may have been billed, so the
+// job is never auto-replayed — only an explicit user retry creates a new
+// job.
+const ReasonInterrupted = "interrupted"
+
 // FailureClass drives Fail's retry decision.
 type FailureClass int
 
@@ -280,9 +287,16 @@ func (c *Claim) Fail(ctx context.Context, cause error, class FailureClass) error
 }
 
 // MarkUnknown ends the job as unknown: the attempt was dispatched and its
-// outcome was never observed. Retained, never auto-requeued.
+// outcome was never observed. Retained, never auto-requeued. The error doc
+// carries reason=interrupted so callers can gate the explicit retry affordance;
+// the repository joins the attempt's reservation id in on write.
 func (c *Claim) MarkUnknown(ctx context.Context, reason string) error {
-	doc := errorDoc(errors.New(reason), false)
+	doc, merr := json.Marshal(map[string]any{
+		"message": reason, "retryable": false, "reason": ReasonInterrupted,
+	})
+	if merr != nil {
+		doc = errorDoc(errors.New(reason), false)
+	}
 	return c.svc.repo.MarkUnknownJob(ctx, c.job.TenantID, c.JobID, c.Owner, c.FenceToken, c.attemptID, doc)
 }
 

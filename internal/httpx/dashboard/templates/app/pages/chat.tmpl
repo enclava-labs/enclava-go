@@ -30,6 +30,7 @@
         <select class="field" id="assistantSelect" aria-label="Assistant"{{if not .Data.Assistants}} disabled{{end}}>
           {{$sel := .Data.SelectedAssistant}}{{range .Data.Assistants}}<option value="{{.ID}}"{{if eq .ID $sel}} selected{{end}}>{{.Name}}</option>{{end}}
         </select>
+        <span class="help">Don't see an assistant you expected? Ask an administrator to grant your role access.</span>
         {{if not .Data.Assistants}}<span class="help">{{.Data.AssistantsEmpty.Text}}</span>{{end}}
       </div>
       {{with .Data.Thread}}{{if .AssistantName}}<div class="threadmeta">

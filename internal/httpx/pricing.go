@@ -23,6 +23,19 @@ type adminPricingCreateRequest struct {
 	EffectiveFrom string `json:"effective_from,omitempty"`
 }
 
+// adminPricingWriteRequest is the pricing POST body: the single-price fields
+// above, or a `prices` array written atomically — the dashboard Set-price
+// form saves every entered category in one transaction, so a rejected unit
+// can never leave a partial price set.
+type adminPricingWriteRequest struct {
+	adminPricingCreateRequest
+	Prices []adminPricingCreateRequest `json:"prices,omitempty"`
+}
+
+// maxBatchPrices bounds one atomic write well past the three displayed
+// categories — a bigger array is a malformed request, not a workload.
+const maxBatchPrices = 12
+
 func (a *App) handleAdminPricing(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
 	setNoStoreHeaders(w)
 	if a.billingRepo == nil {
@@ -53,12 +66,16 @@ func (a *App) handleAdminPricing(w http.ResponseWriter, r *http.Request, princip
 			"offset":  offset,
 		})
 	case http.MethodPost:
-		var req adminPricingCreateRequest
+		var req adminPricingWriteRequest
 		if err := DecodeJSON(r, &req); err != nil {
 			WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 			return
 		}
-		price, effectiveFrom, err := priceFromAdminRequest(req)
+		if req.Prices != nil {
+			a.writePricingBatch(w, r, principal, req.Prices)
+			return
+		}
+		price, effectiveFrom, err := priceFromAdminRequest(req.adminPricingCreateRequest)
 		if err != nil {
 			WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "pricing_invalid")
 			return
@@ -74,6 +91,52 @@ func (a *App) handleAdminPricing(w http.ResponseWriter, r *http.Request, princip
 	default:
 		WriteMethodNotAllowed(w)
 	}
+}
+
+// writePricingBatch validates every entry before touching the store, then
+// inserts all of them inside ONE PutPrices transaction: one invalid unit
+// means nothing is written — a partial price set is the failure the batch
+// contract exists to prevent. A duplicate (subject, capability, unit) key
+// inside one batch is rejected up front rather than failing on the
+// uniqueness constraint mid-write.
+func (a *App) writePricingBatch(w http.ResponseWriter, r *http.Request, principal auth.Principal, items []adminPricingCreateRequest) {
+	if len(items) == 0 {
+		WriteOpenAIError(w, http.StatusBadRequest, "prices must contain at least one entry", "invalid_request_error", "pricing_empty")
+		return
+	}
+	if len(items) > maxBatchPrices {
+		WriteOpenAIError(w, http.StatusBadRequest, "prices holds too many entries", "invalid_request_error", "pricing_batch_too_large")
+		return
+	}
+	seen := make(map[[4]string]bool, len(items))
+	batch := make([]billing.PriceWrite, 0, len(items))
+	for _, item := range items {
+		price, effectiveFrom, err := priceFromAdminRequest(item)
+		if err != nil {
+			WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "pricing_invalid")
+			return
+		}
+		key := [4]string{price.SubjectType, price.SubjectID, price.Capability, string(price.Unit)}
+		if seen[key] {
+			WriteOpenAIError(w, http.StatusBadRequest, "prices repeats a subject/capability/unit pair", "invalid_request_error", "pricing_duplicate")
+			return
+		}
+		seen[key] = true
+		batch = append(batch, billing.PriceWrite{
+			ID: NewID("price"), Price: price,
+			ActorID: principal.ActorID, EffectiveFrom: effectiveFrom,
+		})
+	}
+	if err := a.billingRepo.PutPrices(r.Context(), principal.TenantID, batch); err != nil {
+		log.Printf("failed to create pricing batch: %v", err)
+		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "pricing_create_failed")
+		return
+	}
+	ids := make([]string, len(batch))
+	for i, entry := range batch {
+		ids[i] = entry.ID
+	}
+	WriteJSON(w, http.StatusCreated, map[string]any{"ids": ids, "count": len(batch)})
 }
 
 func (a *App) handleAdminBillingAudit(w http.ResponseWriter, r *http.Request, principal auth.Principal) {

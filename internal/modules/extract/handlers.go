@@ -212,6 +212,15 @@ func (h *Handlers) HandleJobDetail(w http.ResponseWriter, r *http.Request, princ
 		httpx.WriteJSON(w, http.StatusAccepted, map[string]string{"job_id": jobID, "status": "cancellation_requested"})
 		return
 	}
+	if len(parts) == 2 && parts[1] == "retry" && r.Method == http.MethodPost {
+		view, err := h.svc.RetryInterruptedJob(r.Context(), principal, jobID)
+		if err != nil {
+			h.writeJobError(w, err, "job_retry_failed")
+			return
+		}
+		httpx.WriteJSON(w, http.StatusAccepted, view)
+		return
+	}
 	if len(parts) == 1 && r.Method == http.MethodDelete {
 		if err := h.svc.DeleteJob(r.Context(), principal, jobID); err != nil {
 			if errors.Is(err, extract.ErrDeletePending) {
@@ -225,7 +234,7 @@ func (h *Handlers) HandleJobDetail(w http.ResponseWriter, r *http.Request, princ
 		return
 	}
 	if len(parts) == 2 && parts[1] != "result" || len(parts) > 2 {
-		http.NotFound(w, r)
+		httpx.WriteOpenAIError(w, http.StatusNotFound, "job not found", "invalid_request_error", "not_found")
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -251,6 +260,14 @@ func (h *Handlers) HandleJobDetail(w http.ResponseWriter, r *http.Request, princ
 func (h *Handlers) writeJobError(w http.ResponseWriter, err error, code string) {
 	if errors.Is(err, extract.ErrNotFound) {
 		httpx.WriteOpenAIError(w, http.StatusNotFound, "job not found", "invalid_request_error", "not_found")
+		return
+	}
+	if errors.Is(err, extract.ErrForbidden) {
+		httpx.WriteForbidden(w, err.Error())
+		return
+	}
+	if errors.Is(err, extract.ErrExtractionAdmissionLimited) {
+		httpx.WriteOpenAIError(w, http.StatusTooManyRequests, err.Error(), "rate_limit_error", "extraction_admission_limited")
 		return
 	}
 	if errors.Is(err, billing.ErrPriceMissing) {

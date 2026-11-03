@@ -2,6 +2,7 @@ package rag
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -72,11 +73,15 @@ func (s *Service) searchModels(input *SearchInput) error {
 	return nil
 }
 
-// Bounds for the cross-collection search page.
+// Bounds for the cross-collection search page. searchPageDepth is the fused
+// pool a paginated search exposes: pages end honestly when the pool is
+// exhausted, and per-collection reads can never produce more than
+// searchCollection's 50-result cap anyway.
 const (
 	maxSearchCollections = 20
 	defaultSearchLimit   = 20
 	maxSearchLimit       = 50
+	searchPageDepth      = 2 * maxSearchLimit
 	maxQueryRunes        = 512
 	rrfConstant          = 60
 )
@@ -267,6 +272,12 @@ func (s *Service) queryIndex(ctx context.Context, p auth.Principal, collection C
 		if err != nil {
 			return nil, err
 		}
+		sort.Slice(points, func(i, j int) bool {
+			if points[i].Score != points[j].Score {
+				return points[i].Score > points[j].Score
+			}
+			return fmt.Sprint(points[i].ID) < fmt.Sprint(points[j].ID)
+		})
 		for _, point := range points {
 			if _, dup := seen[fmt.Sprint(point.ID)]; dup {
 				continue
@@ -426,6 +437,9 @@ func (s *Service) SearchReadable(ctx context.Context, p auth.Principal, query st
 type SearchReadableOptions struct {
 	Rewrite        bool
 	SelectSections bool
+	// Cursor resumes a previous search after its last returned result;
+	// opaque and validated before use — a malformed value is ErrInvalidInput.
+	Cursor string
 }
 
 func (s *Service) SearchReadableWithOptions(ctx context.Context, p auth.Principal, query string, mode QueryMode, collectionIDs []string, limit int, options SearchReadableOptions) (SearchReadableResult, error) {
@@ -451,10 +465,16 @@ func (s *Service) SearchReadableWithOptions(ctx context.Context, p auth.Principa
 	if limit > maxSearchLimit {
 		limit = maxSearchLimit
 	}
-	perCollection := 4 * limit
-	if perCollection > 100 {
-		perCollection = 100
+	perCollection := maxSearchLimit
+	var cursor searchCursor
+	if options.Cursor != "" {
+		parsed, err := decodeSearchCursor(options.Cursor)
+		if err != nil {
+			return SearchReadableResult{}, err
+		}
+		cursor = parsed
 	}
+
 	readable, err := s.ListCollections(ctx, p)
 	if err != nil {
 		return SearchReadableResult{}, err
@@ -483,8 +503,29 @@ func (s *Service) SearchReadableWithOptions(ctx context.Context, p auth.Principa
 	if !memo.searched && denied != nil {
 		return SearchReadableResult{}, denied
 	}
-	results := fuseRankedResults(lists, limit)
-	results, err = s.reauthorizeResults(ctx, p, results)
+	pool := fuseRankedResults(lists, searchPageDepth)
+	if options.Cursor != "" {
+		remaining := pool[:0]
+		for _, result := range pool {
+			if afterSearchCursor(result, cursor) {
+				remaining = append(remaining, result)
+			}
+		}
+		pool = remaining
+	}
+	page := pool
+	more := false
+	if len(page) > limit {
+		page, more = page[:limit], true
+	}
+	// The continuation position is the last CONSUMED fused result — the
+	// post-authorization re-check can still drop it, and dropping positions
+	// (not results) keeps pages disjoint without a server-side bookmark.
+	var nextCursor string
+	if more && len(page) > 0 {
+		nextCursor = encodeSearchCursor(page[len(page)-1])
+	}
+	results, err := s.reauthorizeResults(ctx, p, page)
 	if err != nil {
 		return SearchReadableResult{}, err
 	}
@@ -502,7 +543,7 @@ func (s *Service) SearchReadableWithOptions(ctx context.Context, p auth.Principa
 		results[i].Locations = locations[i]
 	}
 	facets := sourceKindFacets(results)
-	return SearchReadableResult{Results: results, Facets: facets}, nil
+	return SearchReadableResult{Results: results, Facets: facets, NextCursor: nextCursor}, nil
 }
 
 // selectReadableCollections applies the explicit-ID rule: an explicit
@@ -546,25 +587,90 @@ func selectReadableCollections(readable []Collection, collectionIDs []string) ([
 	return selected, nil
 }
 
+// searchResultKey is the stable identity ordering a fused result: the
+// collection, the immutable version row and the chunk. It is a total order
+// that never depends on which list first saw a hit — the pagination
+// cursor's deterministic tie-break below the fused score.
+type searchResultKey struct {
+	collectionID string
+	versionID    string
+	chunkID      string
+}
+
+func keyOf(r SearchResult) searchResultKey {
+	return searchResultKey{collectionID: r.CollectionID, versionID: r.ObjectVersionID, chunkID: r.ChunkID}
+}
+
+func searchResultKeyLess(a, b searchResultKey) bool {
+	if a.collectionID != b.collectionID {
+		return a.collectionID < b.collectionID
+	}
+	if a.versionID != b.versionID {
+		return a.versionID < b.versionID
+	}
+	return a.chunkID < b.chunkID
+}
+
+// searchCursor is the opaque pagination position: the fused score and the
+// stable identity of the last consumed result. JSON inside base64url keeps
+// the token opaque and URL-safe without a signing scheme — the value is
+// reparsed and bounds-checked on every read.
+type searchCursor struct {
+	Score        float64 `json:"s"`
+	CollectionID string  `json:"c"`
+	VersionID    string  `json:"v"`
+	ChunkID      string  `json:"k"`
+}
+
+func encodeSearchCursor(r SearchResult) string {
+	raw, err := json.Marshal(searchCursor{Score: r.Score, CollectionID: r.CollectionID, VersionID: r.ObjectVersionID, ChunkID: r.ChunkID})
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func decodeSearchCursor(raw string) (searchCursor, error) {
+	var cursor searchCursor
+	data, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(raw))
+	if err != nil {
+		return cursor, fmt.Errorf("%w: invalid search cursor", ErrInvalidInput)
+	}
+	if err := json.Unmarshal(data, &cursor); err != nil {
+		return cursor, fmt.Errorf("%w: invalid search cursor", ErrInvalidInput)
+	}
+	if cursor.CollectionID == "" || cursor.VersionID == "" || cursor.ChunkID == "" {
+		return searchCursor{}, fmt.Errorf("%w: invalid search cursor", ErrInvalidInput)
+	}
+	return cursor, nil
+}
+
+// afterSearchCursor reports whether a fused result sorts strictly after the
+// cursor position under (score desc, stable id asc) — the same comparator
+// fuseRankedResults applies, so pages are disjoint and stable.
+func afterSearchCursor(r SearchResult, c searchCursor) bool {
+	if r.Score != c.Score {
+		return r.Score < c.Score
+	}
+	return searchResultKeyLess(searchResultKey{c.CollectionID, c.VersionID, c.ChunkID}, keyOf(r))
+}
+
 // rankedSearchList is one bounded ranked results list.
 type rankedSearchList struct {
 	results []SearchResult
 }
 
 // fuseRankedResults merges ranked lists with reciprocal rank fusion and a
-// deterministic tie-break (list order, then rank) — the fused order never
-// depends on map iteration or raw cross-collection scores.
+// deterministic tie-break on the stable result identity — the fused order
+// never depends on map iteration, raw cross-collection scores or which list
+// saw a hit first. The RRF score replaces each result's raw per-collection
+// score: it is the rank the fused order (and the pagination cursor) uses.
 func fuseRankedResults(lists []rankedSearchList, limit int) []SearchResult {
-	type key struct {
-		collectionID string
-		versionID    string
-		chunkID      string
-	}
-	scores := make(map[key]float64)
-	order := make(map[key]int)
+	scores := make(map[searchResultKey]float64)
+	order := make(map[searchResultKey]int)
 	for listIndex, list := range lists {
 		for rank, result := range list.results {
-			id := key{result.CollectionID, result.ObjectVersionID, result.ChunkID}
+			id := keyOf(result)
 			scores[id] += 1 / float64(rrfConstant+rank+1)
 			if _, seen := order[id]; !seen {
 				order[id] = listIndex<<32 | rank
@@ -572,18 +678,18 @@ func fuseRankedResults(lists []rankedSearchList, limit int) []SearchResult {
 		}
 	}
 	results := make([]SearchResult, 0, len(scores))
-	for id := range scores {
+	for id, score := range scores {
 		listIndex := int(uint64(order[id]) >> 32)
 		rank := int(uint64(order[id]) & 0xffffffff)
-		results = append(results, lists[listIndex].results[rank])
+		result := lists[listIndex].results[rank]
+		result.Score = score
+		results = append(results, result)
 	}
 	sort.Slice(results, func(i, j int) bool {
-		ki := key{results[i].CollectionID, results[i].ObjectVersionID, results[i].ChunkID}
-		kj := key{results[j].CollectionID, results[j].ObjectVersionID, results[j].ChunkID}
-		if scores[ki] != scores[kj] {
-			return scores[ki] > scores[kj]
+		if results[i].Score != results[j].Score {
+			return results[i].Score > results[j].Score
 		}
-		return order[ki] < order[kj]
+		return searchResultKeyLess(keyOf(results[i]), keyOf(results[j]))
 	})
 	if len(results) > limit {
 		results = results[:limit]

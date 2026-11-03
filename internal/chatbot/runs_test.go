@@ -54,7 +54,7 @@ func TestNormalizeRunEvidenceIDsBoundsAndDedupes(t *testing.T) {
 // route summary only — the assembled request body (system prompt, history,
 // attached passages) never reaches a step row.
 func TestModelAttemptSummaryIsToolSafe(t *testing.T) {
-	summary := modelAttemptSummary("chat-test-model", 3, 2)
+	summary := modelAttemptSummary("chat-test-model", "job-1", "attempt-1", 3, 2)
 	var decoded struct {
 		Model    string `json:"model"`
 		Messages int    `json:"messages"`
@@ -66,7 +66,7 @@ func TestModelAttemptSummaryIsToolSafe(t *testing.T) {
 	if decoded.Model != "chat-test-model" || decoded.Messages != 3 || decoded.Tools != 2 {
 		t.Fatalf("summary = %q", summary)
 	}
-	if summary != `{"model":"chat-test-model","messages":3,"tools":2}` {
+	if summary != `{"model":"chat-test-model","job_id":"job-1","attempt_id":"attempt-1","messages":3,"tools":2}` {
 		t.Fatalf("summary carries more than the route shape: %q", summary)
 	}
 }

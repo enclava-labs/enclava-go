@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -73,7 +74,9 @@ func newConnectorFixture(t *testing.T, adapters ...*testAdapter) *connectorFixtu
 	db := testdb.New(t)
 	ctx := context.Background()
 	tenant := testdb.SeedTenant(t, db, "connector-sync")
-	user := testdb.SeedUser(t, db, tenant, "connector@example.test", nil)
+	user := testdb.SeedUserWithGrants(t, db, tenant, "connector@example.test", []string{"connectors.manage"}, auth.ResourceGrants{
+		Models: auth.Allowlist{All: true}, Endpoints: auth.Allowlist{All: true},
+	})
 	p := auth.Principal{TenantID: tenant, ActorID: user.ID, ActorKind: auth.ActorKindUser, UserID: user.ID,
 		CredentialID: "key_connector", CredentialKind: auth.CredentialKindAPIKey,
 		BillingSubjectID: user.ID, BillingSubjectKind: auth.BillingSubjectUser,
@@ -99,6 +102,7 @@ func newConnectorFixture(t *testing.T, adapters ...*testAdapter) *connectorFixtu
 	}
 	obs := postgres.NewConnectorObservationsRepo(db)
 	svc.SetSyncDependencies(factories, obs, store, sourceRepo)
+	svc.SetPrincipalResolver(auth.NewService(postgres.NewIdentityRepo(db), "").PrincipalForActor)
 	return &connectorFixture{db: db, svc: svc, jobs: jobsSvc, jobRows: jobsRepo, sourceRepo: sourceRepo, repo: sourceRepo, observations: obs,
 		artifacts: store, principal: p, tenant: tenant, connection: conn, adapter: adapter}
 }
@@ -273,9 +277,6 @@ func TestSlackParentGrantBeforeContentAndIdentityBinding(t *testing.T) {
 	if err := f.sourceRepo.InsertSourceIdentity(ctx, source.SourceIdentity{TenantID: f.tenant, ConnectionID: f.connection.ID, SourceKind: f.connection.Kind, ID: "mapped-slack", NativeID: "U-mapped", MappedUserID: user.ID}); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.sourceRepo.InsertSourceIdentity(ctx, source.SourceIdentity{TenantID: f.tenant, ConnectionID: f.connection.ID, SourceKind: f.connection.Kind, ID: "unmapped-slack", NativeID: "U-unmapped"}); err != nil {
-		t.Fatal(err)
-	}
 	f.schedule(t)
 	if _, err := f.runNext(t); err != nil {
 		t.Fatal(err)
@@ -342,13 +343,6 @@ func TestSlackParentGrantBeforeContentAndIdentityBinding(t *testing.T) {
 	admin := f.principal
 	admin.Scopes[auth.ScopePlatformAdmin] = struct{}{}
 	if _, err := f.svc.BindSourcePrincipal(ctx, admin, BindSourcePrincipalInput{ConnectionID: f.connection.ID, NativeUserID: "U-unmapped", MappedUserID: other.ID, VerificationEvidence: "verified in Slack"}); err != nil {
-		t.Fatal(err)
-	}
-	adapter.capabilities = AdapterCapabilities{Access: true}
-	if _, err := f.svc.SyncSourceWindowed(ctx, f.principal, f.connection.ID, 3); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.runNext(t); err != nil {
 		t.Fatal(err)
 	}
 	if err := authorizer.CanRead(ctx, unbound, child, source.ReadOptions{}); err != nil {
@@ -804,5 +798,92 @@ func TestContentSyncRewriteAndRetargetHandoff(t *testing.T) {
 	sync(5)
 	if seen := drainIngests(); len(seen) != 0 {
 		t.Fatalf("same-collection re-sync enqueued ingest: %v", seen)
+	}
+}
+
+func TestScheduledThenManualReplaysConnectorIngest(t *testing.T) {
+	ctx := context.Background()
+	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true}}
+	fail := true
+	adapter.content = func(_ context.Context, _ source.Connection, cursor Cursor, _ int) (ContentPage, error) {
+		if cursor == "" {
+			return ContentPage{Items: []ContentItem{{NativeID: "one", Kind: "document", Text: "hello"}}, NextCursor: "next", Completeness: CompletenessIncomplete}, nil
+		}
+		if fail {
+			return ContentPage{}, errors.New("interrupted")
+		}
+		return ContentPage{Completeness: CompletenessComplete}, nil
+	}
+	f := newConnectorFixture(t, adapter)
+	scheduled := auth.Principal{TenantID: f.tenant, ActorID: f.connection.CreatedBy}
+	if _, err := f.svc.SyncSourceWindowed(ctx, scheduled, f.connection.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.runNext(t); err == nil {
+		t.Fatal("expected interrupted scheduled sync")
+	}
+	fail = false
+	f.schedule(t)
+	if _, err := f.runNext(t); err != nil {
+		t.Fatalf("manual replay failed: %v", err)
+	}
+	rows, err := f.jobRows.ListConnectionJobs(ctx, f.tenant, f.connection.ID, "", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, row := range rows {
+		if row.Operation == OperationIngest {
+			count++
+			var owner auth.Principal
+			if err := json.Unmarshal(row.PrincipalSnapshot, &owner); err != nil {
+				t.Fatal(err)
+			}
+			if owner.ActorID != f.connection.CreatedBy || !owner.AllowedModelsAll || !owner.AllowedEndpointsAll || owner.BillingSubjectID != f.connection.CreatedBy {
+				t.Fatalf("ingest lost creator grants or billing identity: %+v", owner)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("ingest jobs = %d, want one", count)
+	}
+}
+
+func TestManualSyncWindowsAndRetry(t *testing.T) {
+	f := newConnectorFixture(t)
+	ctx := context.Background()
+	a, err := f.svc.SyncSource(ctx, f.principal, f.connection.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := f.svc.SyncSource(ctx, f.principal, f.connection.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.ID == b.ID {
+		t.Fatal("manual syncs reused a job")
+	}
+	c, err := f.svc.SyncSourceKeyed(ctx, f.principal, f.connection.ID, "request-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := f.svc.SyncSourceKeyed(ctx, f.principal, f.connection.ID, "request-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ID != d.ID {
+		t.Fatal("retry created a new job")
+	}
+}
+
+func TestConnectorSyncRejectsDisabledCreator(t *testing.T) {
+	f := newConnectorFixture(t)
+	ctx := context.Background()
+	if _, err := f.db.SQL.ExecContext(ctx, `UPDATE users SET status='disabled' WHERE tenant_id=$1 AND id=$2`, f.tenant, f.connection.CreatedBy); err != nil {
+		t.Fatal(err)
+	}
+	f.schedule(t)
+	if _, err := f.runNext(t); err == nil || !strings.Contains(err.Error(), "connector creator authorization") {
+		t.Fatalf("disabled creator sync error = %v", err)
 	}
 }

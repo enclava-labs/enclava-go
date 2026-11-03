@@ -28,17 +28,17 @@ func TestDashboardCapabilitiesPerRole(t *testing.T) {
 	adminScopes := append(append([]string{}, knowledgeManagerScopes...),
 		"platform.admin", "models.list", "openai.proxy", "pricing.manage")
 
-	member := dashboardCaps{Chat: true, Search: true, Extract: true}
+	member := dashboardCaps{Chat: true, Search: true, Extract: true, API: true}
 	knowledgeManager := dashboardCaps{
 		Chat: true, Search: true, Extract: true,
 		KnowledgeManage: true, SourcesManage: true,
-		ExtractManage: true, AssistantsManage: true,
+		ExtractManage: true, AssistantsManage: true, API: true,
 	}
 	admin := dashboardCaps{
 		Chat: true, Search: true, KnowledgeManage: true,
 		SourcesManage: true, Extract: true, ExtractManage: true,
 		AssistantsManage: true, ToolsManage: true, ModelsManage: true,
-		AccessManage: true, BillingView: true,
+		AccessManage: true, BillingView: true, API: true,
 	}
 	platformAdminOnly := dashboardCaps{ToolsManage: true, AccessManage: true, BillingView: true}
 

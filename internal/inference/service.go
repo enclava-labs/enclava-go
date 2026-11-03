@@ -225,7 +225,12 @@ const (
 // Execute is the single entry point every model call must use: resolve policy,
 // route, reserve, dispatch, settle-or-retain. The principal's authority is
 // never widened by request fields; the returned body is caller-owned.
-func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*Result, error) {
+func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (result *Result, retErr error) {
+	defer func() {
+		if req.Stream && retErr != nil && ctx.Err() != nil {
+			retErr = ctx.Err()
+		}
+	}()
 	if p.TenantID == "" || p.ActorID == "" {
 		return nil, fmt.Errorf("%w: principal lacks tenant/actor", ErrDenied)
 	}
@@ -312,18 +317,47 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 	// AttemptID binds the reservation to a durable job_attempts row when the
 	// caller runs inside a job; standalone calls leave it empty and the
 	// reservation id is the attempt identity.
-	res, err := s.reserve(ctx, p, req, endpoint, capability, upstreamModel, req.AttemptID)
+	reserveCtx := ctx
+	var reserveCancel context.CancelFunc
+	if req.Stream {
+		if err := ctx.Err(); err != nil {
+			permit.Release()
+			return nil, err
+		}
+		// Complete the reservation transaction independently so cancellation
+		// cannot hide a committed hold from the cleanup below.
+		reserveCtx, reserveCancel = context.WithTimeout(context.WithoutCancel(ctx), accountingTimeout)
+	}
+	res, err := s.reserve(reserveCtx, p, req, endpoint, capability, upstreamModel, req.AttemptID)
+	if reserveCancel != nil {
+		reserveCancel()
+	}
 	if err != nil {
 		permit.Release()
 		return nil, err
+	}
+	if req.Stream && ctx.Err() != nil {
+		permit.Release()
+		s.releaseUnsent(ctx, p, res.ID)
+		return nil, ctx.Err()
 	}
 
 	if err := s.billing.MarkDispatched(ctx, p, res.ID); err != nil {
 		permit.Release()
 		// Dispatch never happened; the hold releases on a detached
 		// context even when the caller already walked away.
-		s.releaseUndispatched(ctx, p, res.ID)
+		s.releaseUnsent(ctx, p, res.ID)
+		// A caller cancellation interrupting the write surfaces as a
+		// driver error — report the cancellation itself deterministically.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("mark dispatched: %w", err)
+	}
+	if req.Stream && ctx.Err() != nil {
+		permit.Release()
+		s.releaseUnsent(ctx, p, res.ID)
+		return nil, ctx.Err()
 	}
 
 	// obs watches the transport's writes: on a dispatch failure, sent is
@@ -352,7 +386,7 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 		},
 		GotFirstResponseByte: func() { obs.sent.Store(true); obs.any.Store(true) },
 	}
-	tctx := httptrace.WithClientTrace(context.WithoutCancel(ctx), trace)
+	dctx := httptrace.WithClientTrace(context.WithoutCancel(ctx), trace)
 
 	if req.Stream {
 		// Streams bound their own lifetime via idle/wall limits on the body;
@@ -392,36 +426,63 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (*
 		}, nil
 	}
 
-	dctx, cancel := context.WithTimeout(tctx, s.attemptTimeout)
-	defer cancel()
+	type dispatchOutcome struct {
+		raw []byte
+		err error
+	}
+	out := make(chan dispatchOutcome, 1)
 	dstart := time.Now()
-	raw, err := s.dispatch(dctx, up, capability, req, body)
-	if err != nil {
+	adctx, cancel := context.WithTimeout(dctx, s.attemptTimeout)
+	go func() {
+		raw, derr := s.dispatch(adctx, up, capability, req, body)
+		out <- dispatchOutcome{raw, derr}
+	}()
+	// The upstream call runs detached: the provider may still be executing,
+	// so the attempt and its exact settlement continue after the caller
+	// leaves — but a caller deadline or disconnect returns immediately with
+	// the context error instead of pinning on a silent upstream.
+	settle := func(o dispatchOutcome) (*Result, error) {
+		if o.err != nil {
+			s.observeDispatchFailure(endpoint, o.err)
+			s.settleDispatchError(ctx, p, res, o.err, obs)
+			return nil, o.err
+		}
+		s.observeDispatchSuccess(endpoint, time.Since(dstart))
+		if endpoint.Protocol == "confidential_sdk" {
+			s.stampVerification(ctx, endpoint)
+		}
+		usage, known := usageFromJSON(o.raw)
+		rec, serr := s.settleReservation(ctx, p, res, usage, known)
+		result := &Result{
+			AttemptID:     req.AttemptID,
+			ReservationID: res.ID,
+			Capability:    capability,
+			EndpointID:    endpoint.ID,
+			Model:         upstreamModel,
+			Body:          io.NopCloser(bytes.NewReader(o.raw)),
+			Usage:         rec,
+		}
+		if serr != nil {
+			result.SettlementError = serr
+		}
+		return result, nil
+	}
+	select {
+	case o := <-out:
+		cancel()
 		permit.Release()
-		s.observeDispatchFailure(endpoint, err)
-		s.settleDispatchError(ctx, p, res, err, obs)
-		return nil, err
+		return settle(o)
+	case <-ctx.Done():
+		// The attempt outlives the caller: settle its real outcome and
+		// release the slot when the upstream call actually finishes.
+		go func() {
+			o := <-out
+			cancel()
+			permit.Release()
+			_, _ = settle(o)
+		}()
+		return nil, ctx.Err()
 	}
-	permit.Release()
-	if endpoint.Protocol == "confidential_sdk" {
-		s.stampVerification(ctx, endpoint)
-	}
-	s.observeDispatchSuccess(endpoint, time.Since(dstart))
-	usage, known := usageFromJSON(raw)
-	rec, serr := s.settleReservation(ctx, p, res, usage, known)
-	result := &Result{
-		AttemptID:     req.AttemptID,
-		ReservationID: res.ID,
-		Capability:    capability,
-		EndpointID:    endpoint.ID,
-		Model:         upstreamModel,
-		Body:          io.NopCloser(bytes.NewReader(raw)),
-		Usage:         rec,
-	}
-	if serr != nil {
-		result.SettlementError = serr
-	}
-	return result, nil
 }
 
 // sendObserver is the httptrace evidence that a dispatched attempt actually
@@ -450,6 +511,12 @@ func neverSent(obs *sendObserver, err error) bool {
 // definitive upstream error settles its (possibly zero) reported usage, and
 // anything ambiguous retains unknown liability.
 func (s *Service) settleDispatchError(ctx context.Context, p auth.Principal, res billing.Reservation, err error, obs *sendObserver) {
+	var protocolErr *llm.StreamProtocolError
+	if errors.As(err, &protocolErr) {
+		usage, known := usageFromJSON(protocolErr.Body)
+		_, _ = s.settleReservation(ctx, p, res, usage, known)
+		return
+	}
 	if neverSent(obs, err) {
 		s.releaseUnsent(ctx, p, res.ID)
 		return
@@ -698,6 +765,9 @@ func (s *Service) dispatchStream(ctx context.Context, up Upstream, capability st
 	if err != nil {
 		stopOpenWatch()
 		openCancel()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 	if !stopOpenWatch() {
@@ -794,7 +864,7 @@ func (s *Service) transportFor(ctx context.Context, e Endpoint) (Upstream, error
 // credentials or origin.
 func transportSignature(e Endpoint) string {
 	parts := []string{
-		e.Protocol, e.SDKProvider, e.BaseOrigin, e.CredentialRef,
+		e.Protocol, e.SDKProvider, e.BaseOrigin, e.EnclaveRepo, e.CredentialRef,
 		fmt.Sprintf("%v", e.AuthorizedPrivate),
 		e.AssuranceMode,
 	}
@@ -855,8 +925,21 @@ func (s *Service) defaultTransport(ctx context.Context, e Endpoint, credential s
 		}
 		return a.WithProviderName(e.Protocol), nil
 	case "tinfoil":
-		host := strings.TrimPrefix(strings.TrimPrefix(e.BaseOrigin, "https://"), "http://")
-		return llm.NewTinfoilProvider(credential, host, "", s.attemptTimeout, false, false, 5*time.Minute)
+		// The shared router host uses the SDK's automatic router
+		// configuration (no explicit enclave); any other origin is a
+		// dedicated enclave that must carry its attestation repo — there
+		// is no unattested fallback for this protocol.
+		if !strings.HasPrefix(strings.ToLower(e.BaseOrigin), "https://") {
+			return nil, fmt.Errorf("%w: tinfoil requires an https origin", ErrDenied)
+		}
+		host := TinfoilEnclaveHost(e.BaseOrigin)
+		if host == DefaultTinfoilEnclave && e.EnclaveRepo == "" {
+			return llm.NewTinfoilProvider(credential, "", "", s.attemptTimeout, false, false, 5*time.Minute)
+		}
+		if e.EnclaveRepo == "" {
+			return nil, fmt.Errorf("%w: tinfoil endpoint %q names a dedicated enclave without enclave_repo", ErrDenied, e.ID)
+		}
+		return llm.NewTinfoilProvider(credential, host, e.EnclaveRepo, s.attemptTimeout, false, false, 5*time.Minute)
 	case "confidential_sdk":
 		return llm.NewConfidentialSDK(os.Getenv("CONFIDENTIAL_SDK_CONFIG"), e.SDKProvider, e.BaseOrigin, credential)
 	default:

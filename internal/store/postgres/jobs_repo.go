@@ -54,7 +54,7 @@ const jobColumns = `tenant_id::text, id, operation, status, connection_id,
 	object_id, observed_revision, idempotency_key, input_hash, input_ref,
 	principal, submitter_key, policy, attempts, max_attempts, fence_token,
 	lease_owner, lease_expires_at, dispatched_attempt_id, result_ref, progress, error,
-	submitted_at, started_at, finished_at, deleted_at`
+	submitted_at, updated_at, started_at, finished_at, deleted_at`
 
 // scanJobRow decodes jobColumns order plus any caller-supplied trailing
 func scanJobRow(s rowScanner, extra ...any) (jobs.JobRow, error) {
@@ -70,7 +70,7 @@ func scanJobRow(s rowScanner, extra ...any) (jobs.JobRow, error) {
 		&observed, &row.IdempotencyKey, &row.InputHash, &inputRef, &principal,
 		&submitterKey, &policy, &row.Attempt, &row.MaxAttempts, &row.FenceToken,
 		&leaseOwner, &leaseExpires, &dispatched, &resultRef, &progress, &errDoc,
-		&row.CreatedAt, &startedAt, &finishedAt, &deletedAt}
+		&row.CreatedAt, &row.UpdatedAt, &startedAt, &finishedAt, &deletedAt}
 	dests = append(dests, extra...)
 	if err := s.Scan(dests...); err != nil {
 		return jobs.JobRow{}, err
@@ -115,10 +115,14 @@ func scanJobRow(s rowScanner, extra ...any) (jobs.JobRow, error) {
 	}
 	if len(errDoc) > 0 {
 		var doc struct {
-			Message string `json:"message"`
+			Message       string `json:"message"`
+			Reason        string `json:"reason"`
+			ReservationID string `json:"reservation_id"`
 		}
 		if json.Unmarshal(errDoc, &doc) == nil {
 			row.Error = doc.Message
+			row.OutcomeReason = doc.Reason
+			row.OutcomeReservationID = doc.ReservationID
 		}
 	}
 	return row, nil
@@ -488,8 +492,13 @@ func (r *JobsRepo) Claim(ctx context.Context, workerID string, ttl time.Duration
 		if _, err := tx.ExecContext(ctx, `
 			WITH swept AS (
 				UPDATE jobs j
-				SET status = 'unknown', finished_at = now(),
-				    error = '{"message":"lease expired after dispatch; outcome unobserved","retryable":false}'::jsonb,
+				SET status = 'unknown', finished_at = now(), updated_at = now(),
+				    error = jsonb_build_object(
+				        'message', 'interrupted after the request was sent; usage may have been billed',
+				        'retryable', false, 'reason', 'interrupted',
+				        'reservation_id', (SELECT r.id FROM reservations r
+				            WHERE r.tenant_id = j.tenant_id AND r.job_id = j.id
+				              AND r.attempt_id = j.dispatched_attempt_id ORDER BY r.created_at DESC, r.id DESC LIMIT 1)),
 				    lease_owner = NULL, lease_expires_at = NULL
 				WHERE j.status = 'running'
 				  AND j.lease_expires_at IS NOT NULL AND j.lease_expires_at < now()
@@ -513,6 +522,7 @@ func (r *JobsRepo) Claim(ctx context.Context, workerID string, ttl time.Duration
 			UPDATE jobs j
 			SET status = 'running', fence_token = j.fence_token + 1,
 			    lease_owner = $1, lease_expires_at = now() + $2::interval,
+			    updated_at = now(),
 			    attempts = j.attempts + 1,
 			    started_at = COALESCE(j.started_at, now()),
 			    dispatched_attempt_id = NULL,
@@ -588,7 +598,7 @@ func (r *JobsRepo) ExtendLease(ctx context.Context, tenantID, jobID, owner strin
 	var expires time.Time
 	err := r.db.SQL.QueryRowContext(ctx, `
 		UPDATE jobs
-		SET lease_expires_at = now() + $5::interval
+		SET lease_expires_at = now() + $5::interval, updated_at = now()
 		WHERE tenant_id = $1 AND id = $2 AND status = 'running'
 		  AND lease_owner = $3 AND fence_token = $4
 		RETURNING lease_expires_at`,
@@ -604,7 +614,7 @@ func (r *JobsRepo) ExtendLease(ctx context.Context, tenantID, jobID, owner strin
 func (r *JobsRepo) WriteProgress(ctx context.Context, tenantID, jobID, owner string, fence int64, progress json.RawMessage) error {
 	res, err := r.db.SQL.ExecContext(ctx, `
 		UPDATE jobs
-		SET progress = $5::jsonb
+		SET progress = $5::jsonb, updated_at = now()
 		WHERE tenant_id = $1 AND id = $2 AND status = 'running'
 		  AND lease_owner = $3 AND fence_token = $4`,
 		tenantID, jobID, owner, fence, progress)
@@ -629,7 +639,7 @@ func (r *JobsRepo) CancelRequested(ctx context.Context, tenantID, jobID, owner s
 func (r *JobsRepo) MarkDispatched(ctx context.Context, tenantID, jobID, owner string, fence int64, attemptID string) error {
 	res, err := r.db.SQL.ExecContext(ctx, `
 		UPDATE jobs
-		SET dispatched_attempt_id = $5
+		SET dispatched_attempt_id = $5, updated_at = now()
 		WHERE tenant_id = $1 AND id = $2 AND status = 'running'
 		  AND lease_owner = $3 AND fence_token = $4`,
 		tenantID, jobID, owner, fence, attemptID)
@@ -647,7 +657,7 @@ func (r *JobsRepo) CompleteJob(ctx context.Context, tenantID, jobID, owner strin
 			SET status = CASE WHEN cancel_requested_at IS NOT NULL
 			                  THEN 'cancelled' ELSE 'succeeded' END,
 			    result_ref = $5,
-			    finished_at = now(),
+			    finished_at = now(), updated_at = now(),
 			    lease_owner = NULL, lease_expires_at = NULL,
 			    dispatched_attempt_id = NULL
 			WHERE tenant_id = $1 AND id = $2 AND status = 'running'
@@ -683,7 +693,7 @@ func (r *JobsRepo) FailJob(ctx context.Context, tenantID, jobID, owner string, f
 			    lease_owner = NULL,
 			    lease_expires_at = CASE WHEN $5 THEN $6::timestamptz ELSE NULL END,
 			    dispatched_attempt_id = NULL,
-			    error = $7::jsonb,
+			    error = $7::jsonb, updated_at = now(),
 			    finished_at = CASE WHEN $5 THEN NULL ELSE now() END
 			WHERE tenant_id = $1 AND id = $2 AND status = 'running'
 			  AND lease_owner = $3 AND fence_token = $4`,
@@ -715,7 +725,7 @@ func (r *JobsRepo) ReleaseJob(ctx context.Context, tenantID, jobID, owner string
 			UPDATE jobs
 			SET status = 'queued',
 			    lease_owner = NULL, lease_expires_at = NULL,
-			    dispatched_attempt_id = NULL
+			    dispatched_attempt_id = NULL, updated_at = now()
 			WHERE tenant_id = $1 AND id = $2 AND status = 'running'
 			  AND lease_owner = $3 AND fence_token = $4`,
 			tenantID, jobID, owner, fence)
@@ -738,20 +748,27 @@ func (r *JobsRepo) ReleaseJob(ctx context.Context, tenantID, jobID, owner string
 func (r *JobsRepo) MarkUnknownJob(ctx context.Context, tenantID, jobID, owner string, fence int64, attemptID string, errDoc json.RawMessage) error {
 	return WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
-			UPDATE jobs
-			SET status = 'unknown', finished_at = now(),
-			    error = $5::jsonb,
+			UPDATE jobs j
+			SET status = 'unknown', finished_at = now(), updated_at = now(),
+			    error = $5::jsonb || jsonb_build_object(
+			        'reservation_id', (SELECT r.id FROM reservations r
+			            WHERE r.tenant_id = j.tenant_id AND r.job_id = j.id
+			              AND r.attempt_id = $6 ORDER BY r.created_at DESC, r.id DESC LIMIT 1)),
 			    lease_owner = NULL, lease_expires_at = NULL
-			WHERE tenant_id = $1 AND id = $2 AND status = 'running'
-			  AND lease_owner = $3 AND fence_token = $4`,
-			tenantID, jobID, owner, fence, errDoc)
+			WHERE j.tenant_id = $1 AND j.id = $2 AND j.status = 'running'
+			  AND j.lease_owner = $3 AND j.fence_token = $4`,
+			tenantID, jobID, owner, fence, errDoc, attemptID)
 		if ferr := fenced(res, err); ferr != nil {
 			return fmt.Errorf("mark unknown: %w", ferr)
 		}
 		res, err = tx.ExecContext(ctx, `
-			UPDATE job_attempts
-			SET status = 'unknown', finished_at = now(), error = $3::jsonb
-			WHERE tenant_id = $1 AND id = $2 AND finished_at IS NULL`,
+			UPDATE job_attempts a
+			SET status = 'unknown', finished_at = now(),
+			    error = $3::jsonb || jsonb_build_object(
+			        'reservation_id', (SELECT r.id FROM reservations r
+			            WHERE r.tenant_id = a.tenant_id AND r.job_id = a.job_id
+			              AND r.attempt_id = a.id ORDER BY r.created_at DESC, r.id DESC LIMIT 1))
+			WHERE a.tenant_id = $1 AND a.id = $2 AND a.finished_at IS NULL`,
 			tenantID, attemptID, errDoc)
 		if err != nil {
 			return fmt.Errorf("finish attempt: %w", err)
@@ -770,6 +787,7 @@ func (r *JobsRepo) CancelJob(ctx context.Context, tenantID, jobID string) error 
 		UPDATE jobs
 		SET cancel_requested_at = COALESCE(cancel_requested_at, now()),
 		    status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END,
+		    updated_at = now(),
 		    finished_at = CASE WHEN status = 'queued' THEN now() ELSE finished_at END
 		WHERE tenant_id = $1 AND id = $2
 		  AND status IN ('queued','running')`,
@@ -787,7 +805,7 @@ func (r *JobsRepo) CancelJob(ctx context.Context, tenantID, jobID string) error 
 func (r *JobsRepo) DeleteJob(ctx context.Context, tenantID, jobID string) error {
 	res, err := r.db.SQL.ExecContext(ctx, `
 		UPDATE jobs
-		SET status = 'deleted', deleted_at = now()
+		SET status = 'deleted', deleted_at = now(), updated_at = now()
 		WHERE tenant_id = $1 AND id = $2 AND status <> 'deleted'`,
 		tenantID, jobID)
 	if err != nil {
@@ -845,7 +863,7 @@ func (r *JobsRepo) ExpiredPreviewJobs(ctx context.Context, before time.Time, lim
 func (r *JobsRepo) DeleteExpiredPreviewJobs(ctx context.Context, ids []string) error {
 	for _, id := range ids {
 		if _, err := r.db.SQL.ExecContext(ctx, `
-			UPDATE jobs SET status = 'deleted', deleted_at = now()
+			UPDATE jobs SET status = 'deleted', deleted_at = now(), updated_at = now()
 			WHERE id = $1 AND operation = $2 AND deleted_at IS NULL
 			  AND status IN ('succeeded','failed','cancelled','unknown')`,
 			id, extract.OperationPreview); err != nil {

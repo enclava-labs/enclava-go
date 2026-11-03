@@ -15,7 +15,7 @@
       <div class="author">{{.Author}} · {{relTime .CreatedAt}}</div>
       {{if .Steps}}<details class="toolstep">
         <summary>{{icon "check"}} {{len .Steps}} tool {{if eq (len .Steps) 1}}step{{else}}steps{{end}}</summary>
-        {{range .Steps}}<div class="steprow"><b>{{.Name}}</b> <span class="muted">{{term .Kind}}</span> {{statusPill "job" .Status}}{{if .Error}}<span class="muted stepnote">{{.Error}}</span>{{end}}{{if .Output}}<span class="muted stepnote">{{.Output}}</span>{{end}}</div>{{end}}
+        {{range .Steps}}<div class="steprow"><b>{{.Name}}</b> <span class="muted">{{term .Kind}}</span> {{statusPill "job" .Status}}{{if and (eq .Kind "model") .Input}}<span class="muted stepnote">{{.Input}}</span>{{end}}{{if .Error}}<span class="muted stepnote">{{.Error}}</span>{{end}}{{if .Output}}<span class="muted stepnote">{{.Output}}</span>{{end}}</div>{{end}}
       </details>{{end}}
       {{if .Content}}<div class="bubble">{{.Content}}</div>{{end}}
       {{if and .RunID (not .Pending) (ne .Role "user")}}

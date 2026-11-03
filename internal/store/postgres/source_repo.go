@@ -83,13 +83,21 @@ func (r *SourceRepo) CreateConnection(ctx context.Context, c source.Connection) 
 	return nil
 }
 
-func scanConnection(row *sql.Row, c *source.Connection) error {
+type connectionScanner interface {
+	Scan(dest ...any) error
+}
+
+const connectionColumns = `tenant_id::text, id, kind, name, credential_ref, config,
+	target_collection_id, audience_default, status, created_by,
+	synced_at, sync_status, sync_error, created_at, updated_at`
+
+func scanConnection(row connectionScanner, c *source.Connection) error {
 	var config, audience []byte
 	var target, createdBy, syncStatus, syncError sql.NullString
 	var syncedAt sql.NullTime
 	err := row.Scan(&c.TenantID, &c.ID, &c.Kind, &c.Name, &c.CredentialRef,
 		&config, &target, &audience, &c.Status, &createdBy,
-		&syncedAt, &syncStatus, &syncError)
+		&syncedAt, &syncStatus, &syncError, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -108,11 +116,8 @@ func scanConnection(row *sql.Row, c *source.Connection) error {
 
 func (r *SourceRepo) GetConnection(ctx context.Context, tenantID, id string) (source.Connection, error) {
 	var c source.Connection
-	err := scanConnection(r.db.SQL.QueryRowContext(ctx, `
-		SELECT tenant_id::text, id, kind, name, credential_ref, config,
-		       target_collection_id, audience_default, status, created_by,
-		       synced_at, sync_status, sync_error
-		FROM connections WHERE tenant_id = $1 AND id = $2`, tenantID, id), &c)
+	err := scanConnection(r.db.SQL.QueryRowContext(ctx,
+		`SELECT `+connectionColumns+` FROM connections WHERE tenant_id = $1 AND id = $2`, tenantID, id), &c)
 	if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
 		return source.Connection{}, source.ErrDenied
 	}
@@ -123,11 +128,8 @@ func (r *SourceRepo) GetConnection(ctx context.Context, tenantID, id string) (so
 }
 
 func (r *SourceRepo) ListConnections(ctx context.Context, tenantID string) ([]source.Connection, error) {
-	rows, err := r.db.SQL.QueryContext(ctx, `
-		SELECT tenant_id::text, id, kind, name, credential_ref, config,
-		       target_collection_id, audience_default, status, created_by,
-		       synced_at, sync_status, sync_error
-		FROM connections WHERE tenant_id = $1 ORDER BY id`, tenantID)
+	rows, err := r.db.SQL.QueryContext(ctx,
+		`SELECT `+connectionColumns+` FROM connections WHERE tenant_id = $1 ORDER BY id`, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("list connections: %w", err)
 	}
@@ -135,24 +137,9 @@ func (r *SourceRepo) ListConnections(ctx context.Context, tenantID string) ([]so
 	var out []source.Connection
 	for rows.Next() {
 		var c source.Connection
-		var config, audience []byte
-		var target, createdBy, syncStatus, syncError sql.NullString
-		var syncedAt sql.NullTime
-		if err := rows.Scan(&c.TenantID, &c.ID, &c.Kind, &c.Name, &c.CredentialRef,
-			&config, &target, &audience, &c.Status, &createdBy,
-			&syncedAt, &syncStatus, &syncError); err != nil {
+		if err := scanConnection(rows, &c); err != nil {
 			return nil, fmt.Errorf("scan connection: %w", err)
 		}
-		_ = json.Unmarshal(config, &c.Config)
-		c.TargetCollectionID = target.String
-		c.AudienceDefault = scanJSONList(audience)
-		c.CreatedBy = createdBy.String
-		if syncedAt.Valid {
-			t := syncedAt.Time
-			c.SyncedAt = &t
-		}
-		c.SyncStatus = syncStatus.String
-		c.SyncError = syncError.String
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -166,9 +153,7 @@ func (r *SourceRepo) ListSyncCandidates(ctx context.Context, limit int) ([]sourc
 		limit = 500
 	}
 	rows, err := r.db.SQL.QueryContext(ctx, `
-		SELECT tenant_id::text, id, kind, name, credential_ref, config,
-		       target_collection_id, audience_default, status, created_by,
-		       synced_at, sync_status, sync_error
+		SELECT `+connectionColumns+`
 		FROM connections
 		WHERE status = 'active' AND target_collection_id IS NOT NULL
 		ORDER BY COALESCE(synced_at, created_at) ASC
@@ -180,24 +165,9 @@ func (r *SourceRepo) ListSyncCandidates(ctx context.Context, limit int) ([]sourc
 	var out []source.Connection
 	for rows.Next() {
 		var c source.Connection
-		var config, audience []byte
-		var target, createdBy, syncStatus, syncError sql.NullString
-		var syncedAt sql.NullTime
-		if err := rows.Scan(&c.TenantID, &c.ID, &c.Kind, &c.Name, &c.CredentialRef,
-			&config, &target, &audience, &c.Status, &createdBy,
-			&syncedAt, &syncStatus, &syncError); err != nil {
+		if err := scanConnection(rows, &c); err != nil {
 			return nil, fmt.Errorf("scan sync candidate: %w", err)
 		}
-		_ = json.Unmarshal(config, &c.Config)
-		c.TargetCollectionID = target.String
-		c.AudienceDefault = scanJSONList(audience)
-		c.CreatedBy = createdBy.String
-		if syncedAt.Valid {
-			t := syncedAt.Time
-			c.SyncedAt = &t
-		}
-		c.SyncStatus = syncStatus.String
-		c.SyncError = syncError.String
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -205,7 +175,7 @@ func (r *SourceRepo) ListSyncCandidates(ctx context.Context, limit int) ([]sourc
 
 func (r *SourceRepo) UpdateConnectionStatus(ctx context.Context, tenantID, id, status string) error {
 	res, err := r.db.SQL.ExecContext(ctx,
-		`UPDATE connections SET status = $3 WHERE tenant_id = $1 AND id = $2`,
+		`UPDATE connections SET status = $3, updated_at = now() WHERE tenant_id = $1 AND id = $2`,
 		tenantID, id, status)
 	if err != nil {
 		return fmt.Errorf("update connection status: %w", err)
@@ -586,19 +556,37 @@ func (r *SourceRepo) IngestHandoffExists(ctx context.Context, tenantID, connecti
 func (r *SourceRepo) InsertSourceIdentity(ctx context.Context, id source.SourceIdentity) error {
 	_, err := r.db.SQL.ExecContext(ctx, `
 		INSERT INTO source_identities
-		    (tenant_id, id, connection_id, source_user_native_id, mapped_user_id)
-		VALUES ($1, $2, $3, $4, $5)
+		    (tenant_id, id, connection_id, source_user_native_id, display_name, mapped_user_id)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (tenant_id, connection_id, source_user_native_id)
-		DO UPDATE SET mapped_user_id = EXCLUDED.mapped_user_id`,
-		id.TenantID, id.ID, id.ConnectionID, id.NativeID, nullableText(id.MappedUserID))
+		DO UPDATE SET mapped_user_id = EXCLUDED.mapped_user_id,
+		    display_name = COALESCE(NULLIF(EXCLUDED.display_name, ''), source_identities.display_name)`,
+		id.TenantID, id.ID, id.ConnectionID, id.NativeID, id.DisplayName, nullableText(id.MappedUserID))
 	if err != nil {
 		return fmt.Errorf("upsert source identity: %w", err)
 	}
 	return nil
 }
 
+// ObserveSourceIdentity records a provider-native principal seen during
+// access/membership ingestion. It never touches an existing mapping, so a
+// sync racing an administrator bind cannot clear it.
+func (r *SourceRepo) ObserveSourceIdentity(ctx context.Context, id source.SourceIdentity) error {
+	_, err := r.db.SQL.ExecContext(ctx, `
+		INSERT INTO source_identities
+		    (tenant_id, id, connection_id, source_user_native_id, display_name)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (tenant_id, connection_id, source_user_native_id)
+		DO UPDATE SET display_name = COALESCE(NULLIF(EXCLUDED.display_name, ''), source_identities.display_name)`,
+		id.TenantID, id.ID, id.ConnectionID, id.NativeID, id.DisplayName)
+	if err != nil {
+		return fmt.Errorf("observe source identity: %w", err)
+	}
+	return nil
+}
+
 func (r *SourceRepo) SourceIdentitiesForConnection(ctx context.Context, tenantID, connectionID string) ([]source.SourceIdentity, error) {
-	rows, err := r.db.SQL.QueryContext(ctx, `SELECT tenant_id::text,id,connection_id,source_user_native_id,COALESCE(mapped_user_id,'') FROM source_identities WHERE tenant_id=$1 AND connection_id=$2 ORDER BY source_user_native_id`, tenantID, connectionID)
+	rows, err := r.db.SQL.QueryContext(ctx, `SELECT tenant_id::text,id,connection_id,source_user_native_id,display_name,COALESCE(mapped_user_id,'') FROM source_identities WHERE tenant_id=$1 AND connection_id=$2 ORDER BY source_user_native_id`, tenantID, connectionID)
 	if err != nil {
 		return nil, err
 	}
@@ -606,7 +594,7 @@ func (r *SourceRepo) SourceIdentitiesForConnection(ctx context.Context, tenantID
 	out := []source.SourceIdentity{}
 	for rows.Next() {
 		var row source.SourceIdentity
-		if err := rows.Scan(&row.TenantID, &row.ID, &row.ConnectionID, &row.NativeID, &row.MappedUserID); err != nil {
+		if err := rows.Scan(&row.TenantID, &row.ID, &row.ConnectionID, &row.NativeID, &row.DisplayName, &row.MappedUserID); err != nil {
 			return nil, err
 		}
 		out = append(out, row)
@@ -616,7 +604,7 @@ func (r *SourceRepo) SourceIdentitiesForConnection(ctx context.Context, tenantID
 
 func (r *SourceRepo) SourceIdentityByID(ctx context.Context, tenantID, id string) (source.SourceIdentity, error) {
 	var row source.SourceIdentity
-	err := r.db.SQL.QueryRowContext(ctx, `SELECT tenant_id::text,id,connection_id,source_user_native_id,COALESCE(mapped_user_id,'') FROM source_identities WHERE tenant_id=$1 AND id=$2`, tenantID, id).Scan(&row.TenantID, &row.ID, &row.ConnectionID, &row.NativeID, &row.MappedUserID)
+	err := r.db.SQL.QueryRowContext(ctx, `SELECT tenant_id::text,id,connection_id,source_user_native_id,display_name,COALESCE(mapped_user_id,'') FROM source_identities WHERE tenant_id=$1 AND id=$2`, tenantID, id).Scan(&row.TenantID, &row.ID, &row.ConnectionID, &row.NativeID, &row.DisplayName, &row.MappedUserID)
 	if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
 		return source.SourceIdentity{}, source.ErrDenied
 	}
@@ -664,11 +652,11 @@ func (r *SourceRepo) SourceIdentityForUser(ctx context.Context, tenantID, connec
 	var id source.SourceIdentity
 	var mapped sql.NullString
 	err := r.db.SQL.QueryRowContext(ctx, `
-		SELECT tenant_id::text, id, connection_id, source_user_native_id, mapped_user_id
+		SELECT tenant_id::text, id, connection_id, source_user_native_id, display_name, mapped_user_id
 		FROM source_identities
 		WHERE tenant_id = $1 AND connection_id = $2 AND mapped_user_id = $3`,
 		tenantID, connectionID, userID).Scan(
-		&id.TenantID, &id.ID, &id.ConnectionID, &id.NativeID, &mapped)
+		&id.TenantID, &id.ID, &id.ConnectionID, &id.NativeID, &id.DisplayName, &mapped)
 	if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
 		return source.SourceIdentity{}, source.ErrDenied
 	}

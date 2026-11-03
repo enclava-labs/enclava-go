@@ -56,11 +56,12 @@ func (d searchViewData) DashboardModule() string { return "search" }
 // renders. Error carries a bounded-service outcome (work bound exceeded);
 // other service failures are 500s, never silent empty states.
 type searchResultsData struct {
-	Query  string
-	Rows   []searchResultRow
-	Facets []rag.SourceFacet
-	Error  string
-	Hint   string // secondary line under Error (e.g. lexical still works)
+	Query      string
+	Rows       []searchResultRow
+	Facets     []rag.SourceFacet
+	NextCursor string // opaque continuation token for the "More results" control
+	Error      string
+	Hint       string // secondary line under Error (e.g. lexical still works)
 }
 
 // searchResultRow is one fused result projected for the template: label,
@@ -168,7 +169,7 @@ func (a *App) buildSearchView(w http.ResponseWriter, r *http.Request) (searchVie
 			return view, true
 		}
 	}
-	out, err := a.ragSvc.SearchReadable(ctx, p, view.Query, rag.QueryMode(view.Mode), selected, 0)
+	out, err := a.ragSvc.SearchReadableWithOptions(ctx, p, view.Query, rag.QueryMode(view.Mode), selected, 0, rag.SearchReadableOptions{Cursor: q.Get("cursor")})
 	if err != nil {
 		switch {
 		case errors.Is(err, rag.ErrSearchWorkExceeded):
@@ -189,7 +190,7 @@ func (a *App) buildSearchView(w http.ResponseWriter, r *http.Request) (searchVie
 			return view, false
 		}
 	}
-	results := &searchResultsData{Query: view.Query, Facets: out.Facets}
+	results := &searchResultsData{Query: view.Query, Facets: out.Facets, NextCursor: out.NextCursor}
 	results.Rows = make([]searchResultRow, 0, len(out.Results))
 	for _, res := range out.Results {
 		title := strings.TrimSpace(res.FileName)

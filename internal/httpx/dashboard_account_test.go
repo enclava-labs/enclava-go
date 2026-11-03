@@ -81,9 +81,21 @@ func TestDashboardAccountRenders(t *testing.T) {
 				t.Fatalf("account page main region unclosed, got %s", body)
 			}
 			content := body[mainStart : mainStart+mainEnd]
-			for _, banned := range []string{"Create user", "Service accounts", "API keys", "/dashboard/access"} {
+			// The developer card (P-12) intentionally surfaces API words and
+			// the manager's Access link; identity administration still never
+			// renders — "Create user"/"Service accounts" stay banned for all,
+			// the API surface only for users it does not serve (no scopes at
+			// all → the card itself is absent).
+			for _, banned := range []string{"Create user", "Service accounts"} {
 				if strings.Contains(content, banned) {
 					t.Errorf("admin surface %q leaked onto the account page", banned)
+				}
+			}
+			if len(tc.scopes) == 0 {
+				for _, banned := range []string{"API keys", "/dashboard/access"} {
+					if strings.Contains(content, banned) {
+						t.Errorf("admin surface %q leaked onto the account page", banned)
+					}
 				}
 			}
 		})

@@ -52,38 +52,55 @@ func (r *BillingRepo) InTx(ctx context.Context, fn func(billing.BillingTx) error
 // PutPrice inserts an immutable price row and its audit row. A price change
 // is a new row with a later effective_from — history is never rewritten.
 func (r *BillingRepo) PutPrice(ctx context.Context, tenantID, id string, p billing.Price, actorID string, effectiveFrom time.Time) error {
+	return r.PutPrices(ctx, tenantID, []billing.PriceWrite{
+		{ID: id, Price: p, ActorID: actorID, EffectiveFrom: effectiveFrom},
+	})
+}
+
+// PutPrices inserts every batch entry inside ONE transaction — the Set-price
+// drawer saves input/cached/output together and a partial matrix is a bug.
+func (r *BillingRepo) PutPrices(ctx context.Context, tenantID string, batch []billing.PriceWrite) error {
 	return WithTx(ctx, r.db, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `
+		for _, w := range batch {
+			if err := putPriceTx(ctx, tx, tenantID, w.ID, w.Price, w.ActorID, w.EffectiveFrom); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func putPriceTx(ctx context.Context, tx *sql.Tx, tenantID, id string, p billing.Price, actorID string, effectiveFrom time.Time) error {
+	if _, err := tx.ExecContext(ctx, `
 			INSERT INTO billing_prices
 				(tenant_id, id, subject_type, subject_id, capability, unit_kind,
 				 rate_micros, unit_quantity, currency, effective_from, created_by)
 			VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-			tenantID, id, p.SubjectType, p.SubjectID, p.Capability, string(p.Unit),
-			p.RateMicros, p.UnitQuantity, p.Currency, effectiveFrom, nullStr(actorID)); err != nil {
-			return fmt.Errorf("insert billing price: %w", err)
-		}
-		detail, err := json.Marshal(map[string]any{
-			"subject_type":   p.SubjectType,
-			"subject_id":     p.SubjectID,
-			"capability":     p.Capability,
-			"unit_kind":      string(p.Unit),
-			"rate_micros":    p.RateMicros,
-			"unit_quantity":  p.UnitQuantity,
-			"currency":       p.Currency,
-			"effective_from": effectiveFrom.UTC().Format(time.RFC3339Nano),
-		})
-		if err != nil {
-			return fmt.Errorf("marshal price audit detail: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `
+		tenantID, id, p.SubjectType, p.SubjectID, p.Capability, string(p.Unit),
+		p.RateMicros, p.UnitQuantity, p.Currency, effectiveFrom, nullStr(actorID)); err != nil {
+		return fmt.Errorf("insert billing price: %w", err)
+	}
+	detail, err := json.Marshal(map[string]any{
+		"subject_type":   p.SubjectType,
+		"subject_id":     p.SubjectID,
+		"capability":     p.Capability,
+		"unit_kind":      string(p.Unit),
+		"rate_micros":    p.RateMicros,
+		"unit_quantity":  p.UnitQuantity,
+		"currency":       p.Currency,
+		"effective_from": effectiveFrom.UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return fmt.Errorf("marshal price audit detail: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
 			INSERT INTO billing_price_audit
 				(tenant_id, id, price_id, action, actor_type, actor_id, detail)
 			VALUES ($1::uuid, $2, $3, 'create', 'actor', $4, $5)`,
-			tenantID, newRowID("paudit"), id, nullStr(actorID), string(detail)); err != nil {
-			return fmt.Errorf("insert billing price audit: %w", err)
-		}
-		return nil
-	})
+		tenantID, newRowID("paudit"), id, nullStr(actorID), string(detail)); err != nil {
+		return fmt.Errorf("insert billing price audit: %w", err)
+	}
+	return nil
 }
 
 // CreateBudget inserts an enforceable limit row. Amount budgets carry their

@@ -74,6 +74,7 @@
   // password input carries name="password" (the OA-12/§6.13 fix); success
   // reloads the page so the identities list refreshes and the consumed
   // token leaves the URL.
+
   const linkForm = document.getElementById('account-link-form');
   if (linkForm) linkForm.addEventListener('submit', function (e) {
     e.preventDefault();
@@ -89,6 +90,20 @@
         err && err.status === 403
           ? 'Account linking failed — the challenge or credentials are invalid.'
           : (err && err.message) || 'Could not link the sign-in.');
+    });
+  });
+  // Request API access (P-12/UX-M03): one POST to the account route — the
+  // store caps it at one open request; success reloads the card into its
+  // pending state. Nothing is granted client- or server-side.
+  const accessForm = document.getElementById('account-api-access-form');
+  if (accessForm) accessForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    Enclava.api('POST', '/dashboard/account/api-access-request', {
+      note: accessForm.elements.note.value,
+    }).then(function () {
+      location.reload();
+    }).catch(function (err) {
+      showRequestError(err);
     });
   });
 })();

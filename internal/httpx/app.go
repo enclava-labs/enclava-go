@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"enclava-go/internal/auth"
@@ -54,6 +56,7 @@ type App struct {
 	mcpRepo             *postgres.MCPToolsRepo
 	mcpTransport        *mcp.StreamableHTTP
 	jobsSvc             *jobs.Service
+	vectorStore         *dependencyProbe
 	securityAudit       SecurityAuditRecorder
 	metricsToken        string
 	metricsAuthDisabled bool
@@ -69,6 +72,81 @@ type App struct {
 // calls it next to app.ConfigureMCP. Producers degrade to the non-job items
 // while it is unset.
 func (a *App) ConfigureActivity(jobSvc *jobs.Service) { a.jobsSvc = jobSvc }
+
+// dependencyProbe is a bounded readiness check for one optional dependency:
+// the result is cached for refreshAfter so a dependency outage never turns
+// readiness probes into per-request upstream hangs (single-flight).
+type dependencyProbe struct {
+	name         string
+	timeout      time.Duration
+	refreshAfter time.Duration
+	probe        func(ctx context.Context) error
+	mu           sync.Mutex
+	last         time.Time
+	lastErr      error
+}
+
+const (
+	depProbeTimeout      = 2 * time.Second
+	depProbeRefreshAfter = 10 * time.Second
+)
+
+func (p *dependencyProbe) state(ctx context.Context) map[string]any {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if time.Since(p.last) >= p.refreshAfter {
+		probeCtx, cancel := context.WithTimeout(ctx, p.timeout)
+		p.lastErr = p.probe(probeCtx)
+		cancel()
+		p.last = time.Now()
+	}
+	st := map[string]any{"ready": p.lastErr == nil, "checked_at": p.last.UTC().Format(time.RFC3339)}
+	if p.lastErr != nil {
+		st["error"] = "vector store unavailable"
+	}
+	return st
+}
+
+// ConfigureVectorStoreProbe wires the knowledge-readiness dependency after
+// construction (the ConfigureMCP pattern — NewApp's signature stays
+// untouched). /readyz reports it under dependencies.vector_store and
+// /readyz/knowledge answers it; unset means the dependency is not reported.
+func (a *App) ConfigureVectorStoreProbe(probe func(ctx context.Context) error) {
+	if probe == nil {
+		return
+	}
+	a.vectorStore = &dependencyProbe{
+		name: "vector_store", timeout: depProbeTimeout,
+		refreshAfter: depProbeRefreshAfter, probe: probe,
+	}
+}
+
+// ProbeHTTP checks that the dependency returns a successful HTTP response.
+func ProbeHTTP(url string) func(ctx context.Context) error {
+	client := &http.Client{Timeout: depProbeTimeout}
+	return func(ctx context.Context) error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		res, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		_ = res.Body.Close()
+		if res.StatusCode < 200 || res.StatusCode >= 300 {
+			return fmt.Errorf("dependency returned HTTP %d", res.StatusCode)
+		}
+		return nil
+	}
+}
+
+// handleAPINotFound answers any /api/* and /v1/* path that matched no
+// mounted route with the shared JSON error envelope — API clients never see
+// the plain-text 404 (dashboard and other routes keep their HTML 404).
+func (a *App) handleAPINotFound(w http.ResponseWriter, r *http.Request) {
+	WriteOpenAIError(w, http.StatusNotFound, "route not found", "invalid_request_error", "not_found")
+}
 
 const (
 	preAuthRateLimitPerMinute = 120
@@ -172,6 +250,7 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/health", a.handleHealth)
 	a.mux.HandleFunc("/livez", a.handleLivez)
 	a.mux.HandleFunc("/readyz", a.handleReadyz)
+	a.mux.HandleFunc("/readyz/knowledge", a.handleReadyzKnowledge)
 	a.mux.HandleFunc("/metrics", a.handleMetrics)
 
 	// Paid paths not backed by the shared executor remain unmounted; only
@@ -249,12 +328,25 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/api/v1/identities/me/", a.authenticated("", a.handleIdentityMe))
 	a.mux.HandleFunc("/api/v1/identities/link", a.authenticated("", a.handleIdentityLink))
 
+	// JSON 404 catch-alls for the API surfaces — registered last so every
+	// concrete route above (and the module-registered /api/v1/* routes) wins.
+	a.mux.HandleFunc("/api", a.handleAPINotFound)
+	a.mux.HandleFunc("/api/", a.handleAPINotFound)
+	a.mux.HandleFunc("/v1", a.handleAPINotFound)
+	a.mux.HandleFunc("/v1/", a.handleAPINotFound)
+
 	a.registerDashboardRoutes()
 }
 
 func (a *App) handleRoot(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
-		http.NotFound(w, r)
+		if strings.HasPrefix(r.URL.Path, "/dashboard/") {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("<!doctype html><title>Not found</title><h1>Not found</h1>"))
+		} else {
+			http.NotFound(w, r)
+		}
 		return
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -437,16 +529,55 @@ func (a *App) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		WriteMethodNotAllowed(w)
 		return
 	}
+	deps := map[string]any{
+		"inference":    map[string]any{"ready": true, "configured": false},
+		"vector_store": map[string]any{"ready": false, "configured": false},
+	}
+	if a.vectorStore != nil {
+		deps[a.vectorStore.name] = a.vectorStore.state(r.Context())
+	}
 	if a.prober == nil {
-		WriteJSON(w, http.StatusOK, map[string]any{"ready": true})
+		WriteJSON(w, http.StatusOK, map[string]any{"ready": true, "dependencies": deps})
 		return
 	}
 	snap := a.prober.Snapshot()
+	deps["inference"] = snap
+	payload := struct {
+		llm.ReadinessSnapshot
+		Dependencies map[string]any `json:"dependencies"`
+	}{ReadinessSnapshot: snap, Dependencies: deps}
 	if !snap.Ready {
-		WriteJSON(w, http.StatusServiceUnavailable, snap)
+		WriteJSON(w, http.StatusServiceUnavailable, payload)
 		return
 	}
-	WriteJSON(w, http.StatusOK, snap)
+	WriteJSON(w, http.StatusOK, payload)
+}
+
+// handleReadyzKnowledge answers only the knowledge dependency: 200 while the
+// configured vector store is reachable, 503 when it is not (or was never
+// configured). /readyz stays inference-only — an inference-only deployment
+// must not flap on a knowledge outage.
+func (a *App) handleReadyzKnowledge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	if a.vectorStore == nil {
+		WriteJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"ready": false, "dependencies": map[string]any{
+				"vector_store": map[string]any{"ready": false, "error": "vector store probe not configured"},
+			},
+		})
+		return
+	}
+	state := a.vectorStore.state(r.Context())
+	ready, _ := state["ready"].(bool)
+	payload := map[string]any{"ready": ready, "dependencies": map[string]any{"vector_store": state}}
+	if !ready {
+		WriteJSON(w, http.StatusServiceUnavailable, payload)
+		return
+	}
+	WriteJSON(w, http.StatusOK, payload)
 }
 
 func modelIDFromPath(path string) string {

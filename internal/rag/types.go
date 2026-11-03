@@ -240,10 +240,12 @@ type SearchResult struct {
 
 // SearchReadableResult is the bounded cross-collection search page: fused
 // results plus post-authorization source-kind facets over exactly the
-// returned set.
+// returned set. NextCursor is the opaque continuation token when the fused
+// pool holds results beyond this page (within the bounded fetch depth).
 type SearchReadableResult struct {
-	Results []SearchResult `json:"results"`
-	Facets  []SourceFacet  `json:"facets"`
+	Results    []SearchResult `json:"results"`
+	Facets     []SourceFacet  `json:"facets"`
+	NextCursor string         `json:"next_cursor,omitempty"`
 }
 
 // SourceFacet counts fused results by canonical source kind.
@@ -279,4 +281,7 @@ type EvidenceResolution struct {
 type UploadDocumentOutput struct {
 	Document Document        `json:"document"`
 	Chunks   []DocumentChunk `json:"chunks"`
+	// Deduplicated is true when the upload matched the content hash of a
+	// live document already in the collection — nothing was re-ingested.
+	Deduplicated bool `json:"deduplicated,omitempty"`
 }

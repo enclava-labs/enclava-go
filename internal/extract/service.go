@@ -707,6 +707,46 @@ func (s *Service) GetJob(ctx context.Context, p auth.Principal, jobID string) (J
 	return detail, nil
 }
 
+// RetryInterruptedJob enqueues a fresh extraction job copying an interrupted
+// (status=unknown) job's immutable input and policy under a new idempotency
+// key — an explicit user decision, never an automatic replay: the previous
+// attempt's reservation may have been billed, so retrying can bill again.
+// Any other status is ErrNotFound (the caller sees no retriable job).
+func (s *Service) RetryInterruptedJob(ctx context.Context, p auth.Principal, jobID string) (JobView, error) {
+	row, err := s.jobRows.GetOwnedJob(ctx, p.TenantID, jobID, jobs.SubmitterKey(p))
+	if err != nil {
+		return JobView{}, mapNotFound(err)
+	}
+	if (row.Operation != OperationProcess && row.Operation != OperationVision) ||
+		row.Status != jobs.StatusUnknown {
+		return JobView{}, ErrNotFound
+	}
+	if err := s.authorizeSource(ctx, p, row); err != nil {
+		return JobView{}, ErrNotFound
+	}
+	if !auth.ExtractTemplateAllowed(p, stringValue(row.Policy["template_id"])) {
+		return JobView{}, ErrForbidden
+	}
+	active, err := s.jobRows.CountActiveExtractions(ctx, p.TenantID)
+	if err != nil {
+		return JobView{}, fmt.Errorf("count active extractions: %w", err)
+	}
+	if active >= ExtractAdmissionLimit {
+		return JobView{}, ErrExtractionAdmissionLimited
+	}
+	job, _, err := s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
+		TenantID: p.TenantID, Operation: row.Operation,
+		IdempotencyKey: "retry:" + jobID + ":" + newID("rt"),
+		Subject:        row.Subject,
+		InputRef:       row.InputRef, InputHash: row.InputHash,
+		Policy: row.Policy,
+	})
+	if err != nil {
+		return JobView{}, fmt.Errorf("enqueue retried extraction: %w", err)
+	}
+	return JobView{ID: job.ID, JobID: job.ID, Status: job.Status, TemplateID: stringValue(row.Policy["template_id"])}, nil
+}
+
 // ListTemplates is the authoring/management list: the full tenant set for
 // extract.manage callers, otherwise the caller's execution-grant
 // intersection. An empty grant set yields an empty list — never a fabricated
@@ -1213,15 +1253,17 @@ const validationMarker = "extract-validation:"
 // come from the immutable policy document.
 func jobView(row jobs.JobRow) JobView {
 	v := JobView{
-		ID:           row.ID,
-		JobID:        row.ID,
-		Status:       row.Status,
-		InputRef:     row.InputRef,
-		ResultRef:    row.ResultRef,
-		ErrorMessage: jobError(row.Job),
-		CreatedAt:    row.CreatedAt,
-		UpdatedAt:    row.UpdatedAt,
-		CompletedAt:  row.CompletedAt,
+		ID:            row.ID,
+		JobID:         row.ID,
+		Status:        row.Status,
+		InputRef:      row.InputRef,
+		ResultRef:     row.ResultRef,
+		ErrorMessage:  jobError(row.Job),
+		OutcomeReason: row.OutcomeReason,
+		ReservationID: row.OutcomeReservationID,
+		CreatedAt:     row.CreatedAt,
+		UpdatedAt:     row.UpdatedAt,
+		CompletedAt:   row.CompletedAt,
 	}
 	v.TemplateID = stringValue(row.Policy["template_id"])
 	v.ModelUsed = stringValue(row.Policy["model"])

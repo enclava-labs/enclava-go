@@ -78,6 +78,7 @@
       Enclava.refresh();
     } catch (err) {
       fail(err);
+      Enclava.refresh();
     } finally {
       trigger.disabled = false;
     }

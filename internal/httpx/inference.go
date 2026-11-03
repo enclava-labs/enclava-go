@@ -290,6 +290,11 @@ func (a *App) proxyInferenceStream(w http.ResponseWriter, r *http.Request, body 
 // writeInferenceError maps executor denial families to public outcomes.
 // Internal detail (SQL, credentials, endpoints) never reaches the client.
 func (a *App) writeInferenceError(w http.ResponseWriter, err error) {
+	var protocolErr *llm.StreamProtocolError
+	if errors.As(err, &protocolErr) {
+		WriteOpenAIError(w, http.StatusBadGateway, "upstream stream protocol error", "server_error", "upstream_protocol_error")
+		return
+	}
 	var upstreamErr *llm.UpstreamError
 	if errors.As(err, &upstreamErr) {
 		a.WriteProviderError(w, upstreamErr)

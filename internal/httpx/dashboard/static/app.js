@@ -630,6 +630,14 @@
     no.focus();
   }
 
+  document.addEventListener('enclava:confirm', (e) => {
+    const url = e.target instanceof HTMLElement && e.target.dataset.dismissUrl;
+    if (!url) return;
+    api('POST', url).then(() => refresh()).catch((err) => {
+      if (err.status !== 403 && err.status !== 401) toast('error', err.message || 'Could not dismiss request');
+    });
+  });
+
   document.addEventListener('click', (e) => {
     if (!(e.target instanceof Element)) return;
     if (e.target.id === 'backdrop') { closeDrawer(); return; }

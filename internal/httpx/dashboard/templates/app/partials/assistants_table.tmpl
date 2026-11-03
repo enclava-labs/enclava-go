@@ -13,6 +13,7 @@
           <th scope="col">Knowledge</th>
           <th scope="col">Tools</th>
           <th scope="col">Audience</th>
+          <th scope="col">Availability</th>
           <th scope="col">Status</th>
           <th scope="col">Conversations</th>
         </tr>
@@ -24,7 +25,8 @@
           <td data-label="Knowledge">{{if .Knowledge}}{{range $i, $k := .Knowledge}}{{if $i}}, {{end}}{{$k}}{{end}}{{else}}<span class="muted">No knowledge attached</span>{{end}}</td>
           <td data-label="Tools">{{if .Tools}}{{range $i, $t := .Tools}}{{if $i}}, {{end}}{{$t}}{{end}}{{else}}<span class="muted">No tools</span>{{end}}</td>
           <td data-label="Audience">{{.Audience}}</td>
-          <td data-label="Status">{{statusPill "assistant" .StatusState}}{{if $.Can.AssistantsManage}} <button type="button" class="btn" data-action="open-drawer" data-drawer-url="/dashboard/partials/assistants/drawer?id={{.ID}}">Edit</button>{{end}}</td>
+          <td data-label="Availability">{{if .Availability}}{{range .Availability}}<span class="avail-line"><span class="avail-group">{{.Label}}</span> {{statusPill "availability" .Status}}</span>{{end}}{{else}}<span class="muted">No roles</span>{{end}}</td>
+          <td data-label="Status">{{if eq .StatusState "active"}}<span class="pill good"><i class="dot"></i>Enabled</span>{{else}}{{statusPill "assistant" .StatusState}}{{end}}{{if $.Can.AssistantsManage}} <button type="button" class="btn" data-action="open-drawer" data-drawer-url="/dashboard/partials/assistants/drawer?id={{.ID}}">Edit</button>{{end}}</td>
           <td data-label="Conversations">{{count .Conversations}}</td>
         </tr>
 {{end}}      </tbody>

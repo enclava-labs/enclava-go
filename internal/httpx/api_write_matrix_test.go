@@ -100,11 +100,11 @@ func TestAPIWriteMatrix(t *testing.T) {
 	}
 	// Fresh sources for the POST …/sync row: SyncSource refuses a source
 	// whose pending job already exists (the fixture seeds one).
-	syncSrcA, err := f.connSvc.CreateSource(ctx, manager.principal, connectors.CreateSourceInput{Type: "github", Name: "Sync target A"})
+	syncSrcA, err := f.connSvc.CreateSource(ctx, manager.principal, connectors.CreateSourceInput{Type: "github", Name: "Sync target A", Config: map[string]any{"owner": "acme", "repo": "docs"}})
 	if err != nil {
 		t.Fatalf("seed sync source a: %v", err)
 	}
-	syncSrcB, err := f.connSvc.CreateSource(ctx, manager.principal, connectors.CreateSourceInput{Type: "github", Name: "Sync target B"})
+	syncSrcB, err := f.connSvc.CreateSource(ctx, manager.principal, connectors.CreateSourceInput{Type: "github", Name: "Sync target B", Config: map[string]any{"owner": "acme", "repo": "docs"}})
 	if err != nil {
 		t.Fatalf("seed sync source b: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestAPIWriteMatrix(t *testing.T) {
 			verify: statusIs(http.StatusAccepted)},
 		// ---- Connectors (connectors.manage) ----
 		{name: "connector create source", method: http.MethodPost, path: staticPath("/api/v1/connectors/sources"),
-			body:    staticBody(`{"type":"github","name":"api-created"}`),
+			body:    staticBody(`{"type":"github","name":"api-created","config":{"owner":"acme","repo":"docs"}}`),
 			allowed: roles(roleAdmin, roleManager),
 			verify:  statusIs(http.StatusCreated)},
 		{name: "connector update source", method: http.MethodPut,

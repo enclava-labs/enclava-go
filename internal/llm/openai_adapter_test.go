@@ -134,6 +134,7 @@ func TestAdapterStreamCancelClosesUpstreamBody(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: hello\n\n"))
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
@@ -232,5 +233,24 @@ func TestAdapterStreamErrorBodyHonorsLimits(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("stalled 429 body was not bounded by the idle limit")
+	}
+}
+
+func TestAdapterStreamRejectsNonSSE(t *testing.T) {
+	for _, tc := range []struct{ contentType, body string }{
+		{"application/json", `{"error":{"message":"private upstream detail"}}`},
+		{"text/event-stream", `{"error":"not a frame"}`},
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", tc.contentType)
+			_, _ = w.Write([]byte(tc.body))
+		}))
+		adapter := NewOpenAICompatibleAdapter(server.URL, "key", time.Second).WithAllowPrivateEndpoint()
+		_, err := adapter.CreateChatCompletionStream(context.Background(), []byte(`{"stream":true}`))
+		server.Close()
+		var protocolErr *StreamProtocolError
+		if !errors.As(err, &protocolErr) {
+			t.Fatalf("content type %q: got %v", tc.contentType, err)
+		}
 	}
 }

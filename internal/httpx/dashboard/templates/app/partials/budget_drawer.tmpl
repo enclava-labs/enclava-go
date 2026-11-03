@@ -10,10 +10,12 @@
 {{if .Data.Drawer.Edit}}
 <p class="muted">{{.Data.Drawer.Name}} · {{.Data.Drawer.KindLabel}} · {{.Data.Drawer.PeriodLabel}}</p>
 <p class="help">Only the limit changes — held and settled liability is kept.</p>
-<form data-usage-form data-budget-id="{{.Data.Drawer.BudgetID}}">
+<form data-usage-form data-budget-id="{{.Data.Drawer.BudgetID}}" data-budget-kind="{{.Data.Drawer.Kind}}" data-budget-currency="{{.Data.Drawer.Currency}}">
   <label class="label" for="budget-limit">Limit{{if eq .Data.Drawer.Kind "tokens"}} (tokens){{end}}</label>
-  <input class="field" id="budget-limit" name="limit_value" type="number" min="1" step="1" value="{{.Data.Drawer.LimitValue}}" required>
-{{if eq .Data.Drawer.Kind "amount"}}  <span class="help">Enter the amount in millionths of the currency unit.</span>{{end}}
+  <div class="row"><span class="moneysign" data-budget-symbol{{if eq .Data.Drawer.Kind "tokens"}} hidden{{end}}>{{.Data.Drawer.Symbol}}</span>
+  <input class="field" id="budget-limit" name="limit_value" type="text" inputmode="decimal" value="{{.Data.Drawer.LimitValue}}" required></div>
+{{if eq .Data.Drawer.Kind "amount"}}  <span class="help" data-budget-hint>Stored as {{.Data.Drawer.LimitRaw}} micro-{{.Data.Drawer.Currency}}.</span>{{else}}  <span class="help" data-budget-hint>Whole units.</span>{{end}}
+  <span class="help field-warn" data-budget-warn hidden></span>
   <span class="field-error" hidden></span>
   <div class="drawer-actions">
     <button type="button" class="btn ghost" data-action="close-drawer">Cancel</button>
@@ -63,9 +65,11 @@
     <option value="amount">Amount (money)</option>
     <option value="tokens">Tokens</option>
   </select>
-  <label class="label" for="budget-limit-value">Limit value</label>
-  <input class="field" id="budget-limit-value" name="limit_value" type="number" min="1" step="1" required>
-  <span class="help">For amount budgets, enter millionths of the currency unit.</span>
+  <label class="label" for="budget-limit-value">Limit</label>
+  <div class="row"><span class="moneysign" data-budget-symbol>$</span>
+  <input class="field" id="budget-limit-value" name="limit_value" type="text" inputmode="decimal" required></div>
+  <span class="help" data-budget-hint>For amount budgets enter the currency amount (10.00); for token budgets whole units.</span>
+  <span class="help field-warn" data-budget-warn hidden></span>
   <label class="label" for="budget-currency">Currency</label>
   <input class="field" id="budget-currency" name="currency" type="text" maxlength="3" placeholder="USD">
   <span class="help">Amount budgets only — leave empty for token budgets.</span>

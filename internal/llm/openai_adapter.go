@@ -180,7 +180,9 @@ func (a *OpenAICompatibleAdapter) doStream(ctx context.Context, method, path str
 		upstreamBody, _ := readBoundedBody(stream, maxErrorBodyBytes)
 		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: upstreamBody, Message: upstreamErrorMessage(upstreamBody)}
 	}
-	return stream, nil
+	// A 2xx is not yet a stream: the body must answer text/event-stream
+	// with a legal first frame before the gateway commits SSE headers.
+	return openStreamBody(resp, stream)
 }
 
 func (a *OpenAICompatibleAdapter) doJSON(ctx context.Context, method, path string, body []byte) ([]byte, error) {

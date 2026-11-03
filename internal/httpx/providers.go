@@ -21,6 +21,7 @@ type endpointRequest struct {
 	SDKProvider       string   `json:"sdk_provider,omitempty"`
 	Capabilities      []string `json:"capabilities,omitempty"`
 	BaseOrigin        string   `json:"base_origin,omitempty"`
+	EnclaveRepo       *string  `json:"enclave_repo,omitempty"`
 	CredentialRef     *string  `json:"credential_ref,omitempty"`
 	AssuranceMode     *string  `json:"assurance_mode,omitempty"`
 	AssuranceVerified *bool    `json:"assurance_verified,omitempty"`
@@ -245,6 +246,9 @@ func endpointFromCreateRequest(tenantID string, req endpointRequest) (inference.
 	if req.CredentialRef != nil {
 		endpoint.CredentialRef = strings.TrimSpace(*req.CredentialRef)
 	}
+	if req.EnclaveRepo != nil {
+		endpoint.EnclaveRepo = strings.TrimSpace(*req.EnclaveRepo)
+	}
 	if endpoint.Capabilities == nil {
 		endpoint.Capabilities = []string{}
 	}
@@ -283,6 +287,9 @@ func endpointFromUpdateRequest(existing inference.Endpoint, req endpointRequest)
 	if req.CredentialRef != nil {
 		endpoint.CredentialRef = strings.TrimSpace(*req.CredentialRef)
 	}
+	if req.EnclaveRepo != nil {
+		endpoint.EnclaveRepo = strings.TrimSpace(*req.EnclaveRepo)
+	}
 	if req.AssuranceMode != nil {
 		endpoint.AssuranceMode = strings.TrimSpace(*req.AssuranceMode)
 	}
@@ -295,6 +302,7 @@ func endpointFromUpdateRequest(existing inference.Endpoint, req endpointRequest)
 	if endpoint.Protocol != existing.Protocol ||
 		endpoint.SDKProvider != existing.SDKProvider ||
 		endpoint.BaseOrigin != existing.BaseOrigin ||
+		endpoint.EnclaveRepo != existing.EnclaveRepo ||
 		endpoint.CredentialRef != existing.CredentialRef ||
 		endpoint.AssuranceMode != existing.AssuranceMode ||
 		endpoint.AuthorizedPrivate != existing.AuthorizedPrivate ||
@@ -348,6 +356,16 @@ func validateEndpoint(e inference.Endpoint) (inference.Endpoint, error) {
 	}
 	if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
 		return inference.Endpoint{}, errInvalidProvider("base_origin must be a bare origin")
+	}
+	// enclave_repo exists only for dedicated tinfoil enclaves: the shared
+	// router host verifies through the SDK's router configuration and a
+	// dedicated enclave without its repo could never attest.
+	if e.EnclaveRepo != "" && e.Protocol != "tinfoil" {
+		return inference.Endpoint{}, errInvalidProvider("enclave_repo applies to tinfoil endpoints only")
+	}
+	if e.Protocol == "tinfoil" && e.EnclaveRepo == "" &&
+		inference.TinfoilEnclaveHost(e.BaseOrigin) != inference.DefaultTinfoilEnclave {
+		return inference.Endpoint{}, errInvalidProvider("a dedicated tinfoil enclave requires enclave_repo")
 	}
 	return e, nil
 }

@@ -69,8 +69,13 @@ curl -s -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
 # the same flags apply per collection on POST /api/v1/rag/collections/$CID/search
 ```
 
-Uploads dedupe by content hash; a re-upload of the same bytes returns the
-existing document. On failure, `documents[].error_message` carries the
+Uploads dedupe by content hash against documents the uploader can read within
+the collection: a re-upload of the same bytes returns 200 with
+`deduplicated: true` and the existing document — no new version, ingest job
+or billing. An unreadable match is not disclosed and does not prevent an
+upload; the same bytes in another collection also create their own document.
+On failure,
+`documents[].error_message` carries the
 parser's reason (e.g. malformed document, encrypted PDF). Non-fatal parse
 and chunk problems are persisted per generation and returned on
 `documents[].warnings`: non-UTF-8 input decoded as windows-1252 or UTF-16,
@@ -94,6 +99,13 @@ hits.
 bound. It returns `search_scope_too_large` when more than 20 distinct
 collections are requested, or when no selection is supplied and more than
 20 collections are readable.
+
+`POST /api/v1/rag/search` pages through an opaque `cursor`: the response's
+`next_cursor` feeds the next request's `cursor` (same `query`, `mode`,
+`collection_ids` and `limit`) and pages are stable and disjoint — the fused
+order breaks score ties on the result's stable id. Results are paged over a
+pool bounded at twice the maximum `limit`; when the pool is exhausted the
+response has no `next_cursor`. A malformed cursor is a 400.
 
 Access tokens are written at embedding and refreshed before publication.
 Complete grants snapshots re-project connector objects with revision fencing.
@@ -155,10 +167,22 @@ repeating a `PUT` that failed midway finishes the re-embedding it started.
 /api/v1/connectors/sources/{id}` manage it (scope `connectors.manage`). The
 source's `target_collection_id` routes synced documents into a knowledge
 collection; reads then pass through the source's ACL snapshot in addition
-to collection membership. Source views report `unmapped_principals` —
-provider accounts with no Enclava identity binding — which are skipped and
-get no access until an administrator binds the identity and the source
-re-syncs.
+to collection membership. Source views report `unmapped_principals` — provider
+accounts without an Enclava identity binding get no access until an
+administrator binds the observed identity. Its observed grants and memberships
+then apply without another sync.
+
+GitHub sources require `config.owner` and `config.repo`. A nonempty GitHub
+`credential_ref` must be a `CONNECTOR_GITHUB_*` reference declared in
+`SECRET_BINDINGS` for the tenant, connector purpose and GitHub API origin.
+Public repository content can sync without a credential, but collaborator and
+membership lookup requires a credential with push access even for public
+repositories. `POST /api/v1/connectors/sources/{id}/sync` starts a fresh manual
+sync; send the same `Idempotency-Key` header to retry the same submission.
+Syncing a disabled source returns 409.
+Connector sync workers resolve the source creator's current user grants and
+billing identity for ingest and embedding. A missing or disabled creator fails
+the job; model and endpoint access must be granted to that creator.
 
 Grants inherit down container hierarchies (Slack channels, GitHub
 repositories, Teams channels and chats); group grants additionally require
@@ -200,7 +224,14 @@ templates that declare none), `is_active`, `is_default`.
 Job list rows carry `validation_status` (`needs_review` when the stored
 result failed schema/parse validation, `valid` otherwise) and
 `validation_error_count`; the job still completes terminally. The result
-payload itself carries `validation_errors`/`validation_warnings`.
+payload itself carries `validation_errors`/`validation_warnings`. Rows also
+carry `updated_at` (last write) and, on `unknown` jobs, `outcome_reason`
+(`interrupted` — the request reached the provider before the worker was
+lost) and `reservation_id` (the billing hold that stayed liable; usage may
+already have been billed). Such a job is never auto-replayed:
+`POST /api/v1/extract/jobs/{id}/retry` — an explicit owner call only —
+enqueues a NEW job reusing the same input and returns `202` with the fresh
+job row; retrying can bill again.
 
 Completed results can be copied into knowledge with
 `POST /api/v1/knowledge/imports` `{"collection_id":…,"result_ref":JOB_ID}`.
@@ -214,6 +245,10 @@ curl -s -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
   $BASE/v1/chat/completions \
   -d '{"model":"dsv41","messages":[{"role":"user","content":"hi"}]}' | jq .choices[0].message
 ```
+
+Streaming requests whose upstream returns a non-event-stream response or
+invalid initial framing fail with HTTP 502 and an OpenAI error envelope with
+code `upstream_protocol_error`; the upstream body is not exposed.
 
 ## 6. Own conversations
 
@@ -233,6 +268,18 @@ curl -s -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
 curl -s -H "authorization: Bearer $KEY" -X DELETE $BASE/api/v1/conversations/CONV_ID
 ```
 
+Agent runs created by `POST /api/v1/agent-runs` return `202` with persisted
+`created_at` and `updated_at`. Run steps include terminal errors and end
+times; model-step input summaries include the durable `job_id` and
+`attempt_id` associated with their billing reservation. A wall-clock timeout
+is reported explicitly even while the detached upstream call settles.
+Configured tools that cannot be used report the reason on the run and step.
+
+`DELETE /api/v1/prompt-templates/{id}` returns `409 template_in_use` when an
+assistant still references the instructions; its message names assistants
+visible to the caller. MCP server discovery records the last probe outcome,
+including failures, for the Tools dashboard.
+
 ## 7. Endpoints and capability discovery
 
 Endpoint capabilities and model lists are read from the model server
@@ -244,15 +291,20 @@ curl -s -b jar.txt -H 'content-type: application/json' \
   $BASE/api/v1/providers/discover \
   -d '{"protocol":"openai_compatible","base_origin":"http://spark02:8000","authorized_private":true}' | jq .discovered
 # {"models":["dsv41"],"probe_model":"dsv41",
-#  "capabilities":{"chat/completions":"yes","embeddings":"no","responses":"yes",
-#                  "vision":"unknown","responses/compact":"unknown","mcp":"unknown"}}
+#  "capabilities":{"chat/completions":"yes","embeddings":"unknown","responses":"yes",
+#                  "vision":"unknown","responses/compact":"unknown","mcp":"unknown"},
+#  "probes":[{"capability":"chat/completions","model":"dsv41","result":"yes","error":""}]}
 ```
 
-`yes`/`no` are probe-settled; `unknown` capabilities (vision, compact,
-MCP) have no cheap probe and stay operator judgment. The Models drawer's
-**Discover from server** button calls this same endpoint. Persist an
+Each probe reports `yes`, `no`, or `unknown` for one model; endpoint-wide
+capabilities are `yes` if any suitable model succeeded and `unknown`
+otherwise. At most three candidates are tried per capability. The Models
+drawer's **Discover from server** button calls this endpoint. Persist an
 endpoint with `POST /api/v1/providers` using the discovered values
 (`capabilities` includes `model:<alias>=<upstream-id>` bindings).
+For a dedicated Tinfoil enclave, set `base_origin` to its HTTPS origin and
+`enclave_repo` to the trusted repository reference. The default router origin
+`https://inference.tinfoil.sh` uses automatic router configuration.
 
 ## 8. Security and operations
 
@@ -273,6 +325,22 @@ endpoint with `POST /api/v1/providers` using the discovered values
 - `GET /metrics` exposes Prometheus metrics; require
   `Authorization: Bearer $METRICS_TOKEN`. With no token configured the
   endpoint fails closed (401) unless `METRICS_AUTH_DISABLED=true` is set.
+- `GET /readyz` reports inference readiness and now includes a
+  `dependencies` object (`inference`, `vector_store`) alongside `ready`;
+  it is still inference-gated only — a vector-store outage never flips it.
+  `GET /readyz/knowledge` answers the knowledge dependency alone: 503 while
+  the configured vector store is unreachable (bounded probe: 2 s timeout,
+  result cached 10 s), 200 otherwise. Unknown `/api/*` and `/v1/*` routes
+  return the JSON error envelope (404 `not_found`); dashboard paths keep
+  their HTML 404.
+- API key issuance stays administrator-only. A signed-in member can file a
+  request from Account → Developer:
+  `POST /dashboard/account/api-access-request` (session + CSRF, optional
+  `{"note":"…"}`) stores at most one open request per user and returns
+  `{"status":"open","created":…}`; `POST
+  /dashboard/access-requests/{id}/dismiss` (session + CSRF, `platform.admin`)
+  closes one without granting anything. Open requests surface on the Home
+  attention feed for administrators.
 
 ## 9. Billing reconciliation
 
@@ -295,3 +363,29 @@ fields must be non-negative integers (400 `invalid_request_error`
 otherwise). A nonexistent or cross-tenant id is one indistinguishable 404; a
 reservation not in the `unknown` state returns 409, except an
 already-settled one which returns the existing `usage_record` (200).
+
+## 10. Pricing
+
+`POST /api/v1/admin/pricing` (scope `pricing.manage`) writes immutable price
+rows. The single-entry body is `{subject_type, subject_id, capability,
+unit, rate_micros, unit_quantity, currency?, effective_from?}` — `unit` is
+`input`, `cached_input` or `output` and the rate is `rate_micros`
+currency-micros per `unit_quantity` tokens. A `prices` array of the same
+entries writes every row in ONE transaction — the dashboard's Set-price
+form sends all entered categories this way, so a rejected entry leaves no
+partial price set:
+
+```bash
+curl -s -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  $BASE/api/v1/admin/pricing -d '{
+    "prices":[
+      {"subject_type":"model","subject_id":"dsv41","capability":"chat/completions",
+       "unit":"input","rate_micros":2500000,"unit_quantity":1000000,"currency":"USD"},
+      {"subject_type":"model","subject_id":"dsv41","capability":"chat/completions",
+       "unit":"output","rate_micros":5000000,"unit_quantity":1000000,"currency":"USD"}
+    ]}'
+# → 201 {"ids":["price_…","price_…"],"count":2}
+```
+
+An empty or >12-entry `prices` array, any invalid entry, and a repeated
+(subject, capability, unit) pair all return 400 before anything is written.

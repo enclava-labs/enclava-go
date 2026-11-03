@@ -305,7 +305,7 @@ func (s *Service) enqueueContent(ctx context.Context, principal auth.Principal, 
 		key := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s\x00%d", conn.ID, conn.TargetCollectionID, observation.ObjectRef.ObjectID, observation.ObjectRef.ObservedSeq)))
 		_, _, err := s.jobs.Enqueue(ctx, principal, jobs.EnqueueRequest{
 			TenantID: principal.TenantID, Operation: OperationIngest,
-			IdempotencyKey: OperationIngest + ":" + hex.EncodeToString(key[:]),
+			IdempotencyKey: OperationIngest + ":connector-v3:" + hex.EncodeToString(key[:]),
 			Subject:        jobs.Subject{ConnectionID: conn.ID, ObjectID: observation.ObjectRef.ObjectID, ObservedRevision: observation.ObjectRef.ObservedSeq},
 			InputRef:       observation.ArtifactRef.ID, InputHash: observation.ArtifactRef.SHA256,
 			Policy: map[string]any{"collection_id": conn.TargetCollectionID, "source_ref": observation.ObjectRef, "artifact_ref": observation.ArtifactRef, "source_kind": conn.Kind, "observation_payload": json.RawMessage(observation.Payload)},
@@ -417,13 +417,12 @@ func (s *Service) applyGrantSnapshot(ctx context.Context, principal auth.Princip
 			if err != nil {
 				return err
 			}
-			identity, err := s.canonical.SourceIdentityForNativeID(ctx, conn.TenantID, conn.ID, grant.NativePrincipalID)
-			if errors.Is(err, source.ErrDenied) {
-				unmapped++
-				continue
-			}
+			identity, err := s.observePrincipal(ctx, conn, grant)
 			if err != nil {
 				return err
+			}
+			if identity.MappedUserID == "" {
+				unmapped++
 			}
 			memberships = append(memberships, source.SourceGroupMembership{TenantID: conn.TenantID, ConnectionID: conn.ID, GroupID: group.ID, MemberID: identity.ID, AccessRevision: revision})
 			continue
@@ -456,13 +455,12 @@ func (s *Service) applyGrantSnapshot(ctx context.Context, principal auth.Princip
 			return fmt.Errorf("unsupported source grant effect %q", grant.Effect)
 		}
 		if grant.NativePrincipalID != "" {
-			identity, err := s.canonical.SourceIdentityForNativeID(ctx, conn.TenantID, conn.ID, grant.NativePrincipalID)
-			if errors.Is(err, source.ErrDenied) {
-				unmapped++
-				continue
-			}
+			identity, err := s.observePrincipal(ctx, conn, grant)
 			if err != nil {
 				return err
+			}
+			if identity.MappedUserID == "" {
+				unmapped++
 			}
 			g.SubjectKind, g.SubjectID = source.GrantSubjectUser, identity.ID
 		} else if grant.NativeGroupID != "" {
@@ -491,12 +489,24 @@ func (s *Service) applyGrantSnapshot(ctx context.Context, principal auth.Princip
 	}); err != nil {
 		return err
 	}
-	key := fmt.Sprintf("%s:%s:%s:%d", OperationAccess, conn.ID, kind, revision)
+	key := fmt.Sprintf("%s:connector-v2:%s:%s:%d", OperationAccess, conn.ID, kind, revision)
 	_, _, err = s.jobs.Enqueue(ctx, principal, jobs.EnqueueRequest{TenantID: principal.TenantID, Operation: OperationAccess, IdempotencyKey: key, Subject: jobs.Subject{ConnectionID: conn.ID, ObservedRevision: revision}, InputRef: conn.ID, InputHash: fmt.Sprint(revision), Policy: map[string]any{"connection_id": conn.ID, "snapshot_kind": kind, "revision": revision}})
 	if err != nil {
 		return fmt.Errorf("enqueue rag.access: %w", err)
 	}
 	return nil
+}
+
+func (s *Service) observePrincipal(ctx context.Context, conn source.Connection, grant AccessGrant) (source.SourceIdentity, error) {
+	id, err := connectorObjectID()
+	if err != nil {
+		return source.SourceIdentity{}, err
+	}
+	identity := source.SourceIdentity{TenantID: conn.TenantID, ConnectionID: conn.ID, SourceKind: conn.Kind, ID: id, NativeID: grant.NativePrincipalID, DisplayName: firstNonEmpty(grant.NativePrincipalName, grant.NativePrincipalID)}
+	if err := s.canonical.ObserveSourceIdentity(ctx, identity); err != nil {
+		return source.SourceIdentity{}, err
+	}
+	return s.canonical.ObservedSourceIdentity(ctx, conn.TenantID, conn.ID, grant.NativePrincipalID)
 }
 
 func (s *Service) resolveOrCreateGroup(ctx context.Context, conn source.Connection, nativeID string) (source.SourceGroup, error) {

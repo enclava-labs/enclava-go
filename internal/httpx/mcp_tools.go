@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -214,6 +215,13 @@ func (a *App) handleMCPServerByID(w http.ResponseWriter, r *http.Request, p auth
 		}
 		tools, err := a.mcpTransport.Discover(r.Context(), server)
 		if err != nil {
+			writeCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+			writeErr := a.mcpRepo.RecordDiscoveryFailure(writeCtx, p.TenantID, serverID)
+			cancel()
+			if writeErr != nil {
+				WriteOpenAIError(w, http.StatusInternalServerError, "could not record discovery failure", "server_error", "mcp_discovery_persist_failed")
+				return
+			}
 			WriteOpenAIError(w, http.StatusBadGateway, "MCP discovery failed", "server_error", "mcp_discovery_failed")
 			return
 		}

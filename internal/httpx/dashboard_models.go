@@ -79,10 +79,15 @@ type modelsPriceRow struct {
 	Upstream        string // resolved upstream model id
 	Capability      string
 	CapabilityLabel string
+	Basis           string // endpoint | model — which price set every cell shows
+	SubjectID       string // the Basis set's subject; every cell write lands there
+	Unpriced        bool   // a required unit is missing — reserve would refuse
 	Cells           []modelsPriceCell
 }
 
-// modelsPriceCell is one Input/Cached/Output cell.
+// modelsPriceCell is one Input/Cached/Output cell. The rate data-* pairs
+// prefill the shared Set-price form; the write target is the row's Basis
+// price set (the coverage rule is whole-set, never a per-unit merge).
 type modelsPriceCell struct {
 	Unit         string
 	UnitLabel    string
@@ -91,8 +96,6 @@ type modelsPriceCell struct {
 	RateMicros   int64
 	UnitQuantity int64
 	Currency     string
-	Basis        string // endpoint | model — which price set supplied the rate
-	SubjectID    string // the Basis set's subject: a Set price write lands in the set the cell shows
 }
 
 type modelsDrawerData struct {
@@ -495,7 +498,7 @@ func (a *App) modelsPriceRow(ctx context.Context, tenantID, endpointID, alias, u
 		return billing.Price{}, false
 	}
 	for _, k := range modelsUnitKinds() {
-		cell := modelsPriceCell{Unit: string(k), UnitLabel: unitLabel(k), Required: slices.Contains(kinds, k), Basis: basis, SubjectID: subjectID}
+		cell := modelsPriceCell{Unit: string(k), UnitLabel: unitLabel(k), Required: slices.Contains(kinds, k)}
 		if rate, ok := rateFor(k); ok {
 			cell.Priced = true
 			cell.RateMicros = rate.RateMicros
@@ -504,6 +507,8 @@ func (a *App) modelsPriceRow(ctx context.Context, tenantID, endpointID, alias, u
 		}
 		row.Cells = append(row.Cells, cell)
 	}
+	row.Basis, row.SubjectID = basis, subjectID
+	row.Unpriced = len(missing) > 0
 	return row
 }
 

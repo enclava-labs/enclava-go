@@ -81,6 +81,10 @@ func TestMCPAdministrationDiscoveryApprovalRevisionAndRevocation(t *testing.T) {
 	if discovery.Code != http.StatusOK || !strings.Contains(discovery.Body.String(), `"state":"pending"`) || !strings.Contains(discovery.Body.String(), `"schema_version":1`) || !strings.Contains(discovery.Body.String(), `"input_schema"`) || !strings.Contains(discovery.Body.String(), `"diff_fields":[]`) || !strings.Contains(discovery.Body.String(), `"annotations"`) {
 		t.Fatalf("discovery status=%d body=%s", discovery.Code, discovery.Body.String())
 	}
+	health, err := repo.GetServer(context.Background(), tenant, "server")
+	if err != nil || health.DiscoveryAt.IsZero() || health.DiscoveryError != "" {
+		t.Fatalf("successful discovery health=%+v err=%v", health, err)
+	}
 	if approvals, err := repo.ListAllApprovals(context.Background(), tenant, "server"); err != nil || len(approvals) != 0 {
 		t.Fatalf("discovery auto-approved tools=%v err=%v", approvals, err)
 	}

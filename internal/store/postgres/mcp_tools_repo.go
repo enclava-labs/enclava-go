@@ -82,7 +82,8 @@ func (r *MCPToolsRepo) PutServer(ctx context.Context, s MCPServer) error {
 func (r *MCPToolsRepo) GetServer(ctx context.Context, tenantID, id string) (MCPServer, error) {
 	var s MCPServer
 	var scopes []byte
-	err := r.db.SQL.QueryRowContext(ctx, `SELECT tenant_id::text,id,base_origin,endpoint_path,credential_ref,authorized_private,audience_scopes,enabled,created_at,updated_at FROM mcp_servers WHERE tenant_id=$1::uuid AND id=$2`, tenantID, id).Scan(&s.TenantID, &s.ID, &s.Origin, &s.EndpointPath, &s.CredentialRef, &s.AuthorizedPrivate, &scopes, &s.Enabled, &s.CreatedAt, &s.UpdatedAt)
+	var discoveryAt sql.NullTime
+	err := r.db.SQL.QueryRowContext(ctx, `SELECT tenant_id::text,id,base_origin,endpoint_path,credential_ref,authorized_private,audience_scopes,enabled,last_discovery_at,last_discovery_error,created_at,updated_at FROM mcp_servers WHERE tenant_id=$1::uuid AND id=$2`, tenantID, id).Scan(&s.TenantID, &s.ID, &s.Origin, &s.EndpointPath, &s.CredentialRef, &s.AuthorizedPrivate, &scopes, &s.Enabled, &discoveryAt, &s.DiscoveryError, &s.CreatedAt, &s.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
 		return MCPServer{}, ErrMCPApprovalNotFound
 	}
@@ -92,6 +93,7 @@ func (r *MCPToolsRepo) GetServer(ctx context.Context, tenantID, id string) (MCPS
 	if err = json.Unmarshal(scopes, &s.AudienceScopes); err != nil {
 		return MCPServer{}, err
 	}
+	s.DiscoveryAt = discoveryAt.Time
 	return s, nil
 }
 
@@ -511,7 +513,39 @@ WHERE tenant_id=$1::uuid AND server_id=$2 AND tool_id=$3`,
 			return fmt.Errorf("mark MCP discovery gone: %w", err)
 		}
 	}
+	// The server's health outcome rides the same transaction so a committed
+	// snapshot and a "Connected" pill can never disagree.
+	if _, err := tx.ExecContext(ctx, `UPDATE mcp_servers SET last_discovery_at=now(), last_discovery_error='' WHERE tenant_id=$1::uuid AND id=$2`, tenantID, serverID); err != nil {
+		return fmt.Errorf("record MCP discovery outcome: %w", err)
+	}
 	return tx.Commit()
+}
+
+func (r *MCPToolsRepo) RecordDiscoveryFailure(ctx context.Context, tenantID, serverID string) error {
+	res, err := r.db.SQL.ExecContext(ctx, `UPDATE mcp_servers SET last_discovery_at=now(), last_discovery_error='Discovery failed' WHERE tenant_id=$1::uuid AND id=$2`, tenantID, serverID)
+	if err != nil {
+		return fmt.Errorf("record MCP discovery failure: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrMCPApprovalNotFound
+	}
+	return nil
+}
+
+// DiscoveryState reports one tool's durable discovery state ("pending",
+// "changed", "approved", "rejected", "gone"); unknown tools report an empty
+// string. It is the narrow read run-time tool classification uses to explain
+// WHY a configured tool is unavailable.
+func (r *MCPToolsRepo) DiscoveryState(ctx context.Context, tenantID, serverID, toolID string) (string, error) {
+	var state string
+	err := r.db.SQL.QueryRowContext(ctx, `SELECT state FROM mcp_tool_discoveries WHERE tenant_id=$1::uuid AND server_id=$2 AND tool_id=$3`, tenantID, serverID, toolID).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read MCP discovery state: %w", err)
+	}
+	return state, nil
 }
 
 // ApproveDiscovery is the one atomic review transition: lock the durable

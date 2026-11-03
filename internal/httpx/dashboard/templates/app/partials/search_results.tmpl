@@ -10,6 +10,8 @@
       <button type="button" class="chip active" data-facet="" aria-pressed="true">All</button>
       {{range .Facets}}<button type="button" class="chip" data-facet="{{.SourceKind}}" aria-pressed="false">{{term .SourceKind}} · {{count .Count}}</button>{{end}}
     </div>{{end}}
+    {{if .Rows}}
+    <div id="searchResultRows">
     {{range .Rows}}
     <div class="result" data-source-kind="{{.SourceKind}}">
       <div class="row">
@@ -22,6 +24,17 @@
         <button type="button" class="btn" data-action="evidence:open" data-evidence-id="{{.EvidenceID}}">View evidence</button>
         <a class="btn ghost" data-action="search:ask-about" data-evidence-id="{{.EvidenceID}}" href="/dashboard/chat?evidence={{urlquery .EvidenceID}}">Ask about this</a>
       </div>{{end}}
+    </div>
+    {{end}}
+    {{if .NextCursor}}<div class="row" id="searchMoreRow" style="margin-top:12px">
+      {{/* Same fragment, cursor-paged: only new rows (and a fresh control,
+          while the pool has more) are selected into #searchResultRows — the
+          facets stay the first page's post-authorization payload. search.js
+          drops the clicked control on the successful request. */}}
+      <button type="button" class="btn" data-search-more
+        hx-get="/dashboard/partials/search/results?q={{urlquery $.Data.Query}}&mode={{$.Data.Mode}}&cursor={{urlquery .NextCursor}}{{if $.Data.Collection}}&collection={{$.Data.Collection}}{{end}}"
+        hx-target="#searchResultRows" hx-swap="beforeend" hx-select=".result, #searchMoreRow" hx-push-url="false">More results</button>
+    </div>{{end}}
     </div>
     {{else}}
     {{if not .Error}}{{template "empty" $.Data.ResultsEmpty}}{{end}}

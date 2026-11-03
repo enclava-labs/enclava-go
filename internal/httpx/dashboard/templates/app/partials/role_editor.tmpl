@@ -24,7 +24,7 @@
 {{range $e.Grants}}    <fieldset class="stack" data-grant="{{.Kind}}">
       <legend class="label">{{.Label}}</legend>
 {{if .CallerAll}}      <label class="row"><input type="checkbox" data-grant-all{{if .All}} checked{{end}}> All {{.Label}}</label>
-{{end}}{{range .Items}}      <label class="row"><input type="checkbox" data-grant-item value="{{.ID}}"{{if .Checked}} checked{{end}}> {{.Label}}</label>
+{{end}}{{range .Items}}      <label class="row{{if .Suggested}} grant-suggested{{end}}"><input type="checkbox" data-grant-item value="{{.ID}}"{{if .Checked}} checked{{end}}> {{.Label}}{{if .Suggested}}<span class="grant-suggested-tag">suggested</span>{{end}}</label>
 {{end}}{{if not .Items}}      {{template "empty" .Empty}}
 {{end}}    </fieldset>
 {{end}}  </div>

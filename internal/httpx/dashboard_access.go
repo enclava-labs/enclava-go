@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"enclava-go/internal/auth"
+	"enclava-go/internal/chatbot"
 )
 
 // accessScopeOrder fixes the capability checklist order; accessScopeLabels
@@ -65,6 +66,9 @@ type accessScopeOption struct {
 type accessGrantItem struct {
 	ID, Label string
 	Checked   bool
+	// Suggested marks an item the "Fix availability" flow pre-selected so
+	// the editor can see which boxes repair the assistant it came from.
+	Suggested bool
 }
 
 // accessGrantSection is one AI-resource grant picker: an "All" toggle plus an
@@ -348,6 +352,21 @@ func (a *App) accessGrantSections(ctx context.Context, p auth.Principal, grants 
 	sortGrantItems(endpoints)
 	sortGrantItems(assistants)
 	sortGrantItems(templates)
+	// Embedding models (UX-A08): retrieval embeds under the caller's
+	// models allowlist, so these items carry Kind "models" and merge into
+	// the same grant document on save — a separate kind would need a fifth
+	// grant column the API has no storage for. Checked mirrors the models
+	// grant (an all-grant covers every embedding model too).
+	embedding := make([]accessGrantItem, 0, 4)
+	for _, alias := range a.knowledgeEmbeddingModels(ctx, p.TenantID) {
+		if !auth.ModelAllowed(p, alias) {
+			continue // D-25: never offer items the caller cannot grant
+		}
+		embedding = append(embedding, accessGrantItem{
+			ID: alias, Label: alias, Checked: grants.Models.All || allowlistHas(grants.Models, alias),
+		})
+	}
+	sortGrantItems(embedding)
 	empty := func(label string, callerAll bool) dashboardEmpty {
 		text := "No " + label + " you can grant"
 		if !callerAll {
@@ -362,6 +381,8 @@ func (a *App) accessGrantSections(ctx context.Context, p auth.Principal, grants 
 			Empty: empty("endpoints", p.AllowedEndpointsAll)},
 		{Kind: "assistants", Label: "Assistants", All: grants.Assistants.All, CallerAll: p.AllowedChatbotsAll && p.AllowedAgentsAll, Items: assistants,
 			Empty: empty("assistants", p.AllowedChatbotsAll && p.AllowedAgentsAll)},
+		{Kind: "models", Label: "Embedding models", Items: embedding,
+			Empty: empty("embedding models", p.AllowedModelsAll)},
 		{Kind: "extract_templates", Label: "Extraction templates", All: grants.ExtractTemplates.All, CallerAll: p.AllowedExtractTemplatesAll, Items: templates,
 			Empty: empty("extraction templates", p.AllowedExtractTemplatesAll)},
 	}
@@ -382,7 +403,83 @@ func (a *App) accessRoleEditor(ctx context.Context, p auth.Principal, roleID str
 	}
 	e.Scopes = accessScopeOptions(p, role.Scopes)
 	e.Grants = a.accessGrantSections(ctx, p, role.Grants)
+	// Keep stored list entries even when they are absent from today's catalog.
+	for _, stored := range []struct {
+		kind  string
+		grant auth.Allowlist
+	}{
+		{"models", role.Grants.Models},
+		{"endpoints", role.Grants.Endpoints},
+		{"assistants", role.Grants.Assistants},
+		{"extract_templates", role.Grants.ExtractTemplates},
+	} {
+		for _, id := range stored.grant.Items {
+			found := false
+			for _, section := range e.Grants {
+				if section.Kind == stored.kind {
+					for _, item := range section.Items {
+						if item.ID == id {
+							found = true
+						}
+					}
+				}
+			}
+			if !found {
+				for i := range e.Grants {
+					if e.Grants[i].Kind == stored.kind {
+						e.Grants[i].Items = append(e.Grants[i].Items, accessGrantItem{ID: id, Label: id + " (current)", Checked: true})
+						break
+					}
+				}
+			}
+		}
+	}
 	return e, nil
+}
+
+// accessRoleEditorFix applies the assistants drawer's "Fix availability"
+// link (?fix=<assistantID>): every missing grant item of that assistant's
+// coverage is pre-checked and marked suggested so one save repairs exactly
+// what the coverage check found — nothing more is pre-selected. A bad or
+// unreadable assistant id degrades to the plain editor.
+func (a *App) accessRoleEditorFix(ctx context.Context, p auth.Principal, e *accessRoleEditor, assistantID string) {
+	if assistantID == "" || e.RoleID == "" || a.chatbotSvc == nil {
+		return
+	}
+	bot, err := a.chatbotSvc.Get(ctx, p, assistantID)
+	if err != nil {
+		log.Printf("access role editor fix: assistant %s: %v", assistantID, err)
+		return
+	}
+	role, err := a.identity.GetRole(ctx, p.TenantID, e.RoleID)
+	if err != nil {
+		return
+	}
+	serving := a.assistantServingEndpoints(ctx, p.TenantID, bot)
+	checks := chatbot.RoleAccessCoverage(bot, role.Grants, nil, serving,
+		a.assistantEmbeddingModels(ctx, p, bot))
+	suggested := map[string]map[string]bool{}
+	for _, c := range checks {
+		kind := c.Kind
+		if kind == chatbot.AccessEmbedding {
+			kind = chatbot.AccessModel
+		}
+		if suggested[kind] == nil {
+			suggested[kind] = map[string]bool{}
+		}
+		for _, id := range c.Missing {
+			suggested[kind][id] = true
+		}
+	}
+	for si := range e.Grants {
+		for ii := range e.Grants[si].Items {
+			item := &e.Grants[si].Items[ii]
+			if suggested[e.Grants[si].Kind][item.ID] && !item.Checked {
+				item.Checked = true
+				item.Suggested = true
+			}
+		}
+	}
 }
 
 // --- service accounts / api keys / providers --------------------------------
@@ -629,6 +726,9 @@ func (a *App) handleDashboardAccessRoleEditor(w http.ResponseWriter, r *http.Req
 		return
 	}
 	editor, err := a.accessRoleEditor(r.Context(), p, strings.TrimSpace(r.FormValue("id")))
+	if err == nil && editor != nil {
+		a.accessRoleEditorFix(r.Context(), p, editor, strings.TrimSpace(r.FormValue("fix")))
+	}
 	if err != nil {
 		a.writeIdentityError(w, err, "role_fetch_failed")
 		return

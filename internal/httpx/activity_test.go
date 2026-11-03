@@ -125,8 +125,13 @@ func containsAttentionKind(items []AttentionItem, kind string) bool {
 // whitespace-only upload fails the embed job with "no extractable text".
 func (f *activityFixture) uploadFailedDocument(t *testing.T, uploader auth.Principal, name, collectionID string, audience []string) string {
 	t.Helper()
+	var body strings.Builder
+	for _, b := range []byte(name) {
+		body.WriteString(strings.Repeat(" ", int(b)+1))
+		body.WriteByte('\t')
+	}
 	out, err := f.ragSvc.UploadDocument(f.ctx, uploader, collectionID, rag.UploadDocumentInput{
-		FileName: name, MimeType: "text/plain", Bytes: []byte("   \n"), Audience: audience,
+		FileName: name, MimeType: "text/plain", Bytes: []byte(body.String()), Audience: audience,
 	})
 	if err != nil {
 		t.Fatalf("upload %s: %v", name, err)
@@ -709,7 +714,7 @@ func TestDashboardHomeMetricsRealReads(t *testing.T) {
 	for i := range 3 {
 		if _, err := f.ragSvc.UploadDocument(f.ctx, uploader, collection.ID, rag.UploadDocumentInput{
 			FileName: fmt.Sprintf("doc-%d.txt", i), MimeType: "text/plain",
-			Bytes: []byte("real document body"), Audience: []string{uploader.ActorID, member.ActorID},
+			Bytes: []byte(fmt.Sprintf("real document body %d", i)), Audience: []string{uploader.ActorID, member.ActorID},
 		}); err != nil {
 			t.Fatal(err)
 		}

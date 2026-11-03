@@ -57,6 +57,7 @@ type CanonicalSourceRepository interface {
 	SourceIdentityForNativeID(context.Context, string, string, string) (source.SourceIdentity, error)
 	SourceGroupForNativeID(context.Context, string, string, string) (source.SourceGroup, error)
 	InsertSourceIdentity(context.Context, source.SourceIdentity) error
+	ObserveSourceIdentity(context.Context, source.SourceIdentity) error
 	InsertSourceGroup(context.Context, source.SourceGroup) error
 	SourceIdentitiesForConnection(context.Context, string, string) ([]source.SourceIdentity, error)
 	UserExists(context.Context, string, string) (bool, error)
@@ -72,6 +73,7 @@ type Service struct {
 	observations        ObservationRepository
 	artifacts           *artifacts.Store
 	secrets             *auth.SecretResolver
+	principalForActor   func(context.Context, string, string) (auth.Principal, error)
 	canonical           CanonicalSourceRepository
 	httpClient          *http.Client
 	allowPrivateBaseURL bool
@@ -94,6 +96,10 @@ func (s *Service) SetSyncDependencies(adapters AdapterFactories, observations Ob
 }
 func (s *Service) SetCredentialResolver(resolver *auth.SecretResolver) {
 	s.secrets = resolver
+}
+
+func (s *Service) SetPrincipalResolver(resolve func(context.Context, string, string) (auth.Principal, error)) {
+	s.principalForActor = resolve
 }
 
 func (s *Service) CredentialRefs(p auth.Principal, kind string) []auth.SecretRefMeta {
@@ -167,6 +173,8 @@ func connectionView(c source.Connection) Source {
 		CredentialRef:      c.CredentialRef,
 		Checkpoint:         checkpoint,
 		IsEnabled:          c.Status == "active",
+		CreatedAt:          c.CreatedAt,
+		UpdatedAt:          c.UpdatedAt,
 		LastSyncAt:         c.SyncedAt,
 	}
 }
@@ -366,30 +374,45 @@ func (s *Service) DeleteSource(ctx context.Context, p auth.Principal, id string)
 // job view — the job persists with NO dispatch until the executor registers
 // the handler. Idempotency binds tenant + connection + config identity.
 
+var ErrSourceDisabled = errors.New("connector source is disabled; enable it before syncing")
+var ErrInvalidSource = errors.New("invalid connector source")
+
 func (s *Service) SyncSource(ctx context.Context, p auth.Principal, sourceID string) (SyncJob, error) {
-	return s.syncSource(ctx, p, sourceID, 0)
+	return s.SyncSourceKeyed(ctx, p, sourceID, "")
+}
+
+// SyncSourceKeyed uses a caller-provided key to safely retry a manual request.
+func (s *Service) SyncSourceKeyed(ctx context.Context, p auth.Principal, sourceID, key string) (SyncJob, error) {
+	if strings.TrimSpace(key) == "" {
+		key = newID("manual")
+	}
+	sum := sha256.Sum256([]byte(key))
+	return s.syncSource(ctx, p, sourceID, "m"+hex.EncodeToString(sum[:]))
 }
 
 // SyncSourceWindowed enqueues a scheduled sync whose idempotency key carries
 // the schedule window, so each interval produces one job instead of deduping
 // into the previous (already succeeded) manual/scheduled job.
 func (s *Service) SyncSourceWindowed(ctx context.Context, p auth.Principal, sourceID string, window int64) (SyncJob, error) {
-	return s.syncSource(ctx, p, sourceID, window)
+	return s.syncSource(ctx, p, sourceID, "w"+strconv.FormatInt(window, 10))
 }
 
-func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID string, window int64) (SyncJob, error) {
+func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID string, window string) (SyncJob, error) {
 	if err := requireTenant(p); err != nil {
 		return SyncJob{}, err
-	}
-	if s.jobs == nil || s.observations == nil || s.artifacts == nil || s.canonical == nil || s.adapters == nil {
-		return SyncJob{}, errors.New("connectors: durable sync is not configured")
 	}
 	conn, err := s.repo.GetConnection(ctx, p.TenantID, strings.TrimSpace(sourceID))
 	if err != nil {
 		return SyncJob{}, err
 	}
 	if conn.Status != "active" {
-		return SyncJob{}, errors.New("connector source is disabled")
+		return SyncJob{}, ErrSourceDisabled
+	}
+	if s.jobs == nil || s.observations == nil || s.artifacts == nil || s.canonical == nil || s.adapters == nil {
+		return SyncJob{}, errors.New("connectors: durable sync is not configured")
+	}
+	if err := s.validateConnectorSource(ctx, connectionView(conn)); err != nil {
+		return SyncJob{}, fmt.Errorf("%w: %v", ErrInvalidSource, err)
 	}
 	factory, ok := s.adapters[SourceKind(conn.Kind)]
 	if !ok {
@@ -417,10 +440,7 @@ func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID str
 	if err != nil {
 		return SyncJob{}, err
 	}
-	key := "connector.sync:" + conn.ID + ":" + configHash
-	if window != 0 {
-		key += ":w" + strconv.FormatInt(window, 10)
-	}
+	key := "connector.sync:" + conn.ID + ":" + configHash + ":" + window
 	var response jobs.Job
 	for _, stream := range streams {
 		job, _, err := s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
@@ -568,6 +588,19 @@ func (s *Service) attemptSync(ctx context.Context, claim *jobs.Claim) (string, e
 	}
 	if conn.Status != "active" {
 		return "", errors.New("connector source is no longer active")
+	}
+	if s.principalForActor == nil {
+		return "", errors.New("connector creator authorization resolver is not configured")
+	}
+	if strings.TrimSpace(conn.CreatedBy) == "" {
+		return "", errors.New("connector source has no creator; assign an active user creator before syncing")
+	}
+	principal, err = s.principalForActor(ctx, conn.TenantID, conn.CreatedBy)
+	if err != nil {
+		return "", fmt.Errorf("resolve connector creator authorization: %w", err)
+	}
+	if principal.TenantID != conn.TenantID || principal.ActorID != conn.CreatedBy {
+		return "", errors.New("connector creator authorization returned an invalid principal")
 	}
 	if s.observations == nil || s.artifacts == nil || s.canonical == nil || s.adapters == nil {
 		return "", errors.New("connectors: durable sync is not configured")
@@ -1092,6 +1125,14 @@ func requireAPIOrigin(raw string) (*url.URL, error) {
 }
 
 func (s *Service) validateConnectorSource(ctx context.Context, source Source) error {
+	if source.Type == SourceTypeGitHub {
+		if strings.TrimSpace(stringFromAny(source.Config["owner"])) == "" {
+			return errors.New("config.owner is required for a GitHub source")
+		}
+		if strings.TrimSpace(stringFromAny(source.Config["repo"])) == "" {
+			return errors.New("config.repo is required for a GitHub source")
+		}
+	}
 	if err := validateCredentialRef(source); err != nil {
 		return err
 	}
@@ -1108,7 +1149,7 @@ func validateCredentialRef(source Source) error {
 	}
 	match := connectorCredentialRefPattern.FindStringSubmatch(ref)
 	if match == nil || match[1] != credentialProviderForType(source.Type) {
-		return fmt.Errorf("credential_ref %q is not allowed", ref)
+		return fmt.Errorf("credential_ref must name a CONNECTOR_%s_* binding in SECRET_BINDINGS", credentialProviderForType(source.Type))
 	}
 	return nil
 }

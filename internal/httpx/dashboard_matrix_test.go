@@ -272,7 +272,7 @@ func newMatrixFixture(t *testing.T) *matrixFixture {
 		t.Fatalf("seed preview job: %v", err)
 	}
 	f.connectorSrc, err = f.connSvc.CreateSource(f.ctx, manager.principal, connectors.CreateSourceInput{
-		Type: "github", Name: "Matrix repo",
+		Type: "github", Name: "Matrix repo", Config: map[string]any{"owner": "acme", "repo": "docs"},
 	})
 	if err != nil {
 		t.Fatalf("seed connector source: %v", err)
@@ -449,6 +449,8 @@ func TestDashboardRouteRoleMatrix(t *testing.T) {
 		{"/dashboard/partials/home/running", [4]int{ok, ok, ok, ok}},
 		{"/dashboard/partials/home/attention", [4]int{ok, ok, ok, ok}},
 		{"/dashboard/partials/account/sessions", [4]int{ok, ok, ok, ok}},
+		// API reference (cap api — any API-calling scope; the outsider holds none).
+		{"/dashboard/api", [4]int{ok, ok, ok, deny}},
 		// Chat (cap chat): owner-bound thread — only the member owns the
 		// seeded conversation (platform.admin bypasses ownership), so the
 		// manager sees the designed 404.

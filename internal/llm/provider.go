@@ -1,11 +1,13 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -295,4 +297,105 @@ func (b *boundedStreamBody) Close() error {
 		b.wallTimer.Stop()
 	}
 	return err
+}
+
+// --- Stream-open protocol validation -------------------------------------
+
+// maxStreamProbeLine bounds the accumulated bytes inspected before a
+// streaming body is committed as SSE — enough to classify any legitimate
+// first event line without buffering a multi-megabyte blob.
+const maxStreamProbeLine = 4 * 1024 * 1024
+
+// openStreamBody validates a 2xx streaming response before the body is
+// committed to relay: the Content-Type must be text/event-stream and the
+// first non-blank line must be a legal SSE field or comment. A body that
+// is not SSE — an error document the provider answered 200 to, an HTML
+// interstitial, a bare blob — is drained under the error bound and reported
+// as a 502 upstream-protocol error instead of streaming verbatim to the
+// client. Reads run through the bounded stream body, so a stalled preamble
+// is still cut by the idle limit.
+func openStreamBody(resp *http.Response, stream *boundedStreamBody) (io.ReadCloser, error) {
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || !strings.EqualFold(mediaType, "text/event-stream") {
+		return nil, streamProtocolError(stream)
+	}
+	br := bufio.NewReaderSize(stream, 4096)
+	var head []byte
+	start := 0
+	hasData := false
+	for {
+		line, err := br.ReadSlice('\n')
+		head = append(head, line...)
+		if len(head) > maxStreamProbeLine {
+			return nil, streamProtocolError(&replayBody{head: head, r: br, closer: stream})
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		if err != nil && err != io.EOF {
+			_ = stream.Close()
+			return nil, err
+		}
+		trimmed := bytes.TrimSpace(head[start:])
+		if len(trimmed) == 0 {
+			if hasData {
+				return &replayBody{head: head, r: br, closer: stream}, nil
+			}
+		} else if !looksSSEField(trimmed) {
+			return nil, streamProtocolError(&replayBody{head: head, r: br, closer: stream})
+		} else if bytes.HasPrefix(trimmed, []byte("data:")) || bytes.Equal(trimmed, []byte("data")) {
+			hasData = true
+		}
+		if err == io.EOF {
+			return nil, streamProtocolError(&replayBody{head: head, r: br, closer: stream})
+		}
+		start = len(head)
+	}
+}
+
+// looksSSEField accepts the standard SSE fields and comments.
+func looksSSEField(line []byte) bool {
+	if len(line) > 0 && line[0] == ':' {
+		return true
+	}
+	field, _, _ := bytes.Cut(line, []byte(":"))
+	switch string(field) {
+	case "data", "event", "id", "retry":
+		return true
+	}
+	return false
+}
+
+// replayBody replays bytes already consumed while probing, then continues
+// the underlying body — the opener's validation is transparent to readers.
+type replayBody struct {
+	head   []byte
+	r      io.Reader
+	closer io.Closer
+}
+
+func (b *replayBody) Read(p []byte) (int, error) {
+	if len(b.head) > 0 {
+		n := copy(p, b.head)
+		b.head = b.head[n:]
+		return n, nil
+	}
+	return b.r.Read(p)
+}
+
+func (b *replayBody) Close() error { return b.closer.Close() }
+
+// streamProtocolError drains the rejected body under the error bound — the
+// drain carries any usage the provider reported into settlement — and
+// reports a 502: the endpoint answered 200 to a stream request with a body
+// that is not an event stream.
+type StreamProtocolError struct {
+	Body []byte
+}
+
+func (e *StreamProtocolError) Error() string { return "upstream stream violated the SSE protocol" }
+
+func streamProtocolError(body io.ReadCloser) error {
+	rest, _ := readBoundedBody(body, maxErrorBodyBytes)
+	return &StreamProtocolError{Body: rest}
 }

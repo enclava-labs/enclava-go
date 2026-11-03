@@ -48,14 +48,28 @@
   <h3>Audience</h3>
   <div class="stack">
     <label><input type="radio" name="audience-mode" value="all"{{if .Data.AudienceAll}} checked{{end}}> Everyone in {{.Org}}</label>
-    <label><input type="radio" name="audience-mode" value="members"{{if not .Data.AudienceAll}} checked{{end}}> Specific members</label>
+    <label><input type="radio" name="audience-mode" value="members"{{if and .Data.Assistant (not .Data.AudienceAll)}} checked{{end}}> Specific members</label>
     <div class="stack">
 {{range .Data.Members}}      <label><input type="checkbox" name="audience-member" value="{{.ID}}"{{if .Selected}} checked{{end}}> {{.Label}}</label>
 {{else}}      <p class="muted">No members found.</p>
 {{end}}    </div>
+    <div class="warn-note" data-audience-warn hidden>
+      <span data-audience-warn-text></span>
+      <button type="button" class="btn" data-audience-save-anyway hidden>Save anyway</button>
+    </div>
     <span class="help">Audience members can run this assistant; role grants still apply.</span>
   </div>
-  <label><input type="checkbox" name="is_enabled"{{if or (not .Data.Assistant) .Data.Assistant.IsEnabled}} checked{{end}}> Enabled</label>
+{{if .Data.Coverage}}  <h3>Coverage</h3>
+  <p class="help">Who can actually reach this assistant — role grants plus audience.</p>
+  <div class="stack">
+{{range .Data.Coverage}}    <div class="coverage-role">
+      <div class="coverage-role-head"><b>{{.Name}}</b> {{statusPill "availability" .Status}}{{if and .CanFix $.Can.AccessManage}} <button type="button" class="btn" data-action="open-drawer" data-drawer-url="{{.FixURL}}">Fix for {{.Name}}</button>{{end}}</div>
+      <ul class="coverage-checks">
+{{range .Checks}}        <li>{{if .OK}}<span class="coverage-ok">{{icon "check"}}</span>{{else}}<span class="coverage-miss">{{icon "x"}}</span>{{end}} {{.Label}}{{if .Note}}<span class="subline">{{.Note}}</span>{{else if .Missing}}<span class="subline">missing:{{range .Missing}} <code>{{.}}</code>{{end}}</span>{{end}}</li>
+{{end}}      </ul>
+    </div>
+{{end}}  </div>
+{{end}}  <label><input type="checkbox" name="is_enabled"{{if or (not .Data.Assistant) .Data.Assistant.IsEnabled}} checked{{end}}> Enabled</label>
 {{range .Data.Preserved}}  <input type="hidden" data-setting-key="{{.Key}}" value="{{.JSON}}">
 {{end}}  <div class="drawer-actions">
 {{if .Data.Assistant}}    <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete this assistant? It is removed for every member and role that uses it." data-assistant-delete="{{.Data.Assistant.ID}}">{{icon "x"}}Delete</button>
