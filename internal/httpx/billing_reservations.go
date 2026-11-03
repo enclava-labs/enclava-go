@@ -1,8 +1,7 @@
-// billing_reservations.go — the platform.admin unknown-reservation
-// reconciliation API (JOB-04): list outstanding canonical reservations by
-// state and resolve an unknown hold into reconciled usage (or write it off
-// with all-zero tokens). Resolve delegates the transition to
-// billing.Service.ResolveUnknown so the settled evidence is written once,
+// billing_reservations.go — the platform.admin reconciliation API: list
+// outstanding canonical reservations and reconcile held or unknown holds
+// (or write them off with all-zero tokens). Resolve delegates to
+// billing.Service.ResolveOutstanding so evidence is written once,
 // under the reservation's immutable snapshot.
 package httpx
 
@@ -164,7 +163,7 @@ func (a *App) handleAdminReservationResolve(w http.ResponseWriter, r *http.Reque
 		WriteOpenAIError(w, http.StatusBadRequest, "cached_input_tokens must not exceed input_tokens, which already includes cached tokens", "invalid_request_error", "invalid_tokens")
 		return
 	}
-	rec, err := a.billingSvc.ResolveUnknown(r.Context(), principal, id, billing.Usage{
+	rec, err := a.billingSvc.ResolveOutstanding(r.Context(), principal, id, billing.Usage{
 		InputUnits:       *req.InputTokens - *req.CachedInputTokens,
 		CachedInputUnits: *req.CachedInputTokens,
 		OutputUnits:      *req.OutputTokens,
@@ -176,15 +175,14 @@ func (a *App) handleAdminReservationResolve(w http.ResponseWriter, r *http.Reque
 	WriteJSON(w, http.StatusOK, map[string]any{"usage_record": rec})
 }
 
-// writeReservationResolveError maps the settle-authority errors: unknown or
-// cross-tenant ids are one indistinguishable 404, a reservation not in the
-// unknown state is the 409 conflict.
+// writeReservationResolveError maps unknown or cross-tenant IDs to 404;
+// released reservations conflict while already settled ones return evidence.
 func (a *App) writeReservationResolveError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, billing.ErrReservationNotFound), errors.Is(err, postgres.ErrBudgetNotFound):
 		WriteOpenAIError(w, http.StatusNotFound, "reservation not found", "invalid_request_error", "not_found")
 	case errors.Is(err, billing.ErrReservationState):
-		WriteOpenAIError(w, http.StatusConflict, "reservation is not in the unknown state", "invalid_request_error", "invalid_state")
+		WriteOpenAIError(w, http.StatusConflict, "reservation is not outstanding", "invalid_request_error", "invalid_state")
 	default:
 		log.Printf("failed to resolve reservation: %v", err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "reservation_resolve_failed")

@@ -1,0 +1,32 @@
+{{define "frag-usage-reservations"}}
+<div class="section" id="usage-reservations" hx-get="{{.Data.Reservations.FragmentHref}}" hx-trigger="refresh from:body" hx-swap="outerHTML">
+  <div class="filters" role="group" aria-label="Reservation state">
+    <a class="chip{{if eq .Data.Reservations.State "unknown"}} active{{end}}" href="/dashboard/usage/reservations?state=unknown"{{if eq .Data.Reservations.State "unknown"}} aria-current="page"{{end}}>Unknown</a>
+    <a class="chip{{if eq .Data.Reservations.State "held"}} active{{end}}" href="/dashboard/usage/reservations?state=held"{{if eq .Data.Reservations.State "held"}} aria-current="page"{{end}}>Held</a>
+  </div>
+  {{if .Data.Reservations.Rows}}<div class="card"><div class="tablewrap" role="region" tabindex="0" aria-label="Reservations"><table>
+    <thead><tr><th scope="col">Subject</th><th scope="col">Model</th><th scope="col">Capability</th><th scope="col">State</th><th scope="col">Age</th><th scope="col">Bound</th><th scope="col">Actions</th></tr></thead>
+    <tbody>{{range .Data.Reservations.Rows}}<tr>
+      <td data-label="Subject">{{.SubjectType}} · {{.SubjectID}}<span class="subline">{{.ID}}</span></td>
+      <td data-label="Model">{{.Model}}</td><td data-label="Capability">{{.Capability}}</td>
+      <td data-label="State">{{$.Data.Reservations.State}}</td><td data-label="Age" title="{{absTime .CreatedAt}}">{{relTime .CreatedAt}}</td>
+      <td data-label="Bound" title="{{.BoundMicros}} micros">{{spendMoney .BoundMicros .Currency}} {{.Currency}}</td>
+      <td data-label="Actions"><button type="button" class="btn" data-action="open-drawer" data-drawer-url="/dashboard/partials/usage/reservation-drawer?id={{.ID}}">Resolve</button></td>
+    </tr>{{end}}</tbody>
+  </table></div></div>{{else}}<p class="muted">No {{.Data.Reservations.State}} reservations.</p>{{end}}
+  {{if .Data.Reservations.NextHref}}<p><a class="btn" href="{{.Data.Reservations.NextHref}}">Next page</a></p>{{end}}
+</div>
+{{end}}
+
+{{define "frag-usage-reservation-drawer"}}
+<div class="drawer-head"><h2>Resolve reservation</h2><button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button></div>
+<form data-reservation-form data-reservation-id="{{.Data.Reservations.DrawerID}}">
+  <p>Reservation {{.Data.Reservations.DrawerID}}. Enter reconciled token usage; enter zero for all fields to write off the reservation.</p>
+  <p>Held reservations may still be in flight. Resolving one can preempt its eventual settlement; verify the upstream outcome first.</p>
+  <div class="field"><label for="reservation-input">Input tokens</label><input id="reservation-input" name="input_tokens" type="number" min="0" step="1" required value="0"></div>
+  <div class="field"><label for="reservation-cached">Cached input tokens</label><input id="reservation-cached" name="cached_input_tokens" type="number" min="0" step="1" required value="0"><span class="muted">Included in input tokens.</span></div>
+  <div class="field"><label for="reservation-output">Output tokens</label><input id="reservation-output" name="output_tokens" type="number" min="0" step="1" required value="0"></div>
+  <p class="field-error" role="alert" hidden></p>
+  <button class="btn primary" type="button" data-action="confirm" data-confirm="Resolve this reservation?">Resolve reservation</button>
+</form>
+{{end}}

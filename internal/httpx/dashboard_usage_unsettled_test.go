@@ -76,6 +76,9 @@ func TestDashboardUsageOverviewUnsettled(t *testing.T) {
 	if !strings.Contains(body, "ov-key") {
 		t.Fatalf("key table must render the key row: %s", body)
 	}
+	if !strings.Contains(body, "&lt;$0.01") || !strings.Contains(body, `title="1000 micros USD"`) {
+		t.Fatalf("sub-cent settled spend must show its exact micros: %s", body)
+	}
 }
 
 // TestDashboardUsageUnsettledMixedCurrencies covers two review findings:

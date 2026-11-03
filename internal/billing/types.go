@@ -79,6 +79,12 @@ const (
 	BudgetSubjectUser           = "user"
 	BudgetSubjectServiceAccount = "service_account"
 )
+const (
+	AuditRequestRefused           = "request.refused"
+	RefusalPriceMissing           = "price_missing"
+	RefusalBudgetExceeded         = "budget_exceeded"
+	RefusalBudgetCurrencyMismatch = "budget_currency_mismatch"
+)
 
 // Budget kinds and periods.
 const (
@@ -197,10 +203,11 @@ type Usage struct {
 }
 
 var (
-	ErrBudgetExceeded      = errors.New("billing: budget exceeded")
-	ErrPriceMissing        = errors.New("billing: required price missing")
-	ErrCurrencyMismatch    = errors.New("billing: mixed-currency price set")
-	ErrArithmeticOverflow  = errors.New("billing: arithmetic overflow")
-	ErrReservationNotFound = errors.New("billing: reservation not found")
-	ErrReservationState    = errors.New("billing: reservation state forbids transition")
+	ErrBudgetExceeded         = errors.New("billing: budget exceeded")
+	ErrBudgetCurrencyMismatch = errors.New("billing: budget currency mismatch")
+	ErrPriceMissing           = errors.New("billing: required price missing")
+	ErrCurrencyMismatch       = errors.New("billing: mixed-currency price set")
+	ErrArithmeticOverflow     = errors.New("billing: arithmetic overflow")
+	ErrReservationNotFound    = errors.New("billing: reservation not found")
+	ErrReservationState       = errors.New("billing: reservation state forbids transition")
 )

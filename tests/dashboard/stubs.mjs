@@ -98,6 +98,11 @@ async function inference(req, res) {
     // exercise mid-run reload/stop paths (the resumed-poll contract).
     const slowUser = messages.some((m) => m && m.role === 'user' && typeof m.content === 'string' && m.content.includes('Long-running'));
     if (slowUser) await new Promise((r) => setTimeout(r, 20_000));
+    if (messages.some((m) => m?.role === 'user' && m.content === 'E2E reservation without usage')) {
+      const reply = chatReply(model, 'Usage unavailable.');
+      delete reply.usage;
+      return send(res, 200, reply);
+    }
     // Grounding oracle: if the prompt carries a GROUNDING-MARKER sentence
     // (only reachable through retrieved passages), quote it back — the
     // grounding spec uses this to prove context reached the model.

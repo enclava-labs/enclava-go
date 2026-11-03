@@ -182,7 +182,9 @@ func (r *IdentityRepo) AssignRole(ctx context.Context, tenantID, userID, roleID 
 	// API never reports a conflict for an already-true grant.
 	_, err := r.db.ExecContext(ctx,
 		`INSERT INTO user_roles (tenant_id, user_id, role_id)
-		 VALUES ($1::uuid, $2, $3) ON CONFLICT DO NOTHING`,
+		 SELECT $1::uuid, $2, $3 FROM users
+		 WHERE tenant_id = $1::uuid AND id = $2 AND deleted_at IS NULL
+		 FOR UPDATE ON CONFLICT DO NOTHING`,
 		tenantID, userID, roleID)
 	if err != nil {
 		return fmt.Errorf("assign role: %w", err)
@@ -578,9 +580,72 @@ func (r *IdentityRepo) SetUserStatusAtomically(ctx context.Context, tenantID, us
 		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE users SET status = $3
-			 WHERE tenant_id = $1::uuid AND id = $2`,
+			 WHERE tenant_id = $1::uuid AND id = $2 AND deleted_at IS NULL`,
 			tenantID, userID, status); err != nil {
 			return fmt.Errorf("update user status: %w", err)
+		}
+		return nil
+	})
+}
+
+// DeleteUserAtomically removes a user from active identity while retaining history.
+func (r *IdentityRepo) DeleteUserAtomically(ctx context.Context, tenantID, userID string) error {
+	return WithTx(ctx, r.db, func(tx *sql.Tx) error {
+		if err := lockTenantAuthority(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		var status string
+		err := tx.QueryRowContext(ctx, `SELECT status FROM users
+			WHERE tenant_id = $1::uuid AND id = $2 AND deleted_at IS NULL FOR UPDATE`,
+			tenantID, userID).Scan(&status)
+		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
+			return auth.ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock user for deletion: %w", err)
+		}
+		if status == "active" {
+			var isAdmin bool
+			err = tx.QueryRowContext(ctx, `SELECT EXISTS (
+				SELECT 1 FROM user_roles ur JOIN roles ro
+				ON ro.tenant_id = ur.tenant_id AND ro.id = ur.role_id
+				WHERE ur.tenant_id = $1::uuid AND ur.user_id = $2 AND (ro.scopes ? $3 OR ro.scopes ? '*')
+			)`, tenantID, userID, auth.ScopePlatformAdmin).Scan(&isAdmin)
+			if err != nil {
+				return fmt.Errorf("check user admin role: %w", err)
+			}
+			if isAdmin {
+				var others bool
+				err = tx.QueryRowContext(ctx, `SELECT EXISTS (
+					SELECT 1 FROM user_roles ur JOIN roles ro
+					ON ro.tenant_id = ur.tenant_id AND ro.id = ur.role_id
+					JOIN users u ON u.tenant_id = ur.tenant_id AND u.id = ur.user_id
+					WHERE ur.tenant_id = $1::uuid AND ur.user_id <> $2
+					  AND u.status = 'active' AND u.deleted_at IS NULL AND (ro.scopes ? $3 OR ro.scopes ? '*')
+				)`, tenantID, userID, auth.ScopePlatformAdmin).Scan(&others)
+				if err != nil {
+					return fmt.Errorf("check remaining admins: %w", err)
+				}
+				if !others {
+					return ErrLastAdmin
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET status = 'disabled', deleted_at = now()
+			WHERE tenant_id = $1::uuid AND id = $2`, tenantID, userID); err != nil {
+			return fmt.Errorf("delete user: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE sessions SET revoked_at = now(), revoke_reason = 'user_deleted'
+			WHERE tenant_id = $1::uuid AND user_id = $2 AND revoked_at IS NULL`, tenantID, userID); err != nil {
+			return fmt.Errorf("revoke deleted user sessions: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE api_keys SET revoked_at = now()
+			WHERE tenant_id = $1::uuid AND owner_user_id = $2 AND revoked_at IS NULL`, tenantID, userID); err != nil {
+			return fmt.Errorf("revoke deleted user keys: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM user_roles
+			WHERE tenant_id = $1::uuid AND user_id = $2`, tenantID, userID); err != nil {
+			return fmt.Errorf("remove deleted user roles: %w", err)
 		}
 		return nil
 	})
@@ -715,7 +780,7 @@ func (r *IdentityRepo) UpdateUserTeam(ctx context.Context, tenantID, userID, tea
 func (r *IdentityRepo) GetUser(ctx context.Context, tenantID, userID string) (auth.User, error) {
 	u, err := scanUser(r.db.QueryRowContext(ctx,
 		`SELECT `+userColumns+` FROM users
-		 WHERE tenant_id = $1::uuid AND id = $2`,
+		 WHERE tenant_id = $1::uuid AND id = $2 AND deleted_at IS NULL`,
 		tenantID, userID))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
@@ -729,7 +794,7 @@ func (r *IdentityRepo) GetUser(ctx context.Context, tenantID, userID string) (au
 func (r *IdentityRepo) GetUserByEmail(ctx context.Context, tenantID, email string) (auth.User, error) {
 	u, err := scanUser(r.db.QueryRowContext(ctx,
 		`SELECT `+userColumns+` FROM users
-		 WHERE tenant_id = $1::uuid AND email = $2`,
+		 WHERE tenant_id = $1::uuid AND email = $2 AND deleted_at IS NULL`,
 		tenantID, email))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
@@ -743,7 +808,7 @@ func (r *IdentityRepo) GetUserByEmail(ctx context.Context, tenantID, email strin
 func (r *IdentityRepo) UpdateUserStatus(ctx context.Context, tenantID, userID, status string) error {
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE users SET status = $3
-		 WHERE tenant_id = $1::uuid AND id = $2`,
+		 WHERE tenant_id = $1::uuid AND id = $2 AND deleted_at IS NULL`,
 		tenantID, userID, status)
 	if err != nil {
 		return fmt.Errorf("update user status: %w", err)
@@ -759,7 +824,7 @@ func (r *IdentityRepo) SetPasswordAndRevokeSessions(ctx context.Context, tenantI
 	return WithTx(ctx, r.db, func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx,
 			`UPDATE users SET password_hash = $3, password_set_at = $4
-			 WHERE tenant_id = $1::uuid AND id = $2`,
+			 WHERE tenant_id = $1::uuid AND id = $2 AND deleted_at IS NULL`,
 			tenantID, userID, hash, at)
 		if err != nil {
 			return fmt.Errorf("set password: %w", err)
@@ -797,7 +862,7 @@ func (r *IdentityRepo) TouchLastLogin(ctx context.Context, tenantID, userID stri
 func (r *IdentityRepo) ListUsers(ctx context.Context, tenantID string) ([]auth.User, error) {
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT `+userColumns+` FROM users
-		 WHERE tenant_id = $1::uuid ORDER BY id`,
+		 WHERE tenant_id = $1::uuid AND deleted_at IS NULL ORDER BY id`,
 		tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("list users: %w", err)
@@ -930,7 +995,7 @@ func scanAPIKey(row rowScanner) (auth.APIKeyRecord, error) {
 }
 
 func (r *IdentityRepo) CreateAPIKey(ctx context.Context, tenantID string, k auth.APIKeyRecord) error {
-	_, err := r.db.ExecContext(ctx,
+	result, err := r.db.ExecContext(ctx,
 		`INSERT INTO api_keys
 		 (tenant_id, id, owner_user_id, service_account_id, name,
 		  key_prefix, key_hash, key_hash_algo, scopes, allowed_models,
@@ -938,11 +1003,14 @@ func (r *IdentityRepo) CreateAPIKey(ctx context.Context, tenantID string, k auth
 		  allowed_endpoints, allowed_ips,
 		  rate_limit_per_minute, rate_limit_per_hour, rate_limit_per_day,
 		  expires_at, revoked_at, last_used_at)
-		 VALUES ($1::uuid, $2, $3, $4, $5,
+		 SELECT $1::uuid, $2, $3, $4, $5,
 		  $6, $7, $8, $9::jsonb, $10::jsonb,
 		  $11::jsonb, $12::jsonb, $13::jsonb,
 		  $14::jsonb, $15::jsonb,
-		  $16, $17, $18, $19, $20, $21)`,
+		  $16::bigint, $17::bigint, $18::bigint, $19::timestamptz, $20::timestamptz, $21::timestamptz
+		 WHERE $3::text IS NULL OR EXISTS (
+		  SELECT 1 FROM users WHERE tenant_id = $1::uuid AND id = $3
+		  AND deleted_at IS NULL FOR UPDATE)`,
 		tenantID, k.ID, nullStr(k.OwnerUserID), nullStr(k.ServiceAccountID), k.Name,
 		k.KeyPrefix, k.KeyHash, k.KeyHashAlgo, jsonbArg(k.Scopes), jsonbArg(k.AllowedModels),
 		jsonbArg(k.AllowedTemplates), jsonbArg(k.AllowedChatbots), jsonbArg(k.AllowedAgents),
@@ -952,6 +1020,11 @@ func (r *IdentityRepo) CreateAPIKey(ctx context.Context, tenantID string, k auth
 		k.ExpiresAt, k.RevokedAt, k.LastUsedAt)
 	if err != nil {
 		return fmt.Errorf("create api key: %w", err)
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("create api key: %w", err)
+	} else if n == 0 {
+		return auth.ErrNotFound
 	}
 	return nil
 }
@@ -1113,15 +1186,21 @@ func scanSession(row rowScanner) (auth.Session, error) {
 }
 
 func (r *IdentityRepo) CreateSession(ctx context.Context, tenantID string, s auth.Session) error {
-	_, err := r.db.ExecContext(ctx,
+	result, err := r.db.ExecContext(ctx,
 		`INSERT INTO sessions
 		 (tenant_id, id, user_id, token_hash, csrf_token,
 		  expires_at, idle_expires_at, revoked_at, revoke_reason)
-		 VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		 SELECT $1::uuid, $2, $3, $4, $5, $6::timestamptz, $7::timestamptz, $8::timestamptz, $9 FROM users
+		 WHERE tenant_id = $1::uuid AND id = $3 AND deleted_at IS NULL FOR UPDATE`,
 		tenantID, s.ID, s.UserID, s.TokenHash, s.CSRFToken,
 		s.ExpiresAt, s.IdleExpiresAt, s.RevokedAt, nullStr(s.RevokeReason))
 	if err != nil {
 		return fmt.Errorf("create session: %w", err)
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("create session: %w", err)
+	} else if n == 0 {
+		return auth.ErrNotFound
 	}
 	return nil
 }

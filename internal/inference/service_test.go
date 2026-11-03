@@ -337,6 +337,109 @@ func (f *fx) reservationCount(t *testing.T) int {
 	return n
 }
 
+type failingRefusalAuditBilling struct{ inference.Billing }
+
+func (b *failingRefusalAuditBilling) RecordRequestRefused(context.Context, auth.Principal, string, string, string) error {
+	return errors.New("audit store unavailable")
+}
+
+func TestRequestRefusalAuditFailureIsSurfaced(t *testing.T) {
+	f := newFx(t)
+	f.mkEndpoint(t)
+	f.billingOverride = &failingRefusalAuditBilling{Billing: f.billing}
+	f.build(t)
+	_, err := f.svc.Execute(f.ctx, f.principal, f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err == nil || !strings.Contains(err.Error(), "refusal audit unavailable") || errors.Is(err, billing.ErrPriceMissing) {
+		t.Fatalf("audit failure must surface as an internal error, got %v", err)
+	}
+	if atomic.LoadInt32(&f.upstream.calls) != 0 {
+		t.Fatal("refused request reached upstream")
+	}
+}
+
+func TestRequestRefusalAudit(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		setup      string
+		wantErr    error
+		wantReason string
+		key        bool
+	}{
+		{name: "unpriced model", wantErr: billing.ErrPriceMissing, wantReason: billing.RefusalPriceMissing},
+		{name: "unpriced unit", setup: "partial", wantErr: billing.ErrPriceMissing, wantReason: billing.RefusalPriceMissing},
+		{name: "budget", setup: "budget", wantErr: billing.ErrBudgetExceeded, wantReason: billing.RefusalBudgetExceeded, key: true},
+		{name: "budget currency", setup: "currency", wantErr: billing.ErrCurrencyMismatch, wantReason: billing.RefusalBudgetCurrencyMismatch, key: true},
+		{name: "successful model fallback", setup: "model"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFx(t)
+			f.mkEndpoint(t)
+			p := f.principal
+			if tc.key {
+				p = keyPrincipal(f.tenant, "key-1", p.ActorID)
+			}
+			switch tc.setup {
+			case "partial":
+				f.price(t, inference.CapabilityChat, billing.UnitInput, 1, 1)
+			case "budget", "currency":
+				f.flatPrices(t)
+				currency := "USD"
+				if tc.setup == "currency" {
+					currency = "EUR"
+				}
+				if err := f.brepo.CreateBudget(f.ctx, f.tenant, "budget-refusal", billing.Budget{
+					Subject: billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: p.CredentialID},
+					Kind:    billing.BudgetKindAmount, Period: billing.PeriodMonthly,
+					LimitAmountMicros: 1, Currency: currency, StartsAt: time.Now().UTC().Add(-time.Hour),
+				}); err != nil {
+					t.Fatal(err)
+				}
+			case "model":
+				for _, unit := range []billing.UnitKind{billing.UnitInput, billing.UnitCachedInput, billing.UnitOutput} {
+					if err := f.brepo.PutPrice(f.ctx, f.tenant, "model-"+string(unit), billing.Price{
+						SubjectType: billing.PriceSubjectModel, SubjectID: "gpt-4o-mini",
+						Capability: inference.CapabilityChat, Unit: unit,
+						RateMicros: 1, UnitQuantity: 1, Currency: "USD",
+					}, p.ActorID, time.Now().UTC().Add(-time.Minute)); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			_, err := f.svc.Execute(f.ctx, p, f.chatRequest(`{"messages":[{"role":"user","content":"private prompt"}],"max_tokens":5}`))
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("execute error = %v, want %v", err, tc.wantErr)
+			}
+			rows, err := f.brepo.ListBillingAudit(f.ctx, f.tenant, "", "", 100, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantReason == "" {
+				if len(rows) != 0 {
+					t.Fatalf("successful request created audit rows: %+v", rows)
+				}
+				return
+			}
+			if len(rows) != 1 {
+				t.Fatalf("audit rows = %+v, want one refusal", rows)
+			}
+			row := rows[0]
+			subjectType, subjectID := billing.BudgetSubjectUser, p.ActorID
+			if tc.key {
+				subjectType, subjectID = billing.BudgetSubjectAPIKey, p.CredentialID
+			}
+			if row.Action != billing.AuditRequestRefused || row.SubjectType != subjectType || row.SubjectID != subjectID ||
+				row.ActorType != string(p.ActorKind) || row.ActorID != p.ActorID ||
+				len(row.Detail) != 3 || row.Detail["reason"] != tc.wantReason ||
+				row.Detail["model"] != "gpt-4o-mini" || row.Detail["capability"] != inference.CapabilityChat {
+				t.Fatalf("unexpected refusal audit: %+v", row)
+			}
+			if atomic.LoadInt32(&f.upstream.calls) != 0 {
+				t.Fatal("refused request reached upstream")
+			}
+		})
+	}
+}
+
 func TestExecuteSettlesExactUsage(t *testing.T) {
 	f := newFx(t)
 	f.mkEndpoint(t)

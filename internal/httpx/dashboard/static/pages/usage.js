@@ -196,6 +196,42 @@
     });
   });
 
+  document.addEventListener('submit', (e) => {
+    if (e.target.matches('form[data-reservation-form]')) e.preventDefault();
+  });
+
+  document.addEventListener('enclava:confirm', (e) => {
+    const form = e.target.closest('form[data-reservation-form]');
+    if (!form) return;
+    const error = form.querySelector('.field-error');
+    if (error) error.hidden = true;
+    if (!form.reportValidity()) return;
+    const fields = ['input_tokens', 'cached_input_tokens', 'output_tokens'];
+    const body = {};
+    for (const field of fields) {
+      const raw = form.elements[field].value;
+      const value = Number(raw);
+      if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < 0) {
+        showFormError(form, 'Token counts must be non-negative whole numbers.');
+        return;
+      }
+      body[field] = value;
+    }
+    if (body.cached_input_tokens > body.input_tokens) {
+      showFormError(form, 'Cached input tokens must not exceed input tokens.');
+      return;
+    }
+    window.Enclava.api('POST', '/api/v1/admin/reservations/' +
+      encodeURIComponent(form.dataset.reservationId) + '/resolve', body).then(() => {
+      window.Enclava.closeDrawer();
+      window.Enclava.toast('success', 'Reservation resolved');
+      window.Enclava.refresh();
+    }).catch((err) => {
+      const action = window.Enclava.errorAction(err);
+      showFormError(form, action.text || (err && err.message) || 'Request failed');
+    });
+  });
+
   // Deactivate is a DELETE against the same budget row behind the shared
   // confirm group (app.js arms the group and fires enclava:confirm on the
   // trigger's Confirm); the row stays listed as inactive and admission stops

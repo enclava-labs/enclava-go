@@ -48,19 +48,21 @@ type dashboardConfirm struct {
 // dashboardBaseFuncs registers the frozen helper names; all must exist before
 // layout/components parse (templates reference them at parse time).
 var dashboardBaseFuncs = template.FuncMap{
-	"statusPill":  statusPill,
-	"statusLabel": statusLabel,
-	"statusTone":  statusTone,
-	"term":        term,
-	"relTime":     relTime,
-	"absTime":     absTime,
-	"money":       money,
-	"tokenPrice":  tokenPrice,
-	"count":       count,
-	"icon":        icon,
-	"spark":       spark,
-	"bars":        bars,
-	"mark":        mark,
+	"statusPill":       statusPill,
+	"statusLabel":      statusLabel,
+	"statusTone":       statusTone,
+	"term":             term,
+	"relTime":          relTime,
+	"absTime":          absTime,
+	"money":            money,
+	"spendMoney":       spendMoney,
+	"spendMicrosTitle": spendMicrosTitle,
+	"tokenPrice":       tokenPrice,
+	"count":            count,
+	"icon":             icon,
+	"spark":            spark,
+	"bars":             bars,
+	"mark":             mark,
 }
 
 var (

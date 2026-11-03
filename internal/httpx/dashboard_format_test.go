@@ -113,6 +113,31 @@ func TestMoney(t *testing.T) {
 	}
 }
 
+func TestSpendMoney(t *testing.T) {
+	cases := []struct {
+		micros   int64
+		currency string
+		want     string
+	}{
+		{0, "USD", "$0.00"},
+		{1, "USD", "<$0.01"},
+		{4999, "EUR", "<€0.01"},
+		{5000, "USD", "$0.01"},
+		{1, "NOK", "<0.01 NOK"},
+		{1, "", "<0.01"},
+		{-1, "USD", ">-$0.01"},
+		{-5000, "USD", "-$0.01"},
+	}
+	for _, c := range cases {
+		if got := spendMoney(c.micros, c.currency); got != c.want {
+			t.Errorf("spendMoney(%d, %q) = %q, want %q", c.micros, c.currency, got, c.want)
+		}
+	}
+	if got := spendMicrosTitle(1, "USD"); got != "1 micros USD" {
+		t.Errorf("spendMicrosTitle = %q", got)
+	}
+}
+
 // TestTokenPrice: rates render per 1M tokens without rounding sub-cent prices.
 func TestTokenPrice(t *testing.T) {
 	cases := []struct {

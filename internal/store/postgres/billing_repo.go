@@ -795,6 +795,15 @@ func (r *BillingRepo) CreateBillingAudit(ctx context.Context, tenantID string, r
 	return nil
 }
 
+// RecordRequestRefused stores only billing admission metadata.
+func (r *BillingRepo) RecordRequestRefused(ctx context.Context, tenantID string, subject billing.Subject, actorType, actorID, model, capability, reason string) error {
+	return r.CreateBillingAudit(ctx, tenantID, BillingAuditRow{
+		ID: newRowID("baudit"), SubjectType: subject.Type, SubjectID: subject.ID,
+		Action: billing.AuditRequestRefused, ActorType: actorType, ActorID: actorID,
+		Detail: map[string]any{"reason": reason, "model": model, "capability": capability},
+	})
+}
+
 // ListBillingAudit returns audit rows, optionally filtered by subject.
 func (r *BillingRepo) ListBillingAudit(ctx context.Context, tenantID, subjectType, subjectID string, limit, offset int) ([]BillingAuditRow, error) {
 	q := `

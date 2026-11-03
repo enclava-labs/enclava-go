@@ -36,8 +36,8 @@
 {{define "frag-access-user-drawer"}}{{/* Person drawer (09-07): create mode
      (no id) enrolls via POST /api/v1/identities/users; manage mode writes
      roles (PUT/DELETE …/users/{id}/roles/{roleID}), password (POST …/password),
-     status (PATCH …/users/{id}) and sessions (DELETE …/sessions/{sid}) — the
-     disable path revokes sessions API-side. */}}
+     status (PATCH …/users/{id}), sessions (DELETE …/sessions/{sid}) and
+     deletion (DELETE …/users/{id}) — disable also revokes access API-side. */}}
 <div class="drawer-head">
   <h2>{{if .Data.UserDrawer.Create}}Invite a person{{else}}Manage person{{end}}</h2>
   <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close">{{icon "x"}}<span class="visually-hidden">Close</span></button>
@@ -96,7 +96,8 @@
     <div class="row">
 {{if $d.Disabled}}      <button type="button" class="btn" data-action="confirm" data-confirm="Re-enable this person?" data-access-confirm="user-status" data-user-id="{{$d.ID}}" data-status="active">Enable</button>
 {{else}}      <button type="button" class="btn danger" data-action="confirm" data-confirm="Disable this person? Their sessions and API keys are revoked and they can no longer sign in." data-access-confirm="user-status" data-user-id="{{$d.ID}}" data-status="disabled">Disable</button>
-{{end}}    </div>
+{{end}}      <button type="button" class="btn danger" data-action="confirm" data-confirm="Removes their access now: sessions and API keys are revoked. Past usage and audit history stay." data-access-confirm="user-delete" data-user-id="{{$d.ID}}">Delete person</button>
+    </div>
     <div class="stack">
       <h3>Sessions</h3>
 {{range $d.Sessions}}      <div class="row">

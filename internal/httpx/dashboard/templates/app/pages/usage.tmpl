@@ -13,5 +13,5 @@
 {{end}}  </div>
 </header>
 {{template "tabs" .Data.Tabs}}
-{{if eq .Data.ActiveTab "budgets"}}{{template "frag-usage-budgets" .}}{{else if eq .Data.ActiveTab "audit"}}{{template "frag-usage-audit" .}}{{else}}{{template "frag-usage-overview" .}}{{end}}
+{{if eq .Data.ActiveTab "budgets"}}{{template "frag-usage-budgets" .}}{{else if eq .Data.ActiveTab "reservations"}}{{template "frag-usage-reservations" .}}{{else if eq .Data.ActiveTab "audit"}}{{template "frag-usage-audit" .}}{{else}}{{template "frag-usage-overview" .}}{{end}}
 {{end}}

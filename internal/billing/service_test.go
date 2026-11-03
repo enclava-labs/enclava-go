@@ -483,7 +483,7 @@ func TestReleaseUnsentFreesDispatchedHold(t *testing.T) {
 	}
 }
 
-func TestResolveUnknown(t *testing.T) {
+func TestResolveOutstanding(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 	f.flatPrices(t)
@@ -496,7 +496,7 @@ func TestResolveUnknown(t *testing.T) {
 	if err := f.svc.MarkUnknown(ctx, f.principal, res.ID); err != nil {
 		t.Fatalf("mark unknown: %v", err)
 	}
-	rec, err := f.svc.ResolveUnknown(ctx, f.principal, res.ID, billing.Usage{InputUnits: 42})
+	rec, err := f.svc.ResolveOutstanding(ctx, f.principal, res.ID, billing.Usage{InputUnits: 42})
 	if err != nil {
 		t.Fatalf("resolve unknown: %v", err)
 	}
@@ -512,7 +512,7 @@ func TestResolveUnknown(t *testing.T) {
 	if err := f.svc.MarkUnknown(ctx, f.principal, res2.ID); err != nil {
 		t.Fatalf("mark unknown 2: %v", err)
 	}
-	rec2, err := f.svc.ResolveUnknown(ctx, f.principal, res2.ID, billing.Usage{})
+	rec2, err := f.svc.ResolveOutstanding(ctx, f.principal, res2.ID, billing.Usage{})
 	if err != nil {
 		t.Fatalf("write-off: %v", err)
 	}
@@ -520,18 +520,23 @@ func TestResolveUnknown(t *testing.T) {
 		t.Fatalf("write-off record: %+v", rec2)
 	}
 
-	// Held and released reservations refuse.
+	// A held reservation can also be reconciled.
 	res3, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 1}))
 	if err != nil {
 		t.Fatalf("reserve3: %v", err)
 	}
-	if _, err := f.svc.ResolveUnknown(ctx, f.principal, res3.ID, billing.Usage{}); !errors.Is(err, billing.ErrReservationState) {
-		t.Fatalf("resolve held must fail, got %v", err)
+	rec3, err := f.svc.ResolveOutstanding(ctx, f.principal, res3.ID, billing.Usage{InputUnits: 1})
+	if err != nil || rec3.Outcome != billing.OutcomeReconciled || rec3.AmountMicros != 1 {
+		t.Fatalf("resolve held = %+v, %v", rec3, err)
 	}
-	if err := f.svc.ReleaseUndispatched(ctx, f.principal, res3.ID); err != nil {
-		t.Fatalf("release3: %v", err)
+	res4, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 1}))
+	if err != nil {
+		t.Fatalf("reserve4: %v", err)
 	}
-	if _, err := f.svc.ResolveUnknown(ctx, f.principal, res3.ID, billing.Usage{}); !errors.Is(err, billing.ErrReservationState) {
+	if err := f.svc.ReleaseUndispatched(ctx, f.principal, res4.ID); err != nil {
+		t.Fatalf("release4: %v", err)
+	}
+	if _, err := f.svc.ResolveOutstanding(ctx, f.principal, res4.ID, billing.Usage{}); !errors.Is(err, billing.ErrReservationState) {
 		t.Fatalf("resolve released must fail, got %v", err)
 	}
 }

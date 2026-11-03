@@ -70,6 +70,7 @@ type BillingTx interface {
 // the service one atomic admission/settlement transaction.
 type BillingRepository interface {
 	InTx(ctx context.Context, fn func(BillingTx) error) error
+	RecordRequestRefused(ctx context.Context, tenantID string, subject Subject, actorType, actorID, model, capability, reason string) error
 
 	// PutPrice inserts one immutable rational price row (new effective_from
 	// versions never rewrite history) and audits it.

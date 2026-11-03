@@ -30,6 +30,7 @@ import (
 // price-coverage checks — never a substitute for Reserve.
 type Billing interface {
 	Reserve(ctx context.Context, p auth.Principal, req billing.ReserveRequest) (billing.Reservation, error)
+	RecordRequestRefused(ctx context.Context, p auth.Principal, model, capability, reason string) error
 	Settle(ctx context.Context, p auth.Principal, reservationID string, actual billing.Usage) (billing.UsageRecord, error)
 	MarkUnknown(ctx context.Context, p auth.Principal, reservationID string) error
 	MarkDispatched(ctx context.Context, p auth.Principal, reservationID string) error
@@ -712,14 +713,30 @@ func (s *Service) reserve(ctx context.Context, p auth.Principal, req Request, en
 	if err == nil {
 		return res, nil
 	}
-	if !errors.Is(err, billing.ErrPriceMissing) {
-		return billing.Reservation{}, err
+	if errors.Is(err, billing.ErrPriceMissing) {
+		base.Price = billing.PriceKey{
+			SubjectType: billing.PriceSubjectModel,
+			SubjectID:   upstreamModel,
+		}
+		res, err = s.billing.Reserve(ctx, p, base)
 	}
-	base.Price = billing.PriceKey{
-		SubjectType: billing.PriceSubjectModel,
-		SubjectID:   upstreamModel,
+	reason := ""
+	switch {
+	case errors.Is(err, billing.ErrPriceMissing):
+		reason = billing.RefusalPriceMissing
+	case errors.Is(err, billing.ErrBudgetExceeded):
+		reason = billing.RefusalBudgetExceeded
+	case errors.Is(err, billing.ErrBudgetCurrencyMismatch):
+		reason = billing.RefusalBudgetCurrencyMismatch
 	}
-	return s.billing.Reserve(ctx, p, base)
+	if reason != "" {
+		if auditErr := accounting(ctx, accountingTimeout, func(c context.Context) error {
+			return s.billing.RecordRequestRefused(c, p, upstreamModel, capability, reason)
+		}); auditErr != nil {
+			return billing.Reservation{}, errors.New("billing: refusal audit unavailable")
+		}
+	}
+	return res, err
 }
 
 func (s *Service) dispatch(ctx context.Context, up Upstream, capability string, req Request, body []byte) ([]byte, error) {

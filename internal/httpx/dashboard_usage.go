@@ -1,13 +1,6 @@
 // dashboard_usage.go — Usage & billing (OA-29, source §6.12, plan 09-08).
-// Admin-only: every route sits behind billing.view. Three tabs — overview
-// (7/30/90-day KPIs + server-rendered daily SVG histogram + spend by
-// model/team/key), budgets (all-subject rows with admission-matching
-// progress from budgetProgress, create + limit-only edit through
-// /api/v1/admin/budgets) and audit (combined billing + pricing events).
-// Handlers render only (D-17): writes go through static/pages/usage.js via
-// window.Enclava.api. The six legacy billing registrations/handlers and five
-// legacy templates were deleted atomically with this file — nothing
-// billing-related remains for 09-10 (stats/Home stay until 10-01).
+// Admin-only routes expose usage, budgets, outstanding reservations and audit.
+// Handlers render only; writes go through static/pages/usage.js and the admin API.
 package httpx
 
 import (
@@ -25,9 +18,7 @@ import (
 	"enclava-go/internal/store/postgres"
 )
 
-// usageView is the page model for all three tabs; the page template
-// dispatches on ActiveTab. Fragments render the same view so .Can/.Data
-// stay uniform with the shell envelope.
+// usageView is the page model shared by the usage tabs and fragments.
 type usageView struct {
 	ActiveTab    string
 	Tabs         []dashboardTab
@@ -36,6 +27,7 @@ type usageView struct {
 	Budgets      []usageBudgetRow
 	BudgetsEmpty dashboardEmpty
 	Audit        usageAuditData
+	Reservations usageReservationsData
 	Drawer       usageBudgetDrawer
 }
 
@@ -46,6 +38,7 @@ func usageTabs(active string) []dashboardTab {
 	return []dashboardTab{
 		{Label: "Overview", Href: "/dashboard/usage", Active: active == "overview"},
 		{Label: "Budgets", Href: "/dashboard/usage/budgets", Active: active == "budgets"},
+		{Label: "Reservations", Href: "/dashboard/usage/reservations", Active: active == "reservations"},
 		{Label: "Audit", Href: "/dashboard/usage/audit", Active: active == "audit"},
 	}
 }
@@ -54,6 +47,9 @@ func (a *App) registerDashboardUsageRoutes() {
 	a.mux.HandleFunc("/dashboard/usage", a.sessionAuth.requireCap(capBillingView, a.handleDashboardUsagePage))
 	a.mux.HandleFunc("/dashboard/usage/budgets", a.sessionAuth.requireCap(capBillingView, a.handleDashboardUsageBudgetsPage))
 	a.mux.HandleFunc("/dashboard/usage/audit", a.sessionAuth.requireCap(capBillingView, a.handleDashboardUsageAuditPage))
+	a.mux.HandleFunc("/dashboard/usage/reservations", a.sessionAuth.requireCap(capBillingView, a.handleDashboardUsageReservationsPage))
+	a.mux.HandleFunc("/dashboard/partials/usage/reservations", a.sessionAuth.requireCap(capBillingView, a.handleDashboardUsageReservationsFragment))
+	a.mux.HandleFunc("/dashboard/partials/usage/reservation-drawer", a.sessionAuth.requireCap(capBillingView, a.handleDashboardUsageReservationDrawer))
 	a.mux.HandleFunc("/dashboard/partials/usage/overview", a.sessionAuth.requireCap(capBillingView, a.handleDashboardUsageOverviewFragment))
 	a.mux.HandleFunc("/dashboard/partials/usage/budgets", a.sessionAuth.requireCap(capBillingView, a.handleDashboardUsageBudgetsFragment))
 	a.mux.HandleFunc("/dashboard/partials/usage/audit", a.sessionAuth.requireCap(capBillingView, a.handleDashboardUsageAuditFragment))
@@ -82,6 +78,8 @@ type usageGroupRow struct {
 	Requests, Units int64
 	Spend           string
 	Unsettled       []MoneyAmount
+	SpendMicros     int64
+	SpendCurrency   string
 }
 
 type usageOverviewData struct {
@@ -90,8 +88,14 @@ type usageOverviewData struct {
 	Tokens        int64
 	Spend         string // primary currency via the shared money formatter
 	SpendFoot     string // remaining currencies, "+ €… + £…", "" when single
+	SpendMicros   int64
+	SpendCurrency string
+	SpendExtras   []MoneyAmount
 	Unsettled     string // outstanding liability, primary currency
 	UnsettledFoot string // remaining currencies
+	HeldCount     int
+	UnknownCount  int
+	Outstanding   []MoneyAmount
 	Daily         []dashboardBar
 	ByModel       []usageGroupRow
 	ByTeam        []usageGroupRow
@@ -161,6 +165,32 @@ func (a *App) handleDashboardUsageOverviewFragment(w http.ResponseWriter, r *htt
 func (a *App) usageOverview(ctx context.Context, tenantID string, days int) (usageOverviewData, error) {
 	out := usageOverviewData{Days: days, Empty: dashboardEmpty{Icon: "usage", Text: "No usage in this range."}}
 	since := time.Now().UTC().AddDate(0, 0, -days)
+	amounts := map[string]int64{}
+	for _, state := range []string{billing.ReservationHeld, billing.ReservationUnknown} {
+		cursor := ""
+		for {
+			rows, next, err := a.billingRepo.ReportListReservations(ctx, tenantID, state, reservationsListCap, cursor)
+			if err != nil {
+				return out, err
+			}
+			if state == billing.ReservationHeld {
+				out.HeldCount += len(rows)
+			} else {
+				out.UnknownCount += len(rows)
+			}
+			for _, row := range rows {
+				amounts[row.Currency] += row.BoundMicros
+			}
+			if next == "" {
+				break
+			}
+			cursor = next
+		}
+	}
+	for currency, amount := range amounts {
+		out.Outstanding = append(out.Outstanding, MoneyAmount{Currency: currency, AmountMicros: amount})
+	}
+	sort.Slice(out.Outstanding, func(i, j int) bool { return out.Outstanding[i].Currency < out.Outstanding[j].Currency })
 
 	totals, err := a.billingRepo.UsageTotals(ctx, tenantID, since)
 	if err != nil {
@@ -175,11 +205,14 @@ func (a *App) usageOverview(ctx context.Context, tenantID string, days int) (usa
 		}
 	}
 	if primary >= 0 {
+		out.SpendMicros = totals[primary].AmountMicros
+		out.SpendCurrency = totals[primary].Currency
 		out.Spend = money(totals[primary].AmountMicros, totals[primary].Currency)
 		var extras []string
 		for i, t := range totals {
 			if i != primary {
 				extras = append(extras, money(t.AmountMicros, t.Currency))
+				out.SpendExtras = append(out.SpendExtras, MoneyAmount{AmountMicros: t.AmountMicros, Currency: t.Currency})
 			}
 		}
 		out.SpendFoot = strings.Join(extras, " + ")
@@ -362,7 +395,8 @@ func usageSpendRows(rows []postgres.UsageGroupSum, label func(postgres.UsageGrou
 		row := usageGroupRow{
 			Label: orDash(rowLabel), Sub: sub,
 			Requests: g.RequestCount, Units: g.TotalUnits,
-			Spend: money(g.AmountMicros, g.Currency),
+			Spend:       money(g.AmountMicros, g.Currency),
+			SpendMicros: g.AmountMicros, SpendCurrency: g.Currency,
 		}
 		if key != "" {
 			for _, amt := range unsettled[key] {
@@ -1071,4 +1105,82 @@ func usageAuditAmount(detail map[string]any, currency string) string {
 		return dashboardCountInt(int64(limit)) + " units"
 	}
 	return money(int64(limit), currency)
+}
+
+type usageReservationsData struct {
+	State, NextHref, FragmentHref, DrawerID string
+	Rows                                    []postgres.ReportReservationRow
+}
+
+func (a *App) usageReservations(w http.ResponseWriter, r *http.Request, fragment bool) {
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	setNoStoreHeaders(w)
+	tenantID, ok := a.dashboardTenantID(w, r)
+	if !ok || !a.usageConfigured(w) {
+		return
+	}
+	state := r.URL.Query().Get("state")
+	if state == "" {
+		state = billing.ReservationUnknown
+	}
+	if state != billing.ReservationHeld && state != billing.ReservationUnknown {
+		WriteOpenAIError(w, http.StatusBadRequest, "state must be 'held' or 'unknown'", "invalid_request_error", "invalid_state")
+		return
+	}
+	cursor := r.URL.Query().Get("cursor")
+	rows, next, err := a.billingRepo.ReportListReservations(r.Context(), tenantID, state, reservationsListCap, cursor)
+	if err != nil {
+		if errors.Is(err, postgres.ErrInvalidCursor) {
+			WriteOpenAIError(w, http.StatusBadRequest, "invalid cursor", "invalid_request_error", "invalid_cursor")
+		} else {
+			log.Printf("failed to load reservations: %v", err)
+			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "reservations_list_failed")
+		}
+		return
+	}
+	query := url.Values{"state": {state}}
+	if cursor != "" {
+		query.Set("cursor", cursor)
+	}
+	data := usageReservationsData{State: state, Rows: rows, FragmentHref: "/dashboard/partials/usage/reservations?" + query.Encode()}
+	if next != "" {
+		query.Set("cursor", next)
+		data.NextHref = "/dashboard/usage/reservations?" + query.Encode()
+	}
+	view := usageView{ActiveTab: "reservations", Tabs: usageTabs("reservations"), Reservations: data}
+	if fragment {
+		a.renderDashboardFragment(w, r, "usage", "usage-reservations", view)
+	} else {
+		a.renderDashboard(w, r, "usage", view)
+	}
+}
+
+func (a *App) handleDashboardUsageReservationsPage(w http.ResponseWriter, r *http.Request) {
+	a.usageReservations(w, r, false)
+}
+
+func (a *App) handleDashboardUsageReservationsFragment(w http.ResponseWriter, r *http.Request) {
+	a.usageReservations(w, r, true)
+}
+
+func (a *App) handleDashboardUsageReservationDrawer(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	setNoStoreHeaders(w)
+	if _, ok := a.dashboardTenantID(w, r); !ok || !a.usageConfigured(w) {
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	a.renderDashboardFragment(w, r, "usage", "usage-reservation-drawer", usageView{
+		Reservations: usageReservationsData{DrawerID: id},
+	})
 }

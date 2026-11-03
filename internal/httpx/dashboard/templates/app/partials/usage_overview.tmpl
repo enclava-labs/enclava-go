@@ -21,14 +21,19 @@
     </div>
     <div class="kpi">
       <div class="kpi-label">Spend · {{.Data.Days}} days</div>
-      <div class="kpi-value">{{.Data.Overview.Spend}}</div>
-      <div class="kpi-foot">{{.Data.Overview.SpendFoot}}</div>
+      <div class="kpi-value" title="{{spendMicrosTitle .Data.Overview.SpendMicros .Data.Overview.SpendCurrency}}">{{if .Data.Overview.Spend}}{{spendMoney .Data.Overview.SpendMicros .Data.Overview.SpendCurrency}}{{end}}</div>
+      <div class="kpi-foot">{{range .Data.Overview.SpendExtras}}<span title="{{spendMicrosTitle .AmountMicros .Currency}}">{{spendMoney .AmountMicros .Currency}}</span> {{end}}</div>
     </div>
     <div class="kpi">
       <div class="kpi-label">Unsettled</div>
       <div class="kpi-value">{{if .Data.Overview.Unsettled}}{{.Data.Overview.Unsettled}}{{else}}—{{end}}</div>
       <div class="kpi-foot">{{if .Data.Overview.UnsettledFoot}}{{.Data.Overview.UnsettledFoot}}{{else}}Held + unknown reservations{{end}}</div>
     </div>
+  </div>
+  <div class="card">
+    <div class="section-head"><h2>Outstanding reservations</h2><a href="/dashboard/usage/reservations">View reservations</a></div>
+    <p>{{.Data.Overview.HeldCount}} held · {{.Data.Overview.UnknownCount}} unknown</p>
+    <p>Bound liability: {{if .Data.Overview.Outstanding}}{{range .Data.Overview.Outstanding}}<span title="{{spendMicrosTitle .AmountMicros .Currency}}">{{spendMoney .AmountMicros .Currency}}</span> {{end}}{{else}}—{{end}}</p>
   </div>
   <div class="card">
     <div class="section-head"><h2>Daily requests</h2><span class="muted">Last {{.Data.Days}} days · UTC days</span></div>
@@ -45,7 +50,7 @@
             <td data-label="Model"><b>{{.Label}}</b></td>
             <td data-label="Requests">{{count .Requests}}</td>
             <td data-label="Units">{{count .Units}}</td>
-            <td data-label="Spend">{{.Spend}}</td>
+            <td data-label="Spend" title="{{spendMicrosTitle .SpendMicros .SpendCurrency}}">{{spendMoney .SpendMicros .SpendCurrency}}</td>
           </tr>
 {{end}}        </tbody>
       </table></div>
@@ -61,7 +66,7 @@
             <td data-label="Team"><b>{{.Label}}</b></td>
             <td data-label="Requests">{{count .Requests}}</td>
             <td data-label="Units">{{count .Units}}</td>
-            <td data-label="Spend">{{.Spend}}</td>
+            <td data-label="Spend" title="{{spendMicrosTitle .SpendMicros .SpendCurrency}}">{{spendMoney .SpendMicros .SpendCurrency}}</td>
           </tr>
 {{end}}        </tbody>
       </table></div>
@@ -77,7 +82,7 @@
             <td data-label="Subject"><b>{{.Label}}</b>{{if .Sub}}<span class="subline">{{.Sub}}</span>{{end}}</td>
             <td data-label="Requests">{{count .Requests}}</td>
             <td data-label="Units">{{count .Units}}</td>
-            <td data-label="Spend">{{.Spend}}</td>
+            <td data-label="Spend" title="{{spendMicrosTitle .SpendMicros .SpendCurrency}}">{{spendMoney .SpendMicros .SpendCurrency}}</td>
             <td data-label="Unsettled">{{if .Unsettled}}{{range .Unsettled}}{{money .AmountMicros .Currency}} {{.Currency}} {{end}}{{else}}<span class="muted">—</span>{{end}}</td>
           </tr>
 {{end}}        </tbody>
@@ -94,7 +99,7 @@
             <td data-label="API key"><b>{{.Label}}</b>{{if .Sub}}<span class="subline">{{.Sub}}</span>{{end}}</td>
             <td data-label="Requests">{{count .Requests}}</td>
             <td data-label="Units">{{count .Units}}</td>
-            <td data-label="Spend">{{.Spend}}</td>
+            <td data-label="Spend" title="{{spendMicrosTitle .SpendMicros .SpendCurrency}}">{{spendMoney .SpendMicros .SpendCurrency}}</td>
             <td data-label="Unsettled">{{if .Unsettled}}{{range .Unsettled}}{{money .AmountMicros .Currency}} {{.Currency}} {{end}}{{else}}<span class="muted">—</span>{{end}}</td>
           </tr>
 {{end}}        </tbody>

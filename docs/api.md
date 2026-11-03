@@ -306,6 +306,16 @@ For a dedicated Tinfoil enclave, set `base_origin` to its HTTPS origin and
 `enclave_repo` to the trusted repository reference. The default router origin
 `https://inference.tinfoil.sh` uses automatic router configuration.
 
+## Identity management
+
+`DELETE /api/v1/identities/users/{id}` requires `platform.admin` and returns
+`200` with `{"deleted":true,"id":"..."}`. It revokes the person's sessions and
+API keys immediately, removes role memberships, and hides the deleted account
+from people lists and sign-in. Their email can be used for a new account; past
+usage and audit history remain. Deleting yourself or the last active
+administrator returns `409`; a user outside the caller's tenant returns `404`.
+The action is recorded as `identity.user.deleted` in the security audit log.
+
 ## 8. Security and operations
 
 - Sign-in is throttled per process: 10 attempts/minute per IP and
@@ -345,8 +355,8 @@ For a dedicated Tinfoil enclave, set `base_origin` to its HTTPS origin and
 ## 9. Billing reconciliation
 
 `POST /api/v1/admin/reservations/{id}/resolve` (scope `platform.admin`)
-settles a reservation stuck in the `unknown` state — or writes the hold off
-with all-zero counts — and returns the settled `usage_record`:
+settles a reservation in the `held` or `unknown` state — or writes the hold
+off with all-zero counts — and returns the settled `usage_record`:
 
 ```bash
 curl -s -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
@@ -361,8 +371,24 @@ subset, exactly like every upstream usage object: the service settles
 twice. `cached_input_tokens` must not exceed `input_tokens` and all three
 fields must be non-negative integers (400 `invalid_request_error`
 otherwise). A nonexistent or cross-tenant id is one indistinguishable 404; a
-reservation not in the `unknown` state returns 409, except an
+reservation not in the `held` or `unknown` state returns 409, except an
 already-settled one which returns the existing `usage_record` (200).
+
+The dashboard's Usage → Reservations page requires `platform.admin` and lists
+held and unknown reservations, with state filters and pagination. Both can
+be resolved from its drawer using the reconciliation operation above. Resolving
+a held reservation while its upstream request is still in flight can settle it
+before actual usage arrives; reconcile only after verifying the request's outcome.
+
+`GET /api/v1/admin/billing-audit` (scope `platform.admin`) lists billing
+events, optionally filtered by `subject_type` and `subject_id`. The
+`request.refused` action records inference admission denials with detail
+`reason` (`price_missing`, `budget_exceeded`, or `budget_currency_mismatch`),
+resolved `model`, and `capability`. Its subject is the API key for key-authenticated requests,
+otherwise the user when available; the actor identifies the requesting principal.
+It contains no prompts or credential secrets. Successful requests do not
+produce refusal events. The Usage → Audit view offers a kind chip for each
+recorded event, including `request.refused`.
 
 ## 10. Pricing
 

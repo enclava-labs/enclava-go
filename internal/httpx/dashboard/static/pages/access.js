@@ -3,7 +3,7 @@
  * Every write goes through Enclava.api to the real /api/v1 producers (D-17):
  *   people   POST /api/v1/identities/users · PUT|DELETE …/users/{id}/roles/{roleID}
  *            POST …/users/{id}/password · PATCH …/users/{id} (status) ·
- *            DELETE …/users/{id}/sessions/{sid}
+ *            DELETE …/users/{id}/sessions/{sid} · DELETE …/users/{id}
  *   roles    POST /api/v1/identities/roles · PATCH|DELETE …/roles/{id} — the
  *            PATCH/POST body always carries all four grant kinds in the
  *            canonical stored shape {"mode":"all"}/{"mode":"list","items":[…]}
@@ -292,6 +292,16 @@
           Enclava.refresh();
           return Enclava.openDrawer('/dashboard/partials/access/user-drawer?id=' +
             encodeURIComponent(trigger.dataset.userId));
+        }).catch(() => {});
+        break;
+      case 'user-delete':
+        rerun(() => Enclava.api(
+          'DELETE',
+          '/api/v1/identities/users/' + encodeURIComponent(trigger.dataset.userId),
+        )).then(() => {
+          Enclava.toast('success', 'Person deleted');
+          Enclava.closeDrawer();
+          after();
         }).catch(() => {});
         break;
       case 'role-delete':

@@ -1,6 +1,6 @@
 // billing_reservations_test.go — the platform.admin reconciliation API: a
 // tenant-scoped list over canonical reservation rows plus resolve-through-
-// billing.Service.ResolveUnknown (reconcile or write-off). A resolved
+// billing.Service.ResolveOutstanding (reconcile or write off). A resolved
 // reservation leaves the outstanding set, so it stops counting as unsettled
 // liability everywhere the reports read it.
 package httpx
@@ -123,9 +123,12 @@ func TestAdminReservationsListAndResolve(t *testing.T) {
 		return doBudgetHandler(f.app.handleAdminReservationByID, admin, req)
 	}
 
-	// A held reservation is the wrong state.
-	if rec := resolve(held.ID, `{"input_tokens":1,"cached_input_tokens":0,"output_tokens":0}`); rec.Code != http.StatusConflict {
-		t.Fatalf("resolve held = %d, want 409: %s", rec.Code, rec.Body.String())
+	// A held reservation can be reconciled and leaves the outstanding list.
+	if rec := resolve(held.ID, `{"input_tokens":1,"cached_input_tokens":0,"output_tokens":0}`); rec.Code != http.StatusOK {
+		t.Fatalf("resolve held = %d: %s", rec.Code, rec.Body.String())
+	}
+	if rows := listIDs("?state=held"); len(rows) != 0 {
+		t.Fatalf("resolved held reservation still listed: %+v", rows)
 	}
 	// Negative and missing token counts are refused.
 	if rec := resolve(unknown.ID, `{"input_tokens":-1,"cached_input_tokens":0,"output_tokens":0}`); rec.Code != http.StatusBadRequest {

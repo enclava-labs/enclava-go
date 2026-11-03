@@ -31,6 +31,17 @@ func NewService(repo BillingRepository) *Service {
 	return &Service{repo: repo, now: func() time.Time { return time.Now().UTC() }}
 }
 
+// RecordRequestRefused records a final admission refusal after price fallback.
+func (s *Service) RecordRequestRefused(ctx context.Context, p auth.Principal, model, capability, reason string) error {
+	subject := billingSubjectFor(p)
+	if p.CredentialKind == auth.CredentialKindAPIKey && p.CredentialID != "" {
+		subject = Subject{Type: BudgetSubjectAPIKey, ID: p.CredentialID}
+	} else if p.UserID != "" {
+		subject = Subject{Type: BudgetSubjectUser, ID: p.UserID}
+	}
+	return s.repo.RecordRequestRefused(ctx, p.TenantID, subject, string(p.ActorKind), p.ActorID, model, capability, reason)
+}
+
 // PriceKey selects the billing_prices row set for a priced attempt: one
 // subject (endpoint or model) plus the operation capability, resolved at
 // reservation time.
@@ -297,10 +308,9 @@ func (s *Service) ReleaseUnsent(ctx context.Context, p auth.Principal, reservati
 	})
 }
 
-// ResolveUnknown settles an unknown reservation with the reconciled usage an
-// administrator established — zero usage writes the hold off. Other states
-// refuse except settled, which returns the existing record like Settle.
-func (s *Service) ResolveUnknown(ctx context.Context, p auth.Principal, reservationID string, actual Usage) (UsageRecord, error) {
+// ResolveOutstanding settles a held or unknown reservation with reconciled
+// usage; zero usage writes it off. Settled returns its existing record.
+func (s *Service) ResolveOutstanding(ctx context.Context, p auth.Principal, reservationID string, actual Usage) (UsageRecord, error) {
 	units, err := unitMap(actual)
 	if err != nil {
 		return UsageRecord{}, err
@@ -315,14 +325,14 @@ func (s *Service) ResolveUnknown(ctx context.Context, p auth.Principal, reservat
 			out, err = tx.GetUsageRecord(ctx, p.TenantID, reservationID)
 			return err
 		}
-		if res.State != ReservationUnknown {
+		if res.State != ReservationUnknown && res.State != ReservationHeld {
 			return fmt.Errorf("%w: %s is %s", ErrReservationState, reservationID, res.State)
 		}
 		amount, _, err := chargeLenient(units, res.Price)
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Transition(ctx, p.TenantID, reservationID, ReservationUnknown, ReservationSettled); err != nil {
+		if _, err := tx.Transition(ctx, p.TenantID, reservationID, res.State, ReservationSettled); err != nil {
 			return err
 		}
 		rec := UsageRecord{
@@ -671,7 +681,7 @@ func admit(b Budget, rows []LiabilityRow, bound int64, units map[UnitKind]int64,
 	switch b.Kind {
 	case BudgetKindAmount:
 		if currency != b.Currency {
-			return fmt.Errorf("%w: reservation priced in %s vs %s budget", ErrCurrencyMismatch, currency, b.Currency)
+			return fmt.Errorf("%w: %w: reservation priced in %s vs %s budget", ErrBudgetCurrencyMismatch, ErrCurrencyMismatch, currency, b.Currency)
 		}
 		existing := int64(0)
 		for _, r := range rows {

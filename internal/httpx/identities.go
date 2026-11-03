@@ -530,6 +530,17 @@ func (a *App) handleIdentityUser(w http.ResponseWriter, r *http.Request, princip
 		}
 		roles, _ := a.identity.RolesForUser(r.Context(), principal.TenantID, user.ID)
 		WriteJSON(w, http.StatusOK, redactUser(updated, roles))
+	case http.MethodDelete:
+		if principal.UserID == user.ID {
+			WriteOpenAIError(w, http.StatusConflict, "you cannot delete your own account", "invalid_request_error", "self_delete")
+			return
+		}
+		if err := a.identity.DeleteUserAtomically(r.Context(), principal.TenantID, user.ID); err != nil {
+			a.writeRoleWriteError(w, err, "user_delete_failed")
+			return
+		}
+		a.recordSecurityAudit(r, principal, "identity.user.deleted", "user", user.ID, "success")
+		WriteJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": user.ID})
 	default:
 		WriteMethodNotAllowed(w)
 	}

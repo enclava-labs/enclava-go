@@ -126,6 +126,21 @@ func money(micros int64, currency string) string {
 	return amount
 }
 
+// spendMoney preserves visibility of nonzero spend below the rounding threshold.
+func spendMoney(micros int64, currency string) string {
+	if micros > 0 && micros < 5000 {
+		return "<" + money(10000, currency)
+	}
+	if micros < 0 && micros > -5000 {
+		return ">" + money(-10000, currency)
+	}
+	return money(micros, currency)
+}
+
+func spendMicrosTitle(micros int64, currency string) string {
+	return fmt.Sprintf("%d micros %s", micros, currency)
+}
+
 // tokenPrice renders a rate as currency per 1M tokens, the way price lists
 // quote it: rate_micros per unit_quantity tokens is exactly
 // rate_micros/unit_quantity currency units per million, so sub-cent prices
