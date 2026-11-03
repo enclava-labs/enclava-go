@@ -88,6 +88,47 @@ func newSessionApp(t *testing.T) (*App, *postgres.IdentityRepo, string) {
 	return app, repo, tenant
 }
 
+func TestSessionCookieSecureBehindTrustedProxy(t *testing.T) {
+	app, repo, tenant := newSessionApp(t)
+	seedLoginUser(t, repo, tenant, "proxy@example.com", "correct-horse")
+	app.sessionAuth.SetTrustProxy(true)
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/login", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	if !app.sessionAuth.issueSessionCookies(rec, req, tenant, "user_login_test") {
+		t.Fatal("issue session failed")
+	}
+	for _, name := range []string{sessionCookieName, sessionCSRFCookieName} {
+		if !sessionCookie(t, rec, name).Secure {
+			t.Errorf("%s cookie is not Secure behind trusted HTTPS proxy", name)
+		}
+	}
+	rec = httptest.NewRecorder()
+	app.sessionAuth.clearSessionCookies(rec, req)
+	for _, name := range []string{sessionCookieName, sessionCSRFCookieName} {
+		if !sessionCookie(t, rec, name).Secure {
+			t.Errorf("cleared %s cookie is not Secure behind trusted HTTPS proxy", name)
+		}
+	}
+	app.sessionAuth.SetTrustProxy(false)
+	rec = httptest.NewRecorder()
+	if !app.sessionAuth.issueSessionCookies(rec, req, tenant, "user_login_test") {
+		t.Fatal("issue session failed")
+	}
+	for _, name := range []string{sessionCookieName, sessionCSRFCookieName} {
+		if sessionCookie(t, rec, name).Secure {
+			t.Errorf("%s cookie trusted a forwarded header with proxy trust disabled", name)
+		}
+	}
+	rec = httptest.NewRecorder()
+	app.sessionAuth.clearSessionCookies(rec, req)
+	for _, name := range []string{sessionCookieName, sessionCSRFCookieName} {
+		if sessionCookie(t, rec, name).Secure {
+			t.Errorf("cleared %s cookie trusted a forwarded header with proxy trust disabled", name)
+		}
+	}
+}
+
 func TestDashboardSessionLoginFlow(t *testing.T) {
 	app, repo, tenant := newSessionApp(t)
 	seedLoginUser(t, repo, tenant, "login@example.com", "correct-horse")
@@ -220,11 +261,11 @@ func TestDashboardUnknownPathReturns404(t *testing.T) {
 	app, repo, tenant := newSessionApp(t)
 	seedLoginUser(t, repo, tenant, "catchall@example.com", "correct-horse")
 
-	rec, session, _ := postLogin(t, app, "catchall@example.com", "correct-horse", "")
+	_, session, _ := postLogin(t, app, "catchall@example.com", "correct-horse", "")
 
 	req := httptest.NewRequest(http.MethodGet, "/dashboard/not-a-real-page", nil)
 	req.AddCookie(session)
-	rec = httptest.NewRecorder()
+	rec := httptest.NewRecorder()
 	app.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("unknown dashboard path expected 404, got %d body=%s", rec.Code, rec.Body.String())

@@ -307,7 +307,7 @@ func TestChatbotRunsRepoFailedRunsMessageRunIDAndObservedRoute(t *testing.T) {
 		t.Fatalf("list failed runs: %v", err)
 	}
 	gotIDs := map[string]chatbot.AssistantRun{}
-	var order []string
+	order := make([]string, 0, len(failed))
 	for _, run := range failed {
 		gotIDs[run.ID] = run
 		order = append(order, run.ID)

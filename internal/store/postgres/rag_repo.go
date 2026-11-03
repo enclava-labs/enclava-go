@@ -43,7 +43,7 @@ var _ rag.Repository = (*RAGRepo)(nil)
 // DeleteConnection extend the narrow authorizer seam).
 
 func (r *SourceRepo) UpdateConnection(ctx context.Context, c source.Connection) error {
-	config, err := json.Marshal(map[string]any(c.Config))
+	config, err := json.Marshal(c.Config)
 	if err != nil {
 		return fmt.Errorf("marshal connection config: %w", err)
 	}
@@ -324,6 +324,7 @@ func (r *RAGRepo) LiveIndexNames(ctx context.Context, tenantID, collectionID str
 // published under another index or document-name choice than the
 // collection's current ones and has no newer embed job queued or running.
 func (r *RAGRepo) DocumentsToReembed(ctx context.Context, tenantID string, c rag.Collection) ([]rag.Document, error) {
+	//nolint:gosec // embedded operation is a package constant; values are bound
 	rows, err := r.db.SQL.QueryContext(ctx, `
 		SELECT o.id, v.id, v.observed_seq
 		FROM collection_items ci
@@ -1023,7 +1024,7 @@ func (r *RAGRepo) ListBlockLocators(ctx context.Context, tenantID string, blockI
 		args = append(args, id)
 	}
 	rows, err := r.db.SQL.QueryContext(ctx,
-		`SELECT id, locator FROM blocks WHERE tenant_id = $1 AND id IN (`+strings.Join(placeholders, ",")+`)`,
+		`SELECT id, locator FROM blocks WHERE tenant_id = $1 AND id IN (`+strings.Join(placeholders, ",")+`)`, //nolint:gosec // placeholders are generated "$N" tokens, values bound as args
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("list block locators: %w", err)
@@ -1460,7 +1461,7 @@ func (r *RAGRepo) ListGenerationsForConnection(ctx context.Context, tenantID, co
 	if err != nil {
 		return nil, fmt.Errorf("list connection generations: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var result []rag.IndexGeneration
 	for rows.Next() {
 		var g rag.IndexGeneration
@@ -1558,7 +1559,7 @@ func (r *RAGRepo) ListPendingIndexReconciliations(ctx context.Context, tenantID 
 	if err != nil {
 		return nil, fmt.Errorf("list pending index reconciliations: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var pending []rag.IndexReconciliation
 	for rows.Next() {
 		var item rag.IndexReconciliation
@@ -1631,7 +1632,7 @@ const listPublishedGenerationsQuery = `
 	JOIN knowledge_collections c ON c.tenant_id=g.tenant_id AND c.id=g.collection_id`
 
 func scanPublishedGenerations(rows *sql.Rows) ([]rag.IndexGeneration, error) {
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var result []rag.IndexGeneration
 	for rows.Next() {
 		var generation rag.IndexGeneration
@@ -1668,7 +1669,7 @@ func (r *RAGRepo) ListGenerationChunks(ctx context.Context, tenantID, collection
 	if err != nil {
 		return nil, fmt.Errorf("list generation chunks: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var result []rag.DocumentChunk
 	for rows.Next() {
 		var chunk rag.DocumentChunk

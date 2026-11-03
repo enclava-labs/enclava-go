@@ -15,7 +15,7 @@ func spark(series []float64) template.HTML {
 	const w, h, pad = 100.0, 24.0, 2.0
 	open := fmt.Sprintf(`<svg class="spark" viewBox="0 0 %g %g" aria-hidden="true">`, w, h)
 	if len(series) == 0 {
-		return template.HTML(open + `</svg>`)
+		return template.HTML(open + `</svg>`) //nolint:gosec // SVG consists only of fixed markup and numeric constants.
 	}
 	min, max := series[0], series[0]
 	for _, v := range series {
@@ -39,7 +39,7 @@ func spark(series []float64) template.HTML {
 		}
 		points[i] = fmt.Sprintf("%.2f,%.2f", x, y)
 	}
-	return template.HTML(open + fmt.Sprintf(`<polyline points="%s"/></svg>`, strings.Join(points, " ")))
+	return template.HTML(open + fmt.Sprintf(`<polyline points="%s"/></svg>`, strings.Join(points, " "))) //nolint:gosec // Points are formatted numeric values.
 }
 
 // dashboardBar is one histogram column (frozen input shape for bars()).
@@ -54,7 +54,7 @@ func bars(values []dashboardBar) template.HTML {
 	const w, h = 100.0, 40.0
 	open := fmt.Sprintf(`<svg class="bar" viewBox="0 0 %g %g">`, w, h)
 	if len(values) == 0 {
-		return template.HTML(open + `</svg>`)
+		return template.HTML(open + `</svg>`) //nolint:gosec // SVG consists only of fixed markup and numeric constants.
 	}
 	max := 0.0
 	for _, v := range values {
@@ -76,5 +76,5 @@ func bars(values []dashboardBar) template.HTML {
 			x, h-height, width, height, template.HTMLEscapeString(v.Label))
 	}
 	b.WriteString(`</svg>`)
-	return template.HTML(b.String())
+	return template.HTML(b.String()) //nolint:gosec // Labels are HTML-escaped and geometry is numeric.
 }

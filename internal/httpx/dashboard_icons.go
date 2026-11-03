@@ -71,5 +71,5 @@ func icon(name string, size ...int) template.HTML {
 		px = size[0]
 	}
 	dim := strconv.Itoa(px)
-	return template.HTML(`<svg width="` + dim + `" height="` + dim + `" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">` + body + `</svg>`)
+	return template.HTML(`<svg width="` + dim + `" height="` + dim + `" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">` + body + `</svg>`) //nolint:gosec // Icon paths are fixed and dimensions are numeric.
 }

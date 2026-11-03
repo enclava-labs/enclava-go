@@ -473,7 +473,6 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 	inputRefs := mergeObjectRefs(historyRefs, ragInputs(ragResults))
 	evidenceIDs := mergeStrings(historyEvidence, evidenceIDsForResults(ragResults))
 	payload := map[string]any{"model": bot.Model, "messages": messages, "stream": false, "max_tokens": defaultRunMaxTokens}
-	var definitions []map[string]any
 	var mcpDefinitions []map[string]any
 	if s.mcpTools != nil {
 		mcpDefinitions, err = s.mcpTools.Definitions(ctx, p, owner, bot)
@@ -517,10 +516,12 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 		}
 		return "", invalidInput(errors.New(reason))
 	}
-	definitions, err = builtinToolDefinitions(bot, approved)
+	defs, err := builtinToolDefinitions(bot, approved)
 	if err != nil {
 		return "", err
 	}
+	definitions := make([]map[string]any, 0, len(defs)+len(mcpDefinitions))
+	definitions = append(definitions, defs...)
 	definitions = append(definitions, mcpDefinitions...)
 	toolNames := modelToolNames(definitions)
 	toolSchemas := make(map[string]any, len(definitions))

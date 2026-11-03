@@ -1287,26 +1287,6 @@ func (s *Service) ensureConversation(ctx context.Context, p auth.Principal, bot 
 	return s.repo.GetConversation(ctx, p.TenantID, c.ID)
 }
 
-func (s *Service) recordRequestMessages(ctx context.Context, p auth.Principal, conversationID string, messages []map[string]any) error {
-	for _, msg := range messages {
-		role := strings.TrimSpace(stringFromAny(msg["role"]))
-		if role == "" {
-			continue
-		}
-		if err := s.repo.AddMessage(ctx, Message{
-			TenantID:       p.TenantID,
-			ID:             newID("chatmsg"),
-			ConversationID: conversationID,
-			Role:           role,
-			Content:        contentToString(msg["content"]),
-			OwnerActorID:   p.ActorID,
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 type chatCompletionRequest struct {
 	Model          string           `json:"model"`
 	Messages       []map[string]any `json:"messages"`

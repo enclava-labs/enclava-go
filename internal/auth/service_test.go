@@ -213,7 +213,8 @@ func TestAllowlistDecodersAllSixColumns(t *testing.T) {
 		} {
 			key, rec := testdb.SeedAPIKey(t, db, tenant, testdb.SeedKeySpec{Name: tc.col, OwnerUserID: user.ID, Scopes: []string{"models.list"}})
 			if _, err := db.SQL.ExecContext(context.Background(),
-				`UPDATE api_keys SET `+tc.col+` = $1::jsonb WHERE tenant_id = $2 AND id = $3`, stored.raw, tenant, rec.ID); err != nil {
+				`UPDATE api_keys SET `+tc.col+` = $1::jsonb WHERE tenant_id = $2 AND id = $3`, //nolint:gosec // tc.col is a fixed test-column name, not user input
+				stored.raw, tenant, rec.ID); err != nil {
 				t.Fatalf("set %s %s: %v", tc.col, stored.name, err)
 			}
 			p, err := svc.Authenticate(context.Background(), key)

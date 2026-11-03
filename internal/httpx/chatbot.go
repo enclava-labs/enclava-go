@@ -224,10 +224,7 @@ func (a *App) handleExternalChatbotCompletionStream(w http.ResponseWriter, r *ht
 	scanner.Buffer(make([]byte, 0, maxSSELineBytes), maxSSELineBytes)
 	eventData := make([]byte, 0, 256)
 
-	for {
-		if ctx.Err() != nil {
-			break
-		}
+	for ctx.Err() == nil {
 		if !scanner.Scan() {
 			break
 		}

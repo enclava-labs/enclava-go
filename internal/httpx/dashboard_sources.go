@@ -119,7 +119,7 @@ func (a *App) handleDashboardPageSources(w http.ResponseWriter, r *http.Request)
 			Crumb: "Sources",
 			Title: "Sources",
 			Desc:  "Connected content, synced with the right permissions.",
-			Actions: template.HTML(`<button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/sources/drawer">` +
+			Actions: template.HTML(`<button type="button" class="btn primary" data-action="open-drawer" data-drawer-url="/dashboard/partials/sources/drawer">` + //nolint:gosec // Fixed markup and trusted icon only.
 				string(dashboardIconPlus()) + `Add source</button>`),
 		},
 		Rows:       rows,
@@ -137,13 +137,13 @@ func (a *App) handleDashboardSourcesTable(w http.ResponseWriter, r *http.Request
 	}
 	p, _ := auth.PrincipalFromContext(r.Context())
 	caps, _ := capsFromContext(r.Context())
-	rows, anySyncing := a.dashboardSourceRows(r.Context(), p)
+	rows, _ := a.dashboardSourceRows(r.Context(), p)
 	status := r.URL.Query().Get("status")
 	if _, ok := sourceStatusFilter[status]; !ok && status != "" {
 		status = ""
 	}
 	rows = filterSourceRows(rows, status)
-	anySyncing = anyRowSyncing(rows)
+	anySyncing := anyRowSyncing(rows)
 	a.renderDashboardFragment(w, r, "sources", "sources-table", dashboardSourcesData{Rows: rows, Status: status, AnySyncing: anySyncing, Empty: sourcesEmpty(status, caps.SourcesManage)})
 }
 
@@ -412,10 +412,10 @@ func dashboardNextSync(config map[string]any, last *time.Time, created time.Time
 			return def, true
 		case string:
 			s := strings.TrimSpace(strings.ToLower(v))
-			switch {
-			case s == "":
+			switch s {
+			case "":
 				return def, true
-			case s == "0" || s == "off" || s == "disabled":
+			case "0", "off", "disabled":
 				return 0, false
 			}
 			if secs, err := strconv.ParseFloat(s, 64); err == nil {
@@ -483,7 +483,7 @@ func dashboardStatItems(latest *connectors.SyncJob) (bool, int64) {
 	return false, 0
 }
 
-// dashboardSourceScope summarises the per-provider scope from real config
+// dashboardSourceScope summarizes the per-provider scope from real config
 // keys (§6.8 "scope" column). Unknown shapes render "—".
 func dashboardSourceScope(src connectors.Source) string {
 	cfg := src.Config

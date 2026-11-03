@@ -64,7 +64,7 @@ func (p *Parser) Parse(ctx context.Context, ref artifacts.Ref, opts ParseOptions
 	if err != nil {
 		return source.Document{}, err
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	data, err := io.ReadAll(io.LimitReader(rc, maxParseBytes+1))
 	if err != nil {
 		return source.Document{}, fmt.Errorf("extract: read artifact: %w", err)
@@ -635,9 +635,9 @@ func docxBlocks(data []byte) ([]parseBlock, error) {
 	for _, file := range files {
 		name := file.Name
 		if !strings.HasPrefix(name, "word/") || !strings.HasSuffix(name, ".xml") ||
-			!(name == "word/document.xml" || strings.HasPrefix(name, "word/footnotes") ||
-				strings.HasPrefix(name, "word/endnotes") || strings.HasPrefix(name, "word/header") ||
-				strings.HasPrefix(name, "word/footer")) {
+			(name != "word/document.xml" && !strings.HasPrefix(name, "word/footnotes") &&
+				!strings.HasPrefix(name, "word/endnotes") && !strings.HasPrefix(name, "word/header") &&
+				!strings.HasPrefix(name, "word/footer")) {
 			continue
 		}
 		if file.UncompressedSize64 > uint64(maxExpandedBytes-expanded) {
@@ -938,7 +938,7 @@ func epubMember(zr *zip.Reader, name string) *zip.File {
 
 func epubReadMember(zr *zip.Reader, name string, limit int64) ([]byte, bool) {
 	file := epubMember(zr, name)
-	if file == nil || file.UncompressedSize64 > uint64(limit) {
+	if file == nil || limit < 0 || file.UncompressedSize64 > uint64(limit) {
 		return nil, false
 	}
 	rc, err := file.Open()

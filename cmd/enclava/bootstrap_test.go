@@ -30,7 +30,7 @@ func bootstrapBinary(t *testing.T, dsn string) (string, []string) {
 		"OPENAI_COMPATIBLE_API_KEY=stub-key",
 	}
 	bin := filepath.Join(t.TempDir(), "enclava")
-	build := exec.Command("go", "build", "-o", bin, ".")
+	build := exec.Command("go", "build", "-o", bin, ".") //nolint:gosec // test builds the enclava binary it just compiled
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build enclava binary: %v\n%s", err, out)
 	}
@@ -39,7 +39,7 @@ func bootstrapBinary(t *testing.T, dsn string) (string, []string) {
 
 func runBootstrapCmd(t *testing.T, bin string, env []string, slug string) (string, error) {
 	t.Helper()
-	cmd := exec.Command(bin, "bootstrap", "--tenant", slug, "--email", "a@b.c", "--name", "A", "--issue-key")
+	cmd := exec.Command(bin, "bootstrap", "--tenant", slug, "--email", "a@b.c", "--name", "A", "--issue-key") //nolint:gosec // test runs the binary it built above
 	cmd.Env = env
 	output, err := cmd.CombinedOutput()
 	return string(output), err
@@ -131,7 +131,7 @@ func TestBootstrapSeedsDefaultRoles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query roles: %v", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type seededRole struct {
 		id     string

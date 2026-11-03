@@ -227,7 +227,7 @@ func (s *SessionAuth) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	if returnTo != "" {
 		target = returnTo
 	}
-	http.Redirect(w, r, target, http.StatusSeeOther)
+	http.Redirect(w, r, target, http.StatusSeeOther) //nolint:gosec // safeLocalRedirect rejects non-local return targets above.
 }
 
 // HandleLogout revokes the session server-side, then clears the cookies.
@@ -471,9 +471,9 @@ func (s *SessionAuth) issueSessionCookies(w http.ResponseWriter, r *http.Request
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "session_issue_failed")
 		return false
 	}
-	secure := r.TLS != nil
+	secure := strings.HasPrefix(requestOrigin(r, s.trustProxy), "https://")
 	expires := time.Now().Add(s.sessionTTL)
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure follows the external scheme to support HTTP development.
 		Name:     sessionCookieName,
 		Value:    token,
 		Path:     "/",
@@ -485,7 +485,7 @@ func (s *SessionAuth) issueSessionCookies(w http.ResponseWriter, r *http.Request
 	// The CSRF cookie is script-readable on purpose: page JS echoes it into
 	// X-CSRF-Token for mutations; the server compares against the stored
 	// per-session token, so the cookie alone never authenticates a mutation.
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // CSRF cookie must be script-readable; Secure follows the external scheme.
 		Name:     sessionCSRFCookieName,
 		Value:    csrf,
 		Path:     "/",
@@ -498,9 +498,9 @@ func (s *SessionAuth) issueSessionCookies(w http.ResponseWriter, r *http.Request
 }
 
 func (s *SessionAuth) clearSessionCookies(w http.ResponseWriter, r *http.Request) {
-	secure := r.TLS != nil
+	secure := strings.HasPrefix(requestOrigin(r, s.trustProxy), "https://")
 	for _, name := range []string{sessionCookieName, sessionCSRFCookieName} {
-		http.SetCookie(w, &http.Cookie{
+		http.SetCookie(w, &http.Cookie{ //nolint:gosec // Expired cookies match the attributes used on issuance.
 			Name:     name,
 			Value:    "",
 			Path:     "/",

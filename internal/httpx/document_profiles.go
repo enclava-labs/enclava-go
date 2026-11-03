@@ -113,7 +113,7 @@ func (h *documentPreviewHandlers) previews(w http.ResponseWriter, r *http.Reques
 		WriteOpenAIError(w, http.StatusBadRequest, "multipart file upload or owned artifact reference is required", "invalid_request_error", "invalid_upload")
 		return
 	}
-	maxBytes := int64(h.maxUploadMB) << 20
+	maxBytes := h.maxUploadMB << 20
 	if maxBytes <= 0 {
 		maxBytes = 32 << 20
 	}
@@ -191,7 +191,7 @@ func (h *documentPreviewHandlers) preview(w http.ResponseWriter, r *http.Request
 			WriteOpenAIError(w, http.StatusNotFound, "document preview not found", "invalid_request_error", "not_found")
 			return
 		}
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filename}))
 		w.Header().Set("X-Content-Type-Options", "nosniff")

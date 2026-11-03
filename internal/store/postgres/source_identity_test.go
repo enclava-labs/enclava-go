@@ -48,7 +48,7 @@ func TestMigrationsCompositeFKs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query foreign keys: %v", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	seen := 0
 	for rows.Next() {

@@ -878,7 +878,7 @@ func TestConfidentialEndpointVerifiesBeforeDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verified-confidential execute: %v", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if atomic.LoadInt32(&att.verified) == 0 {
 		t.Fatal("dispatch happened without attestation")
 	}
@@ -958,7 +958,7 @@ func TestRealAdapterEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("real adapter execute: %v", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.Usage == nil || res.Usage.AmountMicros != 10 {
 		t.Fatalf("real dispatch settlement wrong: %+v", res.Usage)
 	}
@@ -990,7 +990,7 @@ func TestExecuteConfidentialSDKOfflineDemo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new SDK inference service: %v", err)
 	}
-	defer svc.Close()
+	defer func() { _ = svc.Close() }()
 	result, err := svc.Execute(f.ctx, f.principal, inference.Request{
 		Capability: inference.CapabilityChat, Model: "gpt-oss-120b",
 		Payload:  []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
@@ -999,7 +999,7 @@ func TestExecuteConfidentialSDKOfflineDemo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SDK execute: %v", err)
 	}
-	defer result.Body.Close()
+	defer func() { _ = result.Body.Close() }()
 	body, err := io.ReadAll(result.Body)
 	if err != nil {
 		t.Fatalf("read SDK response: %v", err)
@@ -1039,7 +1039,7 @@ func TestExecuteConfidentialSDKStreamFailsClosedForE2EERoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new SDK inference service: %v", err)
 	}
-	defer svc.Close()
+	defer func() { _ = svc.Close() }()
 	before := f.reservationCount(t)
 	_, err = svc.Execute(f.ctx, f.principal, inference.Request{
 		Capability: inference.CapabilityChat, Model: "gpt-oss-120b", Stream: true,
@@ -1091,7 +1091,7 @@ func TestExecuteConfidentialSDKOfflineDemoEmbeddings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new SDK inference service: %v", err)
 	}
-	defer svc.Close()
+	defer func() { _ = svc.Close() }()
 	result, err := svc.Execute(f.ctx, f.principal, inference.Request{
 		Capability: inference.CapabilityEmbeddings, Model: "gpt-oss-120b",
 		Payload:  []byte(`{"input":["alpha","beta"]}`),
@@ -1100,7 +1100,7 @@ func TestExecuteConfidentialSDKOfflineDemoEmbeddings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SDK embeddings execute: %v", err)
 	}
-	defer result.Body.Close()
+	defer func() { _ = result.Body.Close() }()
 	body, err := io.ReadAll(result.Body)
 	if err != nil {
 		t.Fatalf("read SDK embeddings response: %v", err)
@@ -1140,7 +1140,7 @@ func TestExecuteConfidentialSDKOfflineDemoResponsesLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new SDK inference service: %v", err)
 	}
-	defer svc.Close()
+	defer func() { _ = svc.Close() }()
 	result, err := svc.Execute(f.ctx, f.principal, inference.Request{
 		Capability: inference.CapabilityResponses, Model: "gpt-oss-120b",
 		Payload:  []byte(`{"model":"gpt-oss-120b","input":"hello"}`),
@@ -1149,7 +1149,7 @@ func TestExecuteConfidentialSDKOfflineDemoResponsesLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SDK Responses create: %v", err)
 	}
-	defer result.Body.Close()
+	defer func() { _ = result.Body.Close() }()
 	raw, err := io.ReadAll(result.Body)
 	if err != nil || !strings.Contains(string(raw), `"object":"response"`) {
 		t.Fatalf("SDK Responses create did not return a response object: %s err=%v", raw, err)
@@ -1641,7 +1641,7 @@ func TestConnectionRefusedReleasesHold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer svc.Close()
+	defer func() { _ = svc.Close() }()
 
 	req := f.chatRequest(`{"messages":[{"role":"user","content":"hi"}]}`)
 	req.EndpointID = "ep-dead"
@@ -1861,7 +1861,7 @@ func TestSettleRetryRecoversExactAccounting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.SettlementError != nil {
 		t.Fatalf("transient settle failures must retry, got %v", res.SettlementError)
 	}
@@ -1890,7 +1890,7 @@ func TestOutputBoundDerivedFromPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	res.Body.Close()
+	_ = res.Body.Close()
 	units := f.reservationUnits(t, res.ReservationID)
 	if units["output"] != 300 {
 		t.Fatalf("held output = %v, want 300 (100×3)", units["output"])
@@ -1903,7 +1903,7 @@ func TestOutputBoundDerivedFromPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	res2.Body.Close()
+	_ = res2.Body.Close()
 	units = f.reservationUnits(t, res2.ReservationID)
 	if units["output"] != 16384 {
 		t.Fatalf("held output = %v, want injected default 16384", units["output"])
@@ -1944,7 +1944,7 @@ func TestOutputBoundDerivedFromPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	res3.Body.Close()
+	_ = res3.Body.Close()
 	units = f.reservationUnits(t, res3.ReservationID)
 	if units["output"] != 1<<17 {
 		t.Fatalf("zero-default hold = %v, want operation bound %d", units["output"], 1<<17)

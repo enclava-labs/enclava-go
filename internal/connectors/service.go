@@ -1007,19 +1007,6 @@ func intFromAny(v any, fallback int) int {
 	return fallback
 }
 
-func boolFromAny(v any, fallback bool) bool {
-	switch b := v.(type) {
-	case bool:
-		return b
-	case string:
-		parsed, err := strconv.ParseBool(strings.TrimSpace(b))
-		if err == nil {
-			return parsed
-		}
-	}
-	return fallback
-}
-
 func maxSlackTimestamp(a, b string) string {
 	a = strings.TrimSpace(a)
 	b = strings.TrimSpace(b)
@@ -1051,15 +1038,6 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-func firstNonNil(values ...any) any {
-	for _, value := range values {
-		if value != nil {
-			return value
-		}
-	}
-	return nil
 }
 
 func connectorBaseURL(source Source, fallback string) string {

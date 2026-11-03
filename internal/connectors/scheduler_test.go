@@ -112,7 +112,7 @@ func (f *fixture) queuedJobsFor(t *testing.T, sourceID string) []string {
 	if err != nil {
 		t.Fatalf("list sync jobs for %s: %v", sourceID, err)
 	}
-	out := []string{}
+	out := make([]string, 0, len(list))
 	for _, j := range list {
 		out = append(out, j.ID)
 	}

@@ -164,7 +164,7 @@ func TestResponseBindingTombstoneHides(t *testing.T) {
 
 func TestResponseBindingSurvivesReconnect(t *testing.T) {
 	db, dsn := openIsolated(t)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	ctx := context.Background()
 	tenant := tenantForTest(6)
 	seedBindingTenant(t, db, tenant)
@@ -192,7 +192,7 @@ func TestResponseBindingSurvivesReconnect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer db2.Close()
+	defer func() { _ = db2.Close() }()
 	repo2 := NewResponseBindingsRepo(db2)
 	got, err := repo2.Resolve(ctx, tenant, "item_pub_1")
 	if err != nil {

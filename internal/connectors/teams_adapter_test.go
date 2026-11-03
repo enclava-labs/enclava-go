@@ -35,27 +35,27 @@ func TestTeamsAdapterPagesChannelRepliesAndChats(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/v1/teams/team/members":
-			io.WriteString(w, `{"value":[{"id":"member","userId":"entra-user","tenantId":"directory"}]}`)
+			_, _ = io.WriteString(w, `{"value":[{"id":"member","userId":"entra-user","tenantId":"directory"}]}`)
 		case "/v1/teams/team/channels":
 			if r.URL.Query().Get("page") == "2" {
 				_, _ = io.WriteString(w, `{"value":[{"id":"channel2","membershipType":"shared"},{"id":"channel3","membershipType":"standard"}]}`)
 			} else {
-				io.WriteString(w, `{"value":[{"id":"channel","membershipType":"private"}],"@odata.nextLink":"http://`+r.Host+`/v1/teams/team/channels?page=2"}`)
+				_, _ = io.WriteString(w, `{"value":[{"id":"channel","membershipType":"private"}],"@odata.nextLink":"http://`+r.Host+`/v1/teams/team/channels?page=2"}`) //nolint:gosec // test fixture: r.Host is the hermetic httptest server
 			}
 		case "/v1/teams/team/channels/channel2/messages", "/v1/teams/team/channels/channel3/messages":
-			io.WriteString(w, `{"value":[]}`)
+			_, _ = io.WriteString(w, `{"value":[]}`)
 		case "/v1/teams/team/channels/channel2/allMembers":
 			_, _ = io.WriteString(w, `{"value":[{"id":"shared-member","userId":"shared-user","tenantId":"directory"}]}`)
 		case "/v1/teams/team/channels/channel/members":
-			io.WriteString(w, `{"value":[{"id":"channel-member","userId":"private-user","tenantId":"directory"}]}`)
+			_, _ = io.WriteString(w, `{"value":[{"id":"channel-member","userId":"private-user","tenantId":"directory"}]}`)
 		case "/v1/chats/chat/members":
-			io.WriteString(w, `{"value":[{"id":"chat-member","userId":"chat-user","tenantId":"directory"}]}`)
+			_, _ = io.WriteString(w, `{"value":[{"id":"chat-member","userId":"chat-user","tenantId":"directory"}]}`)
 		case "/v1/teams/team/channels/channel/messages":
-			io.WriteString(w, `{"value":[{"id":"parent","body":{"content":"message"},"webUrl":"https://teams.example/message","createdDateTime":"2026-10-20T00:00:00Z","lastModifiedDateTime":"2026-10-21T00:00:00Z","attachments":[{"id":"file1","name":"a.txt","contentType":"text/plain","contentUrl":"https://files.example/a"}]}]}`)
+			_, _ = io.WriteString(w, `{"value":[{"id":"parent","body":{"content":"message"},"webUrl":"https://teams.example/message","createdDateTime":"2026-10-20T00:00:00Z","lastModifiedDateTime":"2026-10-21T00:00:00Z","attachments":[{"id":"file1","name":"a.txt","contentType":"text/plain","contentUrl":"https://files.example/a"}]}]}`)
 		case "/v1/teams/team/channels/channel/messages/parent/replies":
-			io.WriteString(w, `{"value":[{"id":"reply","body":{"content":"answer"},"webUrl":"https://teams.example/reply"}]}`)
+			_, _ = io.WriteString(w, `{"value":[{"id":"reply","body":{"content":"answer"},"webUrl":"https://teams.example/reply"}]}`)
 		case "/v1/chats/chat/messages":
-			io.WriteString(w, `{"value":[{"id":"chatmsg","body":{"content":"chat"},"webUrl":"https://teams.example/chat"}]}`)
+			_, _ = io.WriteString(w, `{"value":[{"id":"chatmsg","body":{"content":"chat"},"webUrl":"https://teams.example/chat"}]}`)
 		default:
 			http.NotFound(w, r)
 		}

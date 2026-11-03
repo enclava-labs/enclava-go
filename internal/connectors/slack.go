@@ -434,7 +434,7 @@ func (a slackAdapter) call(ctx context.Context, conn source.Connection, method s
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return fmt.Errorf("slack %s rate limited (Retry-After %s)", method, resp.Header.Get("Retry-After"))
 	}

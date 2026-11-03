@@ -79,23 +79,24 @@ func StartApp(t testing.TB, opts StartOpts) *AppHandle {
 	}
 
 	bin := filepath.Join(t.TempDir(), "enclava")
-	build := exec.Command("go", "build", "-o", bin, "enclava-go/cmd/enclava")
+	build := exec.Command("go", "build", "-o", bin, "enclava-go/cmd/enclava") //nolint:gosec // test builds the enclava binary under test
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build enclava binary: %v\n%s", err, out)
 	}
 
 	dataDir := t.TempDir()
-	env := []string{
-		"PATH=" + os.Getenv("PATH"), // go toolchains and dynamic loaders still need it
-		"DATABASE_URL=" + opts.DatabaseURL,
-		"ENCLAVA_DATA_DIR=" + dataDir,
-	}
+	env := make([]string, 0, 3+len(opts.Env)+1)
+	env = append(env,
+		"PATH="+os.Getenv("PATH"), // go toolchains and dynamic loaders still need it
+		"DATABASE_URL="+opts.DatabaseURL,
+		"ENCLAVA_DATA_DIR="+dataDir,
+	)
 	for k, v := range opts.Env {
 		env = append(env, k+"="+v)
 	}
 
 	if opts.Bootstrap {
-		cmd := exec.Command(bin, append([]string{"bootstrap"}, opts.BootstrapArgs...)...)
+		cmd := exec.Command(bin, append([]string{"bootstrap"}, opts.BootstrapArgs...)...) //nolint:gosec // test runs the binary it built with its own args
 		cmd.Env = env
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("bootstrap failed: %v\n%s", err, out)
@@ -104,7 +105,7 @@ func StartApp(t testing.TB, opts StartOpts) *AppHandle {
 
 	port := freePort(t)
 
-	cmd := exec.Command(bin)
+	cmd := exec.Command(bin) //nolint:gosec // test runs the binary it built
 	cmd.Env = append(env, fmt.Sprintf("APP_PORT=%d", port))
 	buf := &lockedBuffer{}
 	cmd.Stdout = buf
@@ -172,8 +173,8 @@ func (h *AppHandle) Stop() {
 		return
 	}
 	_ = h.cmd.Process.Signal(syscall.SIGTERM)
-	done := make(chan error, 1)
-	go func() { done <- h.cmd.Wait() }()
+	done := make(chan struct{})
+	go func() { _ = h.cmd.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):

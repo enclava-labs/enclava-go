@@ -186,7 +186,7 @@ func (t *StreamableHTTP) Call(ctx context.Context, s Server, a Approval, remote 
 		return nil, ErrDenied
 	}
 	callID := t.next.Add(1)
-	call := rpcRequest{JSONRPC: "2.0", ID: callID, Method: "tools/call", Params: map[string]any{"name": remote, "arguments": json.RawMessage(args)}}
+	call := rpcRequest{JSONRPC: "2.0", ID: callID, Method: "tools/call", Params: map[string]any{"name": remote, "arguments": args}}
 	out, err := t.post(callCtx, client, u, cred, session, call, int(maxBytes)+4096)
 	if err != nil {
 		return nil, err
@@ -329,7 +329,7 @@ func (t *StreamableHTTP) Discover(ctx context.Context, s Server) ([]DiscoveredTo
 	if err != nil {
 		return nil, err
 	}
-	defer list.Body.Close()
+	defer func() { _ = list.Body.Close() }()
 	if session != "" && list.Header.Get("Mcp-Session-Id") != "" && list.Header.Get("Mcp-Session-Id") != session {
 		return nil, ErrDenied
 	}
@@ -378,8 +378,12 @@ func (t *StreamableHTTP) Discover(ctx context.Context, s Server) ([]DiscoveredTo
 
 func (t *StreamableHTTP) postNotify(ctx context.Context, c *http.Client, u *url.URL, cred, session, method string, params any) error {
 	req := rpcRequest{JSONRPC: "2.0", Method: method, Params: params}
-	_, err := t.post(ctx, c, u, cred, session, req, maxProtocolBody)
-	return err
+	resp, err := t.post(ctx, c, u, cred, session, req, maxProtocolBody)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	return nil
 }
 func (t *StreamableHTTP) post(ctx context.Context, c *http.Client, u *url.URL, cred, session string, rpc rpcRequest, max int) (*http.Response, error) {
 	body, err := json.Marshal(rpc)

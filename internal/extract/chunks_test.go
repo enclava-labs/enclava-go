@@ -213,7 +213,7 @@ func TestCSVOversizedHeaderStaysWithinBudget(t *testing.T) {
 func TestChunkFixedPacksShortBlocksUpToSize(t *testing.T) {
 	ref := source.ObjectRef{TenantID: "tenant", ObjectID: "book", ObservedSeq: 1}
 	lines := []string{"Manfred's on the road again,", "making strangers rich.", "It's a hot summer Tuesday,", "and he's standing in the plaza.", strings.Repeat("x", 70)}
-	var blocks []source.Block
+	blocks := make([]source.Block, 0, len(lines))
 	offset := 0
 	for i, line := range lines {
 		blocks = append(blocks, source.Block{ID: string(rune('a' + i)), Ordinal: i, Kind: "paragraph", Text: line, ByteStart: offset, ByteEnd: offset + len(line)})
@@ -224,7 +224,7 @@ func TestChunkFixedPacksShortBlocksUpToSize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var texts []string
+	texts := make([]string, 0, len(chunks))
 	for _, c := range chunks {
 		if utf8.RuneCountInString(c.Text) > 60 {
 			t.Fatalf("chunk over size: %q", c.Text)

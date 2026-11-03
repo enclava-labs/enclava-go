@@ -31,7 +31,7 @@ func main() {
 	if err != nil {
 		fail("open", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := db.PingContext(ctx); err != nil {
 		fail("ping", err)
 	}
@@ -42,7 +42,7 @@ func main() {
 			fail("usage", fmt.Errorf("create needs a schema name"))
 		}
 		schema := os.Args[3]
-		if _, err := db.ExecContext(ctx, `CREATE SCHEMA "`+schema+`"`); err != nil {
+		if _, err := db.ExecContext(ctx, `CREATE SCHEMA "`+schema+`"`); err != nil { //nolint:gosec // schema name is a trusted operator argument to this dev script
 			fail("create schema", err)
 		}
 		fmt.Println(scopedDSN(dsn, schema))
@@ -50,18 +50,18 @@ func main() {
 		if len(os.Args) != 4 {
 			fail("usage", fmt.Errorf("drop needs a schema name"))
 		}
-		if _, err := db.ExecContext(ctx, `DROP SCHEMA IF EXISTS "`+os.Args[3]+`" CASCADE`); err != nil {
+		if _, err := db.ExecContext(ctx, `DROP SCHEMA IF EXISTS "`+os.Args[3]+`" CASCADE`); err != nil { //nolint:gosec // schema name is a trusted operator argument to this dev script
 			fail("drop schema", err)
 		}
 	case "query":
 		if len(os.Args) != 4 {
 			fail("usage", fmt.Errorf("query needs a SQL string"))
 		}
-		rows, err := db.QueryContext(ctx, os.Args[3])
+		rows, err := db.QueryContext(ctx, os.Args[3]) //nolint:gosec // the query text is itself the trusted operator argument
 		if err != nil {
 			fail("query", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 		for rows.Next() {
 			var v sql.NullString
 			if err := rows.Scan(&v); err != nil {

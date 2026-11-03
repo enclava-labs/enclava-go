@@ -110,7 +110,7 @@ func (a *TeamsAdapter) doJSON(req *http.Request, target any) error {
 	for attempt := range 3 {
 		if attempt > 0 && req.Body != nil {
 			if req.GetBody == nil {
-				return errors.New("Teams Graph request cannot be retried")
+				return errors.New("graph request cannot be retried")
 			}
 			body, err := req.GetBody()
 			if err != nil {
@@ -133,7 +133,7 @@ func (a *TeamsAdapter) doJSON(req *http.Request, target any) error {
 			return nil
 		}
 		delay, _ := strconv.Atoi(resp.Header.Get("Retry-After"))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if delay > 30 {
 			delay = 30
 		}
@@ -147,7 +147,7 @@ func (a *TeamsAdapter) doJSON(req *http.Request, target any) error {
 			}
 		}
 	}
-	return errors.New("Teams Graph throttling retry limit exceeded")
+	return errors.New("graph throttling retry limit exceeded")
 }
 
 func (a *TeamsAdapter) get(ctx context.Context, token, endpoint string, target any) error {

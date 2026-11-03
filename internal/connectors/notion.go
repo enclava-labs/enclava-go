@@ -498,6 +498,7 @@ func (a *NotionAdapter) get(ctx context.Context, path string, target any) error 
 		if err != nil {
 			return fmt.Errorf("notion request failed: %w", err)
 		}
+		defer func() { _ = resp.Body.Close() }()
 		status := resp.StatusCode
 		retryAfter := resp.Header.Get("Retry-After")
 		body, readErr := readConnectorBody(resp)

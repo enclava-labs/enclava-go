@@ -55,7 +55,7 @@ func TestRelTime(t *testing.T) {
 	}
 
 	// The title must carry the absolute timestamp.
-	var tt time.Time = now.Add(-12 * time.Minute)
+	tt := now.Add(-12 * time.Minute)
 	wantTitle := `title="` + absTime(tt) + `"`
 	if !strings.Contains(string(relTime(tt)), wantTitle) {
 		t.Fatalf("relTime title must be the absolute time %q", wantTitle)

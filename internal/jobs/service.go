@@ -96,7 +96,7 @@ func submitterKey(p auth.Principal) string {
 	parts := []string{
 		p.TenantID, p.ActorID, string(p.ActorKind),
 		p.CredentialID, string(p.CredentialKind), p.SessionID,
-		p.DelegatedByActorID, p.BillingSubjectID, string(p.BillingSubjectKind),
+		p.DelegatedByActorID, p.BillingSubjectID, p.BillingSubjectKind,
 	}
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%q", parts)))
 	return hex.EncodeToString(sum[:])

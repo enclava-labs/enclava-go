@@ -35,7 +35,7 @@ func (h *Handlers) HandleProcess(w http.ResponseWriter, r *http.Request, princip
 	// No provider-readiness or budget gate here: the shared executor resolves
 	// route capability and admits/settles billing for the actual attempt.
 	r.Body = http.MaxBytesReader(w, r.Body, h.maxUploadMB*1024*1024+64*1024)
-	if err := r.ParseMultipartForm(32 * 1024); err != nil {
+	if err := r.ParseMultipartForm(32 * 1024); err != nil { //nolint:gosec // MaxBytesReader above bounds the entire request body.
 		httpx.WriteOpenAIError(w, http.StatusBadRequest, "invalid multipart form", "invalid_request_error", "invalid_form")
 		return
 	}
@@ -63,7 +63,7 @@ func (h *Handlers) HandleProcess(w http.ResponseWriter, r *http.Request, princip
 		httpx.WriteOpenAIError(w, http.StatusBadRequest, "file is required", "invalid_request_error", "missing_file")
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	if header.Size <= 0 || header.Size > h.maxUploadMB*1024*1024 {
 		httpx.WriteOpenAIError(w, http.StatusRequestEntityTooLarge, "file size is outside the allowed limit", "invalid_request_error", "file_too_large")
 		return
@@ -195,7 +195,7 @@ func (h *Handlers) HandleJobDetail(w http.ResponseWriter, r *http.Request, princ
 			h.writeJobError(w, err, "job_original_failed")
 			return
 		}
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 		disposition := mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(filename)})
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Disposition", disposition)

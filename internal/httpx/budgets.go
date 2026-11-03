@@ -15,19 +15,6 @@ import (
 	"enclava-go/internal/store/postgres"
 )
 
-// microsPerCent converts billing currency-micros to display cents:
-// billing.Price/UsageRecord store int64 micros of a currency unit.
-const microsPerCent int64 = 10_000
-
-// billingSubjectOf resolves the principal's billing subject the same way the
-// billing service does at reserve time.
-func billingSubjectOf(p auth.Principal) billing.Subject {
-	if p.BillingSubjectKind != "" && p.BillingSubjectID != "" {
-		return billing.Subject{Type: p.BillingSubjectKind, ID: p.BillingSubjectID}
-	}
-	return billing.Subject{Type: billing.BudgetSubjectTenant, ID: p.TenantID}
-}
-
 func checkedBudgetAdd(a, b int64) (int64, bool) {
 	if b > 0 && a > math.MaxInt64-b {
 		return 0, false
@@ -38,22 +25,11 @@ func checkedBudgetAdd(a, b int64) (int64, bool) {
 	return a + b, true
 }
 
-func microsToCents(micro int64) int64 {
-	if micro <= 0 {
-		return 0
-	}
-	return (micro + microsPerCent/2) / microsPerCent
-}
-
 type budgetExceededError struct {
 	msg string
 }
 
 func (e budgetExceededError) Error() string { return e.msg }
-
-func errBudgetExceeded(msg string) error {
-	return budgetExceededError{msg: msg}
-}
 
 func (a *App) WriteBudgetError(w http.ResponseWriter, err error) {
 	var be budgetExceededError

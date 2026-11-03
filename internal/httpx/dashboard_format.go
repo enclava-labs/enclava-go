@@ -76,7 +76,7 @@ func relTime(v any) template.HTML {
 			rel = t.Format("2 Jan 2006")
 		}
 	}
-	return template.HTML(fmt.Sprintf(`<time datetime="%s" title="%s">%s</time>`,
+	return template.HTML(fmt.Sprintf(`<time datetime="%s" title="%s">%s</time>`, //nolint:gosec // Timestamp is formatted and text fields are HTML-escaped.
 		t.Format(time.RFC3339),
 		template.HTMLEscapeString(absTime(v)),
 		template.HTMLEscapeString(rel)))

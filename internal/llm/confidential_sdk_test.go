@@ -264,7 +264,7 @@ func TestConfidentialSDKResponseManageRequiresVerifiedVerdict(t *testing.T) {
 func TestCancellableStreamReaderCloseCancelsContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	reader, writer := io.Pipe()
-	defer writer.Close()
+	defer func() { _ = writer.Close() }()
 	stream := &cancellableStreamReader{PipeReader: reader, cancel: cancel}
 	if err := stream.Close(); err != nil {
 		t.Fatal(err)

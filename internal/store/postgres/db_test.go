@@ -59,7 +59,7 @@ func TestFailedMigrationRollsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open second connection: %v", err)
 	}
-	defer other.Close()
+	defer func() { _ = other.Close() }()
 
 	var tables int
 	if err := other.QueryRowContext(ctx,

@@ -95,9 +95,10 @@ func (f *fixture) completeSnapshot(kind string, rev int64, completedAgo time.Dur
 func (f *fixture) grant(objID, kind, subjectID, effect string, rev int64) {
 	f.t.Helper()
 	var userID, groupID any
-	if kind == source.GrantSubjectGroup {
+	switch kind {
+	case source.GrantSubjectGroup:
 		groupID = subjectID
-	} else if kind == source.GrantSubjectUser {
+	case source.GrantSubjectUser:
 		userID = subjectID
 	}
 	if _, err := f.db.SQL.ExecContext(f.ctx, `
@@ -134,14 +135,14 @@ func mustDeny(t *testing.T, err error) {
 func TestCanReadOwner(t *testing.T) {
 	f := newFixture(t)
 	f.conn("conn_a", "active")
-	obj := f.obj("obj_o", "conn_a", source.AuthorizationOwner)
+	f.obj("obj_o", "conn_a", source.AuthorizationOwner)
 	owner := f.user("alice")
 	if _, err := f.db.SQL.ExecContext(f.ctx,
 		"UPDATE source_objects SET owner_actor_id = $3 WHERE tenant_id = $1 AND id = $2",
 		f.tenant, "obj_o", owner); err != nil {
 		t.Fatalf("set owner: %v", err)
 	}
-	obj, _ = f.repo.GetObject(f.ctx, f.tenant, "obj_o")
+	obj, _ := f.repo.GetObject(f.ctx, f.tenant, "obj_o")
 
 	a := source.NewAuthorizer(f.repo, time.Hour)
 	if err := a.CanRead(f.ctx, f.principal("alice"), obj, source.ReadOptions{}); err != nil {

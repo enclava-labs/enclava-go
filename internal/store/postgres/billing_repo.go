@@ -152,7 +152,7 @@ func (r *BillingRepo) GetUsageRecord(ctx context.Context, tenantID, reservationI
 // --- transaction-scoped -----------------------------------------------------
 
 // LockActiveBudgets locks every active budget applicable to any subject in
-// deterministic order so concurrent admissions serialise without deadlocks.
+// deterministic order so concurrent admissions serialize without deadlocks.
 func (t billingTx) LockActiveBudgets(ctx context.Context, tenantID string, subjects []billing.Subject, now time.Time) ([]billing.Budget, error) {
 	if len(subjects) == 0 {
 		return nil, nil
@@ -188,7 +188,7 @@ const budgetSelectSQL = `
 `
 
 func scanBudgets(rows *sql.Rows) ([]billing.Budget, error) {
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []billing.Budget
 	for rows.Next() {
 		var b billing.Budget
@@ -221,7 +221,7 @@ func (t billingTx) SelectPrices(ctx context.Context, tenantID, subjectType, subj
 	if err != nil {
 		return nil, fmt.Errorf("select prices: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []billing.Price
 	for rows.Next() {
 		var p billing.Price
@@ -322,10 +322,10 @@ func queryLiabilities(ctx context.Context, q billingQuerier, tenantID string, sc
 	// Settled usage inside the window: disjoint plain sums per scope rule.
 	var settledScope string
 	args := []any{tenantID, from, untilArg}
-	switch {
-	case scope.Type == billing.BudgetSubjectTenant:
+	switch scope.Type {
+	case billing.BudgetSubjectTenant:
 		settledScope = ""
-	case scope.Type == billing.BudgetSubjectAPIKey:
+	case billing.BudgetSubjectAPIKey:
 		// Key-scoped settled usage matches the verified credential
 		// attribution column plus rows whose canonical subject is the key —
 		// a row is returned once either way, so nothing double-counts.
@@ -370,7 +370,7 @@ func queryLiabilities(ctx context.Context, q billingQuerier, tenantID string, sc
 // scanAmountRows folds (state, currency, sum) aggregate rows into the
 // accumulator keyed by add.
 func scanAmountRows(rows *sql.Rows, add func(state, currency string, amount int64) *billing.LiabilityRow) error {
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var state, currency string
 		var amount int64
@@ -385,7 +385,7 @@ func scanAmountRows(rows *sql.Rows, add func(state, currency string, amount int6
 // scanUnitRows folds (state, currency, kind, sum) aggregate rows into the
 // accumulator.
 func scanUnitRows(rows *sql.Rows, add func(state, currency string, amount int64) *billing.LiabilityRow) error {
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var state, currency, kind string
 		var units int64
@@ -451,7 +451,7 @@ func (t billingTx) InsertReservations(ctx context.Context, rows []billing.Reserv
 				 currency, state, capability, model, endpoint_id, credential_id)
 			VALUES ($1::uuid, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, 'held', $11, $12, $13, $14)`,
 			res.TenantID, res.ID, nullStr(res.JobID), nullStr(res.AttemptID),
-			res.Subject.Type, res.Subject.ID, string(snap), string(units),
+			res.Subject.Type, res.Subject.ID, string(snap), units,
 			res.LimitAmountMicros, res.Currency, res.Capability, res.Model,
 			nullStr(res.EndpointID), res.CredentialID)
 		if err != nil {
@@ -520,7 +520,7 @@ func (t billingTx) InsertUsageRecord(ctx context.Context, rec billing.UsageRecor
 			 price_snapshot, outcome, credential_id)
 		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
 		rec.TenantID, rec.ID, rec.ReservationID, rec.Subject.Type, rec.Subject.ID,
-		rec.Capability, rec.Model, nullStr(rec.EndpointID), string(units),
+		rec.Capability, rec.Model, nullStr(rec.EndpointID), units,
 		rec.AmountMicros, rec.Currency, string(snap), rec.Outcome, rec.CredentialID)
 	if err != nil {
 		return fmt.Errorf("insert usage record: %w", err)
@@ -703,13 +703,13 @@ func (r *BillingRepo) ListPrices(ctx context.Context, tenantID, subjectType, sub
 		q += fmt.Sprintf(" AND capability = $%d", n)
 		args = append(args, capability)
 	}
-	q += fmt.Sprintf(" ORDER BY effective_from DESC, id LIMIT $%d OFFSET $%d", n+1, n+2)
+	q += fmt.Sprintf(" ORDER BY effective_from DESC, id LIMIT $%d OFFSET $%d", n+1, n+2) //nolint:gosec // fragment is constant, values bound as parameters
 	args = append(args, limit, offset)
 	rows, err := r.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list prices: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []PriceRow
 	for rows.Next() {
 		var p PriceRow
@@ -746,7 +746,7 @@ func (r *BillingRepo) ListPriceAudit(ctx context.Context, tenantID string, limit
 	if err != nil {
 		return nil, fmt.Errorf("list price audit: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []PriceAuditRow
 	for rows.Next() {
 		var a PriceAuditRow
@@ -823,13 +823,13 @@ func (r *BillingRepo) ListBillingAudit(ctx context.Context, tenantID, subjectTyp
 		q += fmt.Sprintf(" AND subject_id = $%d", n)
 		args = append(args, subjectID)
 	}
-	q += fmt.Sprintf(" ORDER BY created_at DESC, id LIMIT $%d OFFSET $%d", n+1, n+2)
+	q += fmt.Sprintf(" ORDER BY created_at DESC, id LIMIT $%d OFFSET $%d", n+1, n+2) //nolint:gosec // fragment is constant, values bound as parameters
 	args = append(args, limit, offset)
 	rows, err := r.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list billing audit: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []BillingAuditRow
 	for rows.Next() {
 		var a BillingAuditRow
@@ -909,7 +909,7 @@ func (r *BillingRepo) LatestPrices(ctx context.Context, tenantID, subjectType, s
 	if err != nil {
 		return nil, fmt.Errorf("latest prices: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []billing.Price
 	for rows.Next() {
 		var p billing.Price
@@ -984,7 +984,7 @@ func (r *BillingRepo) UsageTotals(ctx context.Context, tenantID string, since ti
 	if err != nil {
 		return nil, fmt.Errorf("usage totals: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []UsageGroupSum
 	for rows.Next() {
 		var s UsageGroupSum
@@ -1017,7 +1017,7 @@ func (r *BillingRepo) UsageBySubject(ctx context.Context, tenantID string, since
 	if err != nil {
 		return nil, fmt.Errorf("usage by subject: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []UsageGroupSum
 	for rows.Next() {
 		var s UsageGroupSum
@@ -1061,7 +1061,7 @@ func (r *BillingRepo) UsageByModel(ctx context.Context, tenantID string, since t
 }
 
 func scanGroupSums(rows *sql.Rows) ([]UsageGroupSum, error) {
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []UsageGroupSum
 	for rows.Next() {
 		var s UsageGroupSum
@@ -1123,7 +1123,7 @@ func (r *BillingRepo) ListDailyUsage(ctx context.Context, tenantID string, since
 	if err != nil {
 		return nil, fmt.Errorf("daily usage: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []DailyUsageRow
 	for rows.Next() {
 		var row DailyUsageRow

@@ -107,12 +107,12 @@ func (r *EndpointsRepo) ListCapabilities(ctx context.Context, tenantID, capabili
 }
 
 func (r *EndpointsRepo) listWhere(ctx context.Context, tenantID, extra string, args []any) ([]inference.Endpoint, error) {
-	q := `SELECT ` + endpointCols + ` FROM inference_endpoints WHERE tenant_id = $1::uuid ` + extra + ` ORDER BY id`
+	q := `SELECT ` + endpointCols + ` FROM inference_endpoints WHERE tenant_id = $1::uuid ` + extra + ` ORDER BY id` //nolint:gosec // extra fragments are package-internal constants, values bound as args
 	rows, err := r.db.QueryContext(ctx, q, append([]any{tenantID}, args...)...)
 	if err != nil {
 		return nil, fmt.Errorf("list endpoints: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []inference.Endpoint
 	for rows.Next() {
 		e, err := scanEndpoint(rows, tenantID)

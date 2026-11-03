@@ -40,7 +40,7 @@ func TestMCPAdministrationDiscoveryApprovalRevisionAndRevocation(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch request.Method {
 		case "initialize":
-			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"protocolVersion":"2025-06-18"}}`, request.ID)
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"protocolVersion":"2025-06-18"}}`, request.ID)
 		case "tools/list":
 			tools := "[]"
 			if !empty.Load() {
@@ -50,7 +50,7 @@ func TestMCPAdministrationDiscoveryApprovalRevisionAndRevocation(t *testing.T) {
 				}
 				tools = `[{"name":"remote","title":"Remote Tool","inputSchema":` + input + `,"outputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]`
 			}
-			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"tools":%s}}`, request.ID, tools)
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"tools":%s}}`, request.ID, tools)
 		default:
 			t.Errorf("unexpected MCP method %q", request.Method)
 			http.Error(w, "unexpected", http.StatusBadRequest)
@@ -172,11 +172,12 @@ func TestMCPAdministrationEmptySnapshotRevokesOnlyItsServer(t *testing.T) {
 		if empty.Load() {
 			tools = "[]"
 		}
-		if request.Method == "initialize" {
-			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"protocolVersion":"2025-06-18"}}`, request.ID)
-		} else if request.Method == "tools/list" {
-			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"tools":%s}}`, request.ID, tools)
-		} else {
+		switch request.Method {
+		case "initialize":
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"protocolVersion":"2025-06-18"}}`, request.ID)
+		case "tools/list":
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"tools":%s}}`, request.ID, tools)
+		default:
 			t.Errorf("unexpected MCP method %q", request.Method)
 			http.Error(w, "unexpected", http.StatusBadRequest)
 		}
@@ -257,7 +258,7 @@ func TestMCPApprovedToolInvokesOverStreamableHTTPWithJSONBDigests(t *testing.T) 
 		w.Header().Set("Content-Type", "application/json")
 		switch request.Method {
 		case "initialize":
-			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"protocolVersion":"2025-06-18"}}`, request.ID)
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"protocolVersion":"2025-06-18"}}`, request.ID)
 		case "tools/list":
 			input := `{"type":"object","properties":{"q":{"type":"string"}},"required":["q"],"additionalProperties":false}`
 			if reformatted.Load() {
@@ -266,9 +267,9 @@ func TestMCPApprovedToolInvokesOverStreamableHTTPWithJSONBDigests(t *testing.T) 
 			if changedSchema.Load() {
 				input = `{"type":"object","properties":{"q":{"type":"string"},"audit":{"type":"boolean"}},"required":["q","audit"],"additionalProperties":false}`
 			}
-			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"tools":[{"name":"remote","inputSchema":%s,"outputSchema":{"type":"object"}}]}}`, request.ID, input)
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"tools":[{"name":"remote","inputSchema":%s,"outputSchema":{"type":"object"}}]}}`, request.ID, input)
 		case "tools/call":
-			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"structuredContent":{"ok":true}}}`, request.ID)
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"structuredContent":{"ok":true}}}`, request.ID)
 		default:
 			t.Errorf("unexpected MCP method %q", request.Method)
 			http.Error(w, "unexpected", http.StatusBadRequest)

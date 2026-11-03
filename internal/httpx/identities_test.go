@@ -421,7 +421,7 @@ func TestIdentityAdminSessionOpsAndLink(t *testing.T) {
 	f := newIdentityFixture(t)
 	ctx := context.Background()
 
-	// Service-account provisioning honours the caller-scope subset rule.
+	// Service-account provisioning honors the caller-scope subset rule.
 	rec := f.admin(t, http.MethodPost, "/api/v1/identities/service-accounts",
 		`{"name":"bot","scopes":["platform.admin","pricing.manage"]}`)
 	if rec.Code != http.StatusForbidden {

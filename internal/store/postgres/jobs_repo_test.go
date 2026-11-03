@@ -99,7 +99,7 @@ func TestJobsRepoClaimRaces(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			cj, err := r.Claim(ctx, string(rune('a'+i)), time.Second)
+			cj, err := r.Claim(ctx, fmt.Sprintf("%c", 'a'+i), time.Second)
 			if err != nil {
 				t.Errorf("claim: %v", err)
 				return
@@ -119,8 +119,8 @@ func TestJobsRepoClaimRaces(t *testing.T) {
 	if len(winners) != 1 {
 		t.Fatalf("claim must hand job to exactly one worker, got %d", len(winners))
 	}
-	if winners[0].JobRow.Status != jobs.StatusRunning || winners[0].Lease.FenceToken != 1 {
-		t.Fatalf("claimed row: status=%q fence=%d", winners[0].JobRow.Status, winners[0].Lease.FenceToken)
+	if winners[0].Status != jobs.StatusRunning || winners[0].Lease.FenceToken != 1 {
+		t.Fatalf("claimed row: status=%q fence=%d", winners[0].Status, winners[0].Lease.FenceToken)
 	}
 	if winners[0].AttemptID == "" {
 		t.Fatalf("claim must insert the attempt row")
@@ -203,7 +203,7 @@ func TestJobsRepoUndispatchedReclaimReleases(t *testing.T) {
 		t.Fatalf("fence must bump: %d -> %d", cj.Lease.FenceToken, cj2.Lease.FenceToken)
 	}
 	// Old fenced write now fails.
-	if err := r.WriteProgress(ctx, tenant, cj2.JobRow.ID, "w1", cj.Lease.FenceToken,
+	if err := r.WriteProgress(ctx, tenant, cj2.ID, "w1", cj.Lease.FenceToken,
 		json.RawMessage(`{"percent":10}`)); !errors.Is(err, jobs.ErrStaleFence) {
 		t.Fatalf("stale fence write must fail, got %v", err)
 	}
@@ -379,7 +379,7 @@ func TestJobsRepoActivityProgressRoundTrip(t *testing.T) {
 	blank := insertActorJob(t, ctx, r, tenant, "job_blank", "extract.process", jobs.StatusQueued, "actor-1")
 
 	cj, err := r.Claim(ctx, "w1", time.Second)
-	if err != nil || cj == nil || cj.JobRow.ID != counted.ID {
+	if err != nil || cj == nil || cj.ID != counted.ID {
 		t.Fatalf("claim counted job: cj=%v err=%v", cj, err)
 	}
 	if err := r.WriteProgress(ctx, tenant, counted.ID, "w1", cj.Lease.FenceToken,

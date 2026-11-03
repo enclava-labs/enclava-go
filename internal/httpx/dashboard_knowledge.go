@@ -152,7 +152,7 @@ func (a *App) knowledgeListView(w http.ResponseWriter, r *http.Request, p auth.P
 	}
 	if caps.KnowledgeManage {
 		data.Empty = dashboardEmpty{Icon: "knowledge", Text: "No collections yet.", ActionLabel: "New collection", ActionHref: "/dashboard/knowledge?new=1"}
-		data.Header.Actions = template.HTML(`<button type="button" class="btn primary" data-action="knowledge:new">` +
+		data.Header.Actions = template.HTML(`<button type="button" class="btn primary" data-action="knowledge:new">` + //nolint:gosec // Fixed markup and trusted icon only.
 			string(dashboardIconPlus()) + `New collection</button>`)
 		data.EmbeddingModels = a.knowledgeEmbeddingModels(ctx, p.TenantID)
 		data.DefaultEmbeddingModel, data.DefaultEmbeddingDimensions = a.ragSvc.DefaultEmbedding()
@@ -332,7 +332,7 @@ func knowledgeDocumentStatus(raw string) string {
 func (a *App) knowledgeDocuments(w http.ResponseWriter, ctx context.Context, p auth.Principal, collectionID, status string) ([]rag.Document, bool, bool) {
 	docs, err := a.ragSvc.ListDocuments(ctx, p, collectionID, status, dashboardKnowledgeLimit+1, 0)
 	if err != nil {
-		log.Printf("dashboard knowledge documents %s: %v", collectionID, err)
+		log.Printf("dashboard knowledge documents %s: %s", strconv.Quote(collectionID), strconv.Quote(err.Error()))
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return nil, false, false
 	}
@@ -352,7 +352,7 @@ func (a *App) knowledgeCollectionSources(ctx context.Context, p auth.Principal, 
 	}
 	srcs, err := a.connectorSvc.ListSources(ctx, p, "", dashboardSourcesLimit, 0)
 	if err != nil {
-		log.Printf("dashboard knowledge sources %s: %v", collectionID, err)
+		log.Printf("dashboard knowledge sources %s: %s", strconv.Quote(collectionID), strconv.Quote(err.Error()))
 		return nil
 	}
 	out := make([]connectors.Source, 0, len(srcs))

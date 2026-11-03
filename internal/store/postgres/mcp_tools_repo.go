@@ -102,7 +102,7 @@ func (r *MCPToolsRepo) Approve(ctx context.Context, a MCPToolApproval) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if _, err := approveTx(ctx, tx, a); err != nil {
 		return err
 	}
@@ -126,7 +126,7 @@ func approveTx(ctx context.Context, q dbtx, a MCPToolApproval) (MCPToolApproval,
 		return a, fmt.Errorf("postgres: invalid MCP model name")
 	}
 	for _, c := range a.ModelName {
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-' || c == '.') {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_' && c != '-' && c != '.' {
 			return a, fmt.Errorf("postgres: invalid MCP model name")
 		}
 	}
@@ -183,7 +183,7 @@ func (r *MCPToolsRepo) ListApprovals(ctx context.Context, tenantID, serverID str
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := []MCPToolApproval{}
 	for rows.Next() {
 		var id string
@@ -204,7 +204,7 @@ func (r *MCPToolsRepo) ListServers(ctx context.Context, tenantID string) ([]MCPS
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []MCPServer
 	for rows.Next() {
 		var id string
@@ -225,7 +225,7 @@ func (r *MCPToolsRepo) ListAllApprovals(ctx context.Context, tenantID, serverID 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []MCPToolApproval
 	for rows.Next() {
 		var id string
@@ -279,7 +279,7 @@ func (r *MCPToolsRepo) Revoke(ctx context.Context, tenantID, serverID, toolID st
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	revoked, err := revokeTx(ctx, tx, tenantID, serverID, toolID)
 	if err != nil {
 		return err
@@ -344,7 +344,7 @@ func (r *MCPToolsRepo) RecordDiscovery(ctx context.Context, tenantID, serverID s
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	type knownRow struct {
 		inDigest, outDigest, state string
 		schemaVersion              int64
@@ -360,16 +360,16 @@ func (r *MCPToolsRepo) RecordDiscovery(ctx context.Context, tenantID, serverID s
 		var id string
 		var row knownRow
 		if err = rows.Scan(&id, &row.inDigest, &row.outDigest, &row.state, &row.schemaVersion, &row.approvedVersion, &row.inputSchema, &row.outputSchema); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return err
 		}
 		existing[id] = row
 	}
 	if err = rows.Err(); err != nil {
-		rows.Close()
+		_ = rows.Close()
 		return err
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	enabled := make(map[string]bool)
 	approvalVersions := make(map[string]int64)
@@ -384,7 +384,7 @@ func (r *MCPToolsRepo) RecordDiscovery(ctx context.Context, tenantID, serverID s
 		var version int64
 		var inSchema, outSchema json.RawMessage
 		if err = approvalRows.Scan(&id, &isEnabled, &version, &inSchema, &outSchema); err != nil {
-			approvalRows.Close()
+			_ = approvalRows.Close()
 			return err
 		}
 		enabled[id] = isEnabled
@@ -392,10 +392,10 @@ func (r *MCPToolsRepo) RecordDiscovery(ctx context.Context, tenantID, serverID s
 		approvalSchemas[id] = [2]json.RawMessage{inSchema, outSchema}
 	}
 	if err = approvalRows.Err(); err != nil {
-		approvalRows.Close()
+		_ = approvalRows.Close()
 		return err
 	}
-	approvalRows.Close()
+	_ = approvalRows.Close()
 
 	insertDiscovery := func(tool DiscoveredToolSnapshot, annotations []byte, state string, version int64, approvedVersion sql.NullInt64, priorIn, priorOut, diff json.RawMessage) error {
 		_, err := tx.ExecContext(ctx, `INSERT INTO mcp_tool_discoveries (tenant_id,server_id,tool_id,title,description,annotations,remote_name,input_schema,output_schema,input_digest,output_digest,schema_version,state,approved_schema_version,prior_input_schema,prior_output_schema,diff_fields)
@@ -558,7 +558,7 @@ func (r *MCPToolsRepo) ApproveDiscovery(ctx context.Context, tenantID, serverID,
 	if err != nil {
 		return MCPToolApproval{}, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var remoteName, state string
 	var version int64
 	var inputSchema, outputSchema json.RawMessage
@@ -602,7 +602,7 @@ func (r *MCPToolsRepo) RejectDiscovery(ctx context.Context, tenantID, serverID, 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var state string
 	err = tx.QueryRowContext(ctx, `SELECT state FROM mcp_tool_discoveries WHERE tenant_id=$1::uuid AND server_id=$2 AND tool_id=$3 FOR UPDATE`, tenantID, serverID, toolID).Scan(&state)
 	if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
@@ -662,7 +662,7 @@ func (r *MCPToolsRepo) listDiscoveries(ctx context.Context, query string, args .
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := []MCPToolDiscovery{}
 	for rows.Next() {
 		var d MCPToolDiscovery

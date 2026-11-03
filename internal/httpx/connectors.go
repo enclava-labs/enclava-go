@@ -202,20 +202,6 @@ func (a *App) handleConnectorSyncJobByID(w http.ResponseWriter, r *http.Request,
 	WriteJSON(w, http.StatusOK, job)
 
 }
-func writeConnectorSyncError(w http.ResponseWriter, err error, job any) {
-	if errors.Is(err, sql.ErrNoRows) || errors.Is(err, sourceapi.ErrDenied) {
-		WriteOpenAIError(w, http.StatusNotFound, "connector source not found", "invalid_request_error", "not_found")
-		return
-	}
-	WriteJSON(w, http.StatusBadRequest, map[string]any{
-		"error": OpenAIError{
-			Message: err.Error(),
-			Type:    "invalid_request_error",
-			Code:    "connector_sync_failed",
-		},
-		"sync_job": job,
-	})
-}
 
 func writeConnectorNotFoundOrError(w http.ResponseWriter, err error, code string) {
 	if errors.Is(err, sql.ErrNoRows) || errors.Is(err, sourceapi.ErrDenied) {

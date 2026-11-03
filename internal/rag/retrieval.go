@@ -679,8 +679,8 @@ func fuseRankedResults(lists []rankedSearchList, limit int) []SearchResult {
 	}
 	results := make([]SearchResult, 0, len(scores))
 	for id, score := range scores {
-		listIndex := int(uint64(order[id]) >> 32)
-		rank := int(uint64(order[id]) & 0xffffffff)
+		listIndex := order[id] >> 32
+		rank := order[id] & 0xffffffff
 		result := lists[listIndex].results[rank]
 		result.Score = score
 		results = append(results, result)
@@ -886,7 +886,7 @@ func (s *Service) rewriteQuery(ctx context.Context, p auth.Principal, query stri
 	if err != nil || result == nil || result.Body == nil {
 		return query
 	}
-	defer result.Body.Close()
+	defer func() { _ = result.Body.Close() }()
 	response, err := io.ReadAll(io.LimitReader(result.Body, 1<<20))
 	if err != nil {
 		return query
@@ -954,7 +954,7 @@ func (s *Service) selectSections(ctx context.Context, p auth.Principal, results 
 	if err != nil || result == nil || result.Body == nil {
 		return results
 	}
-	defer result.Body.Close()
+	defer func() { _ = result.Body.Close() }()
 	response, err := io.ReadAll(io.LimitReader(result.Body, 1<<20))
 	if err != nil {
 		return results

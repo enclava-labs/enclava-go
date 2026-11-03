@@ -146,7 +146,7 @@ func TestQdrantHybridAndLegacyIntegration(t *testing.T) {
 }
 
 func integrationSparse(text string) rag.SparseVector {
-	indices := make([]uint32, 0)
+	indices := make([]uint32, 0, len(strings.Fields(text)))
 	for _, token := range strings.Fields(text) {
 		h := fnv.New32a()
 		_, _ = h.Write([]byte(token))

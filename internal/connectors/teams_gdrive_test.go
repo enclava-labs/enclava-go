@@ -22,10 +22,10 @@ func TestTeamsFetcherPaginationIDsAndAttachmentMetadata(t *testing.T) {
 				_, _ = fmt.Fprint(w, `{"value":[]}`)
 				return
 			}
-			_, _ = fmt.Fprintf(w, `{"value":[{"id":"channel-1"}],"@odata.nextLink":%q}`, "http://"+r.Host+"/v1.0/teams/team-1/channels?page=next")
+			_, _ = fmt.Fprintf(w, `{"value":[{"id":"channel-1"}],"@odata.nextLink":%q}`, "http://"+r.Host+"/v1.0/teams/team-1/channels?page=next") //nolint:gosec // test fixture: r.Host is the hermetic httptest server
 		case r.URL.Path == "/v1.0/teams/team-1/channels/channel-1/messages":
 			if r.URL.Query().Get("page") == "" {
-				_, _ = fmt.Fprintf(w, `{"value":[{"id":"message-1","body":{"content":"hello"},"webUrl":"https://teams.example/message/1","lastModifiedDateTime":"2026-10-20T00:00:00Z","attachments":[{"name":"report.pdf","contentType":"application/pdf","contentUrl":"https://files.example/report"}]}],"@odata.nextLink":%q}`, "http://"+r.Host+"/v1.0/teams/team-1/channels/channel-1/messages?page=next")
+				_, _ = fmt.Fprintf(w, `{"value":[{"id":"message-1","body":{"content":"hello"},"webUrl":"https://teams.example/message/1","lastModifiedDateTime":"2026-10-20T00:00:00Z","attachments":[{"name":"report.pdf","contentType":"application/pdf","contentUrl":"https://files.example/report"}]}],"@odata.nextLink":%q}`, "http://"+r.Host+"/v1.0/teams/team-1/channels/channel-1/messages?page=next") //nolint:gosec // test fixture: r.Host is the hermetic httptest server
 				return
 			}
 			_, _ = fmt.Fprint(w, `{"value":[{"id":"message-2","body":{"content":"second"}}]}`)
@@ -91,8 +91,8 @@ func TestGoogleDriveFetcherPaginatesAndExportsGoogleDocs(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer drive-test-token" {
 			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
 		}
-		switch {
-		case r.URL.Path == "/drive/v3/files":
+		switch r.URL.Path {
+		case "/drive/v3/files":
 			listCalls++
 			if r.URL.Query().Get("q") != "'folder-1' in parents and trashed = false" {
 				t.Errorf("query = %q", r.URL.Query().Get("q"))
@@ -105,7 +105,7 @@ func TestGoogleDriveFetcherPaginatesAndExportsGoogleDocs(t *testing.T) {
 				}
 				_, _ = fmt.Fprint(w, `{"files":[{"id":"file-2","name":"notes.txt","mimeType":"text/plain","headRevisionId":"rev-2"}]}`)
 			}
-		case r.URL.Path == "/drive/v3/files/doc-1/export":
+		case "/drive/v3/files/doc-1/export":
 			exports++
 			_, _ = fmt.Fprint(w, "exported Google Doc")
 		default:

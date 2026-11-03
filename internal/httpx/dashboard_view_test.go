@@ -145,12 +145,12 @@ func TestThemeFromRequest(t *testing.T) {
 	if got := themeFromRequest(req); got != "" {
 		t.Fatalf("no cookie → %q, want dark default", got)
 	}
-	req.AddCookie(&http.Cookie{Name: "enclava_theme", Value: "light"})
+	req.AddCookie(&http.Cookie{Name: "enclava_theme", Value: "light", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode})
 	if got := themeFromRequest(req); got != "light" {
 		t.Fatalf("light cookie → %q, want light", got)
 	}
 	req = httptest.NewRequest("GET", "/dashboard", nil)
-	req.AddCookie(&http.Cookie{Name: "enclava_theme", Value: "sepia"})
+	req.AddCookie(&http.Cookie{Name: "enclava_theme", Value: "sepia", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode})
 	if got := themeFromRequest(req); got != "" {
 		t.Fatalf("unknown value → %q, want dark default", got)
 	}

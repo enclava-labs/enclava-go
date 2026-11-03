@@ -27,7 +27,7 @@ func TestApplicationRuntimeCutover(t *testing.T) {
 	}
 
 	bin := filepath.Join(t.TempDir(), "enclava")
-	build := exec.Command("go", "build", "-trimpath", "-o", bin, ".")
+	build := exec.Command("go", "build", "-trimpath", "-o", bin, ".") //nolint:gosec // test builds the enclava binary with CGO disabled
 	build.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("CGO_ENABLED=0 build: %v\n%s", err, out)

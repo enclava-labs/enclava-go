@@ -35,7 +35,7 @@ func TestLegacyCutoverRemoved(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range cmdFiles {
-		data, err := os.ReadFile(name)
+		data, err := os.ReadFile(name) //nolint:gosec // test reads files it globbed from its own package dir
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
 		}

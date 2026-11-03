@@ -39,12 +39,6 @@ type dashboardHeader struct {
 	Actions            template.HTML
 }
 
-// dashboardConfirm is the arg of the "confirm-btn" component: the visible
-// label and the data-confirm question ("verb noun?").
-type dashboardConfirm struct {
-	Label, Confirm string
-}
-
 // dashboardBaseFuncs registers the frozen helper names; all must exist before
 // layout/components parse (templates reference them at parse time).
 var dashboardBaseFuncs = template.FuncMap{

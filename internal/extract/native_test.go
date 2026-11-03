@@ -129,10 +129,11 @@ func TestNativeSandboxDeniesExternalSentinelAndNetwork(t *testing.T) {
 		t.Fatal("sandbox read an external sentinel")
 	}
 	httpBinary, err := exec.LookPath("curl")
-	httpArgs := []string{"--connect-timeout", "0.2", "--max-time", "0.5"}
+	httpArgs := make([]string, 0, 5)
+	httpArgs = append(httpArgs, "--connect-timeout", "0.2", "--max-time", "0.5")
 	if err != nil {
 		httpBinary, err = exec.LookPath("wget")
-		httpArgs = []string{"-T", "1", "-O", "-"}
+		httpArgs = append(httpArgs[:0], "-T", "1", "-O", "-")
 	}
 	if err != nil {
 		t.Fatal("curl or wget is required for the isolated-network integration check")
@@ -141,7 +142,7 @@ func TestNativeSandboxDeniesExternalSentinelAndNetwork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	_ = listener.(*net.TCPListener).SetDeadline(time.Now().Add(time.Second))
 	accepted := make(chan struct{}, 1)
 	go func() {

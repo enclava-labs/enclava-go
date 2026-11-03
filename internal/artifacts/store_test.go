@@ -177,7 +177,7 @@ func TestBeginWritingRowBeforeBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
-	defer w.Abort(ctx)
+	defer func() { _ = w.Abort(ctx) }()
 
 	row, err := meta.GetArtifact(ctx, tenantA, ref.ID)
 	if err != nil {
@@ -206,7 +206,7 @@ func TestWriteFinalizeRoundTrip(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(durable, ".tmp", ref.ID+".part")); !os.IsNotExist(err) {
 		t.Fatalf(".part must be gone after finalize: %v", err)
 	}
-	got, err := os.ReadFile(path)
+	got, err := os.ReadFile(path) //nolint:gosec // path is store-composed under the test's t.TempDir durable root
 	if err != nil {
 		t.Fatalf("durable file missing: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestWriteFinalizeRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	readBack, _ := io.ReadAll(rc)
 	if string(readBack) != string(payload) {
 		t.Fatalf("read bytes = %q, want %q", readBack, payload)
@@ -287,7 +287,7 @@ func TestRefTraversalRejected(t *testing.T) {
 	for i, r := range bad {
 		rc, err := s.Read(ctx, r)
 		if err == nil {
-			rc.Close()
+			_ = rc.Close()
 			t.Fatalf("case %d: traversal ref %+v must error", i, r)
 		}
 		if !errors.Is(err, ErrInvalidRef) {
@@ -299,7 +299,7 @@ func TestRefTraversalRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("valid ref must still read: %v", err)
 	}
-	rc.Close()
+	_ = rc.Close()
 }
 
 // TestCrossTenantDenied: tenant A cannot open an artifact addressed by
@@ -312,7 +312,7 @@ func TestCrossTenantDenied(t *testing.T) {
 
 	rc, err := s.Read(ctx, Ref{TenantID: tenantB, ID: ref.ID})
 	if err == nil {
-		rc.Close()
+		_ = rc.Close()
 		t.Fatalf("tenant B must not read tenant A's artifact")
 	}
 	if !errors.Is(err, ErrNotFound) {
@@ -347,7 +347,7 @@ func TestDeleteTombstonesThenRemoves(t *testing.T) {
 	}
 	rc, err := s.Read(ctx, Ref{TenantID: tenantA, ID: ref.ID})
 	if err == nil {
-		rc.Close()
+		_ = rc.Close()
 		t.Fatalf("read of tombstoned artifact must fail")
 	}
 }
@@ -428,7 +428,7 @@ func TestConcurrentBeginsDistinctIDs(t *testing.T) {
 				errs <- err
 				return
 			}
-			if _, err := w.Write([]byte{byte(i)}); err != nil {
+			if _, err := w.Write([]byte{byte(i)}); err != nil { //nolint:gosec // i ranges from 0 to 7 in this test.
 				errs <- err
 				return
 			}
@@ -568,7 +568,7 @@ func TestReconcilePureFS(t *testing.T) {
 		}
 		rc, err := s.Read(ctx, Ref{TenantID: tenantA, ID: ref.ID})
 		if err == nil {
-			rc.Close()
+			_ = rc.Close()
 			t.Fatal("read of missing final must deny")
 		}
 		// Idempotent: second run is a clean no-op.

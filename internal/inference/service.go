@@ -656,8 +656,8 @@ func (s *Service) validateManageTarget(req ManageRequest) error {
 		return fmt.Errorf("%w: responses query", ErrDenied)
 	}
 	for _, r := range req.Query {
-		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') &&
-			!(r >= '0' && r <= '9') && r != '=' && r != '&' &&
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') &&
+			(r < '0' || r > '9') && r != '=' && r != '&' &&
 			r != '_' && r != '-' && r != '.' && r != '%' {
 			return fmt.Errorf("%w: responses query", ErrDenied)
 		}
@@ -675,14 +675,6 @@ func (s *Service) failAttempt(ctx context.Context, p auth.Principal, res billing
 		// row is the evidence either way.
 		_ = cause
 	}
-}
-
-// releaseUndispatched frees a hold only while it is provably never
-// dispatched. Failures here leave the hold — also safe.
-func (s *Service) releaseUndispatched(ctx context.Context, p auth.Principal, reservationID string) {
-	_ = accounting(ctx, accountingTimeout, func(c context.Context) error {
-		return s.billing.ReleaseUndispatched(c, p, reservationID)
-	})
 }
 
 // reserve takes the atomic priced hold: endpoint-priced first, falling back
@@ -824,7 +816,7 @@ func (s *Service) transportFor(ctx context.Context, e Endpoint) (Upstream, error
 			return nil, err
 		}
 		if file != "" {
-			config, err := os.ReadFile(file)
+			config, err := os.ReadFile(file) //nolint:gosec // path resolved from operator config via ConfidentialSDKConfigFile
 			if err != nil {
 				return nil, fmt.Errorf("read confidential SDK config: %w", err)
 			}

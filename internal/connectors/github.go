@@ -78,13 +78,13 @@ func (g *GitHubAdapter) request(ctx context.Context, endpoint string, out any) e
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			e = json.NewDecoder(resp.Body).Decode(out)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			return e
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		retryAfter := resp.Header.Get("Retry-After")
 		status := resp.StatusCode
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if attempt == 2 || (status != http.StatusTooManyRequests && status != http.StatusForbidden) || (!strings.Contains(strings.ToLower(string(body)), "secondary rate limit") && status == http.StatusForbidden) {
 			return fmt.Errorf("github API returned status %d", status)
 		}

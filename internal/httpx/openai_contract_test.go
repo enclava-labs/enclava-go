@@ -30,15 +30,14 @@ import (
 // deterministic in-process upstream transport — no provider is faked at the
 // HTTP layer; every request flows through route → auth → policy → executor.
 type openaiFx struct {
-	t       *testing.T
-	db      *postgres.DB
-	tenant  string
-	app     *App
-	up      *contractUpstream
-	brepo   *postgres.BillingRepo
-	erepo   *postgres.EndpointsRepo
-	keyID   string
-	lastReq atomic.Value // last body the upstream observed
+	t      *testing.T
+	db     *postgres.DB
+	tenant string
+	app    *App
+	up     *contractUpstream
+	brepo  *postgres.BillingRepo
+	erepo  *postgres.EndpointsRepo
+	keyID  string
 }
 
 // contractUpstream is a deterministic in-process HTTP-shaped provider: it
@@ -50,7 +49,6 @@ type contractUpstream struct {
 	embeddingResp  []byte
 	err            error
 	streamErr      error
-	dispatchErr    error
 	streamClosed   *atomic.Bool
 	lastChatBody   []byte
 	lastEmbedBody  []byte
@@ -498,16 +496,16 @@ func TestOfficialSDKInProcessContract(t *testing.T) {
 			_ = json.Unmarshal(body, &meta)
 			if meta.Stream {
 				w.Header().Set("Content-Type", "text/event-stream")
-				io.WriteString(w, "data: {\"id\":\"chatcmpl_sdk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n\n")
-				io.WriteString(w, "data: {\"id\":\"chatcmpl_sdk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n\n")
-				io.WriteString(w, "data: [DONE]\n\n")
+				_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl_sdk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n\n")
+				_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl_sdk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n\n")
+				_, _ = io.WriteString(w, "data: [DONE]\n\n")
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			io.WriteString(w, `{"id":"chatcmpl_sdk","object":"chat.completion","model":"up-chat","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}`)
+			_, _ = io.WriteString(w, `{"id":"chatcmpl_sdk","object":"chat.completion","model":"up-chat","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}`)
 		case r.URL.Path == "/embeddings" && r.Method == http.MethodPost:
 			w.Header().Set("Content-Type", "application/json")
-			io.WriteString(w, `{"object":"list","data":[{"object":"embedding","embedding":[0.5,0.6],"index":0},{"object":"embedding","embedding":[0.7,0.8],"index":1}],"model":"up-embed","usage":{"prompt_tokens":6,"total_tokens":6}}`)
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"object":"embedding","embedding":[0.5,0.6],"index":0},{"object":"embedding","embedding":[0.7,0.8],"index":1}],"model":"up-embed","usage":{"prompt_tokens":6,"total_tokens":6}}`)
 		default:
 			http.NotFound(w, r)
 		}

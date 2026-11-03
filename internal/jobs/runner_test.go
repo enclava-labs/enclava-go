@@ -74,7 +74,7 @@ func TestRunnerExecutesAndCompletes(t *testing.T) {
 			if err != nil {
 				return "", err
 			}
-			defer rc.Close()
+			defer func() { _ = rc.Close() }()
 			b, _ := io.ReadAll(rc)
 			gotInput = string(b)
 			if err := lease.MarkDispatched(ctx); err != nil {
@@ -90,7 +90,9 @@ func TestRunnerExecutesAndCompletes(t *testing.T) {
 
 	waitStatus(t, svc, p, job.ID, jobs.StatusSucceeded, 3*time.Second)
 	stop()
-	<-done
+	if err := <-done; err != nil {
+		t.Fatalf("runner: %v", err)
+	}
 
 	if gotInput != "payload" {
 		t.Fatalf("handler input = %q, want payload", gotInput)
@@ -128,7 +130,9 @@ func TestRunnerDeletesResultAfterStaleCompletion(t *testing.T) {
 		t.Fatal("stale completion result was not cleaned up")
 	}
 	stop()
-	<-done
+	if err := <-done; err != nil {
+		t.Fatalf("runner: %v", err)
+	}
 }
 
 func TestRunnerRequeuesRetryableThenSucceeds(t *testing.T) {
@@ -430,7 +434,10 @@ func TestRunnerShutdownReleasesUndispatchedLease(t *testing.T) {
 	<-started
 	stop()
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runner: %v", err)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("runner did not drain")
 	}

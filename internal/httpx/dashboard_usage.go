@@ -457,11 +457,6 @@ func (a *App) usageSubjectLabels(ctx context.Context, tenantID string) map[strin
 
 // --- budgets ----------------------------------------------------------------
 
-type usageLiabilityRow struct {
-	Currency               string
-	Held, Unknown, Settled string
-}
-
 type usageBudgetRow struct {
 	ID, Name         string
 	SubjectType      string

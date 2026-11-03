@@ -33,10 +33,6 @@ import (
 
 // ── rendered-DOM audit core ───────────────────────────────────────────────
 
-type a11yNode struct {
-	*html.Node
-}
-
 func attr(n *html.Node, key string) (string, bool) {
 	for _, a := range n.Attr {
 		if a.Key == key {
@@ -349,15 +345,6 @@ func cellColumn(n *html.Node) int {
 func firstAttr(n *html.Node, key string) string {
 	v, _ := attr(n, key)
 	return v
-}
-
-func firstClass(n *html.Node) string {
-	c, _ := attr(n, "class")
-	f := strings.Fields(c)
-	if len(f) == 0 {
-		return ""
-	}
-	return f[0]
 }
 
 func truncate(s string, max int) string {

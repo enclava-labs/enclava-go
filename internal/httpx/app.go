@@ -584,41 +584,6 @@ func modelIDFromPath(path string) string {
 	return strings.TrimPrefix(path, "/v1/models/")
 }
 
-func (a *App) handleAttestationStatus(w http.ResponseWriter, r *http.Request, _ auth.Principal) {
-	if r.Method != http.MethodGet {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	attested, ok := a.provider.(llm.AttestationProvider)
-	if !ok {
-		WriteJSON(w, http.StatusOK, map[string]any{
-			"enabled":  false,
-			"provider": "non-attested",
-		})
-		return
-	}
-	WriteJSON(w, http.StatusOK, attested.AttestationStatus())
-}
-
-func (a *App) handleAttestationVerify(w http.ResponseWriter, r *http.Request, _ auth.Principal) {
-	if r.Method != http.MethodPost {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	attested, ok := a.provider.(llm.AttestationProvider)
-	if !ok {
-		WriteOpenAIError(w, http.StatusBadRequest, "configured provider does not support attestation verification", "invalid_request_error", "attestation_unsupported")
-		return
-	}
-	status, err := attested.VerifyAttestation(r.Context())
-	if err != nil {
-		log.Printf("attestation verification failed: %v", err)
-		WriteOpenAIError(w, http.StatusBadGateway, "attestation verification failed", "server_error", "attestation_verify_failed")
-		return
-	}
-	WriteJSON(w, http.StatusOK, status)
-}
-
 var upstreamIDPattern = regexp.MustCompile(`(?i)\b(?:resp|msg|item|chatcmpl|cmpl|call)[_-][A-Za-z0-9_-]{4,}`)
 
 // WriteProviderError surfaces the upstream failure envelope without leaking

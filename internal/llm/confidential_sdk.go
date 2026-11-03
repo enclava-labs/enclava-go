@@ -73,7 +73,7 @@ func sdkClientConfig(path, provider, key string) ([]byte, error) {
 	}
 	cfg := map[string]any{}
 	if file != "" {
-		b, err := os.ReadFile(file)
+		b, err := os.ReadFile(file) //nolint:gosec // path resolved from operator config via ConfidentialSDKConfigFile
 		if err != nil {
 			return nil, fmt.Errorf("read confidential SDK config: %w", err)
 		}

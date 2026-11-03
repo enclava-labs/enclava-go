@@ -204,7 +204,7 @@ func (r *IdentityRepo) RolesForUser(ctx context.Context, tenantID, userID string
 	if err != nil {
 		return nil, fmt.Errorf("roles for user: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []auth.Role
 	for rows.Next() {
@@ -234,7 +234,7 @@ func (r *IdentityRepo) ListRoles(ctx context.Context, tenantID string) ([]auth.R
 	if err != nil {
 		return nil, fmt.Errorf("list roles: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []auth.Role
 	for rows.Next() {
 		var role auth.Role
@@ -279,7 +279,7 @@ func (r *IdentityRepo) RoleUsers(ctx context.Context, tenantID, roleID string) (
 	if err != nil {
 		return nil, fmt.Errorf("role users: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var id string
@@ -867,7 +867,7 @@ func (r *IdentityRepo) ListUsers(ctx context.Context, tenantID string) ([]auth.U
 	if err != nil {
 		return nil, fmt.Errorf("list users: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []auth.User
 	for rows.Next() {
 		u, err := scanUser(rows)
@@ -940,7 +940,7 @@ func (r *IdentityRepo) ListServiceAccounts(ctx context.Context, tenantID string)
 	if err != nil {
 		return nil, fmt.Errorf("list service accounts: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []auth.ServiceAccount
 	for rows.Next() {
 		var sa auth.ServiceAccount
@@ -956,6 +956,7 @@ func (r *IdentityRepo) ListServiceAccounts(ctx context.Context, tenantID string)
 
 // --- API keys --------------------------------------------------------------
 
+//nolint:gosec // column list constant, not credentials
 const apiKeyColumns = `id, tenant_id::text, owner_user_id, service_account_id,
 	name, key_prefix, key_hash, key_hash_algo, scopes, allowed_models,
 	allowed_extract_templates, allowed_chatbots, allowed_agents,
@@ -1052,7 +1053,7 @@ func (r *IdentityRepo) ListAPIKeys(ctx context.Context, tenantID string) ([]auth
 	if err != nil {
 		return nil, fmt.Errorf("list api keys: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []auth.APIKeyRecord
 	for rows.Next() {
@@ -1152,7 +1153,7 @@ func (r *IdentityRepo) FindKeyCandidates(ctx context.Context, prefix string) ([]
 	if err != nil {
 		return nil, fmt.Errorf("find key candidates: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []auth.APIKeyRecord
 	for rows.Next() {
@@ -1279,7 +1280,7 @@ func (r *IdentityRepo) ListSessionsForUser(ctx context.Context, tenantID, userID
 	if err != nil {
 		return nil, fmt.Errorf("list sessions for user: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []auth.Session
 	for rows.Next() {
 		s, err := scanSession(rows)
@@ -1338,7 +1339,7 @@ func (r *IdentityRepo) ListAuthIdentitiesForUser(ctx context.Context, tenantID, 
 	if err != nil {
 		return nil, fmt.Errorf("list auth identities: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []auth.AuthIdentity
 	for rows.Next() {
 		var a auth.AuthIdentity
@@ -1367,7 +1368,7 @@ func (r *IdentityRepo) AdminHolderCounts(ctx context.Context, tenantID, scope st
 	if err != nil {
 		return nil, nil, fmt.Errorf("count admin users: %w", err)
 	}
-	defer userRows.Close()
+	defer func() { _ = userRows.Close() }()
 	for userRows.Next() {
 		var id string
 		if err := userRows.Scan(&id); err != nil {
@@ -1392,7 +1393,7 @@ func (r *IdentityRepo) AdminHolderCounts(ctx context.Context, tenantID, scope st
 	if err != nil {
 		return nil, nil, fmt.Errorf("count admin keys: %w", err)
 	}
-	defer keyRows.Close()
+	defer func() { _ = keyRows.Close() }()
 	for keyRows.Next() {
 		var id string
 		if err := keyRows.Scan(&id); err != nil {
@@ -1511,7 +1512,7 @@ func (r *IdentityRepo) ListOIDCProviders(ctx context.Context, tenantID string) (
 	if err != nil {
 		return nil, fmt.Errorf("list oidc providers: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []auth.OIDCProvider
 	for rows.Next() {

@@ -26,14 +26,14 @@ func TestSlackThreadsAndCursors(t *testing.T) {
 		case "/conversations.history":
 			history++
 			if r.URL.Query().Get("cursor") == "next" {
-				fmt.Fprint(w, `{"ok":true,"messages":[{"user":"U2","text":"later","ts":"2.000002"}],"has_more":false}`)
+				_, _ = fmt.Fprint(w, `{"ok":true,"messages":[{"user":"U2","text":"later","ts":"2.000002"}],"has_more":false}`)
 			} else {
 				_, _ = fmt.Fprint(w, `{"ok":true,"messages":[{"user":"U1","text":"root","ts":"1.000001","thread_ts":"1.000001","reply_count":1,"files":[{"id":"F1"}]}],"has_more":true,"response_metadata":{"next_cursor":"next"}}`)
 			}
 		case "/conversations.replies":
 			_, _ = fmt.Fprint(w, `{"ok":true,"messages":[{"user":"U1","text":"root","ts":"1.000001"},{"user":"U2","text":"reply","ts":"1.000002"}],"has_more":false}`)
 		case "/chat.getPermalink":
-			fmt.Fprintf(w, `{"ok":true,"permalink":"https://workspace.slack.com/archives/%s/p%s"}`, r.URL.Query().Get("channel"), "1000001")
+			_, _ = fmt.Fprintf(w, `{"ok":true,"permalink":"https://workspace.slack.com/archives/%s/p%s"}`, r.URL.Query().Get("channel"), "1000001") //nolint:gosec // test fixture writes hermetic query params to httptest response
 		case "/files.info":
 			_, _ = fmt.Fprint(w, `{"ok":true,"file":{"id":"F1","name":"report.pdf","title":"Report","mimetype":"application/pdf"}}`)
 		default:
@@ -102,7 +102,7 @@ func TestSlackChannelTitleUnavailable(t *testing.T) {
 func TestSlackMembershipDeniedIsIncomplete(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
-		fmt.Fprint(w, `{"ok":false,"error":"not_in_channel"}`)
+		_, _ = fmt.Fprint(w, `{"ok":false,"error":"not_in_channel"}`)
 	}))
 	defer server.Close()
 	t.Setenv("CONNECTOR_SLACK_TEST", "test-token")
@@ -133,11 +133,11 @@ func TestSlackFileAccessUsesFilesShares(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/conversations.members":
-			fmt.Fprint(w, `{"ok":true,"members":["U1"]}`)
+			_, _ = fmt.Fprint(w, `{"ok":true,"members":["U1"]}`)
 		case "/conversations.history":
-			fmt.Fprint(w, `{"ok":true,"messages":[{"user":"U1","text":"attached","ts":"1.000001","files":[{"id":"F1"}]}],"has_more":false}`)
+			_, _ = fmt.Fprint(w, `{"ok":true,"messages":[{"user":"U1","text":"attached","ts":"1.000001","files":[{"id":"F1"}]}],"has_more":false}`)
 		case "/files.info":
-			fmt.Fprint(w, `{"ok":true,"file":{"id":"F1","shares":{"public":{"C2":[{"channel_id":"C2"}]}}}}`)
+			_, _ = fmt.Fprint(w, `{"ok":true,"file":{"id":"F1","shares":{"public":{"C2":[{"channel_id":"C2"}]}}}}`)
 		default:
 			t.Errorf("unexpected endpoint %s", r.URL.Path)
 			http.NotFound(w, r)

@@ -145,7 +145,8 @@ func newFixture(t *testing.T) fixture {
 // aliases bound as "model:" capabilities.
 func (f fixture) seedEndpoint(t *testing.T, aliases ...string) {
 	t.Helper()
-	caps := []string{inference.CapabilityChat, inference.CapabilityVision}
+	caps := make([]string, 0, 2+len(aliases))
+	caps = append(caps, inference.CapabilityChat, inference.CapabilityVision)
 	for _, a := range aliases {
 		caps = append(caps, inference.ModelCapabilityPrefix+a)
 	}

@@ -144,7 +144,7 @@ func (f *accessFixture) seedPickerRows(t *testing.T) (endpointID, botID, templat
 	t.Helper()
 	ctx := context.Background()
 	endpointID, botID, templateID = "ep_alpha", "bot_alpha", "tpl_invoice"
-	if err := postgres.NewEndpointsRepo(f.db).Create(ctx, inference.Endpoint{
+	if err := postgres.NewEndpointsRepo(f.db).Create(ctx, inference.Endpoint{ //nolint:gosec // Synthetic endpoint and credential reference for a picker test.
 		ID: endpointID, TenantID: f.tenant, Protocol: "openai", SDKProvider: "openai",
 		Capabilities: []string{"chat:" + endpointID + ":m1"}, Enabled: true,
 		BaseOrigin: "https://secret-origin.example", CredentialRef: "cred_secret_ref",

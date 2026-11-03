@@ -308,7 +308,7 @@ func (s *Service) enqueueContent(ctx context.Context, principal auth.Principal, 
 			IdempotencyKey: OperationIngest + ":connector-v3:" + hex.EncodeToString(key[:]),
 			Subject:        jobs.Subject{ConnectionID: conn.ID, ObjectID: observation.ObjectRef.ObjectID, ObservedRevision: observation.ObjectRef.ObservedSeq},
 			InputRef:       observation.ArtifactRef.ID, InputHash: observation.ArtifactRef.SHA256,
-			Policy: map[string]any{"collection_id": conn.TargetCollectionID, "source_ref": observation.ObjectRef, "artifact_ref": observation.ArtifactRef, "source_kind": conn.Kind, "observation_payload": json.RawMessage(observation.Payload)},
+			Policy: map[string]any{"collection_id": conn.TargetCollectionID, "source_ref": observation.ObjectRef, "artifact_ref": observation.ArtifactRef, "source_kind": conn.Kind, "observation_payload": observation.Payload},
 		})
 		if err != nil {
 			return fmt.Errorf("enqueue rag.ingest: %w", err)
@@ -368,7 +368,7 @@ func (s *Service) runGrantStream(ctx context.Context, claim *jobs.Claim, princip
 				return e
 			}
 			native := base64.RawURLEncoding.EncodeToString(payload)
-			observations = append(observations, Observation{TenantID: conn.TenantID, ConnectionID: conn.ID, Stream: string(state.Stream), NativeID: native, Payload: payload})
+			observations = append(observations, Observation{TenantID: conn.TenantID, ConnectionID: conn.ID, Stream: state.Stream, NativeID: native, Payload: payload})
 		}
 		state, err = s.observations.PersistPage(ctx, state, observations, string(cursor), false, true, "")
 		if err != nil {

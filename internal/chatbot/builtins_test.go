@@ -89,15 +89,6 @@ func TestEvidenceReadAndExtractionToolsReturnRealReferences(t *testing.T) {
 	}
 }
 
-func containsString(values []string, match string) bool {
-	for _, value := range values {
-		if value == match {
-			return true
-		}
-	}
-	return false
-}
-
 func TestRunToolFailuresAreReturnedToModel(t *testing.T) {
 	for _, tc := range []struct {
 		name string

@@ -137,7 +137,7 @@ func waitStreamFinalized(t *testing.T, s *accountingStream) {
 		time.Sleep(time.Millisecond)
 	}
 	s.readMu.Lock()
-	s.readMu.Unlock()
+	s.readMu.Unlock() //nolint:staticcheck // empty critical section: lock acquisition is the finalize-completion signal
 }
 
 func TestAccountingStreamEarlyCloseRetainsLiability(t *testing.T) {

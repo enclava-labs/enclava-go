@@ -31,7 +31,7 @@ func TestMigration023AdminBackfill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open admin connection: %v", err)
 	}
-	defer adminDB.Close()
+	defer func() { _ = adminDB.Close() }()
 	var buf [8]byte
 	if _, err := rand.Read(buf[:]); err != nil {
 		t.Fatalf("generate schema name: %v", err)
@@ -48,7 +48,7 @@ func TestMigration023AdminBackfill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open scoped connection: %v", err)
 	}
-	defer scoped.Close()
+	defer func() { _ = scoped.Close() }()
 	db := &DB{SQL: scoped}
 
 	// Apply the pre-023 world: every embedded migration except 023, via the

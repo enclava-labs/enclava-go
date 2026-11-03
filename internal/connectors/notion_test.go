@@ -45,19 +45,19 @@ func TestNotionRecursivePaginationAndStructuredTables(t *testing.T) {
 	})
 	mux.HandleFunc("/v1/blocks/root/children", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("start_cursor") == "next" {
-			json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{"id": "table-row", "type": "table_row", "last_edited_time": "r1", "table_row": map[string]any{"cells": []any{[]any{map[string]any{"plain_text": "A"}}}}}}, "has_more": false})
+			_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{"id": "table-row", "type": "table_row", "last_edited_time": "r1", "table_row": map[string]any{"cells": []any{[]any{map[string]any{"plain_text": "A"}}}}}}, "has_more": false})
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{"results": []any{
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{
 			map[string]any{"id": "child", "type": "child_page", "has_children": true, "last_edited_time": "r0", "child_page": map[string]any{"title": "Nested"}},
 			map[string]any{"id": "table", "type": "table", "has_children": true, "last_edited_time": "r0"},
 		}, "has_more": true, "next_cursor": "next"})
 	})
 	mux.HandleFunc("/v1/blocks/table/children", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{"id": "table-row", "type": "table_row", "last_edited_time": "r1", "table_row": map[string]any{"cells": []any{[]any{map[string]any{"plain_text": "A"}}}}}}, "has_more": false})
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{"id": "table-row", "type": "table_row", "last_edited_time": "r1", "table_row": map[string]any{"cells": []any{[]any{map[string]any{"plain_text": "A"}}}}}}, "has_more": false})
 	})
 	mux.HandleFunc("/v1/blocks/child/children", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{"id": "nested-block", "type": "paragraph", "last_edited_time": "r2", "paragraph": map[string]any{"rich_text": []any{map[string]any{"plain_text": "nested"}}}}}, "has_more": false})
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{"id": "nested-block", "type": "paragraph", "last_edited_time": "r2", "paragraph": map[string]any{"rich_text": []any{map[string]any{"plain_text": "nested"}}}}}, "has_more": false})
 	})
 	adapter, conn := notionFixtureAdapter(t, mux)
 	page, err := adapter.Content(context.Background(), conn, "", 100)
@@ -101,10 +101,10 @@ func TestNotionRecursivePaginationAndStructuredTables(t *testing.T) {
 func TestNotionOnlyTraversesSelectedRootsAndRequiresAudience(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/pages/root", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"id": "root", "url": "https://www.notion.so/root"})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "root", "url": "https://www.notion.so/root"})
 	})
 	mux.HandleFunc("/v1/blocks/root/children", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{"id": "linked", "type": "link_to_page", "link_to_page": map[string]any{"page_id": "not-selected"}}}, "has_more": false})
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{"id": "linked", "type": "link_to_page", "link_to_page": map[string]any{"page_id": "not-selected"}}}, "has_more": false})
 	})
 	adapter, conn := notionFixtureAdapter(t, mux)
 	page, err := adapter.Content(context.Background(), conn, "", 100)
@@ -130,7 +130,7 @@ func TestNotionAccessRevokesLostPublisherAndUsesPublishedAudienceGroups(t *testi
 			http.Error(w, "gone", http.StatusNotFound)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{"id": "root", "url": "https://www.notion.so/root"})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "root", "url": "https://www.notion.so/root"})
 	})
 	adapter, conn := notionFixtureAdapter(t, mux)
 	page, err := adapter.Access(context.Background(), conn, "", 100)
@@ -163,10 +163,10 @@ func TestNotionRejectsRedirects(t *testing.T) {
 func TestNotionAccessGrantsSelectedSubtree(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/pages/root", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"id": "root", "url": "https://www.notion.so/root"})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "root", "url": "https://www.notion.so/root"})
 	})
 	mux.HandleFunc("/v1/blocks/root/children", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{"id": "para", "type": "paragraph", "last_edited_time": "r1"}}, "has_more": false})
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{"id": "para", "type": "paragraph", "last_edited_time": "r1"}}, "has_more": false})
 	})
 	adapter, conn := notionFixtureAdapter(t, mux)
 	page, err := adapter.Access(context.Background(), conn, "", 100)

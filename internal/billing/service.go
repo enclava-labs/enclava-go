@@ -571,8 +571,8 @@ func rateGreater(a, b SnapshotRate) bool {
 	if a.UnitQuantity <= 0 || b.UnitQuantity <= 0 {
 		return false
 	}
-	ahi, alo := bits.Mul64(uint64(a.RateMicros), uint64(b.UnitQuantity))
-	bhi, blo := bits.Mul64(uint64(b.RateMicros), uint64(a.UnitQuantity))
+	ahi, alo := bits.Mul64(uint64(a.RateMicros), uint64(b.UnitQuantity)) //nolint:gosec // operands non-negative; uint64 needed for 128-bit product
+	bhi, blo := bits.Mul64(uint64(b.RateMicros), uint64(a.UnitQuantity)) //nolint:gosec // operands non-negative; uint64 needed for 128-bit product
 	return ahi > bhi || (ahi == bhi && alo > blo)
 }
 
@@ -734,11 +734,11 @@ func admit(b Budget, rows []LiabilityRow, bound int64, units map[UnitKind]int64,
 }
 
 func checkedAdd(a, b int64) (int64, bool) {
-	sum, carry := bits.Add64(uint64(a), uint64(b), 0)
+	sum, carry := bits.Add64(uint64(a), uint64(b), 0) //nolint:gosec // deliberate bit reinterpretation; sign checked below
 	// Overflow when the signed result wrapped: operands share sign, result differs.
-	overflow := (a >= 0 && b >= 0 && int64(sum) < 0) || (a < 0 && b < 0 && int64(sum) >= 0)
+	overflow := (a >= 0 && b >= 0 && int64(sum) < 0) || (a < 0 && b < 0 && int64(sum) >= 0) //nolint:gosec // deliberate bit reinterpretation for wrap detection
 	_ = carry
-	return int64(sum), overflow
+	return int64(sum), overflow //nolint:gosec // deliberate bit reinterpretation for wrap detection
 }
 
 // big128 accumulates exact numerators of charge terms (rate_micros×units each
@@ -757,9 +757,9 @@ func (t *big128) addRatMul(a, b, q int64, rule string) {
 		return
 	}
 	// Exact numerator a*b as 128-bit.
-	hi, lo := bits.Mul64(uint64(a), uint64(b))
+	hi, lo := bits.Mul64(uint64(a), uint64(b)) //nolint:gosec // operands non-negative; uint64 needed for 128-bit product
 	// Divide 128-bit numerator by q (q>0), keeping the remainder for rounding.
-	quo, rem := div128(hi, lo, uint64(q))
+	quo, rem := div128(hi, lo, uint64(q)) //nolint:gosec // q > 0 guaranteed by callers; uint64 for 128-bit division
 	if rule == RoundingCeil && rem > 0 {
 		var carry uint64
 		lo2, carry := bits.Add64(quo.lo, 1, 0)

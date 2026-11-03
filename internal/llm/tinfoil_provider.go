@@ -350,7 +350,7 @@ func (p *TinfoilProvider) doJSON(ctx context.Context, method, path string, body 
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := jsonClient.Do(req)
+	resp, err := jsonClient.Do(req) //nolint:bodyclose // readBoundedBody closes resp.Body
 	if err != nil {
 		return nil, fmt.Errorf("upstream request failed: %w", err)
 	}

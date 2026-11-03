@@ -59,7 +59,7 @@ func scanJSONList(raw []byte) []string {
 // Connections
 
 func (r *SourceRepo) CreateConnection(ctx context.Context, c source.Connection) error {
-	config, err := json.Marshal(map[string]any(c.Config))
+	config, err := json.Marshal(c.Config)
 	if err != nil {
 		return fmt.Errorf("marshal connection config: %w", err)
 	}
@@ -590,7 +590,7 @@ func (r *SourceRepo) SourceIdentitiesForConnection(ctx context.Context, tenantID
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := []source.SourceIdentity{}
 	for rows.Next() {
 		var row source.SourceIdentity

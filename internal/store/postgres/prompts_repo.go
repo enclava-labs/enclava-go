@@ -48,7 +48,7 @@ func scanPromptTemplate(s promptScanner) (prompts.Template, error) {
 }
 
 func (r *PromptsRepo) Create(ctx context.Context, t prompts.Template) error {
-	schema, err := json.Marshal(map[string]any(t.VariablesSchema))
+	schema, err := json.Marshal(t.VariablesSchema)
 	if err != nil {
 		return fmt.Errorf("marshal prompt variables_schema: %w", err)
 	}
@@ -134,7 +134,7 @@ func (r *PromptsRepo) GetDefault(ctx context.Context, tenantID string) (prompts.
 }
 
 func (r *PromptsRepo) Update(ctx context.Context, t prompts.Template) error {
-	schema, err := json.Marshal(map[string]any(t.VariablesSchema))
+	schema, err := json.Marshal(t.VariablesSchema)
 	if err != nil {
 		return fmt.Errorf("marshal prompt variables_schema: %w", err)
 	}

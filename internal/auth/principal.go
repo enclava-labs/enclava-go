@@ -114,23 +114,6 @@ func DecodeAllowlist(raw json.RawMessage) (items map[string]struct{}, all bool) 
 	return items, false
 }
 
-// allowlistSet maps a legacy stored string list into the canonical all/list
-// shape, preserving the old storage contract (no column → unrestricted;
-// a "*" item → unrestricted) until 01-08 switches storage to mode rows.
-func allowlistSet(values []string) (map[string]struct{}, bool) {
-	if len(values) == 0 {
-		return map[string]struct{}{}, true
-	}
-	set := make(map[string]struct{}, len(values))
-	for _, v := range values {
-		set[v] = struct{}{}
-	}
-	if _, ok := set["*"]; ok {
-		return map[string]struct{}{}, true
-	}
-	return set, false
-}
-
 func allowlistAllowed(all bool, items map[string]struct{}, ids ...string) bool {
 	if all {
 		return true

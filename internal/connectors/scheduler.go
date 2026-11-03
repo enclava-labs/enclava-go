@@ -26,10 +26,10 @@ func parseSyncInterval(config map[string]any) (time.Duration, bool) {
 		return DefaultSyncInterval, true
 	case string:
 		s := strings.TrimSpace(strings.ToLower(concrete))
-		switch {
-		case s == "":
+		switch s {
+		case "":
 			return DefaultSyncInterval, true
-		case s == "0" || s == "off" || s == "disabled":
+		case "0", "off", "disabled":
 			return 0, false
 		}
 		if secs, err := strconv.ParseFloat(s, 64); err == nil {

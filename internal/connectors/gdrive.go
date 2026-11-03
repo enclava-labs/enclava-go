@@ -76,6 +76,7 @@ func (s *Service) fetchGoogleDriveDocuments(ctx context.Context, source Source) 
 				if err != nil {
 					return nil, fmt.Errorf("google_drive export request failed: %w", err)
 				}
+				defer func() { _ = resp.Body.Close() }()
 				body, readErr := readConnectorBody(resp)
 				if readErr != nil {
 					return nil, readErr
@@ -99,7 +100,7 @@ func (s *Service) fetchGoogleDriveDocuments(ctx context.Context, source Source) 
 }
 
 func readConnectorBody(resp *http.Response) ([]byte, error) {
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
 	if err != nil {
 		return nil, fmt.Errorf("read connector response: %w", err)
@@ -266,6 +267,7 @@ func (a DriveAdapter) driveFiles(ctx context.Context, c source.Connection, state
 	if err != nil {
 		return ContentPage{Completeness: CompletenessIncomplete}, err
 	}
+	defer func() { _ = resp.Body.Close() }()
 	body, err := readDriveBody(resp)
 	if err != nil {
 		return ContentPage{Completeness: CompletenessIncomplete}, err
@@ -385,6 +387,7 @@ func (a DriveAdapter) driveStartToken(ctx context.Context, c source.Connection) 
 	if err != nil {
 		return "", err
 	}
+	defer func() { _ = resp.Body.Close() }()
 	b, err := readDriveBody(resp)
 	if err != nil {
 		return "", err
@@ -524,7 +527,7 @@ func (a DriveAdapter) get(ctx context.Context, c source.Connection, endpoint str
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("google_drive upstream returned status %d", resp.StatusCode)
 	}
@@ -539,7 +542,7 @@ func (a DriveAdapter) get(ctx context.Context, c source.Connection, endpoint str
 }
 
 func readDriveBody(resp *http.Response) ([]byte, error) {
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("google_drive upstream returned status %d", resp.StatusCode)
 	}
@@ -559,6 +562,7 @@ func (a DriveAdapter) sheet(ctx context.Context, c source.Connection, id, name s
 	if err != nil {
 		return nil, "", err
 	}
+	defer func() { _ = resp.Body.Close() }()
 	meta, err := readDriveBody(resp)
 	if err != nil {
 		return nil, "", err
@@ -598,6 +602,7 @@ func (a DriveAdapter) sheet(ctx context.Context, c source.Connection, id, name s
 		if err != nil {
 			return nil, "", err
 		}
+		defer func() { _ = resp.Body.Close() }()
 		b, err := readDriveBody(resp)
 		if err != nil {
 			return nil, "", err
@@ -649,6 +654,7 @@ func (a DriveAdapter) Access(ctx context.Context, c source.Connection, cursor Cu
 	if err != nil {
 		return AccessPage{Completeness: CompletenessIncomplete}, err
 	}
+	defer func() { _ = resp.Body.Close() }()
 	b, err := readDriveBody(resp)
 	if err != nil {
 		return AccessPage{Completeness: CompletenessIncomplete}, err

@@ -14,7 +14,7 @@ import (
 func mark(text, query string) template.HTML {
 	q := strings.ToLower(query)
 	if q == "" {
-		return template.HTML(template.HTMLEscapeString(text))
+		return template.HTML(template.HTMLEscapeString(text)) //nolint:gosec // All text is HTML-escaped.
 	}
 	var b strings.Builder
 	lower := strings.ToLower(text)
@@ -30,5 +30,5 @@ func mark(text, query string) template.HTML {
 		b.WriteString("</mark>")
 		text, lower = text[i+len(q):], lower[i+len(q):]
 	}
-	return template.HTML(b.String())
+	return template.HTML(b.String()) //nolint:gosec // Text segments are escaped and mark tags are constant.
 }

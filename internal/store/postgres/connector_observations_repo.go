@@ -100,7 +100,7 @@ func (r *ConnectorObservationsRepo) PersistPage(ctx context.Context, state Conne
 
 func (r *ConnectorObservationsRepo) GetStream(ctx context.Context, tenantID, connectionID, stream string) (ConnectorStream, error) {
 	var out ConnectorStream
-	err := r.db.SQL.QueryRowContext(ctx, `SELECT tenant_id::text,connection_id::text,stream,run_id::text,fence,cursor,observed_seq,run_start_seq,complete,incomplete,last_error FROM connector_streams WHERE tenant_id=$1 AND connection_id=$2 AND stream=$3`, tenantID, connectionID, string(stream)).Scan(&out.TenantID, &out.ConnectionID, &out.Stream, &out.RunID, &out.Fence, &out.Cursor, &out.ObservedSeq, &out.RunStartSeq, &out.Complete, &out.Incomplete, &out.LastError)
+	err := r.db.SQL.QueryRowContext(ctx, `SELECT tenant_id::text,connection_id::text,stream,run_id::text,fence,cursor,observed_seq,run_start_seq,complete,incomplete,last_error FROM connector_streams WHERE tenant_id=$1 AND connection_id=$2 AND stream=$3`, tenantID, connectionID, stream).Scan(&out.TenantID, &out.ConnectionID, &out.Stream, &out.RunID, &out.Fence, &out.Cursor, &out.ObservedSeq, &out.RunStartSeq, &out.Complete, &out.Incomplete, &out.LastError)
 	if err != nil {
 		return ConnectorStream{}, err
 	}
@@ -129,7 +129,7 @@ func (r *ConnectorObservationsRepo) ListObservations(ctx context.Context, state 
 	if err != nil {
 		return nil, fmt.Errorf("list connector observations: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []ConnectorObservation
 	for rows.Next() {
 		var item ConnectorObservation

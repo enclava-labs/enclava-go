@@ -37,7 +37,7 @@ type Chunk struct {
 }
 
 // ChunkProfile is one immutable, versioned processing profile. Sizes and
-// overlap are measured in Unicode code points and labelled as such — never
+// overlap are measured in Unicode code points and labeled as such — never
 // presented as token counts. Changing a profile creates a new version row;
 // published evidence is never silently mutated.
 type ChunkProfile struct {

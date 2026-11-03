@@ -14,6 +14,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -575,7 +576,7 @@ func (a *App) assignRoleChecked(w http.ResponseWriter, r *http.Request, principa
 		return
 	}
 	if err := a.identity.AssignRole(r.Context(), principal.TenantID, userID, roleID); err != nil {
-		log.Printf("assign role %s to %s: %v", roleID, userID, err)
+		log.Printf("assign role %s to %s: %s", strconv.Quote(roleID), strconv.Quote(userID), strconv.Quote(err.Error()))
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "role_assign_failed")
 		return
 	}
@@ -655,7 +656,7 @@ func (a *App) revokeUserSession(w http.ResponseWriter, r *http.Request, principa
 		return
 	}
 	if err := a.authSvc.RevokeSession(r.Context(), principal.TenantID, sessionID, "administrator revocation"); err != nil {
-		log.Printf("revoke session %s: %v", sessionID, err)
+		log.Printf("revoke session %s: %s", strconv.Quote(sessionID), strconv.Quote(err.Error()))
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "session_revoke_failed")
 		return
 	}

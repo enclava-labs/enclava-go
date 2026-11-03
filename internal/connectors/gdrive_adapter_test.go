@@ -21,13 +21,13 @@ func TestGDriveAdapterPagesAndExportsGoogleDoc(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/drive/changes/startPageToken":
-			fmt.Fprint(w, `{"startPageToken":"start-1"}`)
+			_, _ = fmt.Fprint(w, `{"startPageToken":"start-1"}`)
 		case "/drive/files":
 			listPages++
 			if listPages == 1 {
-				fmt.Fprint(w, `{"nextPageToken":"next","files":[{"id":"doc","name":"Guide","mimeType":"application/vnd.google-apps.document","webViewLink":"https://drive.google.com/open?id=doc","headRevisionId":"rev1","parents":["root"]}]}`)
+				_, _ = fmt.Fprint(w, `{"nextPageToken":"next","files":[{"id":"doc","name":"Guide","mimeType":"application/vnd.google-apps.document","webViewLink":"https://drive.google.com/open?id=doc","headRevisionId":"rev1","parents":["root"]}]}`)
 			} else {
-				fmt.Fprint(w, `{"files":[{"id":"pdf","name":"manual.pdf","mimeType":"application/pdf","webViewLink":"https://drive.google.com/open?id=pdf","headRevisionId":"rev2"},{"id":"shortcut","name":"outside shortcut","mimeType":"application/vnd.google-apps.shortcut","shortcutDetails":{"targetId":"outside-scope"}}]}`)
+				_, _ = fmt.Fprint(w, `{"files":[{"id":"pdf","name":"manual.pdf","mimeType":"application/pdf","webViewLink":"https://drive.google.com/open?id=pdf","headRevisionId":"rev2"},{"id":"shortcut","name":"outside shortcut","mimeType":"application/vnd.google-apps.shortcut","shortcutDetails":{"targetId":"outside-scope"}}]}`)
 			}
 		case "/drive/files/doc/export":
 			exports++
@@ -73,21 +73,21 @@ func TestGDriveAdapterReadsEverySheetAndRestrictions(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/drive/changes/startPageToken":
-			fmt.Fprint(w, `{"startPageToken":"sheet-start"}`)
+			_, _ = fmt.Fprint(w, `{"startPageToken":"sheet-start"}`)
 		case r.URL.Path == "/drive/files":
 			if strings.Contains(r.URL.Query().Get("fields"), "permissions(") {
-				fmt.Fprint(w, `{"files":[{"id":"book","driveId":"shared-drive-1","inheritedPermissionsDisabled":false,"copyRequiresWriterPermission":true,"downloadRestrictions":{"itemDownloadRestriction":{"restrictedForReaders":true,"restrictedForWriters":false}},"permissions":[{"id":"user:1","type":"user","emailAddress":"a@example.test","role":"reader","permissionDetails":[{"inherited":true,"inheritedFrom":"shared-drive-1","role":"reader"}]}]}]}`)
+				_, _ = fmt.Fprint(w, `{"files":[{"id":"book","driveId":"shared-drive-1","inheritedPermissionsDisabled":false,"copyRequiresWriterPermission":true,"downloadRestrictions":{"itemDownloadRestriction":{"restrictedForReaders":true,"restrictedForWriters":false}},"permissions":[{"id":"user:1","type":"user","emailAddress":"a@example.test","role":"reader","permissionDetails":[{"inherited":true,"inheritedFrom":"shared-drive-1","role":"reader"}]}]}]}`)
 				return
 			}
-			fmt.Fprint(w, `{"files":[{"id":"book","name":"Book","mimeType":"application/vnd.google-apps.spreadsheet","webViewLink":"https://drive.google.com/open?id=book","headRevisionId":"rev"}]}`)
+			_, _ = fmt.Fprint(w, `{"files":[{"id":"book","name":"Book","mimeType":"application/vnd.google-apps.spreadsheet","webViewLink":"https://drive.google.com/open?id=book","headRevisionId":"rev"}]}`)
 		case r.URL.Path == "/sheets/spreadsheets/book":
-			fmt.Fprint(w, `{"sheets":[{"properties":{"sheetId":7,"title":"North","gridProperties":{"rowCount":2,"columnCount":2}}},{"properties":{"sheetId":8,"title":"South","gridProperties":{"rowCount":1,"columnCount":1}}}]}`)
+			_, _ = fmt.Fprint(w, `{"sheets":[{"properties":{"sheetId":7,"title":"North","gridProperties":{"rowCount":2,"columnCount":2}}},{"properties":{"sheetId":8,"title":"South","gridProperties":{"rowCount":1,"columnCount":1}}}]}`)
 		case strings.HasSuffix(r.URL.Path, "/'North'!A1:B2"):
 			ranges["North"] = true
-			fmt.Fprint(w, `{"values":[["N1","N2"],["N3","N4"]]}`)
+			_, _ = fmt.Fprint(w, `{"values":[["N1","N2"],["N3","N4"]]}`)
 		case strings.HasSuffix(r.URL.Path, "/'South'!A1:A1"):
 			ranges["South"] = true
-			fmt.Fprint(w, `{"values":[["S1"]]}`)
+			_, _ = fmt.Fprint(w, `{"values":[["S1"]]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -160,9 +160,9 @@ func TestGDriveChangesDeferDeletesUntilAllPagesComplete(t *testing.T) {
 			return
 		}
 		if r.URL.Query().Get("pageToken") == "old" {
-			fmt.Fprint(w, `{"nextPageToken":"next","changes":[{"fileId":"known","removed":true}]}`)
+			_, _ = fmt.Fprint(w, `{"nextPageToken":"next","changes":[{"fileId":"known","removed":true}]}`)
 		} else {
-			fmt.Fprint(w, `{"newStartPageToken":"current","changes":[]}`)
+			_, _ = fmt.Fprint(w, `{"newStartPageToken":"current","changes":[]}`)
 		}
 	}))
 	defer server.Close()
@@ -196,10 +196,10 @@ func TestGDriveExpiredChangesTokenStartsBoundedRescan(t *testing.T) {
 			rescans++
 			w.WriteHeader(http.StatusGone)
 		case "/drive/changes/startPageToken":
-			fmt.Fprint(w, `{"startPageToken":"fresh"}`)
+			_, _ = fmt.Fprint(w, `{"startPageToken":"fresh"}`)
 		case "/drive/files":
 			lists++
-			fmt.Fprint(w, `{"files":[]}`)
+			_, _ = fmt.Fprint(w, `{"files":[]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -241,7 +241,7 @@ func TestGDriveTerminalDeltaReturnsDurableCheckpoint(t *testing.T) {
 func TestGDriveAccessMissingPermissionsIsIncomplete(t *testing.T) {
 	t.Setenv("CONNECTOR_GOOGLE_DRIVE_TOKEN", "fixture-token")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"files":[{"id":"hidden"}]}`)
+		_, _ = fmt.Fprint(w, `{"files":[{"id":"hidden"}]}`)
 	}))
 	defer server.Close()
 	c := source.Connection{Kind: SourceTypeGoogleDrive, CredentialRef: "CONNECTOR_GOOGLE_DRIVE_TOKEN", Config: map[string]any{"base_url": server.URL, "folder_id": "root"}}
@@ -256,9 +256,9 @@ func TestGDriveOversizedFileFailsExplicitly(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/drive/changes/startPageToken":
-			fmt.Fprint(w, `{"startPageToken":"start"}`)
+			_, _ = fmt.Fprint(w, `{"startPageToken":"start"}`)
 		case "/drive/files":
-			fmt.Fprint(w, `{"files":[{"id":"large","name":"large.pdf","mimeType":"application/pdf"}]}`)
+			_, _ = fmt.Fprint(w, `{"files":[{"id":"large","name":"large.pdf","mimeType":"application/pdf"}]}`)
 		case "/drive/files/large":
 			_, _ = w.Write(make([]byte, driveMaxResponse+1))
 		default:

@@ -205,12 +205,12 @@ func TestDashboardChatThreadRender(t *testing.T) {
 		t.Fatalf("seed endpoint: %v", err)
 	}
 
-	f.seedConversation(t, "conv_thread", memberID, bot.ID, "summarise the contract")
+	f.seedConversation(t, "conv_thread", memberID, bot.ID, "summarize the contract")
 	// endpoint_id/model are OBSERVED route fields — the worker persists them
 	// through UpdateRun after dispatch, never at CreateRun.
 	runDone := chatbot.AssistantRun{
 		TenantID: f.tenant, ID: "run_done", ChatbotID: bot.ID, ConversationID: "conv_thread",
-		OwnerActorID: memberID, Status: jobs.StatusQueued, Input: "summarise the contract",
+		OwnerActorID: memberID, Status: jobs.StatusQueued, Input: "summarize the contract",
 	}
 	if err := f.runsRepo.CreateRun(ctx, runDone); err != nil {
 		t.Fatalf("seed done run: %v", err)

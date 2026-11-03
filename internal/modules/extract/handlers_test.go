@@ -316,7 +316,8 @@ func newExtractService(t *testing.T, db *postgres.DB, tenant string, artRepo *po
 	sources := postgres.NewSourceRepo(db)
 	billingRepo := postgres.NewBillingRepo(db)
 	jobsSvc := jobs.NewService(jobsRepo, 10*time.Millisecond)
-	caps := []string{inference.CapabilityChat, inference.CapabilityVision}
+	caps := make([]string, 0, 2+len(aliases))
+	caps = append(caps, inference.CapabilityChat, inference.CapabilityVision)
 	for _, a := range aliases {
 		caps = append(caps, inference.ModelCapabilityPrefix+a)
 	}

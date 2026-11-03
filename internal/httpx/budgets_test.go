@@ -354,7 +354,7 @@ func TestAdminBudgetValidationMatrix(t *testing.T) {
 		t.Fatalf("revoked key subject = %d, want 400", rec.Code)
 	}
 	foreignDB := testdb.New(t)
-	defer foreignDB.Close()
+	defer func() { _ = foreignDB.Close() }()
 	foreignTenant := testdb.SeedTenant(t, foreignDB, fmt.Sprintf("bt%d", budgetTestSeq.Add(1)))
 	foreignUser := testdb.SeedUser(t, foreignDB, foreignTenant, "foreign@budgets.example", nil)
 	_, foreign := testdb.SeedAPIKey(t, foreignDB, foreignTenant, testdb.SeedKeySpec{Name: "foreign", OwnerUserID: foreignUser.ID})

@@ -1157,15 +1157,9 @@ func extractContentText(content any) string {
 
 func parseJSONBody(content string) (map[string]any, error) {
 	t := strings.TrimSpace(content)
-	if strings.HasPrefix(t, "```json") {
-		t = strings.TrimPrefix(t, "```json")
-	}
-	if strings.HasPrefix(t, "```") {
-		t = strings.TrimPrefix(t, "```")
-	}
-	if strings.HasSuffix(t, "```") {
-		t = strings.TrimSuffix(t, "```")
-	}
+	t = strings.TrimPrefix(t, "```json")
+	t = strings.TrimPrefix(t, "```")
+	t = strings.TrimSuffix(t, "```")
 	t = strings.TrimSpace(t)
 	if t == "" {
 		return map[string]any{}, errors.New("empty model response")
@@ -1185,7 +1179,7 @@ func parseJSONBody(content string) (map[string]any, error) {
 func (s *Service) validateOutput(data map[string]any, template Template) ([]string, []string) {
 	errorsList := []string{}
 	warnings := []string{}
-	if data == nil || len(data) == 0 {
+	if len(data) == 0 {
 		errorsList = append(errorsList, "empty extraction output")
 		return errorsList, warnings
 	}

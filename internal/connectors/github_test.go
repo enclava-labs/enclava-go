@@ -16,10 +16,10 @@ func TestGitHubContentPinsIdentityToConnectionAndRevision(t *testing.T) {
 	mux := http.NewServeMux()
 	issueRevision := "2026-01-01T00:00:00Z"
 	mux.HandleFunc("/repos/acme/docs/issues", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode([]any{map[string]any{"id": 99, "number": 7, "title": "Bug", "body": "details", "updated_at": issueRevision, "html_url": "https://github.com/acme/docs/issues/7"}})
+		_ = json.NewEncoder(w).Encode([]any{map[string]any{"id": 99, "number": 7, "title": "Bug", "body": "details", "updated_at": issueRevision, "html_url": "https://github.com/acme/docs/issues/7"}})
 	})
 	mux.HandleFunc("/repos/acme/docs/issues/7/comments", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode([]any{map[string]any{"id": 100, "body": "comment", "updated_at": "2026-01-02T00:00:00Z", "html_url": "https://github.com/acme/docs/issues/7#issuecomment-100"}})
+		_ = json.NewEncoder(w).Encode([]any{map[string]any{"id": 100, "body": "comment", "updated_at": "2026-01-02T00:00:00Z", "html_url": "https://github.com/acme/docs/issues/7#issuecomment-100"}})
 	})
 	mux.HandleFunc("/repos/acme/docs/pulls", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode([]any{map[string]any{"id": 101, "number": 8, "title": "Fix bug", "body": "fix", "updated_at": issueRevision}})
@@ -34,13 +34,13 @@ func TestGitHubContentPinsIdentityToConnectionAndRevision(t *testing.T) {
 		_ = json.NewEncoder(w).Encode([]any{map[string]any{"login": "alice", "permissions": map[string]bool{"push": true}}, map[string]any{"id": 42, "permissions": map[string]bool{"pull": true}}})
 	})
 	mux.HandleFunc("/repos/acme/docs/commits/HEAD", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]string{"sha": "commit1"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"sha": "commit1"})
 	})
 	mux.HandleFunc("/repos/acme/docs/git/trees/commit1", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"tree": []any{map[string]any{"path": "guide.md", "type": "blob", "sha": "blob1", "size": 3}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"tree": []any{map[string]any{"path": "guide.md", "type": "blob", "sha": "blob1", "size": 3}}})
 	})
 	mux.HandleFunc("/repos/acme/docs/contents/guide.md", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]string{"content": base64.StdEncoding.EncodeToString([]byte("doc")), "encoding": "base64", "sha": "blob1"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"content": base64.StdEncoding.EncodeToString([]byte("doc")), "encoding": "base64", "sha": "blob1"})
 	})
 	srv := httptest.NewTLSServer(mux)
 	defer srv.Close()
@@ -126,13 +126,13 @@ func TestGitHubTruncatedTreeFetchesSubtrees(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/acme/docs/git/trees/root", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("recursive") == "1" {
-			json.NewEncoder(w).Encode(map[string]any{"truncated": true})
+			_ = json.NewEncoder(w).Encode(map[string]any{"truncated": true})
 		} else {
-			json.NewEncoder(w).Encode(map[string]any{"tree": []any{map[string]any{"path": "src", "type": "tree", "sha": "sub"}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"tree": []any{map[string]any{"path": "src", "type": "tree", "sha": "sub"}}})
 		}
 	})
 	mux.HandleFunc("/repos/acme/docs/git/trees/sub", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"tree": []any{map[string]any{"path": "main.go", "type": "blob", "sha": "blob", "size": 3}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"tree": []any{map[string]any{"path": "main.go", "type": "blob", "sha": "blob", "size": 3}}})
 	})
 	srv := httptest.NewTLSServer(mux)
 	defer srv.Close()

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -61,13 +62,13 @@ func (a *App) accessLogMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(rec, r)
 		log.Printf(
 			"request id=%s method=%s path=%s status=%d bytes=%d duration=%s remote=%s",
-			requestIDFromContext(r.Context()),
-			r.Method,
-			redactForLog(r.URL.EscapedPath()),
+			strconv.Quote(requestIDFromContext(r.Context())),
+			strconv.Quote(r.Method),
+			strconv.Quote(redactForLog(r.URL.EscapedPath())),
 			rec.status,
 			rec.bytes,
 			time.Since(start).Round(time.Millisecond),
-			clientIP(r, a.trustProxy),
+			strconv.Quote(clientIP(r, a.trustProxy)),
 		)
 	})
 }

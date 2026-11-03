@@ -79,7 +79,7 @@ func (r *BillingRepo) ReportUnsettledBySubject(ctx context.Context, tenantID str
 	if err != nil {
 		return nil, fmt.Errorf("unsettled by subject: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []ReportUnsettledRow
 	for rows.Next() {
 		var row ReportUnsettledRow
@@ -169,7 +169,7 @@ func (r *BillingRepo) ReportPriceCurrencies(ctx context.Context, tenantID string
 	if err != nil {
 		return nil, fmt.Errorf("price currencies: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var c string
@@ -228,7 +228,7 @@ func (r *BillingRepo) ReportListReservations(ctx context.Context, tenantID, stat
 	if err != nil {
 		return nil, "", fmt.Errorf("list reservations: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []ReportReservationRow
 	for rows.Next() {
 		var row ReportReservationRow
@@ -278,7 +278,7 @@ func decodeReservationCursor(cursor string) (time.Time, string, error) {
 }
 
 func scanReportBudgets(rows *sql.Rows) ([]ReportBudgetRow, error) {
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []ReportBudgetRow
 	for rows.Next() {
 		row, err := scanReportBudgetRow(rows)

@@ -129,13 +129,6 @@ func (p *Permit) Release() {
 	})
 }
 
-func (p *Permit) decTenantLocked(pool *admissionPool) {
-	pool.tenants[p.tenant]--
-	if pool.tenants[p.tenant] <= 0 {
-		delete(pool.tenants, p.tenant)
-	}
-}
-
 // Acquire takes one slot for tenant in class cls, waiting FIFO while the
 // pool is full. Cancellation abandons the queue entry and frees its tenant
 // occupancy. Returns ErrOverloaded when the queue is full or the tenant

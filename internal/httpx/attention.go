@@ -151,8 +151,8 @@ func (a *App) attentionSyncs(ctx context.Context, p auth.Principal, caps dashboa
 func syncAttention(src connectors.Source, syncs []connectors.SyncJob) (AttentionItem, bool) {
 	href := "/dashboard/sources/" + src.ID
 	for _, j := range syncs {
-		switch {
-		case j.Status == jobs.StatusFailed:
+		switch j.Status {
+		case jobs.StatusFailed:
 			why := "failed"
 			if syncAuthFailure(j.ErrorMessage) {
 				why = "failed authentication"
@@ -171,7 +171,7 @@ func syncAttention(src connectors.Source, syncs []connectors.SyncJob) (Attention
 					"Reconnect", "/dashboard/sources?edit="+src.ID
 			}
 			return item, true
-		case j.Status == jobs.StatusRunning:
+		case jobs.StatusRunning:
 			kind, label := "sync_running", "is syncing"
 			if time.Since(j.CreatedAt) > syncStalledAfter {
 				kind, label = "sync_stalled", "has been syncing for over a day"

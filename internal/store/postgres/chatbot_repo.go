@@ -66,7 +66,7 @@ func (r *ChatbotRepo) Create(ctx context.Context, b chatbot.Instance) error {
 	if err != nil {
 		return fmt.Errorf("marshal chatbot audience: %w", err)
 	}
-	settings, err := json.Marshal(map[string]any(b.Settings))
+	settings, err := json.Marshal(b.Settings)
 	if err != nil {
 		return fmt.Errorf("marshal chatbot settings: %w", err)
 	}
@@ -137,7 +137,7 @@ func (r *ChatbotRepo) Update(ctx context.Context, b chatbot.Instance) error {
 	if err != nil {
 		return fmt.Errorf("marshal chatbot audience: %w", err)
 	}
-	settings, err := json.Marshal(map[string]any(b.Settings))
+	settings, err := json.Marshal(b.Settings)
 	if err != nil {
 		return fmt.Errorf("marshal chatbot settings: %w", err)
 	}
@@ -414,7 +414,7 @@ func (r *ChatbotRepo) ListConversations(ctx context.Context, tenantID, ownerActo
 		query += ` AND (c.created_at, c.id) < ($3, $4)`
 		args = append(args, afterCreatedAt, afterID)
 	}
-	query += fmt.Sprintf(` ORDER BY c.created_at DESC, c.id DESC LIMIT $%d`, len(args)+1)
+	query += fmt.Sprintf(` ORDER BY c.created_at DESC, c.id DESC LIMIT $%d`, len(args)+1) //nolint:gosec // fragment is constant, limit bound as parameter
 	args = append(args, limit+1)
 
 	rows, err := r.db.SQL.QueryContext(ctx, query, args...)

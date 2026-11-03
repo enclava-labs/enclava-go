@@ -291,7 +291,7 @@ func (s *PreviewService) JobHandler() jobs.HandlerFunc {
 		if err != nil {
 			return "", fmt.Errorf("begin preview result artifact: %w", err)
 		}
-		defer writer.Close()
+		defer func() { _ = writer.Close() }()
 		if err := json.NewEncoder(writer).Encode(result); err != nil {
 			return "", fmt.Errorf("write preview result artifact: %w", err)
 		}
@@ -390,9 +390,10 @@ func (s *PreviewService) Get(ctx context.Context, p auth.Principal, id string) (
 		return PreviewStatus{}, ErrNotFound
 	}
 	errorMessage := ""
-	if row.Status == jobs.StatusFailed {
+	switch row.Status {
+	case jobs.StatusFailed:
 		errorMessage = "document preview failed"
-	} else if row.Status == jobs.StatusUnknown {
+	case jobs.StatusUnknown:
 		errorMessage = "document preview outcome is unknown"
 	}
 	return PreviewStatus{ID: row.ID, Status: row.Status, ErrorMessage: errorMessage, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, CompletedAt: row.CompletedAt}, nil
@@ -407,7 +408,7 @@ func (s *PreviewService) Result(ctx context.Context, p auth.Principal, id string
 	if err != nil {
 		return previewResult{}, ErrNotFound
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	var result previewResult
 	if err := json.NewDecoder(io.LimitReader(rc, 64<<20)).Decode(&result); err != nil {
 		return previewResult{}, fmt.Errorf("decode preview result: %w", err)

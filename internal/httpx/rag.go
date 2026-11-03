@@ -201,7 +201,7 @@ func (a *App) handleRAGCollectionDocumentsUpload(w http.ResponseWriter, r *http.
 		WriteOpenAIError(w, http.StatusBadRequest, "file is required", "invalid_request_error", "missing_file")
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	if header.Size > maxBytes {
 		WriteOpenAIError(w, http.StatusRequestEntityTooLarge, "file size is outside the allowed limit", "invalid_request_error", "file_too_large")
 		return
@@ -318,8 +318,9 @@ func (a *App) handleRAGDocumentByID(w http.ResponseWriter, r *http.Request, prin
 		}
 		w.Header().Set("Content-Type", doc.MimeType)
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", doc.FileName))
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(blob)
+		_, _ = w.Write(blob) //nolint:gosec // Authorized document is served as an attachment, not rendered as HTML.
 	case http.MethodDelete:
 		if !auth.HasScope(principal, "rag.manage") {
 			WriteForbidden(w, "missing required scope: rag.manage")
@@ -441,7 +442,7 @@ func (a *App) handleRAGEvidenceByID(w http.ResponseWriter, r *http.Request, prin
 		w.Header().Set("Content-Disposition", `attachment; filename="retained-copy"`)
 		w.Header().Set("X-Enclava-Evidence-View", "retained-copy")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(blob)
+		_, _ = w.Write(blob) //nolint:gosec // Authorized evidence copy is an octet-stream attachment.
 		return
 	}
 	// Passage view: the quoted chunk content for currently-authorized

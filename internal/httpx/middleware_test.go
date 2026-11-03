@@ -155,7 +155,7 @@ func TestSessionCookieAuthAndCSRFGuard(t *testing.T) {
 		t.Fatalf("issue session: %v", err)
 	}
 	app := endpointMiddlewareApp(repo, svc, postgres.NewEndpointsRepo(db))
-	cookie := &http.Cookie{Name: sessionCookieName, Value: token}
+	cookie := &http.Cookie{Name: sessionCookieName, Value: token, Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode}
 
 	// GET with the session cookie authenticates.
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/probe", nil)

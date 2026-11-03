@@ -56,7 +56,7 @@ func TestChunkProfilesRepoImmutableTenantVersions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen isolated database: %v", err)
 	}
-	defer restarted.Close()
+	defer func() { _ = restarted.Close() }()
 	persisted, err := NewChunkProfilesRepo(restarted).Get(ctx, idTenantA, v1.ID)
 	if err != nil || persisted != gotV1 {
 		t.Fatalf("profile did not survive repository restart: %+v, %v", persisted, err)

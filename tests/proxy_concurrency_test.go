@@ -312,10 +312,10 @@ func TestProxyTwoProcess(t *testing.T) {
 		t.Fatalf("held stream status: %d", s1.StatusCode)
 	}
 	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) && !(up.streamsSeen.Load() == 1 && up.active.Load() == 1) {
+	for time.Now().Before(deadline) && (up.streamsSeen.Load() != 1 || up.active.Load() != 1) {
 		time.Sleep(25 * time.Millisecond)
 	}
-	if !(up.streamsSeen.Load() == 1 && up.active.Load() == 1) {
+	if up.streamsSeen.Load() != 1 || up.active.Load() != 1 {
 		t.Fatalf("timed out waiting for upstream to observe the open stream\nappA: %s\nappB: %s", appA.Logs(), appB.Logs())
 	}
 
@@ -324,7 +324,7 @@ func TestProxyTwoProcess(t *testing.T) {
 	s2done := make(chan *http.Response, 1)
 	s2err := make(chan error, 1)
 	go func() {
-		resp, err := startStream(s2ctx, appA.Client, appA.BaseURL, key)
+		resp, err := startStream(s2ctx, appA.Client, appA.BaseURL, key) //nolint:bodyclose // resp travels through s2done and is closed by the test goroutine at its select
 		if err != nil {
 			s2err <- err
 			return
@@ -489,6 +489,7 @@ func TestProxyTwoProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("kill-phase stream: %v", err)
 	}
+	defer func() { _ = s6.Body.Close() }()
 	if s6.StatusCode != http.StatusOK {
 		t.Fatalf("kill-phase stream status: %d", s6.StatusCode)
 	}
@@ -510,7 +511,7 @@ func TestProxyTwoProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("usage records: %v", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	n := 0
 	for rows.Next() {
 		var raw string

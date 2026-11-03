@@ -172,6 +172,7 @@ func (r *ArtifactRepo) InvalidateWriting(ctx context.Context, tenantID, id, leas
 }
 
 func (r *ArtifactRepo) listRows(ctx context.Context, where string, args ...any) ([]artifacts.ArtifactRow, error) {
+	//nolint:gosec // where fragments are package-internal constants
 	rows, err := r.db.SQL.QueryContext(ctx, `
 		SELECT tenant_id::text, id, kind, version, sha256, byte_size, mime_type,
 		       state, storage_path, lease_owner, lease_expires_at, fence_token,
@@ -180,7 +181,7 @@ func (r *ArtifactRepo) listRows(ctx context.Context, where string, args ...any) 
 	if err != nil {
 		return nil, fmt.Errorf("list artifacts: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := []artifacts.ArtifactRow{}
 	for rows.Next() {
 		var row artifacts.ArtifactRow

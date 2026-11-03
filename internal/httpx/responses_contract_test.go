@@ -69,7 +69,7 @@ func (u *responsesUpstream) DoResponsesRequest(ctx context.Context, method, path
 		u.seq++
 		obj := responseObject(u.seq)
 		var req map[string]any
-		if json.Unmarshal([]byte(body), &req) == nil {
+		if json.Unmarshal(body, &req) == nil {
 			if prev, ok := req["previous_response_id"].(string); ok {
 				obj = strings.Replace(obj, `"output"`, `"previous_response_id":"`+prev+`","output"`, 1)
 			}
@@ -81,14 +81,14 @@ func (u *responsesUpstream) DoResponsesRequest(ctx context.Context, method, path
 		return []byte(`{"object":"response.compaction","output":[{"id":"cmp_UP1","type":"compaction","encrypted_content":"zz"}],"usage":{"input_tokens":30,"output_tokens":3,"total_tokens":33}}`), nil
 	case strings.HasPrefix(p, "/responses/resp_UP1") && method == http.MethodGet:
 		seq := 1
-		fmt.Sscanf(strings.TrimPrefix(p, "/responses/resp_UP1"), "%d", &seq)
+		_, _ = fmt.Sscanf(strings.TrimPrefix(p, "/responses/resp_UP1"), "%d", &seq)
 		if strings.HasSuffix(p, "/input_items") {
 			return []byte(fmt.Sprintf(`{"object":"list","data":[{"id":"msg_UP%d_1","type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"first_id":"msg_UP%d_1","last_id":"msg_UP%d_1","has_more":false}`, seq, seq, seq)), nil
 		}
 		return []byte(responseObject(seq)), nil
 	case strings.HasSuffix(p, "/cancel") && method == http.MethodPost:
 		seq := 1
-		fmt.Sscanf(strings.TrimSuffix(strings.TrimPrefix(p, "/responses/resp_UP1"), "/cancel"), "%d", &seq)
+		_, _ = fmt.Sscanf(strings.TrimSuffix(strings.TrimPrefix(p, "/responses/resp_UP1"), "/cancel"), "%d", &seq)
 		return []byte(fmt.Sprintf(`{"id":"resp_UP%d","object":"response","status":"cancelled","usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}`, seq)), nil
 	case method == http.MethodDelete:
 		return []byte(fmt.Sprintf(`{"id":%q,"object":"response.deleted","deleted":true}`, strings.TrimPrefix(p, "/responses/"))), nil
@@ -467,10 +467,6 @@ func TestResponsesEndpointCollisionStaysLocal(t *testing.T) {
 	f.do(t, f.keyA, http.MethodGet, "/v1/responses/"+pubB, "")
 	if len(f.ups["ep-zz"].calls) == 0 {
 		t.Fatal("ep-alt follow-up missing")
-	}
-	for _, c := range f.ups["ep-resp"].calls {
-		if strings.HasPrefix(c.Path, "/responses/resp_UP1") && len(f.ups["ep-zz"].calls) > 0 && c.Method == http.MethodGet && len(f.ups["ep-resp"].calls) > 2 {
-		}
 	}
 }
 

@@ -89,7 +89,7 @@ func TestReservationSnapshotRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open second connection: %v", err)
 	}
-	defer other.Close()
+	defer func() { _ = other.Close() }()
 
 	var snapRaw, unitsRaw, currency string
 	var limit int64

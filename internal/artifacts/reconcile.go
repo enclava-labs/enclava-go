@@ -57,63 +57,69 @@ func (s *Store) Reconcile(ctx context.Context) error {
 		s.removeOwned(&errs, row.TenantID, row.ID)
 	}
 
-	// (b) Traverse the durable tree. Every regular file at <tenant>/<id> is
-	// checked against its row; anything not owned by a live write or a final
-	// row is removed.
-	err = filepath.WalkDir(s.durableRoot, func(path string, d fs.DirEntry, err error) error {
+	// (b) Traverse the durable tree root-scoped: both the walk and every
+	// removal resolve inside an os.Root, so a swapped symlink cannot make a
+	// delete land outside the durable root (TOCTOU-safe).
+	// Every regular file at <tenant>/<id> is checked against its row;
+	// anything not owned by a live write or a final row is removed.
+	root, rootErr := os.OpenRoot(s.durableRoot)
+	if rootErr != nil {
+		errs = append(errs, fmt.Errorf("walk durable root: %w", rootErr))
+	} else {
+		err = fs.WalkDir(root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
+			if err != nil {
+				errs = append(errs, fmt.Errorf("walk %s: %w", rel, err))
+				if d != nil && d.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			if rel == "." {
+				return nil
+			}
+			if d.IsDir() {
+				// The temp staging area is row-owned and handled via the rows;
+				// scratch lives under a different root entirely.
+				if rel == ".tmp" {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			display := filepath.Join(root.Name(), rel)
+			parts := strings.Split(rel, "/")
+			if len(parts) != 2 {
+				// Not an application-composed <tenant>/<id> file.
+				if rerr := root.Remove(rel); rerr != nil && !os.IsNotExist(rerr) {
+					errs = append(errs, fmt.Errorf("remove stray %s: %w", display, rerr))
+				}
+				return nil
+			}
+			tenantID, id := parts[0], parts[1]
+			row, rerr := s.rowForFile(ctx, tenantID, id)
+			if rerr != nil {
+				errs = append(errs, rerr)
+				return nil
+			}
+			switch {
+			case row == nil:
+				// No row — an incomplete crash artifact or foreign file.
+				removeRooted(&errs, root, rel)
+			case row.State == StateFinal:
+				// Durable and committed; leave it.
+			case row.State == StateWriting && !row.LeaseExpiresAt.IsZero() && row.LeaseExpiresAt.After(now):
+				// Live writer mid-flight (possibly rename-before-commit): keep.
+			default:
+				// Tombstoned/deleting rows and expired writers (fenced in (a)).
+				removeRooted(&errs, root, rel)
+			}
+			return nil
+		})
+		if cerr := root.Close(); cerr != nil {
+			errs = append(errs, fmt.Errorf("close durable root: %w", cerr))
+		}
 		if err != nil {
-			errs = append(errs, fmt.Errorf("walk %s: %w", path, err))
-			if d != nil && d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
+			errs = append(errs, fmt.Errorf("walk durable root: %w", err))
 		}
-		if path == s.durableRoot {
-			return nil
-		}
-		rel, rerr := filepath.Rel(s.durableRoot, path)
-		if rerr != nil {
-			errs = append(errs, fmt.Errorf("walk rel %s: %w", path, rerr))
-			return nil
-		}
-		if d.IsDir() {
-			// The temp staging area is row-owned and handled via the rows;
-			// scratch lives under a different root entirely.
-			if rel == ".tmp" {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		parts := strings.Split(rel, string(filepath.Separator))
-		if len(parts) != 2 {
-			// Not an application-composed <tenant>/<id> file.
-			if rerr := os.Remove(path); rerr != nil && !os.IsNotExist(rerr) {
-				errs = append(errs, fmt.Errorf("remove stray %s: %w", path, rerr))
-			}
-			return nil
-		}
-		tenantID, id := parts[0], parts[1]
-		row, rerr := s.rowForFile(ctx, tenantID, id)
-		if rerr != nil {
-			errs = append(errs, rerr)
-			return nil
-		}
-		switch {
-		case row == nil:
-			// No row — an incomplete crash artifact or foreign file.
-			removeFile(&errs, path)
-		case row.State == StateFinal:
-			// Durable and committed; leave it.
-		case row.State == StateWriting && !row.LeaseExpiresAt.IsZero() && row.LeaseExpiresAt.After(now):
-			// Live writer mid-flight (possibly rename-before-commit): keep.
-		default:
-			// Tombstoned/deleting rows and expired writers (fenced in (a)).
-			removeFile(&errs, path)
-		}
-		return nil
-	})
-	if err != nil {
-		errs = append(errs, fmt.Errorf("walk durable root: %w", err))
 	}
 
 	// (c) Row-driven repair for everything that ever carried durable bytes.
@@ -128,12 +134,12 @@ func (s *Store) Reconcile(ctx context.Context) error {
 				continue
 			}
 			_, statErr := os.Stat(path)
-			switch {
-			case row.State == StateTombstoned || row.State == StateDeleting:
-				if statErr == nil || (statErr != nil && !os.IsNotExist(statErr)) {
+			switch row.State {
+			case StateTombstoned, StateDeleting:
+				if !os.IsNotExist(statErr) {
 					removeFile(&errs, path)
 				}
-			case row.State == StateFinal:
+			case StateFinal:
 				if statErr == nil {
 					continue
 				}
@@ -188,5 +194,14 @@ func (s *Store) removeOwned(errs *[]error, tenantID, id string) {
 func removeFile(errs *[]error, path string) {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		*errs = append(*errs, fmt.Errorf("remove %s: %w", path, err))
+	}
+}
+
+// removeRooted deletes a root-relative file discovered by the durable walk;
+// keeping the operation inside the os.Root prevents symlink traversal.
+func removeRooted(errs *[]error, root *os.Root, rel string) {
+	if err := root.Remove(rel); err != nil && !os.IsNotExist(err) {
+		*errs = append(*errs, fmt.Errorf("remove %s: %w",
+			filepath.Join(root.Name(), rel), err))
 	}
 }

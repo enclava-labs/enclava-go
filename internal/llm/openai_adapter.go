@@ -199,7 +199,7 @@ func (a *OpenAICompatibleAdapter) doJSON(ctx context.Context, method, path strin
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := a.client.Do(req)
+	resp, err := a.client.Do(req) //nolint:bodyclose // readBoundedBody closes resp.Body
 	if err != nil {
 		return nil, fmt.Errorf("upstream request failed: %w", err)
 	}

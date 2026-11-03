@@ -116,7 +116,7 @@ func (s *Service) transportCompositeSignature(e Endpoint) (string, error) {
 			return "", err
 		}
 		if file != "" {
-			config, err := os.ReadFile(file)
+			config, err := os.ReadFile(file) //nolint:gosec // path resolved from operator config via ConfidentialSDKConfigFile
 			if err != nil {
 				return "", fmt.Errorf("read confidential SDK config: %w", err)
 			}

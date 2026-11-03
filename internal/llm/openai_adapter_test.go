@@ -89,7 +89,7 @@ func TestAdapterMutationIsNotReplayed(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	var calls atomic.Int32
-	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := &http.Server{ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
 			// Accept the mutation, then drop the connection before responding:
 			// the request may have been accepted, so the client must not replay it.

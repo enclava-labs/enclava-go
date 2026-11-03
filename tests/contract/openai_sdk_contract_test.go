@@ -10,7 +10,6 @@ import (
 	openai "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/responses"
-	"github.com/openai/openai-go/v3/shared"
 )
 
 // TestOpenAISDKCompatibility exercises the selected public OpenAI core API —
@@ -56,7 +55,7 @@ func TestOpenAISDKCompatibility(t *testing.T) {
 				},
 			},
 		}},
-		Model:       shared.ChatModel(chatModel),
+		Model:       chatModel,
 		Temperature: openai.Float(0),
 	})
 	if err != nil {
@@ -75,7 +74,7 @@ func TestOpenAISDKCompatibility(t *testing.T) {
 				},
 			},
 		}},
-		Model: shared.ChatModel(chatModel),
+		Model: chatModel,
 	})
 	streamEvents := 0
 	for stream.Next() {
@@ -92,7 +91,7 @@ func TestOpenAISDKCompatibility(t *testing.T) {
 		Input: openai.EmbeddingNewParamsInputUnion{
 			OfArrayOfStrings: []string{"embed this", "and this"},
 		},
-		Model: openai.EmbeddingModel(embeddingModel),
+		Model: embeddingModel,
 	})
 	if err != nil {
 		t.Fatalf("embeddings through official SDK: %v", err)
@@ -104,7 +103,7 @@ func TestOpenAISDKCompatibility(t *testing.T) {
 	// The owned Responses lifecycle round-trips through bound public IDs:
 	// create → retrieve → input items → cancel → delete.
 	resp, err := client.Responses.New(ctx, responses.ResponseNewParams{
-		Model: shared.ResponsesModel(responsesModel),
+		Model: responsesModel,
 		Input: responses.ResponseNewParamsInputUnion{OfString: openai.String("say hi")},
 	})
 	if err != nil || resp.ID == "" {
@@ -125,7 +124,7 @@ func TestOpenAISDKCompatibility(t *testing.T) {
 		t.Fatalf("responses input_tokens through official SDK: %v", err)
 	}
 	chained, err := client.Responses.New(ctx, responses.ResponseNewParams{
-		Model:              shared.ResponsesModel(responsesModel),
+		Model:              responsesModel,
 		Input:              responses.ResponseNewParamsInputUnion{OfString: openai.String("say hi again")},
 		PreviousResponseID: openai.String(resp.ID),
 	})

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -727,7 +728,7 @@ func (a *App) recordAPIKeyBillingAudit(ctx context.Context, action, keyID string
 		ActorID:     actor.ActorID,
 		Detail:      metadata,
 	}); err != nil {
-		log.Printf("failed to write billing audit event %s for api key %s: %v", action, keyID, err)
+		log.Printf("failed to write billing audit event %s for api key %s: %s", strconv.Quote(action), strconv.Quote(keyID), strconv.Quote(err.Error()))
 	}
 }
 

@@ -126,15 +126,16 @@ func runNative(ctx context.Context, sandbox, prlimit, binary string, args []stri
 			return nil, err
 		}
 		cleanup = func() { _ = os.RemoveAll(dir) }
-		if err := os.Chmod(dir, 0700); err != nil {
+		if err := os.Chmod(dir, 0700); err != nil { //nolint:gosec // fresh MkdirTemp dir: 0700 is minimal for a private directory (needs the execute bit)
 			cleanup()
 			return nil, err
 		}
 	}
 	defer cleanup()
-	cmdArgs := []string{"--die-with-parent", "--new-session", "--unshare-all", "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--bind", dir, "/work", "--chdir", "/work", "--", prlimit, "--cpu=30", "--as=536870912", "--nproc=16", "--fsize=16777216", "--", binary}
+	cmdArgs := make([]string, 0, 31+len(args)) // 31 fixed sandbox/prlimit arguments below
+	cmdArgs = append(cmdArgs, "--die-with-parent", "--new-session", "--unshare-all", "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--bind", dir, "/work", "--chdir", "/work", "--", prlimit, "--cpu=30", "--as=536870912", "--nproc=16", "--fsize=16777216", "--", binary)
 	cmdArgs = append(cmdArgs, args...)
-	cmd := exec.CommandContext(ctx, sandbox, cmdArgs...)
+	cmd := exec.CommandContext(ctx, sandbox, cmdArgs...) //nolint:gosec // sandbox, prlimit and binary are server-resolved PATH lookups of fixed tool names; args are sandbox-confined
 	cmd.Dir = dir
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=/work", "TMPDIR=/tmp", "LANG=C.UTF-8", "LC_ALL=C.UTF-8", "LD_LIBRARY_PATH=/usr/lib:/usr/lib64"}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -202,8 +203,8 @@ func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data
 	if err != nil {
 		return source.Document{}, err
 	}
-	defer os.RemoveAll(dir)
-	if err = os.Chmod(dir, 0700); err != nil {
+	defer func() { _ = os.RemoveAll(dir) }()
+	if err = os.Chmod(dir, 0700); err != nil { //nolint:gosec // fresh MkdirTemp dir: 0700 is minimal for a private directory (needs the execute bit)
 		return source.Document{}, err
 	}
 	if err = os.WriteFile(filepath.Join(dir, "input"), data, 0600); err != nil {
@@ -347,8 +348,8 @@ func ocrPDFPage(ctx context.Context, sandbox, prlimit, dir string, page int, lan
 		return nil, fmt.Errorf("extract: PDF page rasterization failed: %w", err)
 	}
 	pngPath := filepath.Join(dir, "page.png")
-	defer os.Remove(pngPath)
-	file, err := os.Open(pngPath)
+	defer func() { _ = os.Remove(pngPath) }()
+	file, err := os.Open(pngPath) //nolint:gosec // pngPath is pdftoppm's own output inside the private MkdirTemp dir
 	if err != nil {
 		return nil, fmt.Errorf("%w: PDF page raster missing", ErrMalformedDocument)
 	}

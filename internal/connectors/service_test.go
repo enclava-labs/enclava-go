@@ -633,7 +633,7 @@ func TestCreateSourceStillRejectsUnsafeCredentialsAndPrivateOrigins(t *testing.T
 	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true}}
 	f := newConnectorFixture(t, adapter)
 	f.svc.setAllowPrivateBaseURL(false)
-	_, err := f.svc.CreateSource(context.Background(), f.principal, CreateSourceInput{Type: SourceTypeSlack, Name: "bad credential", CredentialRef: "CONNECTOR_GITHUB_TEST"})
+	_, err := f.svc.CreateSource(context.Background(), f.principal, CreateSourceInput{Type: SourceTypeSlack, Name: "unsafe-ref", CredentialRef: "CONNECTOR_GITHUB_TEST"}) //nolint:gosec // env binding name, not a credential literal
 	if err == nil || !strings.Contains(err.Error(), "credential_ref") {
 		t.Fatalf("unsafe credential ref accepted: %v", err)
 	}
@@ -661,15 +661,19 @@ func TestConnectorHTTPClientRefusesPrivateDial(t *testing.T) {
 	// Loopback must dial (hermetic fixtures).
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
 	defer srv.Close()
-	if _, err := client.Get(srv.URL); err != nil {
+	res, err := client.Get(srv.URL)
+	if err != nil {
 		t.Fatalf("loopback dial refused: %v", err)
 	}
+	_ = res.Body.Close()
 	// A private-range resolved address must be refused at dial time.
 	req, err := http.NewRequest(http.MethodGet, "http://192.0.2.1:1/", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Transport.RoundTrip(req); err == nil {
+	res2, err := client.Transport.RoundTrip(req)
+	if err == nil {
+		_ = res2.Body.Close()
 		t.Fatal("private-address dial accepted, want refusal")
 	}
 }

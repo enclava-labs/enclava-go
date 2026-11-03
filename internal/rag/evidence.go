@@ -228,6 +228,6 @@ func (s *Service) DownloadEvidenceCopy(ctx context.Context, p auth.Principal, id
 	if err != nil {
 		return nil, err
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	return readAll(reader)
 }

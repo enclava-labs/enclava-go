@@ -382,7 +382,7 @@ func getEnvInt(key string, fallback int) int {
 	}
 	i, err := strconv.Atoi(v)
 	if err != nil {
-		log.Printf("warning: invalid value %q for %s, using default %d", v, key, fallback)
+		log.Printf("warning: invalid value %q for %s, using default %d", v, key, fallback) //nolint:gosec // operator-set env value in a startup warning, not a trust boundary
 		return fallback
 	}
 	return i
@@ -398,7 +398,7 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
-		log.Printf("warning: invalid duration %q for %s, using default %v", v, key, fallback)
+		log.Printf("warning: invalid duration %q for %s, using default %v", v, key, fallback) //nolint:gosec // operator-set env value in a startup warning, not a trust boundary
 		return fallback
 	}
 	return d

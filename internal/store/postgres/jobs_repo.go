@@ -64,13 +64,14 @@ func scanJobRow(s rowScanner, extra ...any) (jobs.JobRow, error) {
 	var leaseOwner sql.NullString
 	var leaseExpires, startedAt, finishedAt, deletedAt sql.NullTime
 	var principal, policy, progress, errDoc []byte
-	dests := []any{
+	dests := make([]any, 0, 27+len(extra))
+	dests = append(dests,
 		&row.TenantID, &row.ID, &row.Operation, &row.Status, &connID,
 		&objectID,
 		&observed, &row.IdempotencyKey, &row.InputHash, &inputRef, &principal,
 		&submitterKey, &policy, &row.Attempt, &row.MaxAttempts, &row.FenceToken,
 		&leaseOwner, &leaseExpires, &dispatched, &resultRef, &progress, &errDoc,
-		&row.CreatedAt, &row.UpdatedAt, &startedAt, &finishedAt, &deletedAt}
+		&row.CreatedAt, &row.UpdatedAt, &startedAt, &finishedAt, &deletedAt)
 	dests = append(dests, extra...)
 	if err := s.Scan(dests...); err != nil {
 		return jobs.JobRow{}, err
@@ -143,7 +144,7 @@ func nullInt64(v int64) any {
 }
 
 // isUniqueViolationPG reports SQLSTATE 23505 — the jobs idempotency
-// unique index signalling a same-key insert.
+// unique index signaling a same-key insert.
 func isUniqueViolationPG(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "SQLSTATE 23505")
 }
@@ -291,6 +292,7 @@ func (r *JobsRepo) ListOwnedJobsFiltered(ctx context.Context, tenantID, submitte
 	args := []any{tenantID, submitterKey}
 	query, args = appendJobPredicate(query, args, "operation", ops)
 	query, args = appendJobPredicate(query, args, "status", statuses)
+	//nolint:gosec // limit is an integer, not SQL input
 	query += `
 		ORDER BY submitted_at DESC, id DESC
 		LIMIT ` + strconv.Itoa(limit)
@@ -334,6 +336,7 @@ func (r *JobsRepo) listActivityRows(ctx context.Context, tenantID, actorPredicat
 	}
 	query, args = appendJobPredicate(query, args, "operation", ops)
 	query, args = appendJobPredicate(query, args, "status", statuses)
+	//nolint:gosec // limit is an integer, not SQL input
 	query += `
 		ORDER BY submitted_at DESC, id DESC
 		LIMIT ` + strconv.Itoa(limit)
@@ -382,7 +385,7 @@ func (r *JobsRepo) ListConnectionJobs(ctx context.Context, tenantID, connectionI
 		query += ` AND status = $3`
 		args = append(args, status)
 	}
-	query += ` ORDER BY submitted_at DESC, id DESC LIMIT ` + strconv.Itoa(limit)
+	query += ` ORDER BY submitted_at DESC, id DESC LIMIT ` + strconv.Itoa(limit) //nolint:gosec // limit is an int, cannot inject SQL
 	rows, err := r.db.SQL.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list connection jobs: %w", err)
@@ -465,7 +468,7 @@ func (r *JobsRepo) ListDeletedExtractJobs(ctx context.Context) ([]jobs.JobRow, e
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := []jobs.JobRow{}
 	for rows.Next() {
 		row, err := scanJobRow(rows)
@@ -848,7 +851,7 @@ func (r *JobsRepo) ExpiredPreviewJobs(ctx context.Context, before time.Time, lim
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var expired []extract.ExpiredPreview
 	for rows.Next() {
 		var row extract.ExpiredPreview

@@ -92,7 +92,7 @@ func statusLabel(kind, state string) string {
 // statusPill renders <span class="pill {tone}"><i class="dot"></i>Label</span>
 // with the label escaped.
 func statusPill(kind, state string) template.HTML {
-	return template.HTML(`<span class="pill ` + statusTone(state) + `"><i class="dot"></i>` +
+	return template.HTML(`<span class="pill ` + statusTone(state) + `"><i class="dot"></i>` + //nolint:gosec // Tone is selected from fixed labels and text is HTML-escaped.
 		template.HTMLEscapeString(statusLabel(kind, state)) + `</span>`)
 }
 

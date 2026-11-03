@@ -24,11 +24,10 @@ import (
 // stubOIDCProvider is a discovery+token+JWKS provider on httptest that signs
 // ID tokens with an in-memory RSA key.
 type stubOIDCProvider struct {
-	srv   *httptest.Server
-	key   *rsa.PrivateKey
-	kid   string
-	nonce string // filled from the consumed oidc_states row per token request
-	db    *postgres.DB
+	srv *httptest.Server
+	key *rsa.PrivateKey
+	kid string
+	db  *postgres.DB
 }
 
 func newStubOIDCProvider(t *testing.T, db *postgres.DB) *stubOIDCProvider {
@@ -50,8 +49,8 @@ func newStubOIDCProvider(t *testing.T, db *postgres.DB) *stubOIDCProvider {
 		})
 	})
 	mux.HandleFunc("/keys", func(w http.ResponseWriter, r *http.Request) {
-		n := base64.RawURLEncoding.EncodeToString(p.key.PublicKey.N.Bytes())
-		e := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(p.key.PublicKey.E)).Bytes())
+		n := base64.RawURLEncoding.EncodeToString(p.key.N.Bytes())
+		e := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(p.key.E)).Bytes())
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"keys": []map[string]any{{
@@ -125,7 +124,7 @@ func (p *stubOIDCProvider) signIDToken(subject, nonce, email string, emailVerifi
 
 func seedOIDCProvider(t *testing.T, repo *postgres.IdentityRepo, tenantID, issuer string, enabled bool) {
 	t.Helper()
-	err := repo.CreateOIDCProvider(context.Background(), tenantID, auth.OIDCProvider{
+	err := repo.CreateOIDCProvider(context.Background(), tenantID, auth.OIDCProvider{ //nolint:gosec // ClientSecretRef below is an env var reference, not a credential literal
 		ID:              "prov_stub",
 		Name:            "Stub IdP",
 		Issuer:          issuer,

@@ -53,14 +53,14 @@ func TestHTMLBlocksDoNotIncludeScriptsOrFetchResources(t *testing.T) {
 // silently drop the item's trailing text the way the sibling-boundary
 // rule did.
 func TestHTMLBlocksKeepTextAroundNestedBlocks(t *testing.T) {
-	var texts []string
+	texts := make([]string, 0, 4)
 	for _, b := range htmlBlocks(`<ul><li>before<p>inside</p>after</li><li>next</li></ul>`) {
 		texts = append(texts, b.text)
 	}
 	if strings.Join(texts, "|") != "before|inside|after|next" {
 		t.Fatalf("nested block lost text: %#v", texts)
 	}
-	texts = nil
+	texts = texts[:0]
 	for _, b := range htmlBlocks(`<ul><li>outer<ul><li>deep</li></ul>tail</li><li>sibling</ul>`) {
 		texts = append(texts, b.text)
 	}
@@ -224,6 +224,17 @@ func writeZip(t *testing.T, parts map[string]string) []byte {
 	return buf.Bytes()
 }
 
+func TestEPUBReadMemberNegativeLimit(t *testing.T) {
+	data := writeZip(t, map[string]string{"chapter": "text"})
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := epubReadMember(zr, "chapter", -1); ok {
+		t.Fatal("negative limit must reject the member")
+	}
+}
+
 func TestEPUBSpineOrderSectionsAndFormat(t *testing.T) {
 	data := writeZip(t, map[string]string{
 		"META-INF/container.xml": `<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>`,
@@ -267,7 +278,7 @@ func TestEPUBMalformedAndFallbackOrder(t *testing.T) {
 	}
 }
 
-// TestEPUBConverterMarkupNeverIndexed: calibre/pdftohtml output (XML
+// TestEPUBConverterMarkupNeverIndexed: e-book converter/pdftohtml output (XML
 // declaration, head metadata, empty spacer paragraphs, an unclosed final
 // <p>, a div-only cover page) parses to its text — an empty <p> used to fail
 // the whole member back to raw markup, which was then chunked and embedded.
@@ -278,16 +289,16 @@ func TestEPUBConverterMarkupNeverIndexed(t *testing.T) {
 		"titlepage.xhtml":        `<?xml version='1.0' encoding='utf-8'?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Cover</title></head><body><div class="cover"><img src="cover.jpeg" alt=""/></div><div>A novel by Charles Stross</div></body></html>`,
 		"index_split_000.html": `<?xml version='1.0' encoding='utf-8'?>
 <html xmlns="http://www.w3.org/1999/xhtml"><head><title>Microsoft Word - Accelerando.rtf</title><meta name="generator" content="pdftohtml 0.36"/><link href="stylesheet.css" rel="stylesheet" type="text/css"/></head>
-<body class="calibre"><p class="calibre1">Chapter 1: Lobsters </p><p class="calibre1"> </p>
-<p class="calibre1">Manfred's on the road again, making strangers rich. </p><p class="calibre1">It's a hot summer Tuesday</body></html>`,
+` + `<body class="calibre"><p class="calibre1">Chapter 1: Lobsters </p><p class="calibre1"> </p>` + "\n" + //nolint:misspell // Preserve converter class names in the fixture.
+			`<p class="calibre1">Manfred's on the road again, making strangers rich. </p><p class="calibre1">It's a hot summer Tuesday</body></html>`, //nolint:misspell // Preserve converter class names in the fixture.
 	})
 	blocks, err := epubBlocks(data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var texts []string
+	texts := make([]string, 0, len(blocks))
 	for _, b := range blocks {
-		if strings.ContainsAny(b.text, "<>") || strings.Contains(b.text, "calibre") || strings.Contains(b.text, "pdftohtml") {
+		if strings.ContainsAny(b.text, "<>") || strings.Contains(b.text, "calibre") || strings.Contains(b.text, "pdftohtml") { //nolint:misspell // Check that converter class names are not indexed.
 			t.Fatalf("markup indexed as text: %q", b.text)
 		}
 		texts = append(texts, b.text)

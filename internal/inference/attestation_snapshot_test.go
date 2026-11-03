@@ -63,7 +63,7 @@ func snapCompose(t *testing.T, e Endpoint, credential string) string {
 			t.Fatalf("resolve SDK config file: %v", err)
 		}
 		if file != "" {
-			b, err := os.ReadFile(file)
+			b, err := os.ReadFile(file) //nolint:gosec // path resolved from operator config via ConfidentialSDKConfigFile
 			if err != nil {
 				t.Fatalf("read SDK config: %v", err)
 			}

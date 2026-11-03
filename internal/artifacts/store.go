@@ -202,7 +202,7 @@ func (s *Store) Begin(ctx context.Context, meta Meta, leaseTTL time.Duration, ma
 	}
 
 	tmpPath := filepath.Join(s.tmpDir, id+".part")
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // tmpPath is composed by the store from a generated "art_<hex>" id, never caller input
 	if err != nil {
 		return nil, Ref{}, fmt.Errorf("artifacts: create temp file: %w", err)
 	}
@@ -370,7 +370,7 @@ func (s *Store) Read(ctx context.Context, ref Ref) (io.ReadCloser, error) {
 	if row.State != StateFinal {
 		return nil, ErrNotFound
 	}
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:gosec // path comes from durablePath(): both components validated, result proven inside the durable root
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ErrNotFound
@@ -414,7 +414,7 @@ func (s *Store) ScratchDir(ctx context.Context, tenantID string) (string, func()
 	if err != nil {
 		return "", nil, fmt.Errorf("artifacts: scratch dir: %w", err)
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
+	if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // private scratch dir: directories need the owner-execute bit, 0700 is already minimal
 		_ = os.RemoveAll(dir)
 		return "", nil, fmt.Errorf("artifacts: scratch permissions: %w", err)
 	}
@@ -471,10 +471,10 @@ func newFenceToken() int64 {
 }
 
 func fsyncDir(dir string) error {
-	d, err := os.Open(dir)
+	d, err := os.Open(dir) //nolint:gosec // dir is always a store-composed path under the durable root (only durablePath-derived dirs are fsynced)
 	if err != nil {
 		return err
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 	return d.Sync()
 }

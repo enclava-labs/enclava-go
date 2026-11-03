@@ -236,7 +236,7 @@ func TestDashboardEmptyContract(t *testing.T) {
 // TestDashboardCapsJSONKeys verifies the capability projection carries
 // booleans keyed by the §3.1 names the client map filters on.
 func TestDashboardCapsJSONKeys(t *testing.T) {
-	raw := string(dashboardCapsJSON(dashboardCaps{Chat: true, ModelsManage: true}))
+	raw := dashboardCapsJSON(dashboardCaps{Chat: true, ModelsManage: true})
 	var got map[string]bool
 	if err := json.Unmarshal([]byte(raw), &got); err != nil {
 		t.Fatalf("projection is not JSON: %v", err)

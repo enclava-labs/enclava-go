@@ -94,7 +94,7 @@ func serve() error {
 		}
 	}()
 
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.DataDir, 0o750); err != nil {
 		return fmt.Errorf("data dir init error: %w", err)
 	}
 
