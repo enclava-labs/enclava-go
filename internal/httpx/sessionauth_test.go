@@ -155,16 +155,22 @@ func TestSessionHXExpiryRedirects(t *testing.T) {
 
 func TestPasswordLoginRateLimits(t *testing.T) {
 	s := newTestSessionAuth()
+	// attempt simulates one FAILED sign-in: the pre-check must pass and the
+	// failure is recorded — only failures consume the limits.
 	attempt := func(ip, tenant, email string) bool {
 		r := httptest.NewRequest(http.MethodPost, "/dashboard/login", nil)
 		r.RemoteAddr = ip + ":1234"
 		r.Header.Set("X-Forwarded-For", "203.0.113.1")
 		rec := httptest.NewRecorder()
 		allowed := s.allowPasswordAttempt(rec, r, tenant, email)
-		if !allowed && (rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "Too many sign-in attempts. Try again later.")) {
-			t.Fatalf("unexpected throttled response: %d %s", rec.Code, rec.Body.String())
+		if !allowed {
+			if rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "Too many sign-in attempts. Try again in") {
+				t.Fatalf("unexpected throttled response: %d %s", rec.Code, rec.Body.String())
+			}
+			return false
 		}
-		return allowed
+		s.recordPasswordFailure(r, tenant, email)
+		return true
 	}
 	for i := range 5 {
 		if !attempt(fmt.Sprintf("192.0.2.%d", i+1), "tenant", "User@Example.com") {
@@ -194,6 +200,38 @@ func TestPasswordLoginRateLimits(t *testing.T) {
 	}
 }
 
+// TestSuccessfulLoginsDoNotConsumeLimits pins P-09/BASE-I01: a legitimate
+// user signing in repeatedly never erodes either throttle, because only
+// failures are recorded.
+func TestSuccessfulLoginsDoNotConsumeLimits(t *testing.T) {
+	s := newTestSessionAuth()
+	for range 12 {
+		r := httptest.NewRequest(http.MethodPost, "/dashboard/login", nil)
+		r.RemoteAddr = "198.51.100.9:1234"
+		if !s.allowPasswordAttempt(httptest.NewRecorder(), r, "tenant", "regular@example.com") {
+			t.Fatal("successful sign-in attempts must not consume the limits")
+		}
+	}
+	// Five failures then one more check: the account limiter denies.
+	for range 5 {
+		r := httptest.NewRequest(http.MethodPost, "/dashboard/login", nil)
+		r.RemoteAddr = "198.51.100.8:1234"
+		if !s.allowPasswordAttempt(httptest.NewRecorder(), r, "tenant", "regular@example.com") {
+			t.Fatal("denied too early")
+		}
+		s.recordPasswordFailure(r, "tenant", "regular@example.com")
+	}
+	r := httptest.NewRequest(http.MethodPost, "/dashboard/login", nil)
+	r.RemoteAddr = "198.51.100.8:1234"
+	rec := httptest.NewRecorder()
+	if s.allowPasswordAttempt(rec, r, "tenant", "regular@example.com") {
+		t.Fatal("sixth attempt after five failures must be throttled")
+	}
+	if !strings.Contains(rec.Body.String(), "Try again in") {
+		t.Fatalf("throttled render missing retry hint: %s", rec.Body.String())
+	}
+}
+
 func newTestSessionAuth() *SessionAuth {
 	return &SessionAuth{
 		loginIPLimiter: NewRateLimiter(),
@@ -205,18 +243,21 @@ func newTestSessionAuth() *SessionAuth {
 
 func TestThrottledIPCreatesNoAccountEntries(t *testing.T) {
 	s := newTestSessionAuth()
-	for i := range 10 {
+	fail := func(ip, email string) {
 		r := httptest.NewRequest(http.MethodPost, "/dashboard/login", nil)
-		r.RemoteAddr = "192.0.2.1:1234"
-		s.allowPasswordAttempt(httptest.NewRecorder(), r, "tenant", fmt.Sprintf("u%d@example.com", i))
+		r.RemoteAddr = ip + ":1234"
+		if s.allowPasswordAttempt(httptest.NewRecorder(), r, "tenant", email) {
+			s.recordPasswordFailure(r, "tenant", email)
+		}
+	}
+	for i := range 10 {
+		fail("192.0.2.1", fmt.Sprintf("u%d@example.com", i))
 	}
 	if len(s.loginAccts) != 10 {
 		t.Fatalf("pre-throttle accounts = %d, want 10", len(s.loginAccts))
 	}
 	for i := 10; i < 60; i++ {
-		r := httptest.NewRequest(http.MethodPost, "/dashboard/login", nil)
-		r.RemoteAddr = "192.0.2.1:1234"
-		s.allowPasswordAttempt(httptest.NewRecorder(), r, "tenant", fmt.Sprintf("u%d@example.com", i))
+		fail("192.0.2.1", fmt.Sprintf("u%d@example.com", i))
 	}
 	if len(s.loginAccts) != 10 || len(s.loginAcctLimit.windows) != 10 {
 		t.Fatalf("throttled IP grew account state: %d buckets, %d windows",
@@ -245,6 +286,7 @@ func TestLoginAccountCapSkipsNewAccounts(t *testing.T) {
 		if !s.allowPasswordAttempt(httptest.NewRecorder(), r, "tenant", "new-account@example.com") {
 			t.Fatal("capped account must not deny before the IP limit")
 		}
+		s.recordPasswordFailure(r, "tenant", "new-account@example.com")
 	}
 	if s.allowPasswordAttempt(httptest.NewRecorder(), r, "tenant", "new-account@example.com") {
 		t.Fatal("IP limit must still deny when account limiting is skipped")
@@ -286,9 +328,55 @@ func TestThrottledLoginIsAuditedWithoutEmail(t *testing.T) {
 	for range 6 {
 		r := httptest.NewRequest(http.MethodPost, "/dashboard/login", nil)
 		r.RemoteAddr = "192.0.2.1:1234"
-		s.allowPasswordAttempt(httptest.NewRecorder(), r, "tenant", "secret@example.com")
+		if s.allowPasswordAttempt(httptest.NewRecorder(), r, "tenant", "secret@example.com") {
+			s.recordPasswordFailure(r, "tenant", "secret@example.com")
+		}
 	}
 	if len(audit.rows) != 1 || audit.rows[0].Action != "auth.login.throttled" || audit.rows[0].Outcome != "throttled" || audit.rows[0].TenantID != "tenant" || audit.rows[0].TargetID != "" {
 		t.Fatalf("unexpected audit records: %+v", audit.rows)
+	}
+}
+
+// TestLoginThrottleCountsOnlyFailures drives the real login route: ten
+// consecutive successful sign-ins for one account all succeed (P-09 /
+// BASE-I01), then five failures throttle the sixth attempt with a 429 that
+// names the retry window and preserves the submitted email.
+func TestLoginThrottleCountsOnlyFailures(t *testing.T) {
+	f := newIdentityFixture(t)
+	loginUser(t, f, "throttle@example.com", []string{"chatbot"}, "right-pass")
+
+	// Ten successful sign-ins never consume the per-IP or per-account limits.
+	for range 10 {
+		postLogin(t, f.app, "throttle@example.com", "right-pass", "")
+	}
+
+	post := func(email, password string) *httptest.ResponseRecorder {
+		t.Helper()
+		form := url.Values{"email": {email}, "password": {password}}
+		req := httptest.NewRequest(http.MethodPost, "/dashboard/login", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		f.app.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	for i := range 5 {
+		if rec := post("throttle@example.com", "wrong-pass"); rec.Code != http.StatusOK {
+			t.Fatalf("failed attempt %d expected re-render 200, got %d", i+1, rec.Code)
+		}
+	}
+
+	// The account bucket is full: even the correct password is throttled,
+	// the retry hint is announced and the email field keeps its value.
+	rec := post("throttle@example.com", "right-pass")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("sixth attempt expected 429, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Too many sign-in attempts. Try again in") || !strings.Contains(body, "minutes") {
+		t.Fatalf("429 missing retry hint: %s", body)
+	}
+	if !strings.Contains(body, `value="throttle@example.com"`) {
+		t.Fatalf("429 render must preserve the submitted email: %s", body)
 	}
 }

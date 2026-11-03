@@ -1,4 +1,4 @@
-import { expect, Page } from '@playwright/test';
+import { test as base, expect, Page } from '@playwright/test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
@@ -13,6 +13,7 @@ export const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 export const MANAGER_EMAIL = 'manager@e2e.local';
 export const MEMBER_EMAIL = 'member@e2e.local';
 export const GRANTLESS_EMAIL = 'grantless@e2e.local';
+export const LOCKOUT_EMAIL = 'lockout@e2e.local';
 export const MEMBER_PASSWORD = 'E2e-pass-1234!';
 export const SESSION_COOKIE = 'enclava_session';
 export const CSRF_COOKIE = 'enclava_csrf';
@@ -107,6 +108,9 @@ export async function sessionApi(page: Page, method: string, url: string, body?:
     method,
     headers: {
       'X-CSRF-Token': csrf ? csrf.value : '',
+      // APIRequestContext sends no Sec-Fetch-Site/Origin — the same-origin
+      // gate needs an explicit Origin on cookie-authenticated mutations.
+      Origin: BASE,
       'Content-Type': 'application/json',
     },
     data: body === undefined ? undefined : JSON.stringify(body),
@@ -148,6 +152,38 @@ export async function sessionCookies(page: Page) {
     csrf: cookies.find((c) => c.name === CSRF_COOKIE),
   };
 }
+
+// roleSession is the BASE-I02 guard: the stored role session is a single
+// active session, so any earlier logout or same-account login revokes it.
+// Every test re-probes /dashboard through the context's own request client
+// (same cookie jar as the page) and, when the stored session is rejected,
+// re-mints it through a REAL form login — never an injected cookie. Login
+// persists the fresh state back to .auth/<role>.json for the next context.
+const ROLE_CREDS: Record<string, { email: () => string; password: () => string }> = {
+  admin: { email: () => ADMIN_EMAIL, password: () => ADMIN_PASSWORD },
+  manager: { email: () => MANAGER_EMAIL, password: () => MEMBER_PASSWORD },
+  member: { email: () => MEMBER_EMAIL, password: () => MEMBER_PASSWORD },
+};
+
+export const test = base.extend<{ roleSession: void }>({
+  roleSession: [
+    async ({ context }, use, testInfo) => {
+      const creds = ROLE_CREDS[testInfo.project.name];
+      if (creds) {
+        const res = await context.request.get(`${BASE}/dashboard`);
+        if (res.status() !== 200) {
+          const p = await context.newPage();
+          await login(p, creds.email(), creds.password());
+          await p.close();
+        }
+      }
+      await use();
+    },
+    { auto: true },
+  ],
+});
+
+export { expect };
 
 // awaitTerminal polls the chat thread until every live runline is gone —
 // the terminal render carries Stopped/failed vocabulary, never a timeout.

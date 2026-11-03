@@ -54,6 +54,7 @@
     <a class="navlink" href="/dashboard/account">{{icon "users"}}<span class="navlabel">Account</span></a>
     <button type="button" class="navlink" data-action="theme">{{icon "sun"}}<span class="navlabel">Theme</span></button>
     <form method="post" action="/dashboard/logout">
+      <input type="hidden" name="csrf_token" value="{{.CSRF}}">
       <button type="submit" class="navlink">{{icon "logout"}}<span class="navlabel">Sign out</span></button>
     </form>
   </div>

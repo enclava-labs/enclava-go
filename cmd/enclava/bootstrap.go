@@ -92,6 +92,11 @@ func runBootstrap(ctx context.Context, args []string) error {
 	if strings.TrimSpace(*email) == "" {
 		return errors.New("--email must be non-empty")
 	}
+	if *passwordFlag != "" {
+		if err := auth.ValidatePassword(*passwordFlag); err != nil {
+			return err
+		}
+	}
 
 	cfg, err := config.Load()
 	if err != nil {

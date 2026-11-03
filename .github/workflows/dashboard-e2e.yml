@@ -1,0 +1,74 @@
+name: Dashboard E2E
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dashboard-e2e:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: enclava
+          POSTGRES_PASSWORD: enclava
+          POSTGRES_DB: enclava
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U enclava -d enclava"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      qdrant:
+        image: qdrant/qdrant:v1.15.5
+        ports:
+          - 6333:6333
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check out confidential inference SDK
+        run: |
+          git clone --quiet https://github.com/enclava-labs/confidential-inference-sdk ../enclava-proxy-sdk/confidential-inference-sdk
+          # Keep this pin in sync with the Dockerfile.
+          git -C ../enclava-proxy-sdk/confidential-inference-sdk checkout --quiet adcb08cee700fe9f18ac1954cc146b98295e2008
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Install native processors
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils tesseract-ocr bubblewrap ripgrep
+      - name: Wait for Qdrant
+        run: |
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:6333/readyz > /dev/null; then exit 0; fi
+            sleep 2
+          done
+          echo "Qdrant did not become ready" >&2
+          exit 1
+      - name: Install Playwright
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Run dashboard e2e suite
+        run: scripts/dashboard_e2e.sh
+        env:
+          E2E_DATABASE_URL: postgres://enclava:enclava@127.0.0.1:5432/enclava?sslmode=disable
+          QDRANT_URL: http://127.0.0.1:6333
+      - name: Upload e2e results
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dashboard-e2e-results
+          # test-results/e2e-app.log carries the app log on failure
+          # (dashboard_e2e.sh copies it before teardown).
+          path: test-results/
+          if-no-files-found: warn

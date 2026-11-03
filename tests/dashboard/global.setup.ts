@@ -1,9 +1,9 @@
-import { test, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import * as fs from 'node:fs';
 import {
   BASE, ADMIN_EMAIL, ADMIN_PASSWORD, MANAGER_EMAIL, MEMBER_EMAIL,
-  GRANTLESS_EMAIL, MEMBER_PASSWORD, AUTH_DIR, SEED_FILE, Seed,
-  api, login, stubOrigins,
+  GRANTLESS_EMAIL, LOCKOUT_EMAIL, MEMBER_PASSWORD, AUTH_DIR, SEED_FILE, Seed,
+  api, login, stubOrigins, test,
 } from './fixtures';
 
 // global.setup.ts — the deterministic seed for the whole dashboard-e2e run.
@@ -97,6 +97,12 @@ test('seed: stubs reachable, data seeded, three sessions minted', async ({ page 
   // the grantless truth cases need one account that is never repaired.
   const grantlessUser = await api<{ id: string }>('POST', '/api/v1/identities/users', {
     email: GRANTLESS_EMAIL, display_name: 'E2E Grantless',
+    password: MEMBER_PASSWORD, role_ids: [],
+  });
+  // Dedicated wrong-password target: the login-throttle denial tests must
+  // never spend failed attempts against the shared role accounts.
+  await api<{ id: string }>('POST', '/api/v1/identities/users', {
+    email: LOCKOUT_EMAIL, display_name: 'E2E Lockout',
     password: MEMBER_PASSWORD, role_ids: [],
   });
   const grantlessRole = await api<{ id: string }>('POST', '/api/v1/identities/roles', {

@@ -1,7 +1,7 @@
-import { test, expect } from '@playwright/test';
 import {
   BASE, ADMIN_EMAIL, MEMBER_EMAIL, MANAGER_EMAIL, MEMBER_PASSWORD,
-  GRANTLESS_EMAIL, login, sessionCookies, SESSION_COOKIE, CSRF_COOKIE,
+  GRANTLESS_EMAIL, LOCKOUT_EMAIL, login, sessionCookies, SESSION_COOKIE,
+  CSRF_COOKIE, test, expect,
 } from './fixtures';
 
 // nav.spec.ts — per-role nav truth (§3.3, flow 9): every visible sidebar
@@ -194,7 +194,8 @@ test.describe('session and auth (migrated tests/dashboard.spec.ts)', () => {
   test('login with a wrong password shows an accessible error', async ({ page }) => {
     await page.context().clearCookies();
     await page.goto(`${BASE}/dashboard/login`);
-    await page.fill('input[name="email"]', ADMIN_EMAIL);
+    // Dedicated lockout account — never spend failed attempts on a shared role.
+    await page.fill('input[name="email"]', LOCKOUT_EMAIL);
     await page.fill('input[name="password"]', 'wrong-password');
     await page.click('button[type="submit"]');
     await expect(page).toHaveURL(/\/dashboard\/login/);
@@ -212,6 +213,8 @@ test.describe('session and auth (migrated tests/dashboard.spec.ts)', () => {
   });
 
   test('cookie-authenticated logout requires the session CSRF token', async ({ page, playwright }) => {
+    // Own fresh login — never the shared storage-state session.
+    await login(page, ADMIN_EMAIL, process.env.ADMIN_PASSWORD || '');
     const { session } = await sessionCookies(page);
     const anon = await playwright.request.newContext({ baseURL: BASE });
     const res = await anon.post(`${BASE}/dashboard/logout`, {
@@ -222,6 +225,8 @@ test.describe('session and auth (migrated tests/dashboard.spec.ts)', () => {
   });
 
   test('logout revokes the session and protects pages afterwards', async ({ page, playwright }) => {
+    // Own fresh login — the logout must never consume the shared session.
+    await login(page, ADMIN_EMAIL, process.env.ADMIN_PASSWORD || '');
     const { session, csrf } = await sessionCookies(page);
     await page.goto(`${BASE}/dashboard`);
     await page.locator('button[aria-label="User menu"]').click();

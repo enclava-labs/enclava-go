@@ -33,6 +33,7 @@ type dashboardView struct {
 	User      dashboardUser
 	Org       string // tenant display name; falls back to the tenant slug
 	Theme     string // "light" when the enclava_theme cookie says so; dark ""
+	CSRF      string // session CSRF token; fills the logout form's hidden input
 }
 
 // CapsAttr renders the granted capability names for the body's data-caps
@@ -73,6 +74,7 @@ func (a *App) buildDashboardView(r *http.Request, page string, data any) dashboa
 		User:   a.dashboardUserFor(ctx, p),
 		Org:    a.dashboardOrgName(ctx, p.TenantID),
 		Theme:  themeFromRequest(r),
+		CSRF:   csrfCookieValue(r),
 	}
 	if meta, ok := data.(dashboardPageMeta); ok {
 		v.PageTitle = meta.DashboardTitle()

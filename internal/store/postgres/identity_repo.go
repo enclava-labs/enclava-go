@@ -648,6 +648,56 @@ func (r *IdentityRepo) CreateUser(ctx context.Context, tenantID string, u auth.U
 	return nil
 }
 
+// CreateUserWithRoles writes the user row and its initial memberships in one
+// transaction: every role id is checked inside the transaction first, so an
+// unknown role returns auth.ErrNotFound and a rolled-back attempt leaves no
+// user behind (ADM-I01). RETURNING fills the stored created_at.
+func (r *IdentityRepo) CreateUserWithRoles(ctx context.Context, tenantID string, u auth.User, roleIDs []string) (auth.User, error) {
+	status := u.Status
+	if status == "" {
+		status = "active"
+	}
+	var created auth.User
+	err := WithTx(ctx, r.db, func(tx *sql.Tx) error {
+		for _, roleID := range roleIDs {
+			var exists bool
+			if err := tx.QueryRowContext(ctx,
+				`SELECT EXISTS(SELECT 1 FROM roles WHERE tenant_id = $1::uuid AND id = $2)`,
+				tenantID, roleID).Scan(&exists); err != nil {
+				return fmt.Errorf("check role %s: %w", roleID, err)
+			}
+			if !exists {
+				return auth.ErrNotFound
+			}
+		}
+		row, err := scanUser(tx.QueryRowContext(ctx,
+			`INSERT INTO users
+			 (tenant_id, id, email, display_name, status, team,
+			  password_hash, password_set_at, last_login_at)
+			 VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9)
+			 RETURNING `+userColumns,
+			tenantID, u.ID, u.Email, u.DisplayName, status, u.Team,
+			nullStr(u.PasswordHash), u.PasswordSetAt, u.LastLoginAt))
+		if err != nil {
+			return fmt.Errorf("create user: %w", err)
+		}
+		for _, roleID := range roleIDs {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO user_roles (tenant_id, user_id, role_id)
+				 VALUES ($1::uuid, $2, $3) ON CONFLICT DO NOTHING`,
+				tenantID, u.ID, roleID); err != nil {
+				return fmt.Errorf("assign role %s: %w", roleID, err)
+			}
+		}
+		created = row
+		return nil
+	})
+	if err != nil {
+		return auth.User{}, err
+	}
+	return created, nil
+}
+
 // UpdateUserTeam rewrites the free-form team label (empty clears it — "No
 // team" is a first-class state); the label is trimmed and length-capped by
 // the HTTP layer before it reaches the store.

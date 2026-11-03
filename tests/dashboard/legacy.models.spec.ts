@@ -1,4 +1,5 @@
-import { test, expect, Page } from '@playwright/test';
+import { Page } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 // models.spec.ts — the Models + Pricing Set-price regression (OA-27): the
 // old pricing.js was never served, so the popover never submitted. This spec

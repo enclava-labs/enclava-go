@@ -239,3 +239,12 @@ func TestBootstrapSeedsDefaultRoles(t *testing.T) {
 		}
 	}
 }
+
+// TestBootstrapRejectsShortPassword proves --password runs the shared
+// server-side policy (AUTH-I02) and fails before any database work.
+func TestBootstrapRejectsShortPassword(t *testing.T) {
+	err := runBootstrap(context.Background(), []string{"--tenant", "x", "--email", "a@b.c", "--password", "short"})
+	if err == nil || !strings.Contains(err.Error(), "at least 8 characters") {
+		t.Fatalf("short --password error = %v, want the policy message", err)
+	}
+}

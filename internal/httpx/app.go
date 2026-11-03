@@ -308,8 +308,10 @@ func (a *App) authenticated(scope string, next func(http.ResponseWriter, *http.R
 		}
 		if cookieAuth && r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
 			// Cookie-authenticated mutations must carry the session's CSRF
-			// token (header preferred, script-readable cookie as fallback).
-			if err := a.authSvc.ValidateCSRF(r.Context(), principal.TenantID, principal.SessionID, csrfFromRequest(r)); err != nil {
+			// token (header or form field — never the cookie alone) and be a
+			// same-origin request.
+			if !sameOriginMutation(r, a.trustProxy) ||
+				a.authSvc.ValidateCSRF(r.Context(), principal.TenantID, principal.SessionID, csrfFromRequest(r)) != nil {
 				WriteForbidden(w, "missing or invalid CSRF token")
 				return
 			}
@@ -355,17 +357,31 @@ func (a *App) enforceRateLimits(w http.ResponseWriter, key string, now time.Time
 	if a.rl == nil || len(checks) == 0 {
 		return true
 	}
+	// Admission first: a request denied by one window consumes no budget in
+	// the others. Each window gets its own bucket so one request counts once
+	// per window and windows keep independent reset timestamps.
 	for _, check := range checks {
 		if check.limit <= 0 {
 			continue
 		}
-		dec := a.rl.AllowKey(key, check.limit, check.window, now)
-		if !dec.Allowed {
+		if dec := a.rl.CheckKey(rateLimitBucketKey(key, check.window), check.limit, check.window, now); !dec.Allowed {
 			writeRateLimited(w, dec)
 			return false
 		}
 	}
+	for _, check := range checks {
+		if check.limit <= 0 {
+			continue
+		}
+		a.rl.AllowKey(rateLimitBucketKey(key, check.window), check.limit, check.window, now)
+	}
 	return true
+}
+
+// rateLimitBucketKey namespaces the caller's limiter key by window size so a
+// single identity holds one counter per window (IDOP-I01).
+func rateLimitBucketKey(key string, window time.Duration) string {
+	return key + ":" + itoa(int64(window/time.Second))
 }
 
 // envRateLimit reads an operator-tunable pre-auth budget from the

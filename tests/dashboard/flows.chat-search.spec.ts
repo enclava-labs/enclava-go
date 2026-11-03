@@ -1,4 +1,4 @@
-import { test, expect, Page } from '@playwright/test';
+import type { Page } from '@playwright/test';
 
 declare global {
   interface Window {
@@ -10,7 +10,7 @@ declare global {
 }
 import {
   BASE, MEMBER_EMAIL, MEMBER_PASSWORD, GRANTLESS_EMAIL,
-  api, login, seedData, awaitTerminal, uploadDoc,
+  api, login, seedData, awaitTerminal, uploadDoc, test, expect,
 } from './fixtures';
 
 // flows.chat-search.spec.ts — member-project §9.2 flows 1–2 plus the

@@ -240,3 +240,25 @@ endpoint with `POST /api/v1/providers` using the discovered values
 - `GET /metrics` exposes Prometheus metrics; require
   `Authorization: Bearer $METRICS_TOKEN`. With no token configured the
   endpoint fails closed (401) unless `METRICS_AUTH_DISABLED=true` is set.
+
+## 8. Billing reconciliation
+
+`POST /api/v1/admin/reservations/{id}/resolve` (scope `platform.admin`)
+settles a reservation stuck in the `unknown` state — or writes the hold off
+with all-zero counts — and returns the settled `usage_record`:
+
+```bash
+curl -s -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  $BASE/api/v1/admin/reservations/res_abc/resolve \
+  -d '{"input_tokens":12,"cached_input_tokens":4,"output_tokens":8}'
+```
+
+`input_tokens` is the provider-reported input total and INCLUDES its cached
+subset, exactly like every upstream usage object: the service settles
+`input_tokens - cached_input_tokens` as uncached input plus
+`cached_input_tokens` as cached input, so cached tokens are never billed
+twice. `cached_input_tokens` must not exceed `input_tokens` and all three
+fields must be non-negative integers (400 `invalid_request_error`
+otherwise). A nonexistent or cross-tenant id is one indistinguishable 404; a
+reservation not in the `unknown` state returns 409, except an
+already-settled one which returns the existing `usage_record` (200).

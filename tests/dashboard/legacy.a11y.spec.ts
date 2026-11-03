@@ -1,4 +1,5 @@
-import { test, expect, Page, Locator, APIRequestContext } from '@playwright/test';
+import { Page, Locator, APIRequestContext } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 declare global {
   interface Window {
@@ -75,6 +76,9 @@ async function api(request: APIRequestContext, page: Page, method: string, path:
     headers: {
       Cookie: sess ? `enclava_session=${sess.value}` : '',
       'X-CSRF-Token': csrf ? csrf.value : '',
+      // APIRequestContext sends no Sec-Fetch-Site/Origin — the same-origin
+      // gate needs an explicit Origin on cookie-authenticated requests.
+      Origin: BASE,
       'Content-Type': 'application/json',
     },
     data: body === undefined ? undefined : JSON.stringify(body),

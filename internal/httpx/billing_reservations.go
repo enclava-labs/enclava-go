@@ -40,7 +40,9 @@ type adminReservationDTO struct {
 
 // adminReservationResolveRequest is the POST resolve body: the reconciled
 // per-kind token counts. All three are required integers ≥ 0 — an absent
-// field can never silently write usage off.
+// field can never silently write usage off. input_tokens includes its
+// cached subset exactly like every upstream usage object; the handler
+// settles uncached input so cached tokens never bill twice.
 type adminReservationResolveRequest struct {
 	InputTokens       *int64 `json:"input_tokens"`
 	CachedInputTokens *int64 `json:"cached_input_tokens"`
@@ -158,8 +160,12 @@ func (a *App) handleAdminReservationResolve(w http.ResponseWriter, r *http.Reque
 			return
 		}
 	}
+	if *req.CachedInputTokens > *req.InputTokens {
+		WriteOpenAIError(w, http.StatusBadRequest, "cached_input_tokens must not exceed input_tokens, which already includes cached tokens", "invalid_request_error", "invalid_tokens")
+		return
+	}
 	rec, err := a.billingSvc.ResolveUnknown(r.Context(), principal, id, billing.Usage{
-		InputUnits:       *req.InputTokens,
+		InputUnits:       *req.InputTokens - *req.CachedInputTokens,
 		CachedInputUnits: *req.CachedInputTokens,
 		OutputUnits:      *req.OutputTokens,
 	})

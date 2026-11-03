@@ -844,3 +844,115 @@ func TestBudgetTimezoneLiabilityWindow(t *testing.T) {
 		t.Fatalf("invalid zone must fall back to UTC day start, got %v", from)
 	}
 }
+
+// TestLiabilityWindowSurvivesDstMidnightGap: when local midnight does not
+// exist on the boundary day (America/Santiago springs forward at 24:00 on
+// 2026-09-05, skipping 00:00–00:59 of 2026-09-06), the window must open at
+// the first instant of the local date — never in the previous local day,
+// which would count prior-day usage.
+func TestLiabilityWindowSurvivesDstMidnightGap(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.flatPrices(t)
+
+	santiago, err := time.LoadLocation("America/Santiago")
+	if err != nil {
+		t.Skipf("zoneinfo unavailable: %v", err)
+	}
+	daily := billing.Budget{
+		Subject: billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: f.keyID},
+		Kind:    billing.BudgetKindAmount, Period: billing.PeriodDaily,
+		LimitAmountMicros: 1_000, Currency: "USD",
+		Timezone: "America/Santiago",
+		// StartsAt must predate every exercised boundary — LiabilityFrom
+		// takes the LATER of starts_at and the period window start.
+		StartsAt: time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+
+	// now = noon on the gap day: the window opens at 01:00 -03:00 (04:00Z),
+	// the first existing instant — not 23:00 -04:00 of 2026-09-05.
+	gapNow := time.Date(2026, 9, 6, 12, 0, 0, 0, santiago)
+	wantStart := time.Date(2026, 9, 6, 1, 0, 0, 0, santiago)
+	if from := billing.LiabilityFrom(daily, gapNow); !from.Equal(wantStart) {
+		t.Fatalf("gap-day window start = %v, want %v", from, wantStart)
+	}
+
+	// Usage settled at 2026-09-05 23:30 local is prior-day usage and must
+	// not count, even though the naive normalized boundary precedes it.
+	res1, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 1}))
+	if err != nil {
+		t.Fatalf("reserve prior-day: %v", err)
+	}
+	res2, err := f.svc.Reserve(ctx, f.principal, f.req(billing.Usage{InputUnits: 2}))
+	if err != nil {
+		t.Fatalf("reserve in-day: %v", err)
+	}
+	for _, res := range []billing.Reservation{res1, res2} {
+		if _, err := f.svc.Settle(ctx, f.principal, res.ID, billing.Usage{InputUnits: 1}); err != nil {
+			t.Fatalf("settle %s: %v", res.ID, err)
+		}
+	}
+	stamp := func(res billing.Reservation, at time.Time) {
+		if _, err := f.db.SQL.ExecContext(ctx,
+			`UPDATE usage_records SET created_at = $3 WHERE tenant_id = $1::uuid AND reservation_id = $2`,
+			f.tenant, res.ID, at.UTC()); err != nil {
+			t.Fatalf("backdate %s: %v", res.ID, err)
+		}
+	}
+	stamp(res1, time.Date(2026, 9, 5, 23, 30, 0, 0, santiago)) // 03:30Z, prior day
+	stamp(res2, time.Date(2026, 9, 6, 2, 0, 0, 0, santiago))   // 05:00Z, in window
+
+	windowFrom := billing.LiabilityFrom(daily, gapNow)
+	var counted int64
+	if err := f.repo.InTx(ctx, func(tx billing.BillingTx) error {
+		rows, err := tx.Liabilities(ctx, f.tenant,
+			billing.Subject{Type: billing.BudgetSubjectAPIKey, ID: f.keyID}, windowFrom)
+		if err != nil {
+			return err
+		}
+		for _, r := range rows {
+			counted += r.AmountMicros
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("liabilities: %v", err)
+	}
+	if counted != 1 {
+		t.Fatalf("gap-day window counted %d micros of settled usage, want 1 (prior-day row must not count)", counted)
+	}
+
+	// An ordinary day still opens at local midnight.
+	ordinaryNow := time.Date(2026, 9, 8, 12, 0, 0, 0, santiago)
+	ordinaryStart := time.Date(2026, 9, 8, 0, 0, 0, 0, santiago)
+	if from := billing.LiabilityFrom(daily, ordinaryNow); !from.Equal(ordinaryStart) {
+		t.Fatalf("ordinary-day window start = %v, want %v", from, ordinaryStart)
+	}
+
+	// Week and month boundaries landing on gap days likewise open at the
+	// first existing instant.
+	tehran, err := time.LoadLocation("Asia/Tehran")
+	if err != nil {
+		t.Skipf("zoneinfo unavailable: %v", err)
+	}
+	weekly := daily
+	weekly.Period = billing.PeriodWeekly
+	weekly.Timezone = "Asia/Tehran"
+	// Midnight of Monday 2021-03-22 does not exist in Asia/Tehran.
+	weekNow := time.Date(2021, 3, 24, 12, 0, 0, 0, tehran)
+	if from := billing.LiabilityFrom(weekly, weekNow); !from.Equal(time.Date(2021, 3, 22, 1, 0, 0, 0, tehran)) {
+		t.Fatalf("gap-Monday weekly start = %v, want 2021-03-22 01:00 +04:30", from)
+	}
+
+	asuncion, err := time.LoadLocation("America/Asuncion")
+	if err != nil {
+		t.Skipf("zoneinfo unavailable: %v", err)
+	}
+	monthly := daily
+	monthly.Period = billing.PeriodMonthly
+	monthly.Timezone = "America/Asuncion"
+	// Midnight of 2023-10-01 does not exist in America/Asuncion.
+	monthNow := time.Date(2023, 10, 15, 12, 0, 0, 0, asuncion)
+	if from := billing.LiabilityFrom(monthly, monthNow); !from.Equal(time.Date(2023, 10, 1, 1, 0, 0, 0, asuncion)) {
+		t.Fatalf("gap-1st monthly start = %v, want 2023-10-01 01:00 -03:00", from)
+	}
+}

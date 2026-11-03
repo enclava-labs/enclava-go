@@ -1,7 +1,6 @@
-import { test, expect } from '@playwright/test';
 import {
   BASE, ADMIN_EMAIL, ADMIN_PASSWORD,
-  seedData, awaitTerminal,
+  seedData, awaitTerminal, test, expect,
 } from './fixtures';
 
 declare global {

@@ -1,5 +1,5 @@
-import { test, expect, Page, APIRequestContext } from '@playwright/test';
-import { seedData } from './fixtures';
+import { Page } from '@playwright/test';
+import { test, expect, seedData } from './fixtures';
 
 // home.spec.ts — per-role Home (OA-31) browser coverage: section composition
 // per capability (§6.2), the zero-filled 30-point
@@ -42,6 +42,7 @@ async function api(page: Page, method: string, path: string, body?: unknown) {
     method,
     headers: {
       'Content-Type': 'application/json',
+      Origin: BASE,
       ...(csrf ? { 'X-CSRF-Token': csrf.value } : {}),
     },
     data: body === undefined ? undefined : JSON.stringify(body),
@@ -60,7 +61,7 @@ async function seedText(page: Page, path: string, fileName: string, bytes: strin
   form.append('file', new Blob([bytes], { type: 'text/plain' }), fileName);
   const res = await page.request.fetch(`${BASE}${path}`, {
     method: 'POST',
-    headers: csrf ? { 'X-CSRF-Token': csrf.value } : {},
+    headers: { ...(csrf ? { 'X-CSRF-Token': csrf.value } : {}), Origin: BASE },
     multipart: form as unknown as FormData,
   });
   if (!res.ok()) {

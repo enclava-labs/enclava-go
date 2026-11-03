@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"strings"
@@ -69,20 +70,40 @@ const loginAccountCap = 4096
 const loginAccountWindow = 15 * time.Minute
 
 // Login throttling is per process; use shared admission storage for multi-instance enforcement.
+// allowPasswordAttempt gates the credential check WITHOUT consuming budget:
+// only failures count (recordPasswordFailure), so successful sign-ins never
+// erode either limit.
 func (s *SessionAuth) allowPasswordAttempt(w http.ResponseWriter, r *http.Request, tenantID, email string) bool {
 	now := time.Now()
 	ip := clientIP(r, s.trustProxy)
-	// A throttled IP must not mint account buckets — check first and bail.
-	if !s.loginIPLimiter.AllowKey(ip, 10, time.Minute, now).Allowed {
-		return s.denyPasswordAttempt(w, r, tenantID)
+	if dec := s.loginIPLimiter.CheckKey(ip, 10, time.Minute, now); !dec.Allowed {
+		return s.denyPasswordAttempt(w, r, tenantID, email, dec.RetryAfter)
 	}
-	account := sha256.Sum256([]byte(tenantID + "\x00" + strings.ToLower(strings.TrimSpace(email))))
-	key := fmt.Sprintf("%x", account)
-	if s.trackLoginAccount(key, now) &&
-		!s.loginAcctLimit.AllowKey(key, 5, loginAccountWindow, now).Allowed {
-		return s.denyPasswordAttempt(w, r, tenantID)
+	key := loginAccountKey(tenantID, email)
+	if dec := s.loginAcctLimit.CheckKey(key, 5, loginAccountWindow, now); !dec.Allowed {
+		return s.denyPasswordAttempt(w, r, tenantID, email, dec.RetryAfter)
 	}
 	return true
+}
+
+// recordPasswordFailure counts one failed credential check against the
+// caller IP and the normalized tenant+email bucket.
+func (s *SessionAuth) recordPasswordFailure(r *http.Request, tenantID, email string) {
+	now := time.Now()
+	s.loginIPLimiter.AllowKey(clientIP(r, s.trustProxy), 10, time.Minute, now)
+	key := loginAccountKey(tenantID, email)
+	// The account map bounds distinct buckets; a full map of live entries
+	// skips account limiting while the IP limit still applies.
+	if s.trackLoginAccount(key, now) {
+		s.loginAcctLimit.AllowKey(key, 5, loginAccountWindow, now)
+	}
+}
+
+// loginAccountKey hashes tenant+normalized email so the limiter never holds
+// the raw address.
+func loginAccountKey(tenantID, email string) string {
+	account := sha256.Sum256([]byte(tenantID + "\x00" + strings.ToLower(strings.TrimSpace(email))))
+	return fmt.Sprintf("%x", account)
 }
 
 // trackLoginAccount reports whether the account key is (or may be) tracked.
@@ -109,12 +130,16 @@ func (s *SessionAuth) trackLoginAccount(key string, now time.Time) bool {
 	return true
 }
 
-func (s *SessionAuth) denyPasswordAttempt(w http.ResponseWriter, r *http.Request, tenantID string) bool {
+func (s *SessionAuth) denyPasswordAttempt(w http.ResponseWriter, r *http.Request, tenantID, email string, retryAfterSecs int64) bool {
 	s.recordSecurityAudit(r, auth.Principal{TenantID: tenantID}, "auth.login.throttled", "session", "", "throttled")
 	setNoStoreHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusTooManyRequests)
-	s.renderLogin(w, r, dashboardLoginData{Error: "Too many sign-in attempts. Try again later."})
+	mins := (retryAfterSecs + 59) / 60
+	if mins < 1 {
+		mins = 1
+	}
+	s.renderLogin(w, r, dashboardLoginData{Email: email, ReturnTo: r.FormValue("return_to"), Error: fmt.Sprintf("Too many sign-in attempts. Try again in %d minutes.", mins)})
 	return false
 }
 
@@ -187,6 +212,7 @@ func (s *SessionAuth) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	}
 	principal, err := s.auth.AuthenticatePassword(r.Context(), tenantID, email, r.FormValue("password"))
 	if err != nil {
+		s.recordPasswordFailure(r, tenantID, email)
 		s.recordSecurityAudit(r, auth.Principal{TenantID: tenantID}, "auth.login.failed", "session", "", "failure")
 		s.renderLogin(w, r, dashboardLoginData{
 			Email: email, ReturnTo: returnTo,
@@ -216,9 +242,10 @@ func (s *SessionAuth) HandleLogout(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/dashboard/login", http.StatusSeeOther)
 		return
 	}
-	if err := s.auth.ValidateCSRF(r.Context(), principal.TenantID, principal.SessionID,
-		csrfFromRequest(r)); err != nil {
-		WriteUnauthorized(w, "invalid CSRF token")
+	if !sameOriginMutation(r, s.trustProxy) ||
+		s.auth.ValidateCSRF(r.Context(), principal.TenantID, principal.SessionID,
+			csrfFromRequest(r)) != nil {
+		WriteForbidden(w, "invalid CSRF token")
 		return
 	}
 	if err := s.auth.RevokeSession(r.Context(), principal.TenantID, principal.SessionID, "logout"); err != nil {
@@ -399,8 +426,9 @@ func (s *SessionAuth) RequireSession(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
-			if err := s.auth.ValidateCSRF(r.Context(), principal.TenantID, principal.SessionID,
-				csrfFromRequest(r)); err != nil {
+			if !sameOriginMutation(r, s.trustProxy) ||
+				s.auth.ValidateCSRF(r.Context(), principal.TenantID, principal.SessionID,
+					csrfFromRequest(r)) != nil {
 				WriteForbidden(w, "missing or invalid CSRF token")
 				return
 			}
@@ -485,16 +513,69 @@ func (s *SessionAuth) clearSessionCookies(w http.ResponseWriter, r *http.Request
 	}
 }
 
-// csrfFromRequest reads the CSRF token from the mutation's header, falling
-// back to the script-readable cookie.
+// csrfFromRequest reads the CSRF token the mutation actually supplied: the
+// X-CSRF-Token header, or — for real HTML form posts — the csrf_token field.
+// The enclava_csrf cookie is NEVER a source: it is sent automatically, so
+// treating it as the token would let any cross-site request authenticate a
+// mutation (AUTH-I01). PostFormValue caches the urlencoded body for the
+// handler that re-parses it.
 func csrfFromRequest(r *http.Request) string {
 	if v := strings.TrimSpace(r.Header.Get("X-CSRF-Token")); v != "" {
 		return v
 	}
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return ""
+	}
+	if mediaType == "application/x-www-form-urlencoded" || mediaType == "multipart/form-data" {
+		return strings.TrimSpace(r.PostFormValue("csrf_token"))
+	}
+	return ""
+}
+
+// csrfCookieValue reads the script-readable CSRF cookie for server-side form
+// rendering (the logout form's hidden csrf_token input).
+func csrfCookieValue(r *http.Request) string {
 	if cookie, err := r.Cookie(sessionCSRFCookieName); err == nil {
 		return cookie.Value
 	}
 	return ""
+}
+
+// sameOriginMutation enforces the fetch-metadata contract on cookie
+// authentication: Sec-Fetch-Site (when the browser sends it) must be
+// same-origin or none; when it is absent an Origin header must name this
+// deployment's own origin. Both absent → the CSRF token is the only proof.
+// Required because the script-readable CSRF cookie is shared with sibling
+// ports/subdomains, so the token alone does not stop them (AUTH-I01).
+func sameOriginMutation(r *http.Request, trustProxy bool) bool {
+	if site := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); site != "" {
+		return site == "same-origin" || site == "none"
+	}
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		return strings.EqualFold(origin, requestOrigin(r, trustProxy))
+	}
+	return true
+}
+
+// requestOrigin is the origin the browser addresses (the externalBase
+// scheme://host shape), honoring forwarded proto/host only when the
+// deployment trusts proxy headers.
+func requestOrigin(r *http.Request, trustProxy bool) string {
+	scheme := "https"
+	if r.TLS == nil {
+		scheme = "http"
+	}
+	host := r.Host
+	if trustProxy {
+		if v := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]); v == "http" || v == "https" {
+			scheme = v
+		}
+		if v := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Host"), ",")[0]); v != "" {
+			host = v
+		}
+	}
+	return scheme + "://" + host
 }
 
 // returnToParam reads + allowlist-checks the ?return_to query param.

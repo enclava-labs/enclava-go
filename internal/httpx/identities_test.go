@@ -1621,3 +1621,134 @@ func TestIdentityUserTeamAttribute(t *testing.T) {
 		t.Fatalf("default team = %v", got)
 	}
 }
+
+// TestIdentityPasswordPolicyEnforcedServerSide proves the shared minimum
+// length/whitespace policy (AUTH-I02) rejects weak passwords on every
+// password-setting API path — the dashboard's client-side hint is not the
+// boundary.
+func TestIdentityPasswordPolicyEnforcedServerSide(t *testing.T) {
+	f := newIdentityFixture(t)
+	weak := []string{`"a"`, `"abcdefg"`, `"        "`}
+
+	// Admin create.
+	for _, pw := range weak {
+		rec := f.admin(t, http.MethodPost, "/api/v1/identities/users",
+			`{"email":"weak@example.com","password":`+pw+`}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("create with %s: %d %s, want 400", pw, rec.Code, rec.Body.String())
+		}
+	}
+	if _, err := f.repo.GetUserByEmail(context.Background(), f.tenant, "weak@example.com"); !errors.Is(err, auth.ErrNotFound) {
+		t.Fatalf("rejected create must leave no user: %v", err)
+	}
+	rec := f.admin(t, http.MethodPost, "/api/v1/identities/users",
+		`{"email":"strong@example.com","password":"abcd1234"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("8+ password must be accepted: %d %s", rec.Code, rec.Body.String())
+	}
+	userID := decodeJSON(t, rec)["id"].(string)
+
+	// Admin reset.
+	for _, pw := range weak {
+		rec := f.admin(t, http.MethodPost, "/api/v1/identities/users/"+userID+"/password",
+			`{"password":`+pw+`}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("admin reset with %s: %d %s, want 400", pw, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Self-service change (needs an 8+ current password to pass re-proof).
+	sess, csrf := login(t, f.app, "strong@example.com", "abcd1234")
+	for _, pw := range weak {
+		rec := sessionDo(t, f.app, http.MethodPost, "/api/v1/identities/me/password",
+			`{"current_password":"abcd1234","password":`+pw+`}`, sess, csrf)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("self change with %s: %d %s, want 400", pw, rec.Code, rec.Body.String())
+		}
+	}
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/identities/me/password",
+		`{"current_password":"abcd1234","password":"new-pass-99"}`, sess, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("self change with 8+: %d %s", rec.Code, rec.Body.String())
+	}
+	if _, err := f.app.authSvc.AuthenticatePassword(context.Background(), f.tenant, "strong@example.com", "new-pass-99"); err != nil {
+		t.Fatalf("new password must authenticate: %v", err)
+	}
+}
+
+// TestIdentityUserCreateRoleValidationAtomic proves a role_ids list is
+// validated before any write: an unknown id refuses the whole request with no
+// user left behind, so a retry never meets 'already exists' (ADM-I01).
+func TestIdentityUserCreateRoleValidationAtomic(t *testing.T) {
+	f := newIdentityFixture(t)
+	rec := f.admin(t, http.MethodPost, "/api/v1/identities/roles",
+		`{"name":"atomic","scopes":["platform.admin"]}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create role: %d %s", rec.Code, rec.Body.String())
+	}
+	roleID := decodeJSON(t, rec)["id"].(string)
+
+	rec = f.admin(t, http.MethodPost, "/api/v1/identities/users",
+		`{"email":"atomic@example.com","password":"pw-123456","role_ids":["`+roleID+`","role_missing"]}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown role expected 404, got %d %s", rec.Code, rec.Body.String())
+	}
+	if _, err := f.repo.GetUserByEmail(context.Background(), f.tenant, "atomic@example.com"); !errors.Is(err, auth.ErrNotFound) {
+		t.Fatalf("refused create must leave no user: %v", err)
+	}
+
+	rec = f.admin(t, http.MethodPost, "/api/v1/identities/users",
+		`{"email":"atomic@example.com","password":"pw-123456","role_ids":["`+roleID+`"]}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("retry after refused create: %d %s", rec.Code, rec.Body.String())
+	}
+	roles, err := f.repo.RolesForUser(context.Background(), f.tenant, decodeJSON(t, rec)["id"].(string))
+	if err != nil || len(roles) != 1 || roles[0].ID != roleID {
+		t.Fatalf("membership missing after atomic create: %v %v", roles, err)
+	}
+}
+
+// TestIdentityCreateResponsesCarryCreatedAt proves create-user and
+// create-role payloads carry the persisted created_at — not the year-one
+// zero value (ADM-I02).
+func TestIdentityCreateResponsesCarryCreatedAt(t *testing.T) {
+	f := newIdentityFixture(t)
+
+	rec := f.admin(t, http.MethodPost, "/api/v1/identities/roles",
+		`{"name":"stamped","scopes":["platform.admin"]}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create role: %d %s", rec.Code, rec.Body.String())
+	}
+	role := decodeJSON(t, rec)
+	raw, _ := role["created_at"].(string)
+	roleAt, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil || roleAt.IsZero() {
+		t.Fatalf("role created_at = %q (%v), want persisted timestamp", raw, err)
+	}
+	storedRole, err := f.repo.GetRole(context.Background(), f.tenant, role["id"].(string))
+	if err != nil {
+		t.Fatalf("fetch role: %v", err)
+	}
+	if !roleAt.Equal(storedRole.CreatedAt) {
+		t.Fatalf("role created_at %v != stored %v", roleAt, storedRole.CreatedAt)
+	}
+
+	rec = f.admin(t, http.MethodPost, "/api/v1/identities/users",
+		`{"email":"stamped@example.com","password":"pw-123456","role_ids":["`+role["id"].(string)+`"]}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create user: %d %s", rec.Code, rec.Body.String())
+	}
+	user := decodeJSON(t, rec)
+	raw, _ = user["created_at"].(string)
+	userAt, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil || userAt.IsZero() {
+		t.Fatalf("user created_at = %q (%v), want persisted timestamp", raw, err)
+	}
+	storedUser, err := f.repo.GetUserByEmail(context.Background(), f.tenant, "stamped@example.com")
+	if err != nil {
+		t.Fatalf("fetch user: %v", err)
+	}
+	if !userAt.Equal(storedUser.CreatedAt) {
+		t.Fatalf("user created_at %v != stored %v", userAt, storedUser.CreatedAt)
+	}
+}

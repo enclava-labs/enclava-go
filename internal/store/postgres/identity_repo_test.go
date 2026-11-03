@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"enclava-go/internal/auth"
@@ -177,5 +178,60 @@ func TestRoleGrantsDenyByDefault(t *testing.T) {
 		if a.All || len(a.Items) != 0 {
 			t.Fatalf("malformed %s grant must deny, got %+v", name, a)
 		}
+	}
+}
+
+// TestCreateUserWithRolesAtomic proves the user row and its initial
+// memberships commit or refuse together: an unknown role id returns
+// auth.ErrNotFound and leaves no user behind (ADM-I01), while all-valid roles
+// persist alongside the stored created_at (ADM-I02).
+func TestCreateUserWithRolesAtomic(t *testing.T) {
+	db := testdb.New(t)
+	ctx := context.Background()
+	repo := postgres.NewIdentityRepo(db)
+	tenant := testdb.SeedTenant(t, db, "atomic-create")
+
+	roleA := auth.Role{ID: "role_atomic_a", Name: "atomic-a", Scopes: []string{"chat"}}
+	roleB := auth.Role{ID: "role_atomic_b", Name: "atomic-b", Scopes: []string{"chat"}}
+	for _, role := range []auth.Role{roleA, roleB} {
+		if err := repo.CreateRole(ctx, tenant, role); err != nil {
+			t.Fatalf("create role %s: %v", role.ID, err)
+		}
+	}
+
+	// One valid + one unknown role id refuses the whole write.
+	_, err := repo.CreateUserWithRoles(ctx, tenant, auth.User{
+		ID: "user_atomic_fail", Email: "fail@example.com", Status: "active",
+	}, []string{roleA.ID, "role_missing"})
+	if !errors.Is(err, auth.ErrNotFound) {
+		t.Fatalf("unknown role: %v, want ErrNotFound", err)
+	}
+	if _, err := repo.GetUserByEmail(ctx, tenant, "fail@example.com"); !errors.Is(err, auth.ErrNotFound) {
+		t.Fatalf("rolled-back user must not exist: %v", err)
+	}
+
+	// All-valid roles commit the user and every membership atomically.
+	created, err := repo.CreateUserWithRoles(ctx, tenant, auth.User{
+		ID: "user_atomic_ok", Email: "ok@example.com", Status: "active", Team: "atlas",
+	}, []string{roleA.ID, roleB.ID})
+	if err != nil {
+		t.Fatalf("create with roles: %v", err)
+	}
+	if created.CreatedAt.IsZero() {
+		t.Fatal("created user must carry stored created_at")
+	}
+	stored, err := repo.GetUserByEmail(ctx, tenant, "ok@example.com")
+	if err != nil {
+		t.Fatalf("fetch created user: %v", err)
+	}
+	if !created.CreatedAt.Equal(stored.CreatedAt) {
+		t.Fatalf("created_at %v != stored %v", created.CreatedAt, stored.CreatedAt)
+	}
+	roles, err := repo.RolesForUser(ctx, tenant, created.ID)
+	if err != nil {
+		t.Fatalf("roles for user: %v", err)
+	}
+	if len(roles) != 2 {
+		t.Fatalf("expected 2 memberships, got %v", roles)
 	}
 }

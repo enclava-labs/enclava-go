@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -20,16 +21,37 @@ func HashPassword(pw string) (string, error) {
 	return string(hash), nil
 }
 
+// ValidatePassword is the single server-side password policy (AUTH-I02):
+// every path that sets a password — self-service change, admin create/reset
+// and bootstrap --password — runs it before hashing. The byte cap bounds
+// bcrypt's hashing cost.
+func ValidatePassword(pw string) error {
+	switch {
+	case len(pw) < 8:
+		return errors.New("password must be at least 8 characters")
+	case strings.TrimSpace(pw) == "":
+		return errors.New("password must not be all whitespace")
+	case len(pw) > 1024:
+		return errors.New("password must be at most 1024 bytes")
+	}
+	return nil
+}
+
 // VerifyPassword reports whether pw matches the stored bcrypt hash.
 func VerifyPassword(hash, pw string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(pw)) == nil
 }
 
-// CreateUser creates a local account with a bcrypt-hashed password. Account
+// CreateUser creates a local account with a bcrypt-hashed password and its
+// initial role memberships atomically — an unknown role id refuses the whole
+// write, so a retry never meets a half-created account (ADM-I01). Account
 // creation requires an administrator actor — there is no public signup.
-func (s *Service) CreateUser(ctx context.Context, admin Principal, tenantID, email, displayName, password string) (User, error) {
+func (s *Service) CreateUser(ctx context.Context, admin Principal, tenantID, email, displayName, password, team string, roleIDs []string) (User, error) {
 	if !HasScope(admin, ScopePlatformAdmin) {
 		return User{}, errors.New("platform.admin scope required to create users")
+	}
+	if err := ValidatePassword(password); err != nil {
+		return User{}, err
 	}
 	hash, err := HashPassword(password)
 	if err != nil {
@@ -42,13 +64,11 @@ func (s *Service) CreateUser(ctx context.Context, admin Principal, tenantID, ema
 		Email:         email,
 		DisplayName:   displayName,
 		Status:        "active",
+		Team:          team,
 		PasswordHash:  hash,
 		PasswordSetAt: &now,
 	}
-	if err := s.repo.CreateUser(ctx, tenantID, user); err != nil {
-		return User{}, err
-	}
-	return user, nil
+	return s.repo.CreateUserWithRoles(ctx, tenantID, user, roleIDs)
 }
 
 func randomHex(n int) string {

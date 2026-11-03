@@ -1,4 +1,5 @@
-import { test, expect, Page, Route, type Locator } from '@playwright/test';
+import { Page, Route, type Locator } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 // sources.spec.ts — Sources add-source wizard (OA-23, plan 09-02) against the
 // served dashboard: the wizard create→chained-first-sync request chain, the
@@ -50,7 +51,7 @@ async function ensureCollection(page: Page): Promise<Created> {
   const csrf = (await page.context().cookies())
     .find((c) => c.name === 'enclava_csrf')?.value ?? '';
   const res = await page.request.post(`${BASE}/api/v1/rag/collections`, {
-    headers: { 'X-CSRF-Token': csrf },
+    headers: { 'X-CSRF-Token': csrf, Origin: BASE },
     data: { name: `Sources spec ${Date.now()}` },
   });
   if (res.status() !== 201) {
@@ -155,7 +156,7 @@ test('wizard creates a GitHub source and chains the real first sync', async ({ p
 
   // Cleanup so the spec is rerunnable against the same seed.
   const del = await page.request.delete(`${BASE}/api/v1/connectors/sources/${id}`, {
-    headers: { 'X-CSRF-Token': (await page.context().cookies()).find((c) => c.name === 'enclava_csrf')?.value ?? '' },
+    headers: { 'X-CSRF-Token': (await page.context().cookies()).find((c) => c.name === 'enclava_csrf')?.value ?? '', Origin: BASE },
   });
   expect(del.status()).toBe(200);
 });

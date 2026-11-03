@@ -1,4 +1,5 @@
-import { test, expect, Page } from '@playwright/test';
+import { Page } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 // tools.spec.ts — Tools page (09-05, OA-26) in a real Chromium. Proves the
 // versioned approve contract end to end: the PUT body carries the persisted
@@ -57,7 +58,7 @@ async function reviewableTool(page: Page) {
   const csrf = (await page.context().cookies()).find((c) => c.name === 'enclava_csrf');
   const origin = process.env.E2E_MCP_URL || '';
   if (!origin) throw new Error('E2E_MCP_URL unset — the MCP fixture is required to seed a discovery row');
-  const hdrs = { 'X-CSRF-Token': csrf ? csrf.value : '', 'Content-Type': 'application/json' };
+  const hdrs = { 'X-CSRF-Token': csrf ? csrf.value : '', Origin: BASE, 'Content-Type': 'application/json' };
   const srvRes = await page.request.post(`${BASE}/api/v1/mcp/servers`, {
     headers: hdrs,
     data: { id: `e2e-tools-${Date.now()}`, origin, endpoint_path: '/mcp', authorized_private: true, enabled: true, audience_scopes: ['chatbot'] },

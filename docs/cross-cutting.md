@@ -4,7 +4,7 @@ These checklists summarize the shared implementation boundaries; they do not rep
 
 ## When you add an HTTP route
 
-- Register it with the appropriate authentication, scope or session/capability wrapper. Cookie-authenticated mutations also need CSRF protection.
+- Register it with the appropriate authentication, scope or session/capability wrapper. Cookie-authenticated mutations also need CSRF protection: the session's token in the `X-CSRF-Token` header (or a `csrf_token` form field for HTML form posts) plus a same-origin request (`Sec-Fetch-Site` same-origin/none, or a matching `Origin` when it is absent).
 - For dashboard capabilities, update the mapping in `internal/httpx/dashboard_caps.go` and the corresponding matrix row in `internal/httpx/dashboard_matrix_test.go`.
 - Update `internal/httpx/route_auth_test.go` only when the route is genuinely public; give its allow-list entry a reason. A new private route must have a recognized wrapper at registration.
 

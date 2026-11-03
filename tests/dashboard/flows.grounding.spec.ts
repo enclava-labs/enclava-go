@@ -1,5 +1,4 @@
-import { test, expect } from '@playwright/test';
-import { api, seedData, uploadDoc } from './fixtures';
+import { api, seedData, uploadDoc, test, expect } from './fixtures';
 
 // flows.grounding.spec.ts — the whole knowledge pipeline over the public
 // API, no UI: upload a book to a collection, confirm the ingest worker
@@ -13,7 +12,8 @@ import { api, seedData, uploadDoc } from './fixtures';
 // grounding check, not a stub oracle.
 
 const MARKER = 'GROUNDING-MARKER-7f3k9';
-const MODEL = process.env.GROUNDING_MODEL || seedData().chatModel;
+// Resolved lazily inside the test — seed.json does not exist until the
+// setup project runs; a module-scope read fails collection on a fresh run.
 // A real model answers in model time, not stub time.
 const RUN_TIMEOUT = process.env.GROUNDING_MODEL ? 200_000 : 60_000;
 
@@ -61,7 +61,7 @@ test('book → embeddings → grounded assistant answer, end to end over the API
     // 3. An assistant grounded on exactly that collection.
     const bot = await api<Chatbot>('POST', '/api/v1/chatbots', {
       name: `grounded ${suffix}`,
-      model: MODEL,
+      model: process.env.GROUNDING_MODEL || seedData().chatModel,
       rag_collection_ids: [collectionID],
       audience: ['*'],
     });

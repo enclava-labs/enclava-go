@@ -161,6 +161,10 @@ type IdentityRepository interface {
 
 	// Users.
 	CreateUser(ctx context.Context, tenantID string, u User) error
+	// CreateUserWithRoles inserts the user and its initial memberships in one
+	// transaction: an unknown role id returns ErrNotFound and no user row is
+	// left behind (ADM-I01). Returned user carries the stored created_at.
+	CreateUserWithRoles(ctx context.Context, tenantID string, u User, roleIDs []string) (User, error)
 	GetUser(ctx context.Context, tenantID, userID string) (User, error)
 	GetUserByEmail(ctx context.Context, tenantID, email string) (User, error)
 	UpdateUserStatus(ctx context.Context, tenantID, userID, status string) error

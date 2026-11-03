@@ -128,7 +128,7 @@ func TestLoginAuditAndThrottling(t *testing.T) {
 			t.Fatalf("attempt %d throttled early", i+1)
 		}
 	}
-	if rec := post("missing@example.com", "wrong"); rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "Too many sign-in attempts. Try again later.") {
+	if rec := post("missing@example.com", "wrong"); rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "Too many sign-in attempts. Try again in") {
 		t.Fatalf("sixth failed login: %d %s", rec.Code, rec.Body.String())
 	}
 	rows, err := repo.List(context.Background(), f.tenant, 100, "")

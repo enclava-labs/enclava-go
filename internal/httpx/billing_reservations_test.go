@@ -134,13 +134,18 @@ func TestAdminReservationsListAndResolve(t *testing.T) {
 	if rec := resolve(unknown.ID, `{"input_tokens":3}`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("missing fields = %d, want 400", rec.Code)
 	}
+	// Cached is a subset of input — never larger.
+	if rec := resolve(unknown.ID, `{"input_tokens":3,"cached_input_tokens":4,"output_tokens":0}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("cached > input = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
 	// Unknown id is one indistinguishable 404.
 	if rec := resolve("res_nope", `{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0}`); rec.Code != http.StatusNotFound {
 		t.Fatalf("resolve missing = %d, want 404", rec.Code)
 	}
 
 	// Reconcile the unknown reservation: it settles and leaves the list.
-	rec := resolve(unknown.ID, `{"input_tokens":55,"cached_input_tokens":5,"output_tokens":10}`)
+	// input_tokens carries its cached subset (60 = 4 cached + 56 uncached).
+	rec := resolve(unknown.ID, `{"input_tokens":60,"cached_input_tokens":4,"output_tokens":10}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("resolve = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -264,5 +269,66 @@ func TestAdminReservationsListPaginatesCursor(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/reservations?state=unknown&cursor=not-a-cursor", nil)
 	if rec := doBudgetHandler(f.app.handleAdminReservations, admin, req); rec.Code != http.StatusBadRequest {
 		t.Fatalf("malformed cursor = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminReservationResolveReconcilesCachedSubset: resolve treats
+// input_tokens exactly like the upstream usage object — cached_input_tokens
+// is a subset of it, settled disjointly as input-minus-cached, so cached
+// tokens are never billed twice.
+func TestAdminReservationResolveReconcilesCachedSubset(t *testing.T) {
+	f := newReservationFixture(t)
+	svc := f.app.billingSvc
+	admin := f.adminPrincipal()
+	ctx := context.Background()
+
+	for id, p := range map[string]billing.Price{
+		"resv-sub-in":  {SubjectType: billing.PriceSubjectModel, SubjectID: "m", Capability: "chat", Unit: billing.UnitInput, RateMicros: 5, UnitQuantity: 1, Currency: "USD"},
+		"resv-sub-cin": {SubjectType: billing.PriceSubjectModel, SubjectID: "m", Capability: "chat", Unit: billing.UnitCachedInput, RateMicros: 1, UnitQuantity: 1, Currency: "USD"},
+		"resv-sub-out": {SubjectType: billing.PriceSubjectModel, SubjectID: "m", Capability: "chat", Unit: billing.UnitOutput, RateMicros: 3, UnitQuantity: 1, Currency: "USD"},
+	} {
+		if err := f.repo.PutPrice(ctx, f.tenant, id, p, "tester", time.Now().UTC().Add(-time.Minute)); err != nil {
+			t.Fatalf("put price %s: %v", id, err)
+		}
+	}
+	p := auth.Principal{TenantID: f.tenant}
+	res, err := svc.Reserve(ctx, p, billing.ReserveRequest{
+		Capability: "chat", Model: "m", EndpointID: "ep",
+		Estimate: billing.Usage{InputUnits: 10, CachedInputUnits: 5, OutputUnits: 10},
+		Price:    billing.PriceKey{SubjectType: billing.PriceSubjectModel, SubjectID: "m"},
+	})
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if err := svc.MarkUnknown(ctx, admin, res.ID); err != nil {
+		t.Fatalf("mark unknown: %v", err)
+	}
+
+	// {input 12, cached 4, output 8} must settle {input 8, cached_input 4,
+	// output 8} — 8×5 + 4×1 + 8×3 = 68 micros, not input-verbatim's 88.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/reservations/"+res.ID+"/resolve",
+		strings.NewReader(`{"input_tokens":12,"cached_input_tokens":4,"output_tokens":8}`))
+	rec := doBudgetHandler(f.app.handleAdminReservationByID, admin, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("resolve = %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		UsageRecord struct {
+			Units        map[string]int64 `json:"units"`
+			AmountMicros int64            `json:"amountMicros"`
+			Outcome      string           `json:"outcome"`
+		} `json:"usage_record"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode resolve body: %v", err)
+	}
+	want := map[string]int64{"input": 8, "cached_input": 4, "output": 8}
+	for k, v := range want {
+		if body.UsageRecord.Units[k] != v {
+			t.Fatalf("units[%q] = %d, want %d (all units %+v)", k, body.UsageRecord.Units[k], v, body.UsageRecord.Units)
+		}
+	}
+	if body.UsageRecord.AmountMicros != 68 || body.UsageRecord.Outcome != billing.OutcomeReconciled {
+		t.Fatalf("reconciled record = %+v, want amount 68/outcome reconciled", body.UsageRecord)
 	}
 }

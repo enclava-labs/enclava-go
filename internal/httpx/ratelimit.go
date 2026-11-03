@@ -35,6 +35,54 @@ func (rl *RateLimiter) AllowKey(key string, limit int64, window time.Duration, n
 	return rl.allow(key, limit, window, now)
 }
 
+// CheckKey reports the admission decision for a request WITHOUT consuming
+// budget: callers can gate on every window first and only record the attempt
+// (AllowKey) once it is actually consumed. An absent or expired window is
+// allowed and reports the reset a window started now would have.
+func (rl *RateLimiter) CheckKey(key string, limit int64, window time.Duration, now time.Time) RateLimitDecision {
+	if limit <= 0 {
+		return RateLimitDecision{Allowed: true}
+	}
+	if window <= 0 {
+		window = time.Minute
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	w, ok := rl.windows[key]
+	if !ok || now.Sub(w.start) >= window {
+		return RateLimitDecision{
+			Allowed:    true,
+			Limit:      limit,
+			Remaining:  limit,
+			ResetEpoch: now.Add(window).Unix(),
+		}
+	}
+	if w.count >= limit {
+		retryAfter := int64(w.start.Add(window).Sub(now).Seconds())
+		if retryAfter < 0 {
+			retryAfter = 0
+		}
+		return RateLimitDecision{
+			Allowed:    false,
+			Limit:      limit,
+			Remaining:  0,
+			ResetEpoch: w.start.Add(window).Unix(),
+			RetryAfter: retryAfter,
+		}
+	}
+	return RateLimitDecision{
+		Allowed:    true,
+		Limit:      limit,
+		Remaining:  limit - w.count,
+		ResetEpoch: w.start.Add(window).Unix(),
+	}
+}
+
 func (rl *RateLimiter) allow(key string, limit int64, window time.Duration, now time.Time) RateLimitDecision {
 	if limit <= 0 {
 		return RateLimitDecision{Allowed: true}

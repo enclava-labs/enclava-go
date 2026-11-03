@@ -114,7 +114,7 @@ func priceFromAdminRequest(req adminPricingCreateRequest) (billing.Price, time.T
 	req.SubjectID = strings.TrimSpace(req.SubjectID)
 	req.Capability = strings.TrimSpace(req.Capability)
 	req.Unit = strings.TrimSpace(req.Unit)
-	req.Currency = strings.ToUpper(strings.TrimSpace(req.Currency))
+	req.Currency = strings.TrimSpace(req.Currency)
 	if req.SubjectType != billing.PriceSubjectEndpoint && req.SubjectType != billing.PriceSubjectModel {
 		return billing.Price{}, time.Time{}, errInvalidPricing("subject_type must be endpoint or model")
 	}
@@ -136,8 +136,8 @@ func priceFromAdminRequest(req adminPricingCreateRequest) (billing.Price, time.T
 	if req.Currency == "" {
 		req.Currency = "USD"
 	}
-	if len(req.Currency) != 3 {
-		return billing.Price{}, time.Time{}, errInvalidPricing("currency must be a three-letter code")
+	if !validCurrencyCode(req.Currency) {
+		return billing.Price{}, time.Time{}, errInvalidPricing("currency must be a 3-letter ISO-4217 alpha-3 code the platform bills in")
 	}
 	effectiveFrom := time.Now().UTC()
 	if raw := strings.TrimSpace(req.EffectiveFrom); raw != "" {

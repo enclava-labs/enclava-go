@@ -633,18 +633,34 @@ func periodStart(period, timezone string, now time.Time) time.Time {
 			loc = l
 		}
 	}
-	now = now.In(loc)
+	localNow := now.In(loc)
 	switch period {
 	case PeriodDaily:
-		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+		return localDateStart(loc, localNow.Year(), localNow.Month(), localNow.Day())
 	case PeriodWeekly:
 		// ISO week starts Monday.
-		d := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
-		return d.AddDate(0, 0, -int((int(now.Weekday())+6)%7))
+		monday := localNow.AddDate(0, 0, -(int(localNow.Weekday())+6)%7)
+		return localDateStart(loc, monday.Year(), monday.Month(), monday.Day())
 	case PeriodMonthly:
-		return time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, loc)
+		return localDateStart(loc, localNow.Year(), localNow.Month(), 1)
 	default:
 		return time.Time{}
+	}
+}
+
+// localDateStart returns the first instant whose local calendar date is
+// y-m-d in loc. time.Date normalizes a skipped midnight onto the previous
+// (or later) day, so the result is stepped forward from the normalized
+// instant until the target date is reached — DST gaps are shorter than a
+// day and a boundary must never open in the previous local day. Ordinary
+// days return their local midnight unchanged.
+func localDateStart(loc *time.Location, y int, m time.Month, d int) time.Time {
+	target := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+	for t := time.Date(y, m, d, 0, 0, 0, 0, loc); ; t = t.Add(time.Minute) {
+		c := t.In(loc)
+		if !time.Date(c.Year(), c.Month(), c.Day(), 0, 0, 0, 0, time.UTC).Before(target) {
+			return t
+		}
 	}
 }
 

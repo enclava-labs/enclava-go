@@ -343,7 +343,7 @@ func (a *App) handleAdminBudgetCreate(w http.ResponseWriter, r *http.Request, pr
 	}
 	switch req.Kind {
 	case billing.BudgetKindAmount:
-		if !validBudgetCurrency(req.Currency) {
+		if !validCurrencyCode(req.Currency) {
 			WriteOpenAIError(w, http.StatusBadRequest, "currency must be a 3-letter ISO-4217 alpha-3 code the platform bills in", "invalid_request_error", "invalid_currency")
 			return
 		}
@@ -616,9 +616,9 @@ func (a *App) verifyBudgetSubject(ctx context.Context, tenantID, subjectType, su
 	}
 }
 
-// validBudgetCurrency accepts 3-letter ISO-4217 alpha-3 codes — the exact
+// validCurrencyCode accepts 3-letter ISO-4217 alpha-3 codes — the exact
 // shape billing prices and usage rows carry (CHAR(3), uppercase A-Z).
-func validBudgetCurrency(code string) bool {
+func validCurrencyCode(code string) bool {
 	if len(code) != 3 {
 		return false
 	}

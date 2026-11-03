@@ -1,4 +1,5 @@
-import { test, expect, Page } from '@playwright/test';
+import { Page } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 // access.spec.ts — Access page browser scenarios (09-07, OA-28) against the
 // real server: the roles editor's PATCH must carry all four AI-resource grant
@@ -44,6 +45,7 @@ async function api(page: Page, method: string, path: string, body?: unknown): Pr
     data: body === undefined ? undefined : JSON.stringify(body),
     headers: {
       'Content-Type': 'application/json',
+      Origin: BASE,
       ...(csrf ? { 'X-CSRF-Token': csrf.value } : {}),
     },
   });

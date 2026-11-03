@@ -1,4 +1,5 @@
-import { test, expect, Page, APIRequestContext } from '@playwright/test';
+import { Page, APIRequestContext } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 // a11y-pages.spec.ts — plan 11-05's OWNED page-flow keyboard suite (OA-38):
 //   · citation button → evidence opens → close returns focus to the button
@@ -47,6 +48,7 @@ async function api(request: APIRequestContext, page: Page, method: string, path:
     headers: {
       Cookie: sess ? `enclava_session=${sess.value}` : '',
       'X-CSRF-Token': csrf ? csrf.value : '',
+      Origin: BASE,
       ...(body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
     },
     multipart: body instanceof FormData ? body : undefined,

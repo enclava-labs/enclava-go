@@ -1,4 +1,5 @@
-import { test, expect, Page } from '@playwright/test';
+import { Page } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 // usage.spec.ts — Usage & billing page (09-08, OA-29) in a real Chromium.
 // Proves the 08-07 budget write contracts end to end: a create POST carries
@@ -108,6 +109,10 @@ test('admin edits a budget limit via the drawer; the PATCH body is exactly {limi
   // Seed a real budget through the same API the page writes through.
   const seedName = `e2e-edit-${Date.now()}`;
   const created = await page.request.post(`${BASE}/api/v1/admin/budgets`, {
+    headers: {
+      'X-CSRF-Token': (await page.context().cookies()).find((c) => c.name === 'enclava_csrf')?.value ?? '',
+      Origin: BASE,
+    },
     data: {
       name: seedName,
       subject_type: 'tenant',

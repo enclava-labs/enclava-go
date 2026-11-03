@@ -30,14 +30,14 @@
       <a class="btn" href="/auth/oidc/{{.ID}}/start{{if $.ReturnTo}}?return_to={{$.ReturnTo | urlquery}}{{end}}">Continue with {{.Name}}</a>
       {{end}}
     </div>
-    <p class="muted">or</p>
     {{end}}
     <form method="post" action="/dashboard/login" autocomplete="off">
+      <h1 class="card-title">Sign in</h1>
       <input type="hidden" name="return_to" value="{{.ReturnTo}}">
       <p><label class="label" for="email">Email</label>
-      <input class="field" type="email" id="email" name="email" required autocomplete="username" autofocus value="{{.Email}}"></p>
+      <input class="field" type="email" id="email" name="email" required autocomplete="username"{{if not .Email}} autofocus{{end}} value="{{.Email}}"></p>
       <p><label class="label" for="password">Password</label>
-      <input class="field" type="password" id="password" name="password" required autocomplete="current-password"></p>
+      <input class="field" type="password" id="password" name="password" required autocomplete="current-password"{{if .Email}} autofocus{{end}}></p>
       <button class="btn primary" type="submit">Sign in</button>
     </form>
     {{end}}

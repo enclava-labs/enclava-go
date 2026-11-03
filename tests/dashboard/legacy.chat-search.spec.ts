@@ -1,4 +1,5 @@
-import { test, expect, Page, APIRequestContext } from '@playwright/test';
+import { Page, APIRequestContext } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 // chat-search.spec.ts — the Chat consumer scenarios (OA-32, plan 10-02):
 // real login, real /api/v1 seeding, two-turn run with conversation adoption,
@@ -46,6 +47,7 @@ async function api(request: APIRequestContext, page: Page, method: string, path:
     headers: {
       Cookie: sess ? `enclava_session=${sess.value}` : '',
       'X-CSRF-Token': csrf ? csrf.value : '',
+      Origin: BASE,
       ...(body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
     },
     multipart: body instanceof FormData ? body : undefined,

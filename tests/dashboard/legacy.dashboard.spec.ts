@@ -1,4 +1,5 @@
-import { test, expect, Page, APIRequestContext } from '@playwright/test';
+import { Page } from '@playwright/test';
+import { test, expect, LOCKOUT_EMAIL } from './fixtures';
 
 // Explicit isolated credentials and base URL are required — there are no
 // built-in example defaults to fall back to.
@@ -70,7 +71,8 @@ test.describe('Authentication', () => {
   test('login with a wrong password shows an accessible error', async ({ page }) => {
     await page.context().clearCookies();
     await page.goto(`${BASE}/dashboard/login`);
-    await page.fill('input[name="email"]', ADMIN_EMAIL);
+    // Dedicated lockout account — never spend failed attempts on a shared role.
+    await page.fill('input[name="email"]', LOCKOUT_EMAIL);
     await page.fill('input[name="password"]', 'wrong-password');
     await page.click('button[type="submit"]');
     await expect(page).toHaveURL(/\/dashboard\/login/);
@@ -318,12 +320,14 @@ test.describe('API Keys management', () => {
     });
     expect([401, 403]).toContain(denied.status());
 
-    // With the session's CSRF token the same mutation is authorized.
+    // With the session's CSRF token (and the same-origin header
+    // APIRequestContext does not send on its own) the mutation is authorized.
     const allowed = await request.post(`${BASE}/api/v1/admin/api-keys`, {
       headers: {
         Cookie: `${SESSION_COOKIE}=${session!.value}`,
         'Content-Type': 'application/json',
         'X-CSRF-Token': csrf!.value,
+        Origin: BASE,
       },
       data: '{"name":"csrf-ok-' + Date.now() + '","scopes":["chatbot"],"allowed_models":[],"allowed_endpoints":[],"allowed_chatbots":[],"allowed_agents":[],"allowed_extract_templates":[]}',
     });

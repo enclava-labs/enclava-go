@@ -1,9 +1,8 @@
-import { test, expect } from '@playwright/test';
 import type { Page } from '@playwright/test';
 import {
   BASE, MANAGER_EMAIL, MEMBER_EMAIL, ADMIN_EMAIL, ADMIN_PASSWORD,
   MEMBER_PASSWORD, login, seedData, sessionCookies, SESSION_COOKIE,
-  awaitTerminal,
+  awaitTerminal, test, expect,
 } from './fixtures';
 
 declare global {

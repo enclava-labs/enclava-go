@@ -1,5 +1,4 @@
-import { test, expect, Route } from '@playwright/test';
-import type { Locator, Page } from '@playwright/test';
+import type { Route, Locator, Page } from '@playwright/test';
 
 declare global {
   interface Window {
@@ -9,6 +8,7 @@ declare global {
 
 import {
   BASE, MANAGER_EMAIL, MEMBER_EMAIL, MEMBER_PASSWORD, login, seedData, api, sessionApi,
+  test, expect,
 } from './fixtures';
 
 // flows.manager.spec.ts — knowledge-manager §9.2 flows 3–4 plus the

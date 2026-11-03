@@ -325,8 +325,8 @@ func (a *App) handleIdentityUsers(w http.ResponseWriter, r *http.Request, princi
 			WriteOpenAIError(w, http.StatusBadRequest, "a valid email is required", "invalid_request_error", "invalid_email")
 			return
 		}
-		if req.Password == "" {
-			WriteOpenAIError(w, http.StatusBadRequest, "password is required", "invalid_request_error", "missing_password")
+		if err := auth.ValidatePassword(req.Password); err != nil {
+			WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_password")
 			return
 		}
 		team := ""
@@ -337,25 +337,22 @@ func (a *App) handleIdentityUsers(w http.ResponseWriter, r *http.Request, princi
 				return
 			}
 		}
+		// Role ids validate before any write: the memberships then commit
+		// inside the same transaction as the user row (ADM-I01).
+		for _, roleID := range req.RoleIDs {
+			if !a.checkRoleAssignable(w, r, principal, roleID) {
+				return
+			}
+		}
 		// Administrator-controlled enrollment only — there is no public signup.
-		user, err := a.authSvc.CreateUser(r.Context(), principal, principal.TenantID, email, strings.TrimSpace(req.DisplayName), req.Password)
+		user, err := a.authSvc.CreateUser(r.Context(), principal, principal.TenantID, email, strings.TrimSpace(req.DisplayName), req.Password, team, req.RoleIDs)
 		if err != nil {
 			a.writeIdentityError(w, err, "user_create_failed")
 			return
 		}
 		a.recordSecurityAudit(r, principal, "identity.user.created", "user", user.ID, "success")
-		if team != "" {
-			if err := a.identity.UpdateUserTeam(r.Context(), principal.TenantID, user.ID, team); err != nil {
-				log.Printf("update user team %s: %v", user.ID, err)
-				WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "user_create_failed")
-				return
-			}
-			user.Team = team
-		}
 		for _, roleID := range req.RoleIDs {
-			if !a.assignRoleChecked(w, r, principal, user.ID, roleID, false) {
-				return
-			}
+			a.recordSecurityAudit(r, principal, "identity.role.assigned", "user", user.ID, "success", map[string]any{"role_id": roleID})
 		}
 		roles, _ := a.identity.RolesForUser(r.Context(), principal.TenantID, user.ID)
 		WriteJSON(w, http.StatusCreated, redactUser(user, roles))
@@ -421,7 +418,7 @@ func (a *App) handleIdentityUserByID(w http.ResponseWriter, r *http.Request, pri
 		roleID := segs[2]
 		switch r.Method {
 		case http.MethodPut, http.MethodPost:
-			a.assignRoleChecked(w, r, principal, user.ID, roleID, true)
+			a.assignRoleChecked(w, r, principal, user.ID, roleID)
 		case http.MethodDelete:
 			a.unassignRoleChecked(w, r, principal, user, roleID)
 		default:
@@ -538,11 +535,10 @@ func (a *App) handleIdentityUser(w http.ResponseWriter, r *http.Request, princip
 	}
 }
 
-// assignRoleChecked writes one user_roles membership: the role must exist in
-// the tenant and its scopes must be a subset of the calling admin's scopes.
-// respond controls whether a success body is written — the create-user path
-// defers its single 201 payload.
-func (a *App) assignRoleChecked(w http.ResponseWriter, r *http.Request, principal auth.Principal, userID, roleID string, respond bool) bool {
+// checkRoleAssignable verifies the role exists in the tenant and never widens
+// the caller's authority — the shared gate for both the assign subroute and
+// the create-user role_ids list.
+func (a *App) checkRoleAssignable(w http.ResponseWriter, r *http.Request, principal auth.Principal, roleID string) bool {
 	role, err := a.identity.GetRole(r.Context(), principal.TenantID, roleID)
 	if err != nil {
 		a.writeIdentityError(w, err, "role_fetch_failed")
@@ -558,16 +554,22 @@ func (a *App) assignRoleChecked(w http.ResponseWriter, r *http.Request, principa
 		WriteForbidden(w, "role grants exceed the caller's resource authority")
 		return false
 	}
+	return true
+}
+
+// assignRoleChecked writes one user_roles membership and the assigned:true
+// response: the role must exist in the tenant and pass the authority checks.
+func (a *App) assignRoleChecked(w http.ResponseWriter, r *http.Request, principal auth.Principal, userID, roleID string) {
+	if !a.checkRoleAssignable(w, r, principal, roleID) {
+		return
+	}
 	if err := a.identity.AssignRole(r.Context(), principal.TenantID, userID, roleID); err != nil {
 		log.Printf("assign role %s to %s: %v", roleID, userID, err)
 		WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "role_assign_failed")
-		return false
+		return
 	}
 	a.recordSecurityAudit(r, principal, "identity.role.assigned", "user", userID, "success", map[string]any{"role_id": roleID})
-	if respond {
-		WriteJSON(w, http.StatusOK, map[string]any{"assigned": true, "user_id": userID, "role_id": roleID})
-	}
-	return true
+	WriteJSON(w, http.StatusOK, map[string]any{"assigned": true, "user_id": userID, "role_id": roleID})
 }
 
 func (a *App) unassignRoleChecked(w http.ResponseWriter, r *http.Request, principal auth.Principal, user auth.User, roleID string) {
@@ -584,8 +586,8 @@ func (a *App) unassignRoleChecked(w http.ResponseWriter, r *http.Request, princi
 
 // setUserPassword rewrites the stored bcrypt hash; plaintext never persists.
 func (a *App) setUserPassword(w http.ResponseWriter, r *http.Request, principal auth.Principal, user auth.User, password string) {
-	if password == "" {
-		WriteOpenAIError(w, http.StatusBadRequest, "password is required", "invalid_request_error", "missing_password")
+	if err := auth.ValidatePassword(password); err != nil {
+		WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_password")
 		return
 	}
 	hash, err := auth.HashPassword(password)
@@ -718,8 +720,14 @@ func (a *App) handleIdentityRoles(w http.ResponseWriter, r *http.Request, princi
 			WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", "role_create_failed")
 			return
 		}
-		a.recordSecurityAudit(r, principal, "identity.role.created", "role", role.ID, "success")
-		WriteJSON(w, http.StatusCreated, roleDTO(role, nil))
+		// Re-read so the response carries the stored created_at (ADM-I02).
+		stored, err := a.identity.GetRole(r.Context(), principal.TenantID, role.ID)
+		if err != nil {
+			a.writeIdentityError(w, err, "role_fetch_failed")
+			return
+		}
+		a.recordSecurityAudit(r, principal, "identity.role.created", "role", stored.ID, "success")
+		WriteJSON(w, http.StatusCreated, roleDTO(stored, nil))
 	default:
 		WriteMethodNotAllowed(w)
 	}

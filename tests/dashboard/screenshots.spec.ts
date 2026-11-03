@@ -1,6 +1,5 @@
-import { test, expect } from '@playwright/test';
 import type { Page } from '@playwright/test';
-import { BASE } from './fixtures';
+import { BASE, test, expect } from './fixtures';
 
 // screenshots.spec.ts — the both-theme × 1440/390 visual matrix plus the
 // migrated computed-style a11y cases (see 12-04 SUMMARY case map):
