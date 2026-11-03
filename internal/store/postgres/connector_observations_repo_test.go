@@ -103,14 +103,15 @@ func TestConnectorStreamPagesPersistBeforeCursorAndFenceOldRuns(t *testing.T) {
 	}
 }
 
-func TestConnectorUnmappedPrincipalsUsesLatestCompleteSnapshots(t *testing.T) {
+func TestConnectorUnmappedPrincipalsCountsDistinctUnboundAccounts(t *testing.T) {
 	db := testdb.New(t)
 	ctx := context.Background()
 	tenant := testdb.SeedTenant(t, db, "connector-unmapped")
 	other := testdb.SeedTenant(t, db, "connector-unmapped-other")
-	connections := postgres.NewSourceRepo(db)
+	user := testdb.SeedUser(t, db, tenant, "bound@example.test", nil)
+	sources := postgres.NewSourceRepo(db)
 	for _, id := range []string{tenant, other} {
-		if err := connections.CreateConnection(ctx, source.Connection{TenantID: id, ID: "conn", Kind: source.ConnectionSlack, Name: "Slack", Status: "active"}); err != nil {
+		if err := sources.CreateConnection(ctx, source.Connection{TenantID: id, ID: "conn", Kind: source.ConnectionSlack, Name: "Slack", Status: "active"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -118,20 +119,36 @@ func TestConnectorUnmappedPrincipalsUsesLatestCompleteSnapshots(t *testing.T) {
 	if count, err := repo.UnmappedPrincipals(ctx, tenant, "conn"); err != nil || count != 0 {
 		t.Fatalf("empty count = %d, %v", count, err)
 	}
-	_, err := db.SQL.ExecContext(ctx, `
-		INSERT INTO access_snapshots (tenant_id, id, connection_id, kind, revision, status, unmapped_subjects)
-		VALUES ($1, 'g1', 'conn', 'grants', 1, 'complete', 10),
-		       ($1, 'g2', 'conn', 'grants', 2, 'complete', 2),
-		       ($1, 'g3', 'conn', 'grants', 3, 'incomplete', 100),
-		       ($1, 'm1', 'conn', 'membership', 1, 'complete', 3),
-		       ($1, 'm2', 'conn', 'membership', 2, 'incomplete', 100),
-		       ($1, 'c1', 'conn', 'content', 1, 'complete', 100),
-		       ($2, 'g4', 'conn', 'grants', 4, 'complete', 100)`, tenant, other)
-	if err != nil {
-		t.Fatal(err)
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := db.SQL.ExecContext(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if count, err := repo.UnmappedPrincipals(ctx, tenant, "conn"); err != nil || count != 5 {
-		t.Fatalf("latest complete count = %d, %v; want 5", count, err)
+	exec(`INSERT INTO source_objects (tenant_id, id, connection_id, kind, native_id, authorization_mode, observed_seq)
+		VALUES ($1, 'obj', 'conn', 'channel', 'slack:C1', 'source_acl', 1), ($2, 'obj', 'conn', 'channel', 'slack:C1', 'source_acl', 1)`, tenant, other)
+	exec(`INSERT INTO source_groups (tenant_id, id, connection_id, source_group_native_id, name) VALUES ($1, 'grp', 'conn', 'C1', 'C1')`, tenant)
+	exec(`INSERT INTO source_identities (tenant_id, id, connection_id, source_user_native_id, mapped_user_id)
+		VALUES ($1, 'both', 'conn', 'U1', NULL), ($1, 'member', 'conn', 'U2', NULL), ($1, 'bound', 'conn', 'U3', $2),
+		       ($1, 'stale', 'conn', 'U4', NULL), ($1, 'pending', 'conn', 'U5', NULL)`, tenant, user.ID)
+	exec(`INSERT INTO source_identities (tenant_id, id, connection_id, source_user_native_id) VALUES ($1, 'elsewhere', 'conn', 'U9')`, other)
+	exec(`INSERT INTO access_snapshots (tenant_id, id, connection_id, kind, revision, status)
+		VALUES ($1, 'g1', 'conn', 'grants', 1, 'complete'), ($1, 'g2', 'conn', 'grants', 2, 'complete'),
+		       ($1, 'g3', 'conn', 'grants', 3, 'incomplete'), ($1, 'm1', 'conn', 'membership', 1, 'complete'),
+		       ($2, 'g9', 'conn', 'grants', 9, 'complete')`, tenant, other)
+	grant := func(tenantID, id, identity string, revision int) {
+		exec(`INSERT INTO source_grants (tenant_id, id, object_id, subject_type, source_identity_id, effect, access_revision)
+			VALUES ($1, $2, 'obj', 'user', $3, 'allow', $4)`, tenantID, id, identity, revision)
+	}
+	grant(tenant, "gr-stale", "stale", 1)     // superseded revision
+	grant(tenant, "gr-both", "both", 2)       // also a member below
+	grant(tenant, "gr-bound", "bound", 2)     // has an Enclava binding
+	grant(tenant, "gr-pending", "pending", 3) // incomplete revision
+	grant(other, "gr-elsewhere", "elsewhere", 9)
+	exec(`INSERT INTO source_group_memberships (tenant_id, id, group_id, source_identity_id, access_revision)
+		VALUES ($1, 'm-both', 'grp', 'both', 1), ($1, 'm-member', 'grp', 'member', 1)`, tenant)
+	if count, err := repo.UnmappedPrincipals(ctx, tenant, "conn"); err != nil || count != 2 {
+		t.Fatalf("distinct unbound accounts = %d, %v; want 2 (both, member)", count, err)
 	}
 }
 

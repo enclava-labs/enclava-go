@@ -528,3 +528,62 @@ func TestIngestHandoffExistsGeneration(t *testing.T) {
 		t.Fatalf("generation covers seq 3 only: handoff=%v err=%v", exists, err)
 	}
 }
+
+// TestIngestFailed mirrors the document "failed" status for the newest
+// generation: a failed embed job on a staging generation counts, a newer
+// published generation clears it, and other collections never count.
+func TestIngestFailed(t *testing.T) {
+	db, repo, ctx := newRepo(t)
+	seedTenant(t, ctx, db, idTenantA)
+	if err := repo.CreateConnection(ctx, source.Connection{
+		TenantID: idTenantA, ID: "conn_a", Kind: "slack", Name: "slack", CredentialRef: "ref"}); err != nil {
+		t.Fatalf("create connection: %v", err)
+	}
+	if _, err := repo.UpsertObject(ctx, source.Object{
+		TenantID: idTenantA, ConnectionID: "conn_a", ID: "obj_a", Kind: "message",
+		NativeID: "slack:C1:1.0", AuthorizationMode: source.AuthorizationSourceACL, ObservedSeq: 1}); err != nil {
+		t.Fatalf("upsert object: %v", err)
+	}
+	if err := repo.InsertObjectVersion(ctx, idTenantA, source.ObjectVersion{
+		ObjectID: "obj_a", ObservedSeq: 2, ArtifactRef: "art_a", SHA256: "aa", ByteSize: 1, MimeType: "text/plain"}); err != nil {
+		t.Fatalf("insert version: %v", err)
+	}
+	for _, col := range []string{"col_a", "col_b"} {
+		if _, err := db.SQL.ExecContext(ctx, `
+			INSERT INTO knowledge_collections (tenant_id, id, name, qdrant_collection)
+			VALUES ($1, $2, $2, 'qdr_' || $2)`, idTenantA, col); err != nil {
+			t.Fatalf("insert collection %s: %v", col, err)
+		}
+	}
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := db.SQL.ExecContext(ctx, query, append([]any{idTenantA}, args...)...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assert := func(collection string, want bool, note string) {
+		t.Helper()
+		got, err := repo.IngestFailed(ctx, idTenantA, collection, "obj_a", 2)
+		if err != nil || got != want {
+			t.Fatalf("%s: failed=%v err=%v, want %v", note, got, err, want)
+		}
+	}
+	assert("col_a", false, "no generation")
+
+	exec(`INSERT INTO index_generations (tenant_id, id, collection_id, object_version_id, generation, state)
+		VALUES ($1, 'gen_1', 'col_a', 'obj_a#2', 1, 'staging')`)
+	exec(`INSERT INTO jobs (tenant_id, id, operation, status, connection_id, object_id, observed_revision,
+		                  idempotency_key, input_ref, input_hash, principal, submitter_key, policy)
+		VALUES ($1, 'job_embed_1', 'rag.embed', 'failed', 'conn_a', 'obj_a', 2,
+		        'key-embed-1', 'obj_a#2', 'h', '{}', 'sub', '{"generation":"1"}'::jsonb)`)
+	assert("col_a", true, "staging generation whose embed job failed")
+	assert("col_b", false, "failure in another collection")
+
+	exec(`INSERT INTO index_generations (tenant_id, id, collection_id, object_version_id, generation, state)
+		VALUES ($1, 'gen_2', 'col_a', 'obj_a#2', 2, 'published')`)
+	assert("col_a", false, "newer published generation")
+
+	exec(`INSERT INTO index_generations (tenant_id, id, collection_id, object_version_id, generation, state)
+		VALUES ($1, 'gen_3', 'col_a', 'obj_a#2', 3, 'failed')`)
+	assert("col_a", true, "newest generation failed")
+}

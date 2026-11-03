@@ -1585,7 +1585,7 @@ func (r *RAGRepo) CompleteIndexReconciliation(ctx context.Context, item rag.Inde
 		return fmt.Errorf("complete index reconciliation: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
-		return fmt.Errorf("index reconciliation reservation changed")
+		return rag.ErrIndexReconciliationChanged
 	}
 	return nil
 }

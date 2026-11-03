@@ -59,8 +59,10 @@ func TestRealAdaptersACLPipeline(t *testing.T) {
 					_, _ = fmt.Fprint(w, `{"ok":true,"channel":{"name":"general"}}`)
 				case "/conversations.members":
 					_, _ = fmt.Fprint(w, `{"ok":true,"members":["U1"]}`)
-				case "/chat.getPermalink":
-					_, _ = fmt.Fprint(w, `{"ok":true,"permalink":"https://example.test/message"}`)
+				case "/auth.test":
+					_, _ = fmt.Fprint(w, `{"ok":true,"url":"https://example.slack.com/"}`)
+				case "/users.list":
+					_, _ = fmt.Fprint(w, `{"ok":true,"members":[{"id":"U1","name":"u1"}]}`)
 				case "/repos/acme/docs/commits/HEAD":
 					_, _ = fmt.Fprint(w, `{"sha":"commit1"}`)
 				case "/repos/acme/docs/git/trees/commit1":
@@ -97,7 +99,7 @@ func TestRealAdaptersACLPipeline(t *testing.T) {
 			case SourceTypeSlack:
 				envRef, nativeUser, objectKind, nativeObject = "CONNECTOR_SLACK_TEST", "U1", "message", "slack:C1:1.000001"
 				config = map[string]any{"base_url": server.URL, "channel_id": "C1"}
-				adapter = slackAdapter{client: server.Client()}
+				adapter = &slackAdapter{client: server.Client(), baseURL: server.URL, token: "fixture-token", users: map[string]string{}}
 			case SourceTypeGitHub:
 				envRef, nativeUser, objectKind, nativeObject = "CONNECTOR_GITHUB_TEST", "alice", "file", "github:connection-test:acme/docs:guide.md"
 				config = map[string]any{"api_url": server.URL, "owner": "acme", "repo": "docs"}

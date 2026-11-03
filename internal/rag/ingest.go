@@ -124,7 +124,12 @@ func (s *Service) IngestJobHandler() jobs.HandlerFunc {
 		return versionID, nil
 	}
 }
-func applyConnectorStructure(document source.Document, object source.Object, raw string) source.Document {
+
+// applyConnectorStructure maps connector item kinds and locators onto parsed
+// blocks. Block parents stay within the parsed document (blocks.parent_id is
+// a block reference); the item's parent object (channel, thread, page) is
+// already recorded on source_objects.parent_object_id.
+func applyConnectorStructure(document source.Document, raw string) source.Document {
 	var metadata struct {
 		ConnectionID string         `json:"connection_id"`
 		Kind         string         `json:"kind"`
@@ -135,9 +140,6 @@ func applyConnectorStructure(document source.Document, object source.Object, raw
 	}
 	for i := range document.Blocks {
 		block := &document.Blocks[i]
-		if object.ParentObjectID != "" {
-			block.ParentID = object.ParentObjectID
-		}
 		block.Locator = metadata.Locator
 		switch metadata.Kind {
 		case "message", "teams_chat_message":

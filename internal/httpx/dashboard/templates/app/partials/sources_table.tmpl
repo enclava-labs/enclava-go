@@ -40,7 +40,7 @@
           <td data-label="Last sync">{{relTime .Source.LastSyncAt}}</td>
           <td data-label="Next sync">{{if .NextEnabled}}{{relTime .NextAt}}{{else}}—{{end}}</td>
           <td data-label="Items">{{if .HasItems}}{{count .Items}}{{else}}—{{end}}</td>
-          <td data-label="Permissions">{{.Permissions}}{{if gt .Source.UnmappedPrincipals 0}}<span class="subline">{{.Source.UnmappedPrincipals}} source accounts have no Enclava binding and get no access</span>{{end}}</td>
+          <td data-label="Permissions">{{.Permissions}}{{if gt .Source.UnmappedPrincipals 0}}<span class="subline">{{if eq .Source.UnmappedPrincipals 1}}1 source account has no Enclava binding and gets no access{{else}}{{.Source.UnmappedPrincipals}} source accounts have no Enclava binding and get no access{{end}}</span>{{end}}</td>
           <td data-label="Actions">
             <span class="row">
 {{if $.Can.SourcesManage}}              <button type="button" class="btn" data-action="sources:sync" data-source-id="{{.Source.ID}}">{{icon "refresh"}}Sync now</button>

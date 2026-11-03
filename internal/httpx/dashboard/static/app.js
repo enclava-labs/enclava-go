@@ -307,9 +307,12 @@
     }
   }
 
+  // A drawer whose 'open' frame is still pending counts as open, so a close
+  // (Esc, evidence:close) right after opening is never lost.
+  let drawerFrame = 0;
   function drawerOpen() {
     const d = el('drawer');
-    return !!(d && d.classList.contains('open'));
+    return !!(d && (d.classList.contains('open') || drawerFrame));
   }
 
   function visibleFocusables(root) {
@@ -344,7 +347,11 @@
     drawer.classList.toggle('modal', !!modal);
     // A frame must pass before 'open' lands or the transform transition is
     // lost on the first paint after unhiding.
-    requestAnimationFrame(() => { if (!drawer.hidden) drawer.classList.add('open'); });
+    cancelAnimationFrame(drawerFrame);
+    drawerFrame = requestAnimationFrame(() => {
+      drawerFrame = 0;
+      if (!drawer.hidden) drawer.classList.add('open');
+    });
     const backdrop = el('backdrop');
     if (backdrop) backdrop.classList.add('open');
     overlayOpener = document.activeElement instanceof Element ? document.activeElement : null;
@@ -354,7 +361,9 @@
 
   function closeDrawer() {
     const drawer = el('drawer');
-    if (!drawer || !drawer.classList.contains('open')) return;
+    if (!drawer || !drawerOpen()) return;
+    cancelAnimationFrame(drawerFrame);
+    drawerFrame = 0;
     drawer.classList.remove('open', 'modal');
     drawer.innerHTML = '';
     drawer.removeAttribute('role');
@@ -362,7 +371,7 @@
     drawer.removeAttribute('aria-labelledby');
     // hidden lands after the slide-out transition; a reopen inside the
     // window un-hides the drawer and this guard leaves it alone.
-    setTimeout(() => { if (!drawer.classList.contains('open')) drawer.hidden = true; }, 250);
+    setTimeout(() => { if (!drawerOpen()) drawer.hidden = true; }, 250);
     const backdrop = el('backdrop');
     if (backdrop) backdrop.classList.remove('open');
     if (overlayOpener && document.contains(overlayOpener)) overlayOpener.focus();

@@ -1791,6 +1791,46 @@ func TestReuploadSameSourceIsNewVersionNotDuplicate(t *testing.T) {
 	}
 }
 
+// racingReconcileRepo lets a concurrent embed worker complete each pending
+// reconciliation just before this worker's own completion.
+type racingReconcileRepo struct {
+	*postgres.RAGRepo
+	raced int
+}
+
+func (r *racingReconcileRepo) CompleteIndexReconciliation(ctx context.Context, item rag.IndexReconciliation) error {
+	if err := r.RAGRepo.CompleteIndexReconciliation(ctx, item); err != nil {
+		return err
+	}
+	r.raced++
+	return r.RAGRepo.CompleteIndexReconciliation(ctx, item)
+}
+
+// TestReconcileIndexPointsToleratesConcurrentCompletion: every embed attempt
+// reconciles the tenant, so parallel workers race on the same items; losing
+// that race must not fail the embed that triggered it.
+func TestReconcileIndexPointsToleratesConcurrentCompletion(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	f.stageSearchDoc(t, c, "obj_raced", "superseded content", "{}")
+	if _, err := f.db.SQL.ExecContext(ctx, `UPDATE index_generations SET state='superseded' WHERE tenant_id=$1 AND object_version_id='obj_raced#1'`, f.tenant); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.SQL.ExecContext(ctx, `INSERT INTO index_reconciliation (tenant_id, collection_id, object_version_id, generation, fence_token, state) VALUES ($1, $2, 'obj_raced#1', 1, 1, 'pending')`, f.tenant, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	repo := &racingReconcileRepo{RAGRepo: f.repo}
+	svc := rag.NewService(repo, f.vector, f.executor, "embed-test", f.store, f.jobs)
+	if err := svc.ReconcileIndexPoints(ctx, f.tenant); err != nil || repo.raced != 1 {
+		t.Fatalf("reconcile after a lost race: err=%v raced=%d", err, repo.raced)
+	}
+	var pending int
+	if err := f.db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM index_reconciliation WHERE tenant_id=$1 AND state='pending'`, f.tenant).Scan(&pending); err != nil || pending != 0 {
+		t.Fatalf("pending reconciliations = %d, err = %v", pending, err)
+	}
+}
+
 func TestKnowledgeImportReservationSurvivesCrashAfterObjectCreation(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()

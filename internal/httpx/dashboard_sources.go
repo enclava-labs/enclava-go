@@ -239,6 +239,9 @@ type dashboardSourceBindingsData struct {
 	SourceName string
 	Source     connectors.Source
 	Bindings   []source.SourceIdentity
+	// Users backs the Enclava-user picker; UserLabels shows mapped bindings by email.
+	Users      []auth.User
+	UserLabels map[string]string
 }
 
 func (a *App) handleDashboardSourcesBindings(w http.ResponseWriter, r *http.Request) {
@@ -264,6 +267,16 @@ func (a *App) handleDashboardSourcesBindings(w http.ResponseWriter, r *http.Requ
 		data.Bindings = rows
 	} else {
 		log.Printf("dashboard sources bindings: %v", err)
+	}
+	if a.identity != nil {
+		if users, err := a.identity.ListUsers(r.Context(), p.TenantID); err == nil {
+			data.Users, data.UserLabels = users, make(map[string]string, len(users))
+			for _, u := range users {
+				data.UserLabels[u.ID] = u.Email
+			}
+		} else {
+			log.Printf("dashboard sources bindings users: %v", err)
+		}
 	}
 	a.renderDashboardFragment(w, r, "sources", "sources-bindings", data)
 }

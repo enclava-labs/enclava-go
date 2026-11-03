@@ -223,7 +223,17 @@ func (s *Service) observeContentItem(ctx context.Context, conn source.Connection
 		if err := s.canonical.ObserveObject(ctx, conn.TenantID, object.ID, parentID, upstream); err != nil {
 			return Observation{}, err
 		}
+		retry := false
 		if !metadataChanged {
+			// Failed indexing (for example before the creator's source identity was
+			// bound) is retried as a new version so the ingest job key changes.
+			failed, failErr := s.canonical.IngestFailed(ctx, conn.TenantID, conn.TargetCollectionID, object.ID, latest.ObservedSeq)
+			if failErr != nil {
+				return Observation{}, failErr
+			}
+			retry = failed
+		}
+		if !metadataChanged && !retry {
 			handedOff, handErr := s.canonical.IngestHandoffExists(ctx, conn.TenantID, conn.ID, conn.TargetCollectionID, object.ID, latest.ObservedSeq)
 			if handErr != nil {
 				return Observation{}, handErr

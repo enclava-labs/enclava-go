@@ -202,11 +202,11 @@
   <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button>
 </div>
 <p class="muted">Verified mappings from {{if .Data.SourceName}}“{{.Data.SourceName}}”{{else}}this source{{end}}'s native users to Enclava users. Bindings decide whose access a source-native grant can widen.</p>
-{{if gt .Data.Source.UnmappedPrincipals 0}}<p class="help">{{.Data.Source.UnmappedPrincipals}} source accounts have no Enclava binding and get no access</p>{{end}}
+{{if gt .Data.Source.UnmappedPrincipals 0}}<p class="help">{{if eq .Data.Source.UnmappedPrincipals 1}}1 source account has no Enclava binding and gets no access{{else}}{{.Data.Source.UnmappedPrincipals}} source accounts have no Enclava binding and get no access{{end}}</p>{{end}}
 <div class="stack">
   {{range .Data.Bindings}}  <div class="row">
-    <code>{{.NativeID}}</code>
-    {{if .MappedUserID}}<span>→ <code>{{.MappedUserID}}</code></span>
+    <code>{{.NativeID}}</code>{{if and .DisplayName (ne .DisplayName .NativeID)}} <span>{{.DisplayName}}</span>{{end}}
+    {{if .MappedUserID}}<span>→ <code>{{or (index $.Data.UserLabels .MappedUserID) .MappedUserID}}</code></span>
     <button type="button" class="btn danger" data-action="sources:unbind" data-source-id="{{$.Data.SourceID}}" data-binding-id="{{.ID}}">Revoke</button>
     {{else}}<span class="muted">unbound</span>{{end}}
   </div>
@@ -216,9 +216,11 @@
 <div class="section">
   <div class="section-head"><h2>Bind a user</h2></div>
   <label class="label" for="bind-native">Observed native user ID</label>
-  <input class="field" id="bind-native" data-bind-native required>
+  <input class="field" id="bind-native" data-bind-native list="bind-native-ids" autocomplete="off" required>
+  <datalist id="bind-native-ids">{{range .Data.Bindings}}{{if not .MappedUserID}}<option value="{{.NativeID}}">{{.DisplayName}}</option>{{end}}{{end}}</datalist>
   <label class="label" for="bind-mapped">Enclava user ID</label>
-  <input class="field" id="bind-mapped" data-bind-mapped required>
+  <input class="field" id="bind-mapped" data-bind-mapped list="bind-users" autocomplete="off" required>
+  <datalist id="bind-users">{{range .Data.Users}}<option value="{{.ID}}">{{.Email}}</option>{{end}}</datalist>
   <label class="label" for="bind-evidence">Administrator verification evidence</label>
   <input class="field" id="bind-evidence" data-bind-evidence required>
   <span class="help">Where the verification is recorded (ticket, request, review).</span>

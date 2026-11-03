@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"enclava-go/internal/rag"
 	"enclava-go/internal/source"
 )
 
@@ -548,6 +549,34 @@ func (r *SourceRepo) IngestHandoffExists(ctx context.Context, tenantID, connecti
 		return false, fmt.Errorf("check ingest handoff: %w", err)
 	}
 	return exists, nil
+}
+
+// IngestFailed mirrors the document "failed" status: the newest generation of
+// the object version in the collection is failed, or its embed/ingest job is.
+func (r *SourceRepo) IngestFailed(ctx context.Context, tenantID, collectionID, objectID string, observedSeq int64) (bool, error) {
+	var failed bool
+	err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT COALESCE((
+			SELECT g.state = 'failed' OR EXISTS (
+				SELECT 1 FROM jobs j
+				WHERE j.tenant_id = g.tenant_id
+				  AND j.operation IN ('`+rag.OperationEmbed+`', '`+rag.OperationIngest+`')
+				  AND j.input_ref = g.object_version_id
+				  AND j.policy->>'generation' = g.generation::text
+				  AND j.status = 'failed')
+			FROM index_generations g
+			JOIN source_object_versions v
+			  ON v.tenant_id = g.tenant_id AND v.id = g.object_version_id
+			WHERE g.tenant_id = $1 AND g.collection_id = $2
+			  AND v.object_id = $3 AND v.observed_seq = $4
+			ORDER BY g.generation DESC
+			LIMIT 1
+		), false)`,
+		tenantID, collectionID, objectID, observedSeq).Scan(&failed)
+	if err != nil {
+		return false, fmt.Errorf("check ingest failure: %w", err)
+	}
+	return failed, nil
 }
 
 // ---------------------------------------------------------------------

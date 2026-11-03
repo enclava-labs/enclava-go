@@ -74,6 +74,11 @@ type SourceRepository interface {
 	// that object version in the target collection. Lets a connector
 	// re-enqueue work stranded by the crash window or a retarget.
 	IngestHandoffExists(ctx context.Context, tenantID, connectionID, collectionID, objectID string, observedSeq int64) (bool, error)
+	// IngestFailed reports whether the newest index generation of the object
+	// version in the collection failed (its state or its embed/ingest job), so
+	// a later sync can observe the unchanged item again and retry indexing —
+	// for example once the source creator's identity has been bound.
+	IngestFailed(ctx context.Context, tenantID, collectionID, objectID string, observedSeq int64) (bool, error)
 
 	// Source identities, groups and memberships (upsert by unique keys).
 	InsertSourceIdentity(ctx context.Context, id SourceIdentity) error

@@ -190,6 +190,10 @@ func (s *Service) AccessBackfillJobHandler() jobs.HandlerFunc {
 	}
 }
 
+// ErrIndexReconciliationChanged reports that another worker completed or
+// re-fenced a pending index reconciliation first.
+var ErrIndexReconciliationChanged = errors.New("index reconciliation reservation changed")
+
 func (s *Service) ReconcileIndexPoints(ctx context.Context, tenantID string) error {
 	if s.vectorStore == nil {
 		return errors.New("rag reconciliation: vector store is not configured")
@@ -202,6 +206,7 @@ func (s *Service) ReconcileIndexPoints(ctx context.Context, tenantID string) err
 		if len(pending) == 0 {
 			return nil
 		}
+		completed := 0
 		for _, item := range pending {
 			published, err := s.repo.ListPublishedGenerations(ctx, tenantID, item.CollectionID)
 			if err != nil {
@@ -215,9 +220,17 @@ func (s *Service) ReconcileIndexPoints(ctx context.Context, tenantID string) err
 			if err := deleteReconciledGeneration(ctx, s.vectorStore, item, false); err != nil {
 				return err
 			}
-			if err := s.repo.CompleteIndexReconciliation(ctx, item); err != nil {
+			// Every embed attempt reconciles the tenant, so concurrent workers race
+			// on the same items; losing that race leaves nothing for this one to do.
+			if err := s.repo.CompleteIndexReconciliation(ctx, item); errors.Is(err, ErrIndexReconciliationChanged) {
+				continue
+			} else if err != nil {
 				return err
 			}
+			completed++
+		}
+		if completed == 0 {
+			return nil
 		}
 	}
 }

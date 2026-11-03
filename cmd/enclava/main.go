@@ -250,7 +250,7 @@ func serve() error {
 			return connectors.NewGitHubAdapter(c, secretResolver)
 		},
 		connectors.SourceKindSlack: func(c source.Connection) (connectors.Adapter, error) {
-			return connectors.NewSlackAdapter(c)
+			return connectors.NewSlackAdapter(c, secretResolver)
 		},
 		connectors.SourceKindTeams: func(c source.Connection) (connectors.Adapter, error) {
 			return connectors.NewTeamsAdapter(c, secretResolver)

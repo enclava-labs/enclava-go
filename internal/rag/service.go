@@ -1226,6 +1226,9 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		return "", err
 	}
 	if err := s.authorizer.CanReadVersion(ctx, p, obj, ver, source.ReadOptions{}); err != nil {
+		if obj.ConnectionID != "" && errors.Is(err, source.ErrDenied) {
+			return "", fmt.Errorf("%w: the indexing user has no access to this item in the source; bind their source identity, then sync again", err)
+		}
 		return "", err
 	}
 	// Superseded-version fence: a newer version exists → this attempt must
@@ -1317,7 +1320,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		if len(document.Blocks) == 0 {
 			return "", errors.New("document has no extractable text")
 		}
-		document = applyConnectorStructure(document, obj, ver.Provenance)
+		document = applyConnectorStructure(document, ver.Provenance)
 		if err := s.repo.SaveParsedDocument(ctx, "extract-v1", document); err != nil {
 			return "", err
 		}

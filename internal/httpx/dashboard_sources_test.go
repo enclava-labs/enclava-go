@@ -396,10 +396,10 @@ func TestDashboardSourcesDrawerProviders(t *testing.T) {
 }
 
 // TestDashboardSourcesUnmappedWarning proves the "source accounts have no
-// Enclava binding" copy is driven by the real access_snapshots projection:
-// it surfaces in the sources table's Permissions cell and inside the
+// Enclava binding" copy is driven by the real snapshot projection: it
+// surfaces in the sources table's Permissions cell and inside the
 // access.manage-gated bindings drawer when the latest complete snapshots
-// report unmapped principals, and stays hidden at zero. Assertions pin
+// reference unbound accounts, and stays hidden at zero. Assertions pin
 // rendered text only — never markup around the interpolated count.
 func TestDashboardSourcesUnmappedWarning(t *testing.T) {
 	f := newIdentityFixture(t)
@@ -429,19 +429,37 @@ func TestDashboardSourcesUnmappedWarning(t *testing.T) {
 		made[name] = id
 	}
 
-	// Latest-complete-per-kind wins: grants rev 2 supersedes rev 1, the
-	// incomplete rev 3 and the content row never count → 3 + 2 = 5 unmapped.
-	if _, err := f.db.SQL.ExecContext(ctx, `
-		INSERT INTO access_snapshots (tenant_id, id, connection_id, kind, revision, status, unmapped_subjects)
-		VALUES ($1, 'snap_g1', $2, 'grants', 1, 'complete', 10),
-		       ($1, 'snap_g2', $2, 'grants', 2, 'complete', 3),
-		       ($1, 'snap_g3', $2, 'grants', 3, 'incomplete', 100),
-		       ($1, 'snap_m1', $2, 'membership', 1, 'complete', 2),
-		       ($1, 'snap_c1', $2, 'content', 1, 'complete', 100)`,
-		f.tenant, made["warn"]); err != nil {
-		t.Fatalf("seed access snapshots: %v", err)
+	// Distinct unbound accounts in the latest complete snapshot per kind: a is
+	// in both grants rev 2 and membership rev 1 (counted once), b and c in one
+	// each; d is only in superseded rev 1 and e only in incomplete rev 3 → 3.
+	tenant, conn := f.tenant, made["warn"]
+	for _, seed := range []struct {
+		stmt string
+		args []any
+	}{
+		{`INSERT INTO access_snapshots (tenant_id, id, connection_id, kind, revision, status)
+		  VALUES ($1, 'snap_g1', $2, 'grants', 1, 'complete'), ($1, 'snap_g2', $2, 'grants', 2, 'complete'),
+		         ($1, 'snap_g3', $2, 'grants', 3, 'incomplete'), ($1, 'snap_m1', $2, 'membership', 1, 'complete'),
+		         ($1, 'snap_c1', $2, 'content', 1, 'complete')`, []any{tenant, conn}},
+		{`INSERT INTO source_objects (tenant_id, id, connection_id, kind, native_id, authorization_mode, observed_seq)
+		  VALUES ($1, 'obj_warn', $2, 'channel', 'slack:C456', 'source_acl', 1)`, []any{tenant, conn}},
+		{`INSERT INTO source_groups (tenant_id, id, connection_id, source_group_native_id, name)
+		  VALUES ($1, 'grp_warn', $2, 'C456', 'C456')`, []any{tenant, conn}},
+		{`INSERT INTO source_identities (tenant_id, id, connection_id, source_user_native_id, display_name, mapped_user_id)
+		  VALUES ($1, 'sid_a', $2, 'UA', 'Alice Slack', NULL), ($1, 'sid_b', $2, 'UB', '', NULL), ($1, 'sid_c', $2, 'UC', '', NULL),
+		         ($1, 'sid_d', $2, 'UD', '', NULL), ($1, 'sid_e', $2, 'UE', '', NULL),
+		         ($1, 'sid_f', $2, 'UF', '', (SELECT id FROM users WHERE tenant_id = $1 AND email = 'admin-bindings@example.com'))`, []any{tenant, conn}},
+		{`INSERT INTO source_grants (tenant_id, id, object_id, subject_type, source_identity_id, effect, access_revision)
+		  SELECT $1, 'grant_' || s.id, 'obj_warn', 'user', s.id, 'allow', s.rev
+		  FROM (VALUES ('sid_a', 2), ('sid_b', 2), ('sid_d', 1), ('sid_e', 3), ('sid_f', 2)) AS s(id, rev)`, []any{tenant}},
+		{`INSERT INTO source_group_memberships (tenant_id, id, group_id, source_identity_id, access_revision)
+		  SELECT $1, 'member_' || s.id, 'grp_warn', s.id, 1 FROM (VALUES ('sid_a'), ('sid_c')) AS s(id)`, []any{tenant}},
+	} {
+		if _, err := f.db.SQL.ExecContext(ctx, seed.stmt, seed.args...); err != nil {
+			t.Fatalf("seed access snapshots: %v", err)
+		}
 	}
-	const warning = "5 source accounts have no Enclava binding and get no access"
+	const warning = "3 source accounts have no Enclava binding and get no access"
 
 	// Table page: the warn row carries the Permissions-cell subline; the
 	// clean row proves zero hides it — exactly one occurrence across both.
@@ -463,8 +481,19 @@ func TestDashboardSourcesUnmappedWarning(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("warn bindings partial: expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	if body := rec.Body.String(); !strings.Contains(body, warning) {
+	body := rec.Body.String()
+	if !strings.Contains(body, warning) {
 		t.Fatalf("bindings drawer missing the unmapped-principals warning %q", warning)
+	}
+	// Observed names and pickers spare the admin from hunting raw IDs; the
+	// bound account (sid_f) is shown by email and left out of the picker.
+	for _, want := range []string{"Alice Slack", `<option value="UA">Alice Slack</option>`, ">admin-bindings@example.com</option>", "→ <code>admin-bindings@example.com</code>"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("bindings drawer missing %q", want)
+		}
+	}
+	if strings.Contains(body, `<option value="UF">`) {
+		t.Fatal("bound account offered in the unbound picker")
 	}
 	rec = sessionDo(t, f.app, http.MethodGet,
 		"/dashboard/partials/sources/bindings?source="+made["clean"], "", sess, csrf)

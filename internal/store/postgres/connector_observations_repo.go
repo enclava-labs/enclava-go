@@ -107,16 +107,26 @@ func (r *ConnectorObservationsRepo) GetStream(ctx context.Context, tenantID, con
 	return out, nil
 }
 
+// UnmappedPrincipals counts distinct source accounts in the latest complete
+// grants and membership snapshots that have no Enclava binding now — an
+// account present in both snapshots counts once, and binding it takes effect
+// without another sync.
 func (r *ConnectorObservationsRepo) UnmappedPrincipals(ctx context.Context, tenantID, connectionID string) (int, error) {
 	var count int
 	err := r.db.SQL.QueryRowContext(ctx, `
-		SELECT COALESCE(sum(unmapped_subjects), 0) FROM (
-			SELECT DISTINCT ON (kind) unmapped_subjects
+		WITH latest AS (
+			SELECT DISTINCT ON (kind) kind, revision
 			FROM access_snapshots
 			WHERE tenant_id=$1 AND connection_id=$2 AND status='complete'
 			  AND kind IN ('grants', 'membership')
 			ORDER BY kind, revision DESC
-		) latest`, tenantID, connectionID).Scan(&count)
+		)
+		SELECT count(*) FROM source_identities i
+		WHERE i.tenant_id=$1 AND i.connection_id=$2 AND i.mapped_user_id IS NULL
+		  AND (EXISTS (SELECT 1 FROM source_grants g JOIN latest l ON l.kind='grants' AND g.access_revision=l.revision
+		               WHERE g.tenant_id=$1 AND g.source_identity_id=i.id)
+		    OR EXISTS (SELECT 1 FROM source_group_memberships m JOIN latest l ON l.kind='membership' AND m.access_revision=l.revision
+		               WHERE m.tenant_id=$1 AND m.source_identity_id=i.id))`, tenantID, connectionID).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("count unmapped connector principals: %w", err)
 	}

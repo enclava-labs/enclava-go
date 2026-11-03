@@ -180,9 +180,24 @@ membership lookup requires a credential with push access even for public
 repositories. `POST /api/v1/connectors/sources/{id}/sync` starts a fresh manual
 sync; send the same `Idempotency-Key` header to retry the same submission.
 Syncing a disabled source returns 409.
+
+Slack sources require `config.channel_id` (one channel per source; invite the
+app's bot user to it) and a `CONNECTOR_SLACK_*` `credential_ref` bound in
+`SECRET_BINDINGS` to `https://slack.com` with a bot token. Required scopes:
+`channels:history`/`groups:history` and `channels:read`/`groups:read` for
+public/private channels, plus `users:read` for author names and `files:read`
+for attachments. Every message and thread reply becomes one document headed
+with channel, author and UTC time, with mentions resolved and a permalink back
+to Slack; join/leave notices are skipped. Slack rate limits are waited out
+using `Retry-After` (up to five times per call).
+
 Connector sync workers resolve the source creator's current user grants and
 billing identity for ingest and embedding. A missing or disabled creator fails
-the job; model and endpoint access must be granted to that creator.
+the job; model and endpoint access must be granted to that creator. Indexing
+also needs the creator's own source access: on a new source the first sync's
+items fail with "the indexing user has no access to this item in the source"
+until the creator's observed identity is bound. Bind it, then sync again —
+every sync retries items whose indexing failed.
 
 Grants inherit down container hierarchies (Slack channels, GitHub
 repositories, Teams channels and chats); group grants additionally require

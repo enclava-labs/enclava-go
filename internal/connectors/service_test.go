@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -802,6 +803,78 @@ func TestContentSyncRewriteAndRetargetHandoff(t *testing.T) {
 	sync(5)
 	if seen := drainIngests(); len(seen) != 0 {
 		t.Fatalf("same-collection re-sync enqueued ingest: %v", seen)
+	}
+}
+
+// TestContentSyncRetriesFailedIndexing: an unchanged item whose indexing
+// failed (for example the embed ran before the creator's source identity was
+// bound) is handed off again on the next sync as a new version reusing the
+// artifact; once indexing succeeded the re-sync is idempotent again.
+func TestContentSyncRetriesFailedIndexing(t *testing.T) {
+	ctx := context.Background()
+	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true}}
+	adapter.content = func(context.Context, source.Connection, Cursor, int) (ContentPage, error) {
+		return ContentPage{Items: []ContentItem{{NativeID: "msg-1", Kind: "message", Filename: "msg.txt", MIMEType: "text/plain", Text: "hello"}}, Completeness: CompletenessComplete, Snapshot: true}, nil
+	}
+	f := newConnectorFixture(t, adapter)
+	if _, err := f.db.SQL.ExecContext(ctx, `INSERT INTO knowledge_collections (tenant_id, id, name, qdrant_collection) VALUES ($1, $2, $2, 'qdr_' || $2)`, f.tenant, f.connection.TargetCollectionID); err != nil {
+		t.Fatal(err)
+	}
+	syncAndDrain := func(window int64) (source.ObjectVersion, int) {
+		t.Helper()
+		if _, err := f.svc.SyncSourceWindowed(ctx, f.principal, f.connection.ID, window); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.runNext(t); err != nil {
+			t.Fatal(err)
+		}
+		ingests := 0
+		for {
+			claim, err := f.jobs.Lease(ctx, "ingest-drain", time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if claim == nil {
+				break
+			}
+			if claim.Job().Operation != OperationIngest {
+				t.Fatalf("unexpected queued job %q", claim.Job().Operation)
+			}
+			ingests++
+			if _, err := claim.Complete(ctx, "{}"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		object, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "message", "msg-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		version, err := f.sourceRepo.LatestObjectVersion(ctx, f.tenant, object.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return version, ingests
+	}
+	generation := func(version source.ObjectVersion, n int, state string) {
+		t.Helper()
+		if _, err := f.db.SQL.ExecContext(ctx, `INSERT INTO index_generations (tenant_id, id, collection_id, object_version_id, generation, state) VALUES ($1, $2, $3, $4, $5, $6)`,
+			f.tenant, fmt.Sprintf("gen-%d", n), f.connection.TargetCollectionID, fmt.Sprintf("%s#%d", version.ObjectID, version.ObservedSeq), n, state); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	v1, ingests := syncAndDrain(1)
+	if ingests != 1 {
+		t.Fatalf("initial sync enqueued %d ingests", ingests)
+	}
+	generation(v1, 1, "failed")
+	v2, ingests := syncAndDrain(2)
+	if ingests != 1 || v2.ObservedSeq != v1.ObservedSeq+1 || v2.ArtifactRef != v1.ArtifactRef {
+		t.Fatalf("failed indexing was not retried: ingests=%d v1=%+v v2=%+v", ingests, v1, v2)
+	}
+	generation(v2, 2, "published")
+	if v3, ingests := syncAndDrain(3); ingests != 0 || v3.ObservedSeq != v2.ObservedSeq {
+		t.Fatalf("indexed item was handed off again: ingests=%d v3=%+v", ingests, v3)
 	}
 }
 

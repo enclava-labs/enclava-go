@@ -420,7 +420,8 @@ func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID str
 	}
 	adapter, err := factory(conn)
 	if err != nil {
-		return SyncJob{}, err
+		// Adapters only fail construction on configuration: credential binding, base URL or required config.
+		return SyncJob{}, fmt.Errorf("%w: %v", ErrInvalidSource, err)
 	}
 	capabilities := adapter.Capabilities()
 	streams := []StreamKind{}
