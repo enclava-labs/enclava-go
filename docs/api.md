@@ -172,9 +172,14 @@ accounts without an Enclava identity binding get no access until an
 administrator binds the observed identity. Its observed grants and memberships
 then apply without another sync.
 
+Each source names its credential by `credential_ref`: either a
+`CONNECTOR_<PROVIDER>_*` reference bound in `SECRET_BINDINGS` by the operator
+for the tenant, connector purpose and API origin, or a credential an
+administrator added under **Sources → Credentials** (see below).
+
 GitHub sources require `config.owner` and `config.repo`. A nonempty GitHub
-`credential_ref` must be a `CONNECTOR_GITHUB_*` reference declared in
-`SECRET_BINDINGS` for the tenant, connector purpose and GitHub API origin.
+`credential_ref` must be a `CONNECTOR_GITHUB_*` credential for the GitHub API
+origin.
 Public repository content can sync without a credential, but collaborator and
 membership lookup requires a credential with push access even for public
 repositories. `POST /api/v1/connectors/sources/{id}/sync` starts a fresh manual
@@ -182,8 +187,8 @@ sync; send the same `Idempotency-Key` header to retry the same submission.
 Syncing a disabled source returns 409.
 
 Slack sources require `config.channel_id` (one channel per source; invite the
-app's bot user to it) and a `CONNECTOR_SLACK_*` `credential_ref` bound in
-`SECRET_BINDINGS` to `https://slack.com` with a bot token. Required scopes:
+app's bot user to it) and a `CONNECTOR_SLACK_*` `credential_ref` holding a bot
+token for `https://slack.com`. Required scopes:
 `channels:history`/`groups:history` and `channels:read`/`groups:read` for
 public/private channels, plus `users:read` for author names and `files:read`
 for attachments. Every message and thread reply becomes one document headed
@@ -210,6 +215,37 @@ Sync dedupes on content hash: unchanged bytes reuse the artifact and version
 unless the ingest handoff is missing or title/URI/name/mime metadata changed
 (which creates a new version). Editing a source's config resets its stored
 listing checkpoint so the next sync re-lists from the start.
+
+### Connector credentials
+
+Tenant administrators (`platform.admin` + `connectors.manage`) manage
+credentials in the dashboard (Sources → Credentials) or the API. Secrets are
+write-only: they are sealed with AES-256-GCM under `ENCLAVA_SECRETS_KEY`
+(32 bytes, base64 — `openssl rand -base64 32`; without it the store is off and
+only `SECRET_BINDINGS` work) and never returned. A stored credential is sent
+only to its provider's API origin (or the custom HTTPS origin it was added
+with, e.g. GitHub Enterprise); its ID is the `credential_ref` sources use,
+derived from the name (`Enclava Labs` → `CONNECTOR_SLACK_ENCLAVA_LABS`).
+
+- `GET /api/v1/connectors/credentials` — stored credentials (with `used_by`
+  source IDs), refs bound in server configuration and per-provider OAuth state.
+- `POST /api/v1/connectors/credentials` `{provider, name, secret, origin?}` —
+  add a token or key; GitHub, Slack, Notion and Google Drive tokens are checked
+  against the provider first (`400 credential_invalid` when refused). Teams
+  takes the app registration's client secret; tenant and client IDs stay on
+  the source.
+- `PUT /api/v1/connectors/credentials/{id}` `{secret}` rotates a token;
+  `DELETE` removes it (`409 credential_in_use` while sources use it).
+- `PUT /api/v1/connectors/oauth-apps/{provider}` `{client_id, client_secret}` /
+  `DELETE` — the tenant's OAuth app for GitHub, Slack, Notion or Google Drive.
+
+OAuth sign-in needs `PUBLIC_BASE_URL` (the browser-facing origin). Register
+`$PUBLIC_BASE_URL/dashboard/connectors/oauth/callback/{provider}` as the
+redirect URI in the provider's app, save its client ID and secret, then use
+**Connect with …** on the Credentials tab. Requested scopes: Slack bot scopes
+above; GitHub `repo read:org`; Notion the integration's capabilities; Google
+Drive `drive.readonly` with offline access (access tokens are refreshed
+automatically). Reconnecting under the same name replaces the stored grant.
 
 ## 4. Structured extraction
 

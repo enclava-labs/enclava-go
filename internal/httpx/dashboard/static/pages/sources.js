@@ -400,6 +400,95 @@
       .then(function () { Enclava.closeDrawer(); Enclava.toast('success', 'Connection saved'); Enclava.refresh(); })
       .catch(function (err) { reportError(err, id); });
   }
+
+  // ── Credentials tab (access.manage): every write via Enclava.api ────────
+
+  function credsSection() { return document.getElementById('sources-credentials'); }
+  function credsCard(provider) {
+    var root = credsSection();
+    return root ? root.querySelector('[data-cred-provider="' + provider + '"]') : null;
+  }
+  function credsField(card, sel) {
+    var input = card && card.querySelector(sel);
+    return input ? String(input.value || '').trim() : '';
+  }
+  function credsShowError(card, msg) {
+    var slot = card && card.querySelector('[data-creds-error]');
+    if (slot) { slot.textContent = msg || ''; slot.hidden = !msg; }
+  }
+
+  function credsAdd(provider) {
+    var card = credsCard(provider);
+    if (!card) return;
+    var name = credsField(card, '[data-add-name]');
+    var secret = credsField(card, '[data-add-secret]');
+    if (!name || !secret) {
+      credsShowError(card, 'Name and secret are required.');
+      return;
+    }
+    var payload = { provider: provider, name: name, secret: secret };
+    var origin = credsField(card, '[data-add-origin]');
+    if (origin) payload.origin = origin;
+    Enclava.api('POST', '/api/v1/connectors/credentials', payload)
+      .then(function () { Enclava.toast('success', 'Credential added'); Enclava.refresh(); })
+      .catch(function (err) {
+        credsShowError(card, (err && err.message) || 'Adding the credential failed.');
+        reportError(err);
+      });
+  }
+
+  function credsRotate(button) {
+    var card = button.closest('[data-cred-provider]');
+    var secret = credsField(card, '[data-rotate-secret]');
+    if (!secret) {
+      credsShowError(card, 'Enter the new secret first.');
+      return;
+    }
+    Enclava.api('PUT', '/api/v1/connectors/credentials/' + encodeURIComponent(button.dataset.credId), { secret: secret })
+      .then(function () { Enclava.toast('success', 'Credential rotated'); Enclava.refresh(); })
+      .catch(function (err) { credsShowError(card, (err && err.message) || 'Rotating the credential failed.'); reportError(err); });
+  }
+
+  function credsDelete(id) {
+    Enclava.api('DELETE', '/api/v1/connectors/credentials/' + encodeURIComponent(id))
+      .then(function () { Enclava.toast('success', 'Credential deleted'); Enclava.refresh(); })
+      .catch(function (err) { reportError(err); });
+  }
+
+  function credsOAuthSave(provider) {
+    var card = credsCard(provider);
+    if (!card) return;
+    var payload = {
+      client_id: credsField(card, '[data-oauth-client-id]'),
+      client_secret: credsField(card, '[data-oauth-client-secret]'),
+    };
+    if (!payload.client_id || !payload.client_secret) {
+      credsShowError(card, 'Client ID and client secret are required.');
+      return;
+    }
+    Enclava.api('PUT', '/api/v1/connectors/oauth-apps/' + encodeURIComponent(provider), payload)
+      .then(function () { Enclava.toast('success', 'OAuth app saved'); Enclava.refresh(); })
+      .catch(function (err) { credsShowError(card, (err && err.message) || 'Saving the OAuth app failed.'); reportError(err); });
+  }
+
+  function credsOAuthRemove(provider) {
+    Enclava.api('DELETE', '/api/v1/connectors/oauth-apps/' + encodeURIComponent(provider))
+      .then(function () { Enclava.toast('success', 'OAuth app removed'); Enclava.refresh(); })
+      .catch(function (err) { reportError(err); });
+  }
+
+  // OAuth start is a full-page navigation — the server redirects to the
+  // provider and returns to ?connected=/?error= on this tab.
+  function credsConnect(provider, button) {
+    var card = credsCard(provider);
+    var name = credsField(card, '[data-connect-name]');
+    if (!name) {
+      credsShowError(card, 'Name the credential first.');
+      return;
+    }
+    location.assign('/dashboard/connectors/oauth/start/' + encodeURIComponent(provider) +
+      '?name=' + encodeURIComponent(name));
+  }
   // ── Events ───────────────────────────────────────────────────────────────
 
   function addAudienceRow() {
@@ -414,7 +503,7 @@
 
   document.addEventListener('click', function (e) {
     if (!(e.target instanceof Element)) return;
-    var trigger = e.target.closest('[data-action^="sources:"]');
+    var trigger = e.target.closest('[data-action^="sources:"], [data-action^="creds:"]');
     if (!trigger) return;
     switch (trigger.dataset.action) {
       case 'sources:provider':
@@ -464,6 +553,18 @@
         validateStep(currentStep(), currentProvider());
         break;
       }
+      case 'creds:add':
+        credsAdd(trigger.dataset.provider);
+        break;
+      case 'creds:rotate':
+        credsRotate(trigger);
+        break;
+      case 'creds:oauth-save':
+        credsOAuthSave(trigger.dataset.provider);
+        break;
+      case 'creds:connect':
+        credsConnect(trigger.dataset.provider, trigger);
+        break;
     }
   });
 
@@ -472,6 +573,12 @@
     if (!(e.target instanceof Element)) return;
     if (e.target.dataset.sourceDel === '1' && e.target.dataset.sourceId) {
       deleteSource(e.target.dataset.sourceId);
+    }
+    if (e.target.dataset.credDel === '1' && e.target.dataset.credId) {
+      credsDelete(e.target.dataset.credId);
+    }
+    if (e.target.dataset.oauthDel === '1' && e.target.dataset.provider) {
+      credsOAuthRemove(e.target.dataset.provider);
     }
   });
 

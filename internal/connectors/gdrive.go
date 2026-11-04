@@ -128,11 +128,10 @@ func (DriveAdapter) Capabilities() AdapterCapabilities {
 }
 
 func (a DriveAdapter) request(ctx context.Context, c source.Connection, method, endpoint string) (*http.Response, error) {
-	view := connectionView(c)
 	if c.Kind != string(SourceTypeGoogleDrive) {
 		return nil, errors.New("google_drive adapter kind does not match connection")
 	}
-	token, err := connectorToken(view)
+	token, err := a.service.connectorCredential(c, endpoint)
 	if err != nil {
 		return nil, err
 	}

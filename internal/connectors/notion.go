@@ -56,7 +56,7 @@ type NotionAdapter struct {
 
 // NewNotionAdapter builds a publisher-selected Notion adapter. Traversal is
 // bounded to 500 items and depth 8 by default; config may lower either bound.
-func NewNotionAdapter(conn source.Connection, resolver *auth.SecretResolver) (Adapter, error) {
+func NewNotionAdapter(conn source.Connection, resolver CredentialResolver) (Adapter, error) {
 	if conn.Kind != source.ConnectionNotion {
 		return nil, errors.New("notion adapter kind does not match connection")
 	}

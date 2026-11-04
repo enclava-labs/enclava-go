@@ -107,9 +107,8 @@ func TestRealAdaptersACLPipeline(t *testing.T) {
 			case SourceTypeGoogleDrive:
 				envRef, nativeUser, objectKind, nativeObject = "CONNECTOR_GOOGLE_DRIVE_TEST", "alice@example.test", SourceTypeGoogleDrive, "doc"
 				config = map[string]any{"base_url": server.URL + "/drive", "folder_id": "root"}
-				adapter = NewGDriveAdapter(&Service{httpClient: server.Client()})
+				adapter = NewGDriveAdapter(driveTestService(server))
 			}
-			t.Setenv(envRef, "fixture-token")
 			f := newACLPipelineFixture(t, kind, envRef, config, adapter)
 			ctx := context.Background()
 			mapped := testdb.SeedUser(t, f.db, f.tenant, "mapped@example.test", nil)

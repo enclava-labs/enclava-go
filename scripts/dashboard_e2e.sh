@@ -185,6 +185,9 @@ export APP_PORT
 CLIENT_HOST="$APP_HOST"
 [ "$CLIENT_HOST" = "0.0.0.0" ] && CLIENT_HOST=127.0.0.1
 BASE_URL="http://$CLIENT_HOST:$APP_PORT"
+# Fixed test-only key: the Credentials tab stores secrets only when set.
+export ENCLAVA_SECRETS_KEY="ZTJlLWNyZWRlbnRpYWxzLWtleS0zMi1ieXRlcy0hISE="
+export PUBLIC_BASE_URL="$BASE_URL"
 log "starting app on $APP_HOST:$APP_PORT"
 ./enclava >"$DATA_DIR/app.log" 2>&1 &
 APP_PID=$!

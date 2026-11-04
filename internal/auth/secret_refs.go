@@ -85,6 +85,9 @@ type SecretRefMeta struct {
 	RefID    string `json:"ref_id"`
 	TenantID string `json:"tenant_id"`
 	Purpose  string `json:"purpose"`
+	// Name labels credentials administrators added in the dashboard; empty
+	// for server-configured bindings.
+	Name string `json:"name,omitempty"`
 }
 
 // SecretResolver resolves opaque credential references against the

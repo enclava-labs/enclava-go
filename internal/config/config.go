@@ -1,8 +1,10 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -68,6 +70,13 @@ type Config struct {
 	// and validates this trusted runtime configuration — a stored
 	// credential_ref never names an environment variable itself.
 	SecretBindings []auth.SecretBinding
+	// SecretsKey (ENCLAVA_SECRETS_KEY, 32 bytes base64) seals connector
+	// credentials administrators add in the dashboard; unset disables that
+	// store and leaves SECRET_BINDINGS as the only credential source.
+	SecretsKey []byte
+	// PublicBaseURL (PUBLIC_BASE_URL) is the browser-facing origin OAuth
+	// redirect URIs are built from; unset disables connector OAuth.
+	PublicBaseURL string
 
 	// Inference admission limits (CON-01): process-local capacity bounds.
 	// They bound this process only — shared tenant/billing admission is
@@ -296,6 +305,21 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.SecretBindings = bindings
+
+	if raw := strings.TrimSpace(os.Getenv("ENCLAVA_SECRETS_KEY")); raw != "" {
+		key, err := base64.StdEncoding.DecodeString(raw)
+		if err != nil || len(key) != 32 {
+			return Config{}, fmt.Errorf("ENCLAVA_SECRETS_KEY must be 32 bytes, base64-encoded (openssl rand -base64 32)")
+		}
+		cfg.SecretsKey = key
+	}
+	if raw := strings.TrimRight(strings.TrimSpace(os.Getenv("PUBLIC_BASE_URL")), "/"); raw != "" {
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.Path != "" || u.RawQuery != "" {
+			return Config{}, fmt.Errorf("PUBLIC_BASE_URL must be an absolute origin such as https://enclava.example.com")
+		}
+		cfg.PublicBaseURL = raw
+	}
 
 	return cfg, nil
 }

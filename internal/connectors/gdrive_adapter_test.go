@@ -9,11 +9,22 @@ import (
 	"strings"
 	"testing"
 
+	"enclava-go/internal/auth"
 	"enclava-go/internal/source"
 )
 
+// fixedCredential resolves every ref to one token; origin binding is covered
+// by the auth and credentials packages.
+type fixedCredential string
+
+func (f fixedCredential) Resolve(_, _, _, _ string) (string, error) { return string(f), nil }
+func (fixedCredential) Metadata(string) []auth.SecretRefMeta        { return nil }
+
+func driveTestService(server *httptest.Server) *Service {
+	return &Service{httpClient: server.Client(), secrets: fixedCredential("fixture-token")}
+}
+
 func TestGDriveAdapterPagesAndExportsGoogleDoc(t *testing.T) {
-	t.Setenv("CONNECTOR_GOOGLE_DRIVE_TOKEN", "fixture-token")
 	listPages, exports := 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer fixture-token" {
@@ -43,7 +54,7 @@ func TestGDriveAdapterPagesAndExportsGoogleDoc(t *testing.T) {
 	}))
 	defer server.Close()
 	c := source.Connection{Kind: SourceTypeGoogleDrive, CredentialRef: "CONNECTOR_GOOGLE_DRIVE_TOKEN", Config: map[string]any{"base_url": server.URL + "/drive", "folder_id": "root"}}
-	a := NewGDriveAdapter(&Service{httpClient: server.Client()})
+	a := NewGDriveAdapter(driveTestService(server))
 	p1, err := a.Content(context.Background(), c, "", 1)
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +79,6 @@ func TestGDriveAdapterPagesAndExportsGoogleDoc(t *testing.T) {
 }
 
 func TestGDriveAdapterReadsEverySheetAndRestrictions(t *testing.T) {
-	t.Setenv("CONNECTOR_GOOGLE_DRIVE_TOKEN", "fixture-token")
 	ranges := map[string]bool{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -94,7 +104,7 @@ func TestGDriveAdapterReadsEverySheetAndRestrictions(t *testing.T) {
 	}))
 	defer server.Close()
 	c := source.Connection{Kind: SourceTypeGoogleDrive, CredentialRef: "CONNECTOR_GOOGLE_DRIVE_TOKEN", Config: map[string]any{"base_url": server.URL + "/drive", "sheets_base_url": server.URL + "/sheets", "folder_id": "root"}}
-	a := NewGDriveAdapter(&Service{httpClient: server.Client()})
+	a := NewGDriveAdapter(driveTestService(server))
 	p, err := a.Content(context.Background(), c, "", 10)
 	if err != nil {
 		t.Fatal(err)
@@ -132,13 +142,12 @@ func TestGDriveAdapterReadsEverySheetAndRestrictions(t *testing.T) {
 }
 
 func TestGDriveUnrestrictedAccessUsesRoleScope(t *testing.T) {
-	t.Setenv("CONNECTOR_GOOGLE_DRIVE_TOKEN", "fixture-token")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, `{"files":[{"id":"doc","permissions":[{"id":"u","type":"user","emailAddress":"a@example.test","role":"writer","permissionDetails":[{"inherited":true,"inheritedFrom":"parent","role":"writer"}]},{"id":"g","type":"group","emailAddress":"team@example.test","role":"reader"}]}]}`)
 	}))
 	defer server.Close()
 	c := source.Connection{Kind: SourceTypeGoogleDrive, CredentialRef: "CONNECTOR_GOOGLE_DRIVE_TOKEN", Config: map[string]any{"base_url": server.URL, "folder_id": "root"}}
-	page, err := NewGDriveAdapter(&Service{httpClient: server.Client()}).Access(context.Background(), c, "", 10)
+	page, err := NewGDriveAdapter(driveTestService(server)).Access(context.Background(), c, "", 10)
 	if err != nil || page.Completeness != CompletenessComplete || !page.Snapshot || len(page.Grants) != 2 {
 		t.Fatalf("access = %#v, error = %v", page, err)
 	}
@@ -153,7 +162,6 @@ func TestGDriveUnrestrictedAccessUsesRoleScope(t *testing.T) {
 }
 
 func TestGDriveChangesDeferDeletesUntilAllPagesComplete(t *testing.T) {
-	t.Setenv("CONNECTOR_GOOGLE_DRIVE_TOKEN", "fixture-token")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/drive/changes" {
 			http.NotFound(w, r)
@@ -167,7 +175,7 @@ func TestGDriveChangesDeferDeletesUntilAllPagesComplete(t *testing.T) {
 	}))
 	defer server.Close()
 	c := source.Connection{Kind: SourceTypeGoogleDrive, CredentialRef: "CONNECTOR_GOOGLE_DRIVE_TOKEN", Config: map[string]any{"base_url": server.URL + "/drive", "folder_id": "root"}}
-	a := NewGDriveAdapter(&Service{httpClient: server.Client()})
+	a := NewGDriveAdapter(driveTestService(server))
 	cursor, _ := encodeDriveCursor(driveCursor{Mode: "changes", Token: "old", InScope: []string{"known"}})
 	first, err := a.Content(context.Background(), c, cursor, 10)
 	if err != nil || len(first.Items) != 0 || first.Completeness != CompletenessComplete || first.NextCursor == "" || first.Checkpoint != "" {
@@ -188,7 +196,6 @@ func TestGDriveChangesDeferDeletesUntilAllPagesComplete(t *testing.T) {
 }
 
 func TestGDriveExpiredChangesTokenStartsBoundedRescan(t *testing.T) {
-	t.Setenv("CONNECTOR_GOOGLE_DRIVE_TOKEN", "fixture-token")
 	rescans, lists := 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -206,7 +213,7 @@ func TestGDriveExpiredChangesTokenStartsBoundedRescan(t *testing.T) {
 	}))
 	defer server.Close()
 	c := source.Connection{Kind: SourceTypeGoogleDrive, CredentialRef: "CONNECTOR_GOOGLE_DRIVE_TOKEN", Config: map[string]any{"base_url": server.URL + "/drive", "folder_id": "root"}}
-	a := NewGDriveAdapter(&Service{httpClient: server.Client()})
+	a := NewGDriveAdapter(driveTestService(server))
 	cursor, _ := encodeDriveCursor(driveCursor{Mode: "changes", Token: "expired", InScope: []string{"stale"}})
 	page, err := a.Content(context.Background(), c, cursor, 10)
 	state, decodeErr := decodeDriveCursor(page.NextCursor)
@@ -221,7 +228,6 @@ func TestGDriveExpiredChangesTokenStartsBoundedRescan(t *testing.T) {
 }
 
 func TestGDriveTerminalDeltaReturnsDurableCheckpoint(t *testing.T) {
-	t.Setenv("CONNECTOR_GOOGLE_DRIVE_TOKEN", "fixture-token")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("pageToken") != "old" {
 			t.Errorf("page token = %q", r.URL.Query().Get("pageToken"))
@@ -231,7 +237,7 @@ func TestGDriveTerminalDeltaReturnsDurableCheckpoint(t *testing.T) {
 	defer server.Close()
 	c := source.Connection{Kind: SourceTypeGoogleDrive, CredentialRef: "CONNECTOR_GOOGLE_DRIVE_TOKEN", Config: map[string]any{"base_url": server.URL, "folder_id": "root"}}
 	cursor, _ := encodeDriveCursor(driveCursor{Mode: "changes", Token: "old", InScope: []string{"known"}})
-	page, err := NewGDriveAdapter(&Service{httpClient: server.Client()}).Content(context.Background(), c, cursor, 10)
+	page, err := NewGDriveAdapter(driveTestService(server)).Content(context.Background(), c, cursor, 10)
 	state, decodeErr := decodeDriveCursor(page.Checkpoint)
 	if err != nil || decodeErr != nil || page.NextCursor != "" || page.Checkpoint == "" || state.Mode != "changes" || state.Token != "fresh" || len(state.InScope) != 1 || state.InScope[0] != "known" {
 		t.Fatalf("terminal delta=%#v checkpoint=%#v err=%v decode=%v", page, state, err, decodeErr)
@@ -239,20 +245,18 @@ func TestGDriveTerminalDeltaReturnsDurableCheckpoint(t *testing.T) {
 }
 
 func TestGDriveAccessMissingPermissionsIsIncomplete(t *testing.T) {
-	t.Setenv("CONNECTOR_GOOGLE_DRIVE_TOKEN", "fixture-token")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, `{"files":[{"id":"hidden"}]}`)
 	}))
 	defer server.Close()
 	c := source.Connection{Kind: SourceTypeGoogleDrive, CredentialRef: "CONNECTOR_GOOGLE_DRIVE_TOKEN", Config: map[string]any{"base_url": server.URL, "folder_id": "root"}}
-	page, err := NewGDriveAdapter(&Service{httpClient: server.Client()}).Access(context.Background(), c, "", 10)
+	page, err := NewGDriveAdapter(driveTestService(server)).Access(context.Background(), c, "", 10)
 	if err != nil || page.Completeness != CompletenessIncomplete || page.Snapshot {
 		t.Fatalf("access page=%#v error=%v", page, err)
 	}
 }
 
 func TestGDriveOversizedFileFailsExplicitly(t *testing.T) {
-	t.Setenv("CONNECTOR_GOOGLE_DRIVE_TOKEN", "fixture-token")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/drive/changes/startPageToken":
@@ -267,7 +271,7 @@ func TestGDriveOversizedFileFailsExplicitly(t *testing.T) {
 	}))
 	defer server.Close()
 	c := source.Connection{Kind: SourceTypeGoogleDrive, CredentialRef: "CONNECTOR_GOOGLE_DRIVE_TOKEN", Config: map[string]any{"base_url": server.URL + "/drive", "folder_id": "root"}}
-	page, err := NewGDriveAdapter(&Service{httpClient: server.Client()}).Content(context.Background(), c, "", 10)
+	page, err := NewGDriveAdapter(driveTestService(server)).Content(context.Background(), c, "", 10)
 	if err == nil || page.Completeness != CompletenessIncomplete || !strings.Contains(err.Error(), "exceeds configured bound") {
 		t.Fatalf("oversized result page=%#v error=%v", page, err)
 	}

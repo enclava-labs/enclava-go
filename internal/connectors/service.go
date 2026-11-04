@@ -72,7 +72,7 @@ type Service struct {
 	adapters            AdapterFactories
 	observations        ObservationRepository
 	artifacts           *artifacts.Store
-	secrets             *auth.SecretResolver
+	secrets             CredentialResolver
 	principalForActor   func(context.Context, string, string) (auth.Principal, error)
 	canonical           CanonicalSourceRepository
 	httpClient          *http.Client
@@ -94,8 +94,34 @@ func NewService(repo Repository, jobSvc *jobs.Service, jobRows JobReader) *Servi
 func (s *Service) SetSyncDependencies(adapters AdapterFactories, observations ObservationRepository, artifactStore *artifacts.Store, canonical CanonicalSourceRepository) {
 	s.adapters, s.observations, s.artifacts, s.canonical = adapters, observations, artifactStore, canonical
 }
-func (s *Service) SetCredentialResolver(resolver *auth.SecretResolver) {
+
+// CredentialResolver releases connector credentials for (tenant, purpose,
+// origin, ref) and lists the refs a tenant may use. *auth.SecretResolver
+// (SECRET_BINDINGS) and the dashboard credential store both satisfy it.
+type CredentialResolver interface {
+	Resolve(tenantID, purpose, origin, refID string) (string, error)
+	Metadata(tenantID string) []auth.SecretRefMeta
+}
+
+func (s *Service) SetCredentialResolver(resolver CredentialResolver) {
 	s.secrets = resolver
+}
+
+// connectorCredential releases the connection's credential for the
+// endpoint's origin; "" when the connection names none.
+func (s *Service) connectorCredential(c source.Connection, endpoint string) (string, error) {
+	ref := strings.TrimSpace(c.CredentialRef)
+	if ref == "" {
+		return "", nil
+	}
+	if s.secrets == nil {
+		return "", errors.New("connector credential resolver is not configured")
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return "", errors.New("connector endpoint is not an absolute URL")
+	}
+	return s.secrets.Resolve(c.TenantID, auth.SecretPurposeConnector, u.Scheme+"://"+u.Host, ref)
 }
 
 func (s *Service) SetPrincipalResolver(resolve func(context.Context, string, string) (auth.Principal, error)) {
@@ -1128,7 +1154,7 @@ func validateCredentialRef(source Source) error {
 	}
 	match := connectorCredentialRefPattern.FindStringSubmatch(ref)
 	if match == nil || match[1] != credentialProviderForType(source.Type) {
-		return fmt.Errorf("credential_ref must name a CONNECTOR_%s_* binding in SECRET_BINDINGS", credentialProviderForType(source.Type))
+		return fmt.Errorf("credential_ref must name a CONNECTOR_%s_* credential (added under Sources → Credentials or bound in SECRET_BINDINGS)", credentialProviderForType(source.Type))
 	}
 	return nil
 }

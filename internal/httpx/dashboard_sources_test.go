@@ -15,16 +15,19 @@
 package httpx
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/connectors"
+	"enclava-go/internal/credentials"
 	"enclava-go/internal/jobs"
 	"enclava-go/internal/rag"
 	"enclava-go/internal/store/postgres"
@@ -502,5 +505,145 @@ func TestDashboardSourcesUnmappedWarning(t *testing.T) {
 	}
 	if body := rec.Body.String(); strings.Contains(body, "source accounts have no Enclava binding") {
 		t.Fatal("clean source rendered the unmapped-principals warning")
+	}
+}
+
+// TestDashboardSourcesCredentialsTab covers the access.manage-gated
+// Credentials tab and its API over the real store: the disabled notice
+// without ENCLAVA_SECRETS_KEY, write-only secrets, name conflicts, the
+// wizard offering stored credentials, in-use deletes, the OAuth start and
+// callback redirects, escaped return notices and manager denial.
+func TestDashboardSourcesCredentialsTab(t *testing.T) {
+	f := newIdentityFixture(t)
+	repo := postgres.NewCredentialsRepo(f.db)
+	disabled, err := credentials.NewService(repo, nil, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.app.ConfigureCredentials(disabled)
+	sess, csrf := loginUser(t, f, "admin-creds@example.com",
+		[]string{auth.ScopePlatformAdmin, "connectors.manage", "rag"}, "admin-pass")
+	errorCode := func(rec *httptest.ResponseRecorder) string {
+		code, _ := decodeJSON(t, rec)["error"].(map[string]any)["code"].(string)
+		return code
+	}
+
+	rec := sessionDo(t, f.app, http.MethodGet, "/dashboard/sources/credentials", "", sess, csrf)
+	page := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.Contains(page, "ENCLAVA_SECRETS_KEY") || strings.Contains(page, `data-action="creds:add"`) {
+		t.Fatalf("disabled store: expected the notice without forms, got %d body=%s", rec.Code, page)
+	}
+	for _, provider := range []string{"Slack", "Microsoft Teams", "GitHub", "Notion", "Google Drive"} {
+		if !strings.Contains(page, "<h2>"+provider+"</h2>") {
+			t.Fatalf("credentials page missing the %s card", provider)
+		}
+	}
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/connectors/credentials", `{"provider":"teams","name":"Ops Graph","secret":"s"}`, sess, csrf)
+	if rec.Code != http.StatusConflict || errorCode(rec) != "credentials_disabled" {
+		t.Fatalf("disabled create: got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	svc, err := credentials.NewService(repo, bytes.Repeat([]byte{9}, 32), nil, "https://enclava.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.app.ConfigureCredentials(svc)
+	f.app.connectorSvc.SetCredentialResolver(svc)
+	// Teams secrets are not probed (app-only client credentials), so this
+	// create needs no provider round trip.
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/connectors/credentials", `{"provider":"teams","name":"Ops Graph","secret":"client-secret-1"}`, sess, csrf)
+	if rec.Code != http.StatusCreated || strings.Contains(rec.Body.String(), "client-secret-1") {
+		t.Fatalf("create: got %d body=%s", rec.Code, rec.Body.String())
+	}
+	const credID = "CONNECTOR_TEAMS_OPS_GRAPH"
+	if id, _ := decodeJSON(t, rec)["id"].(string); id != credID {
+		t.Fatalf("create: id = %q", id)
+	}
+	for body, want := range map[string]string{ //nolint:gosec // Synthetic request bodies for validation cases.
+		`{"provider":"teams","name":"ops graph","secret":"other"}`: "credential_conflict",
+		`{"provider":"jira","name":"X","secret":"s"}`:              "credential_invalid",
+		`{"provider":"teams","name":"Empty","secret":"  "}`:        "credential_invalid",
+	} {
+		rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/connectors/credentials", body, sess, csrf)
+		if got := errorCode(rec); got != want {
+			t.Fatalf("POST %s: code %q (%d), want %q", body, got, rec.Code, want)
+		}
+	}
+	rec = sessionDo(t, f.app, http.MethodGet, "/api/v1/connectors/credentials", "", sess, csrf)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), credID) || strings.Contains(rec.Body.String(), "client-secret-1") ||
+		!strings.Contains(rec.Body.String(), `"redirect_uri":"https://enclava.test/dashboard/connectors/oauth/callback/slack"`) {
+		t.Fatalf("list: got %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = sessionDo(t, f.app, http.MethodGet, "/dashboard/sources/credentials", "", sess, csrf)
+	if page := rec.Body.String(); !strings.Contains(page, "Ops Graph") || !strings.Contains(page, `data-action="creds:add"`) || strings.Contains(page, "ENCLAVA_SECRETS_KEY") {
+		t.Fatalf("enabled page: body=%s", page)
+	}
+	rec = sessionDo(t, f.app, http.MethodGet, "/dashboard/partials/sources/credentials", "", sess, csrf)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `id="sources-credentials"`) {
+		t.Fatalf("credentials fragment: expected the section, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = sessionDo(t, f.app, http.MethodGet, "/dashboard/partials/sources/drawer", "", sess, csrf)
+	if !strings.Contains(rec.Body.String(), `<option value="`+credID+`">Ops Graph</option>`) {
+		t.Fatalf("wizard does not offer the stored credential: %s", rec.Body.String())
+	}
+
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/connectors/sources",
+		`{"type":"teams","name":"Ops channel","config":{"tenant_id":"t","client_id":"c","team_id":"team"},"credential_ref":"`+credID+`"}`, sess, csrf)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create source: got %d body=%s", rec.Code, rec.Body.String())
+	}
+	sourceID, _ := decodeJSON(t, rec)["id"].(string)
+	rec = sessionDo(t, f.app, http.MethodDelete, "/api/v1/connectors/credentials/"+credID, "", sess, csrf)
+	if rec.Code != http.StatusConflict || errorCode(rec) != "credential_in_use" || !strings.Contains(rec.Body.String(), sourceID) {
+		t.Fatalf("delete in use: got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec = sessionDo(t, f.app, http.MethodDelete, "/api/v1/connectors/sources/"+sourceID, "", sess, csrf); rec.Code != http.StatusOK {
+		t.Fatalf("delete source: got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec = sessionDo(t, f.app, http.MethodDelete, "/api/v1/connectors/credentials/"+credID, "", sess, csrf); rec.Code != http.StatusOK {
+		t.Fatalf("delete: got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// OAuth: no app yet → back to the tab with the reason; with an app → the
+	// provider's consent URL; an unknown state never stores anything.
+	rec = sessionDo(t, f.app, http.MethodGet, "/dashboard/connectors/oauth/start/slack?name=Labs", "", sess, csrf)
+	if loc := rec.Header().Get("Location"); rec.Code != http.StatusSeeOther || !strings.HasPrefix(loc, "/dashboard/sources/credentials?error=") {
+		t.Fatalf("start without app: got %d location=%q", rec.Code, loc)
+	}
+	rec = sessionDo(t, f.app, http.MethodPut, "/api/v1/connectors/oauth-apps/slack", `{"client_id":"123.456","client_secret":"app-secret"}`, sess, csrf)
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "app-secret") {
+		t.Fatalf("save OAuth app: got %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = sessionDo(t, f.app, http.MethodGet, "/dashboard/connectors/oauth/start/slack?name=Labs", "", sess, csrf)
+	consent, _ := url.Parse(rec.Header().Get("Location"))
+	if rec.Code != http.StatusSeeOther || consent == nil || consent.Host != "slack.com" || consent.Query().Get("client_id") != "123.456" || consent.Query().Get("state") == "" {
+		t.Fatalf("start: got %d location=%q", rec.Code, rec.Header().Get("Location"))
+	}
+	rec = sessionDo(t, f.app, http.MethodGet, "/dashboard/connectors/oauth/callback/slack?code=c&state=forged", "", sess, csrf)
+	if loc := rec.Header().Get("Location"); rec.Code != http.StatusSeeOther || !strings.Contains(loc, "error=") || strings.Contains(loc, "connected=") {
+		t.Fatalf("forged callback: got %d location=%q", rec.Code, loc)
+	}
+
+	// OAuth return notices render — the error is escaped text, never markup.
+	rec = sessionDo(t, f.app, http.MethodGet,
+		"/dashboard/sources/credentials?connected=cred_1&error="+url.QueryEscape("<b>bad</b>"), "", sess, csrf)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.Contains(body, "Credential connected") || !strings.Contains(body, "&lt;b&gt;bad&lt;/b&gt;") ||
+		strings.Contains(body, "<b>bad</b>") {
+		t.Fatalf("credentials notices: connected/error not rendered escaped; body=%s", body)
+	}
+
+	// A sources manager without platform.admin is denied the tab, its
+	// fragment, the API and the OAuth routes; the Sources page hides the tab.
+	mgrSess, mgrCSRF := loginUser(t, f, "manager-creds@example.com", []string{"connectors.manage", "rag"}, "manager-pass")
+	for _, path := range []string{"/dashboard/sources/credentials", "/dashboard/partials/sources/credentials", "/api/v1/connectors/credentials", "/dashboard/connectors/oauth/start/slack?name=X"} {
+		rec := sessionDo(t, f.app, http.MethodGet, path, "", mgrSess, mgrCSRF)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("GET %s: expected 403 for manager, got %d", path, rec.Code)
+		}
+	}
+	rec = sessionDo(t, f.app, http.MethodGet, "/dashboard/sources", "", mgrSess, mgrCSRF)
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "/dashboard/sources/credentials") {
+		t.Fatalf("manager sources page: expected 200 without the Credentials tab, got %d", rec.Code)
 	}
 }

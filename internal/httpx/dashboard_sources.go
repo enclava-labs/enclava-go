@@ -23,6 +23,7 @@ import (
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/connectors"
+	"enclava-go/internal/credentials"
 	"enclava-go/internal/rag"
 	"enclava-go/internal/source"
 )
@@ -56,6 +57,7 @@ var dashboardSourcePermissions = map[string]string{
 // dashboardSourcesData is the page/table view model.
 type dashboardSourcesData struct {
 	Header     dashboardHeader
+	Tab        string // "sources" | "credentials" — selects the rendered section
 	Rows       []dashboardSourceRow
 	Status     string // active filter bucket: ""|syncing|healthy|attention|paused
 	AnySyncing bool
@@ -96,7 +98,9 @@ var sourceStatusFilter = map[string]func(dashboardSourceRow) bool{
 
 func (a *App) registerDashboardSourcesRoutes() {
 	a.mux.HandleFunc("/dashboard/sources", a.sessionAuth.requireCap(capSourcesManage, a.handleDashboardPageSources))
+	a.mux.HandleFunc("/dashboard/sources/credentials", a.sessionAuth.requireCap(capAccessManage, a.handleDashboardPageCredentials))
 	a.mux.HandleFunc("/dashboard/partials/sources/table", a.sessionAuth.requireCap(capSourcesManage, a.handleDashboardSourcesTable))
+	a.mux.HandleFunc("/dashboard/partials/sources/credentials", a.sessionAuth.requireCap(capAccessManage, a.handleDashboardSourcesCredentials))
 	a.mux.HandleFunc("/dashboard/partials/sources/drawer", a.sessionAuth.requireCap(capSourcesManage, a.handleDashboardSourcesDrawer))
 	a.mux.HandleFunc("/dashboard/partials/sources/bindings", a.sessionAuth.requireCap(capAccessManage, a.handleDashboardSourcesBindings))
 }
@@ -123,6 +127,7 @@ func (a *App) handleDashboardPageSources(w http.ResponseWriter, r *http.Request)
 				string(dashboardIconPlus()) + `Add source</button>`),
 		},
 		Rows:       rows,
+		Tab:        "sources",
 		Status:     status,
 		AnySyncing: anySyncing,
 		Empty:      sourcesEmpty(status, caps.SourcesManage),
@@ -145,6 +150,126 @@ func (a *App) handleDashboardSourcesTable(w http.ResponseWriter, r *http.Request
 	rows = filterSourceRows(rows, status)
 	anySyncing := anyRowSyncing(rows)
 	a.renderDashboardFragment(w, r, "sources", "sources-table", dashboardSourcesData{Rows: rows, Status: status, AnySyncing: anySyncing, Empty: sourcesEmpty(status, caps.SourcesManage)})
+}
+
+// ── Credentials tab (access.manage-gated like the bindings drawer) ────────
+
+// dashboardCredentialsData feeds the Credentials tab: the secrets store's
+// own listing plus the one-shot OAuth return notices (?connected/?error).
+type dashboardCredentialsData struct {
+	Header       dashboardHeader
+	Tab          string
+	Enabled      bool
+	RedirectBase string
+	Cards        []dashboardCredentialCard
+	Connected    string // credential ID from a completed OAuth redirect
+	Error        string
+	LoadError    bool // Listing failed — degrade to the notice, hide forms
+}
+
+func (d dashboardCredentialsData) DashboardTitle() string  { return "Credentials" }
+func (d dashboardCredentialsData) DashboardModule() string { return "sources" }
+
+// dashboardCredentialCard is one provider card: stored credentials,
+// environment-bound refs and the OAuth-app state grouped for render.
+type dashboardCredentialCard struct {
+	Provider         string
+	Label            string
+	Hint             string
+	Credentials      []credentials.CredentialView
+	EnvRefs          []string
+	OAuthSupported   bool
+	OAuthConfigured  bool
+	OAuthClientID    string
+	OAuthRedirectURI string
+	CanConnect       bool // app configured AND a public base URL is set
+}
+
+// dashboardCredentialHints is the short "what to paste" line per provider —
+// static product facts, like dashboardSourcePermissions.
+var dashboardCredentialHints = map[string]string{
+	"github":       "A fine-grained or classic personal access token with repo read access.",
+	"slack":        "A bot token (xoxb-…) with channels:history, groups:history, channels:read, groups:read, users:read and files:read.",
+	"notion":       "An internal integration secret from the Notion integration's settings.",
+	"teams":        "The app registration's client secret — tenant and client IDs stay on each source.",
+	"google_drive": "OAuth is recommended — access tokens expire after about an hour.",
+}
+
+// handleDashboardPageCredentials renders the Credentials tab page; the
+// fragment route below re-renders just the section for htmx refreshes.
+func (a *App) handleDashboardPageCredentials(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	data := a.dashboardCredentialsView(r)
+	data.Header = dashboardHeader{
+		Crumb: "Sources",
+		Title: "Connector credentials",
+		Desc:  "API tokens and OAuth apps the tenant's sources connect with.",
+	}
+	a.renderDashboard(w, r, "sources", data)
+}
+
+func (a *App) handleDashboardSourcesCredentials(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	a.renderDashboardFragment(w, r, "sources", "sources-credentials", a.dashboardCredentialsView(r))
+}
+
+// dashboardCredentialsView assembles the per-provider cards from the real
+// credentials listing. A missing service or a listing error degrades to the
+// disabled/failed notice — never a fabricated provider state.
+func (a *App) dashboardCredentialsView(r *http.Request) dashboardCredentialsData {
+	p, _ := auth.PrincipalFromContext(r.Context())
+	q := r.URL.Query()
+	data := dashboardCredentialsData{
+		Tab:       "credentials",
+		Connected: strings.TrimSpace(q.Get("connected")),
+		Error:     strings.TrimSpace(q.Get("error")),
+	}
+	var listing credentials.Listing
+	if a.credentials == nil {
+		data.LoadError = true
+	} else if l, err := a.credentials.List(r.Context(), p); err != nil {
+		log.Printf("dashboard sources credentials: %v", err)
+		data.LoadError = true
+	} else {
+		listing = l
+	}
+	data.Enabled = listing.Enabled
+	data.RedirectBase = listing.RedirectBase
+	for _, provider := range dashboardSourceProviders {
+		card := dashboardCredentialCard{
+			Provider: provider.ID,
+			Label:    provider.Label,
+			Hint:     dashboardCredentialHints[provider.ID],
+		}
+		for _, cred := range listing.Credentials {
+			if cred.Provider == provider.ID {
+				card.Credentials = append(card.Credentials, cred)
+			}
+		}
+		for _, env := range listing.Environment {
+			if env.Provider == provider.ID {
+				card.EnvRefs = append(card.EnvRefs, env.ID)
+			}
+		}
+		for _, app := range listing.OAuth {
+			if app.Provider != provider.ID {
+				continue
+			}
+			card.OAuthSupported = app.Supported
+			card.OAuthConfigured = app.Configured
+			card.OAuthClientID = app.ClientID
+			card.OAuthRedirectURI = app.RedirectURI
+		}
+		card.CanConnect = card.OAuthSupported && card.OAuthConfigured && data.RedirectBase != ""
+		data.Cards = append(data.Cards, card)
+	}
+	return data
 }
 
 func sourcesEmpty(status string, canManage bool) dashboardEmpty {

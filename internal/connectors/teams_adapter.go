@@ -21,7 +21,7 @@ const teamsGraph = "https://graph.microsoft.com/v1.0"
 // shortcut: complete bounded scans replace delta for every scope; use Graph delta only if it gains deletion-aware app-only support.
 type TeamsAdapter struct {
 	connection  source.Connection
-	resolver    *auth.SecretResolver
+	resolver    CredentialResolver
 	client      *http.Client
 	baseURL     string
 	tokenMu     sync.Mutex
@@ -29,7 +29,7 @@ type TeamsAdapter struct {
 	tokenExpiry time.Time
 }
 
-func NewTeamsAdapter(connection source.Connection, resolver *auth.SecretResolver) (Adapter, error) {
+func NewTeamsAdapter(connection source.Connection, resolver CredentialResolver) (Adapter, error) {
 	if connection.Kind != source.ConnectionTeams {
 		return nil, errors.New("teams adapter requires a teams connection")
 	}

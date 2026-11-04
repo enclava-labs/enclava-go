@@ -20,6 +20,7 @@ import (
 	"enclava-go/internal/chatbot"
 	"enclava-go/internal/config"
 	"enclava-go/internal/connectors"
+	"enclava-go/internal/credentials"
 	"enclava-go/internal/extract"
 	"enclava-go/internal/httpx"
 	"enclava-go/internal/inference"
@@ -245,21 +246,26 @@ func serve() error {
 	ragSvc.SetIndexRetirementSoak(cfg.IndexRetirementSoak)
 	previewSvc := extract.NewPreviewService(chunkProfilesRepo, jobsRepoPG, jobsSvc, artifactStore, sourceRepo, cfg.MaxUploadSizeMB)
 	previewSvc.SetSourceAccessMaxStale(cfg.SourceAccessMaxStale)
+	// Dashboard-managed credentials first, SECRET_BINDINGS as the fallback.
+	credentialSvc, err := credentials.NewService(postgres.NewCredentialsRepo(pgDB), cfg.SecretsKey, secretResolver, cfg.PublicBaseURL)
+	if err != nil {
+		return err
+	}
 	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG)
-	connectorSvc.SetCredentialResolver(secretResolver)
+	connectorSvc.SetCredentialResolver(credentialSvc)
 	connectorSvc.SetPrincipalResolver(authSvc.PrincipalForActor)
 	adapterFactories := connectors.AdapterFactories{
 		connectors.SourceKindGitHub: func(c source.Connection) (connectors.Adapter, error) {
-			return connectors.NewGitHubAdapter(c, secretResolver)
+			return connectors.NewGitHubAdapter(c, credentialSvc)
 		},
 		connectors.SourceKindSlack: func(c source.Connection) (connectors.Adapter, error) {
-			return connectors.NewSlackAdapter(c, secretResolver)
+			return connectors.NewSlackAdapter(c, credentialSvc)
 		},
 		connectors.SourceKindTeams: func(c source.Connection) (connectors.Adapter, error) {
-			return connectors.NewTeamsAdapter(c, secretResolver)
+			return connectors.NewTeamsAdapter(c, credentialSvc)
 		},
 		connectors.SourceKindNotion: func(c source.Connection) (connectors.Adapter, error) {
-			return connectors.NewNotionAdapter(c, secretResolver)
+			return connectors.NewNotionAdapter(c, credentialSvc)
 		},
 		connectors.SourceKindGoogleDrive: func(source.Connection) (connectors.Adapter, error) {
 			return connectors.NewGDriveAdapter(connectorSvc), nil
@@ -368,6 +374,7 @@ func serve() error {
 	)
 	app.ConfigureMCP(mcpRepo, mcpTransport)
 	app.ConfigureActivity(jobsSvc)
+	app.ConfigureCredentials(credentialSvc)
 	app.SetSecurityAudit(auditRepo)
 	app.ConfigureVectorStoreProbe(httpx.ProbeHTTP(cfg.QdrantURL + "/collections"))
 	app.ConfigureMetrics(cfg.MetricsToken, cfg.MetricsAuthDisabled, jobsRepoPG, admission)

@@ -18,6 +18,7 @@ import (
 	"enclava-go/internal/billing"
 	"enclava-go/internal/chatbot"
 	"enclava-go/internal/connectors"
+	"enclava-go/internal/credentials"
 	"enclava-go/internal/extract"
 	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
@@ -39,6 +40,7 @@ type App struct {
 	promptSvc           *prompts.Service
 	chatbotSvc          *chatbot.Service
 	connectorSvc        *connectors.Service
+	credentials         *credentials.Service
 	billingSvc          *billing.Service
 	billingRepo         *postgres.BillingRepo
 	endpoints           *postgres.EndpointsRepo
@@ -299,6 +301,9 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/api/v1/connectors/sources/", a.authenticated("connectors.manage", a.handleConnectorSourceByID))
 	a.mux.HandleFunc("/api/v1/connectors/sync-jobs", a.authenticated("connectors.manage", a.handleConnectorSyncJobs))
 	a.mux.HandleFunc("/api/v1/connectors/sync-jobs/", a.authenticated("connectors.manage", a.handleConnectorSyncJobByID))
+	a.mux.HandleFunc("/api/v1/connectors/credentials", a.authenticated("connectors.manage", a.handleConnectorCredentials))
+	a.mux.HandleFunc("/api/v1/connectors/credentials/", a.authenticated("connectors.manage", a.handleConnectorCredentialByID))
+	a.mux.HandleFunc("/api/v1/connectors/oauth-apps/", a.authenticated("connectors.manage", a.handleConnectorOAuthApp))
 
 	a.mux.HandleFunc("/api/v1/admin/api-keys", a.authenticated("platform.admin", a.handleAdminAPIKeys))
 	a.mux.HandleFunc("/api/v1/admin/api-keys/", a.authenticated("platform.admin", a.handleAdminAPIKeyByID))

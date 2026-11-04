@@ -12,7 +12,7 @@
   <h3>Connect</h3>
   <label class="label" for="source-edit-credential">Credential reference</label>
   <input class="field" id="source-edit-credential" data-edit-credential list="source-edit-credentials" value="{{.Data.EditSource.CredentialRef}}" autocomplete="off">
-  <datalist id="source-edit-credentials">{{range index .Data.CredentialRefs .Data.EditSource.Type}}<option value="{{.RefID}}"></option>{{end}}</datalist>
+  <datalist id="source-edit-credentials">{{range index .Data.CredentialRefs .Data.EditSource.Type}}<option value="{{.RefID}}">{{.Name}}</option>{{end}}</datalist>
   <p class="help">Choose the credential used to connect this source.</p>
   <button type="button" class="btn primary" data-action="sources:save-credential">Save connection</button>
 </div>
@@ -52,8 +52,8 @@
     <label class="label"><input type="checkbox" data-config="reconcile" data-type="bool" value="true"> Reconcile access on every sync</label>
     <label class="label" for="slack-credential">Credential reference</label>
     <input class="field" id="slack-credential" data-credential list="cred-slack" autocomplete="off" required>
-    <datalist id="cred-slack">{{range index .Data.CredentialRefs "slack"}}<option value="{{.RefID}}"></option>{{end}}</datalist>
-    {{if not (index .Data.CredentialRefs "slack")}}<span class="help">No Slack credentials configured — an administrator must bind a CONNECTOR_SLACK_* secret first.</span>{{end}}
+    <datalist id="cred-slack">{{range index .Data.CredentialRefs "slack"}}<option value="{{.RefID}}">{{.Name}}</option>{{end}}</datalist>
+    {{if not (index .Data.CredentialRefs "slack")}}<span class="help">No Slack credentials configured — <a href="/dashboard/sources/credentials">add one in Credentials</a> or bind a CONNECTOR_SLACK_* secret in server configuration.</span>{{end}}
   </div>
 
   <div data-provider-fields="teams" hidden>
@@ -75,8 +75,8 @@
     <input class="field" id="teams-graph" data-config="graph_base_url" autocomplete="off" placeholder="https://graph.microsoft.com/v1.0">
     <label class="label" for="teams-credential">Credential reference</label>
     <input class="field" id="teams-credential" data-credential list="cred-teams" autocomplete="off" required>
-    <datalist id="cred-teams">{{range index .Data.CredentialRefs "teams"}}<option value="{{.RefID}}"></option>{{end}}</datalist>
-    {{if not (index .Data.CredentialRefs "teams")}}<span class="help">No Teams credentials configured — an administrator must bind a CONNECTOR_TEAMS_* secret first.</span>{{end}}
+    <datalist id="cred-teams">{{range index .Data.CredentialRefs "teams"}}<option value="{{.RefID}}">{{.Name}}</option>{{end}}</datalist>
+    {{if not (index .Data.CredentialRefs "teams")}}<span class="help">No Teams credentials configured — <a href="/dashboard/sources/credentials">add one in Credentials</a> or bind a CONNECTOR_TEAMS_* secret in server configuration.</span>{{end}}
   </div>
 
   <div data-provider-fields="github" hidden>
@@ -93,8 +93,8 @@
     <input class="field" id="github-api" data-config="api_url" autocomplete="off" placeholder="https://api.github.com">
     <label class="label" for="github-credential">Credential reference</label>
     <input class="field" id="github-credential" data-credential list="cred-github" autocomplete="off">
-    <datalist id="cred-github">{{range index .Data.CredentialRefs "github"}}<option value="{{.RefID}}"></option>{{end}}</datalist>
-    <span class="help">Public repository content can sync without a credential. Collaborator and membership lookup still requires a CONNECTOR_GITHUB_* credential binding with push access, even for public repositories; without it only content syncs.</span>
+    <datalist id="cred-github">{{range index .Data.CredentialRefs "github"}}<option value="{{.RefID}}">{{.Name}}</option>{{end}}</datalist>
+    <span class="help">Public repository content can sync without a credential. Collaborator and membership lookup still requires a CONNECTOR_GITHUB_* credential binding with push access, even for public repositories; without it only content syncs. Manage stored credentials in <a href="/dashboard/sources/credentials">Credentials</a>.</span>
   </div>
 
   <div data-provider-fields="notion" hidden>
@@ -111,8 +111,8 @@
     <input class="field" id="notion-base" data-config="base_url" autocomplete="off" placeholder="https://api.notion.com/v1">
     <label class="label" for="notion-credential">Credential reference</label>
     <input class="field" id="notion-credential" data-credential list="cred-notion" autocomplete="off" required>
-    <datalist id="cred-notion">{{range index .Data.CredentialRefs "notion"}}<option value="{{.RefID}}"></option>{{end}}</datalist>
-    {{if not (index .Data.CredentialRefs "notion")}}<span class="help">No Notion credentials configured — an administrator must bind a CONNECTOR_NOTION_* secret first.</span>{{end}}
+    <datalist id="cred-notion">{{range index .Data.CredentialRefs "notion"}}<option value="{{.RefID}}">{{.Name}}</option>{{end}}</datalist>
+    {{if not (index .Data.CredentialRefs "notion")}}<span class="help">No Notion credentials configured — <a href="/dashboard/sources/credentials">add one in Credentials</a> or bind a CONNECTOR_NOTION_* secret in server configuration.</span>{{end}}
   </div>
 
   <div data-provider-fields="google_drive" hidden>
@@ -129,8 +129,8 @@
     <input class="field" id="drive-sheets" data-config="sheets_base_url" autocomplete="off" placeholder="https://sheets.googleapis.com/v4">
     <label class="label" for="drive-credential">Credential reference</label>
     <input class="field" id="drive-credential" data-credential list="cred-google_drive" autocomplete="off" required>
-    <datalist id="cred-google_drive">{{range index .Data.CredentialRefs "google_drive"}}<option value="{{.RefID}}"></option>{{end}}</datalist>
-    {{if not (index .Data.CredentialRefs "google_drive")}}<span class="help">No Google Drive credentials configured — an administrator must bind a CONNECTOR_GOOGLE_DRIVE_* secret first.</span>{{end}}
+    <datalist id="cred-google_drive">{{range index .Data.CredentialRefs "google_drive"}}<option value="{{.RefID}}">{{.Name}}</option>{{end}}</datalist>
+    {{if not (index .Data.CredentialRefs "google_drive")}}<span class="help">No Google Drive credentials configured — <a href="/dashboard/sources/credentials">add one in Credentials</a> or bind a CONNECTOR_GOOGLE_DRIVE_* secret in server configuration.</span>{{end}}
   </div>
   <span class="field-error" data-wizard-error hidden></span>
 </div>

@@ -101,7 +101,7 @@ type slackAdapter struct {
 // resolved through SECRET_BINDINGS for the connection's tenant and the Slack
 // API origin, so a stored credential_ref is never read as an environment name
 // and the token is never sent to an unbound origin.
-func NewSlackAdapter(conn source.Connection, resolver *auth.SecretResolver) (Adapter, error) {
+func NewSlackAdapter(conn source.Connection, resolver CredentialResolver) (Adapter, error) {
 	if err := slackConnection(conn); err != nil {
 		return nil, err
 	}

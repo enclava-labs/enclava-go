@@ -36,7 +36,7 @@ type ghTreeEntry struct {
 	Size int64  `json:"size"`
 }
 
-func NewGitHubAdapter(c source.Connection, secrets *auth.SecretResolver) (Adapter, error) {
+func NewGitHubAdapter(c source.Connection, secrets CredentialResolver) (Adapter, error) {
 	owner, repo := strings.TrimSpace(stringFromAny(c.Config["owner"])), strings.TrimSpace(stringFromAny(c.Config["repo"]))
 	if owner == "" || repo == "" {
 		return nil, errors.New("github config.owner and config.repo are required")
@@ -46,9 +46,14 @@ func NewGitHubAdapter(c source.Connection, secrets *auth.SecretResolver) (Adapte
 	if e != nil || u.Scheme != "https" || u.Host == "" {
 		return nil, errors.New("github API origin must be HTTPS")
 	}
-	token, e := secrets.Resolve(c.TenantID, auth.SecretPurposeConnector, u.Scheme+"://"+u.Host, c.CredentialRef)
-	if e != nil {
-		return nil, e
+	var token string
+	if ref := strings.TrimSpace(c.CredentialRef); ref != "" {
+		if secrets == nil {
+			return nil, errors.New("github credential resolver is not configured")
+		}
+		if token, e = secrets.Resolve(c.TenantID, auth.SecretPurposeConnector, u.Scheme+"://"+u.Host, ref); e != nil {
+			return nil, e
+		}
 	}
 	paths := stringListFromAny(c.Config["paths"])
 	if len(paths) == 0 {
