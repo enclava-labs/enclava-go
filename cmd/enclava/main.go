@@ -193,6 +193,7 @@ func serve() error {
 		Secrets:       secretResolver,
 		Artifacts:     artifactRepo,
 		Conversations: postgres.NewChatbotConversationStore(chatbotRepo),
+		ModelSettings: postgres.NewModelSettingsRepo(pgDB),
 	}, inference.WithAdmission(admission), inference.WithDefaultMaxOutputTokens(cfg.InferenceDefaultMaxOutputTokens))
 	if err != nil {
 		return fmt.Errorf("inference service init error: %w", err)
@@ -217,6 +218,7 @@ func serve() error {
 	)
 	extractSvc.SetSourceRepository(sourceRepo)
 	extractSvc.SetDefaultMaxOutputTokens(cfg.ExtractMaxOutputTokens)
+	extractSvc.SetDefaultModelResolver(inferenceSvc.DefaultModel)
 	if err := extractSvc.ReconcileDeletedJobs(ctx); err != nil {
 		return fmt.Errorf("extract deletion recovery error: %w", err)
 	}
@@ -239,6 +241,7 @@ func serve() error {
 	ragSvc.SetDefaultEmbeddingDimensions(cfg.DefaultEmbeddingDimensions)
 	ragSvc.SetSourceAccessMaxStale(cfg.SourceAccessMaxStale)
 	ragSvc.SetUtilityModel(cfg.UtilityModel)
+	ragSvc.SetDefaultModelResolver(inferenceSvc.DefaultModel)
 	ragSvc.SetIndexRetirementSoak(cfg.IndexRetirementSoak)
 	previewSvc := extract.NewPreviewService(chunkProfilesRepo, jobsRepoPG, jobsSvc, artifactStore, sourceRepo, cfg.MaxUploadSizeMB)
 	previewSvc.SetSourceAccessMaxStale(cfg.SourceAccessMaxStale)

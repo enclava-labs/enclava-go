@@ -1,0 +1,42 @@
+{{define "frag-models-catalog"}}{{/* Models tab fragment: one row per chat
+     model alias the tenant's endpoints serve, with the three tenant
+     settings as live controls — Available to people, the single Default and
+     the Fallback alias. Writes go through /api/v1/models/settings/{model}
+     from pages/models.js; refresh re-fetches through the section's hx-get so
+     a save (or a refused one) re-renders the controls from stored state. */}}
+<section class="section" id="models-catalog" hx-get="/dashboard/partials/models/catalog" hx-trigger="refresh from:body" hx-swap="outerHTML">
+  <div class="card">
+    <p class="desc">Default is used for new assistants, extraction and search rewrites, and API chat requests that name no model. Available to people — unchecked models are hidden from people and refused for them; administrators can still test them. Fallback answers instead when the model has no working endpoint, is unavailable, or its server refuses or fails before answering.</p>
+    {{if .Data.Error}}<div class="attention">{{icon "alert"}}<p>{{.Data.Error}}</p></div>{{end}}
+    {{if .Data.Catalog}}
+    <div class="tablewrap" role="region" tabindex="0" aria-label="Models">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Model</th>
+            <th scope="col">Served by</th>
+            <th scope="col">Available to people</th>
+            <th scope="col">Default{{if .Data.HasDefault}} <button type="button" class="btn ghost" data-action="models:clear-default" aria-label="Clear default model">Clear default</button>{{end}}</th>
+            <th scope="col">Fallback</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Data.Catalog}}
+          <tr data-model-row="{{.Model}}">
+            <td data-label="Model"><b>{{.Model}}</b>{{if not .Routable}}<span class="subline">No enabled endpoint</span>{{end}}</td>
+            <td data-label="Served by">{{range $i, $e := .Endpoints}}{{if $i}}, {{end}}{{$e}}{{else}}<span class="muted">—</span>{{end}}</td>
+            <td data-label="Available to people"><input type="checkbox" data-models-available data-model="{{.Model}}"{{if .Available}} checked{{end}} aria-label="{{.Model}} — available to people"></td>
+            <td data-label="Default"><input type="radio" name="models-default" data-models-default data-model="{{.Model}}"{{if .Default}} checked{{end}} aria-label="{{.Model}} — default model"></td>
+            <td data-label="Fallback">{{$row := .}}<select class="field" data-models-fallback data-model="{{.Model}}" aria-label="{{.Model}} — fallback model">
+              <option value=""{{if not .Fallback}} selected{{end}}>None</option>
+              {{range $f := $.Data.Catalog}}{{if ne $f.Model $row.Model}}<option value="{{$f.Model}}"{{if eq $f.Model $row.Fallback}} selected{{end}}>{{$f.Model}}</option>{{end}}{{end}}
+            </select></td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+    {{else if not .Data.Error}}{{template "empty" .Data.Empty}}{{end}}
+  </div>
+</section>
+{{end}}

@@ -69,6 +69,7 @@ type Service struct {
 	authorizer            *source.Authorizer
 	maxUploadMB           int64
 	defaultMaxOutputToken int64
+	defaultModel          func(ctx context.Context, tenantID string) (string, error)
 }
 
 // SetSourceRepository enables current source-grant checks for jobs tied to an
@@ -88,6 +89,12 @@ func (s *Service) SetDefaultMaxOutputTokens(n int64) {
 		n = 0
 	}
 	s.defaultMaxOutputToken = n
+}
+
+// SetDefaultModelResolver supplies the tenant default chat model, used when
+// neither the template nor the extraction settings name a model.
+func (s *Service) SetDefaultModelResolver(resolve func(ctx context.Context, tenantID string) (string, error)) {
+	s.defaultModel = resolve
 }
 
 // maxExtractOutputBound is the accepted template/env cap range's ceiling;
@@ -941,6 +948,11 @@ func (s *Service) resolveModel(ctx context.Context, tenantID string, t Template)
 	settings, err := s.settingsRepo.GetSettings(ctx, tenantID)
 	if err == nil && strings.TrimSpace(settings.DefaultModel) != "" {
 		return settings.DefaultModel, nil
+	}
+	if s.defaultModel != nil {
+		if model, err := s.defaultModel(ctx, tenantID); err == nil && strings.TrimSpace(model) != "" {
+			return model, nil
+		}
 	}
 	models, err := s.ModelsForExtract(ctx, tenantID)
 	if err != nil {

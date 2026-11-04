@@ -259,6 +259,8 @@ func (a *App) registerBaseRoutes() {
 	// Registered before the /providers/ subtree so discovery wins the exact match.
 	a.mux.HandleFunc("/api/v1/providers/discover", a.authenticated("pricing.manage", a.handleProviderDiscover))
 	a.mux.HandleFunc("/api/v1/providers/", a.authenticated("pricing.manage", a.handleProviderByID))
+	a.mux.HandleFunc("/api/v1/models/settings", a.authenticated("pricing.manage", a.handleModelSettings))
+	a.mux.HandleFunc("/api/v1/models/settings/", a.authenticated("pricing.manage", a.handleModelSettingByID))
 	a.mux.HandleFunc("/api/v1/processing-restrictions", a.authenticated("pricing.manage", a.handleProcessingRestrictions))
 	a.mux.HandleFunc("/api/v1/rag/collections", a.authenticated("rag", a.handleRAGCollections))
 	// 08-08: bounded multi-collection search page — fused results plus

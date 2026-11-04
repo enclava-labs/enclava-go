@@ -42,10 +42,11 @@ func newModelsFixture(t *testing.T) *modelsFixture {
 	endpoints := postgres.NewEndpointsRepo(db)
 	sourceRepo := postgres.NewSourceRepo(db)
 	executor, err := inference.NewService(inference.Deps{
-		Endpoints:  endpoints,
-		Sources:    sourceRepo,
-		Authorizer: source.NewAuthorizer(sourceRepo, time.Hour),
-		Billing:    billing.NewService(billingRepo),
+		Endpoints:     endpoints,
+		Sources:       sourceRepo,
+		Authorizer:    source.NewAuthorizer(sourceRepo, time.Hour),
+		Billing:       billing.NewService(billingRepo),
+		ModelSettings: postgres.NewModelSettingsRepo(db),
 	})
 	if err != nil {
 		t.Fatalf("inference service: %v", err)
@@ -104,7 +105,9 @@ func TestDashboardModelsMemberDenied(t *testing.T) {
 	routes := []string{
 		"/dashboard/models",
 		"/dashboard/models/pricing",
+		"/dashboard/models/catalog",
 		"/dashboard/partials/models/endpoints",
+		"/dashboard/partials/models/catalog",
 		"/dashboard/partials/models/pricing",
 		"/dashboard/partials/models/endpoint-drawer",
 		"/dashboard/partials/models/price-history",
@@ -441,5 +444,68 @@ func TestDashboardPriceHistory(t *testing.T) {
 	// Newest effective first: the fresh input rate appears before the old one.
 	if strings.Index(body, "$1.25") > strings.Index(body, "$1.00") {
 		t.Fatalf("history must sort newest effective first\n%s", body)
+	}
+}
+
+// TestDashboardModelsCatalog: the Models tab renders one row per chat model
+// with controls reflecting stored settings — the semantics paragraph, an
+// "available" checkbox, one checked default radio with the Clear default
+// control, and the fallback select naming the other model. A model bound
+// only on a disabled endpoint lists but shows "No enabled endpoint"; an
+// embeddings-only alias never renders.
+func TestDashboardModelsCatalog(t *testing.T) {
+	f := newModelsFixture(t)
+	session, csrf := modelsLogin(t, f, "admin@models.test", "pricing.manage")
+	modelsSeedEndpoint(t, f, inference.Endpoint{
+		ID: "ep-a", Protocol: "openai_compatible", BaseOrigin: "https://a.example", Enabled: true,
+		Capabilities: []string{inference.CapabilityChat, "model:m-cat-a", "model:m-cat-b"},
+	})
+	modelsSeedEndpoint(t, f, inference.Endpoint{
+		ID: "ep-off", Protocol: "openai_compatible", BaseOrigin: "https://off.example", Enabled: false,
+		Capabilities: []string{inference.CapabilityChat, "model:m-cat-off"},
+	})
+	modelsSeedEndpoint(t, f, inference.Endpoint{
+		ID: "ep-emb", Protocol: "openai_compatible", BaseOrigin: "https://e.example", Enabled: true,
+		Capabilities: []string{inference.CapabilityEmbeddings, "model:m-emb-only"},
+	})
+	// Seed settings through the real API: b is the default with a as its
+	// fallback; a is withheld from people.
+	put := func(model, body string) {
+		rec := sessionDo(t, f.app, http.MethodPut, "/api/v1/models/settings/"+model, body, session, csrf)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PUT /api/v1/models/settings/%s %s: %d %s", model, body, rec.Code, rec.Body.String())
+		}
+	}
+	put("m-cat-b", `{"default":true,"fallback_model":"m-cat-a"}`)
+	put("m-cat-a", `{"available":false}`)
+
+	rec := modelsGet(t, f, "/dashboard/models/catalog", session, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /dashboard/models/catalog: expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"Default is used for new assistants", "Available to people", "Fallback answers instead",
+		`data-model-row="m-cat-a"`, `data-model-row="m-cat-b"`, `data-model-row="m-cat-off"`,
+		`data-model="m-cat-b" checked`, `data-models-fallback data-model="m-cat-b"`,
+		`<option value="m-cat-a" selected`, `data-action="models:clear-default"`,
+		"Served by", "ep-a", "No enabled endpoint",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("catalog tab missing %q\n%s", want, body)
+		}
+	}
+	// m-cat-a is stored unavailable → its checkbox must not render checked.
+	rowA := regexp.MustCompile(`(?s)data-model-row="m-cat-a">.*?</tr>`).FindString(body)
+	if strings.Contains(rowA, `data-models-available data-model="m-cat-a" checked`) {
+		t.Fatalf("m-cat-a stored unavailable but renders checked\n%s", rowA)
+	}
+	if strings.Contains(body, "m-emb-only") {
+		t.Fatalf("embeddings-only alias must not list in the chat catalog\n%s", body)
+	}
+	// The fragment route serves the same table for hx-get refreshes.
+	rec = modelsGet(t, f, "/dashboard/partials/models/catalog", session, csrf)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `id="models-catalog"`) {
+		t.Fatalf("catalog fragment: %d\n%s", rec.Code, rec.Body.String())
 	}
 }

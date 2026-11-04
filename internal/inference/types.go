@@ -131,6 +131,9 @@ type Result struct {
 	Capability string
 	EndpointID string
 	Model      string
+	// FallbackFrom is the requested model alias when its configured fallback
+	// answered instead; "" when the requested model answered.
+	FallbackFrom string
 
 	// Body is the bounded response or stream. Callers must Close it exactly;
 	// closing is idempotent. For non-streaming results usage is already

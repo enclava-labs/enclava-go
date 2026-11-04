@@ -155,6 +155,8 @@ type fx struct {
 	// transportHook runs inside the transport factory before the fake is
 	// returned — tests use it to gate concurrent construction.
 	transportHook func()
+	// modelSettings enables availability/default/fallback when set before build.
+	modelSettings inference.ModelSettingsRepository
 }
 
 func newFx(t *testing.T) *fx {
@@ -201,6 +203,7 @@ func (f *fx) build(t *testing.T) {
 		Billing:       billingSeam,
 		Artifacts:     f.artifact,
 		Conversations: f.conversations,
+		ModelSettings: f.modelSettings,
 	}, inference.WithTransportFactory(
 		func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {
 			if f.transportHook != nil {

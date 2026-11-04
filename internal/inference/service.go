@@ -63,6 +63,9 @@ type Deps struct {
 	Secrets       *auth.SecretResolver
 	Artifacts     ArtifactStore
 	Conversations ConversationStore
+	// ModelSettings is optional: nil keeps every model available with no
+	// default or fallback.
+	ModelSettings ModelSettingsRepository
 }
 
 // Service is the one inference executor.
@@ -72,6 +75,7 @@ type Service struct {
 	authorizer    ObjectAuthorizer
 	artifacts     ArtifactStore
 	conversations ConversationStore
+	modelSettings ModelSettingsRepository
 	billing       Billing
 	secrets       *auth.SecretResolver
 
@@ -182,6 +186,7 @@ func NewService(deps Deps, opts ...Option) (*Service, error) {
 		authorizer:       deps.Authorizer,
 		artifacts:        deps.Artifacts,
 		conversations:    deps.Conversations,
+		modelSettings:    deps.ModelSettings,
 		billing:          deps.Billing,
 		secrets:          deps.Secrets,
 		payloadLimit:     maxPayloadBytes,
@@ -223,10 +228,9 @@ const (
 	defaultMaxOutputTokens int64 = 16384
 )
 
-// Execute is the single entry point every model call must use: resolve policy,
-// route, reserve, dispatch, settle-or-retain. The principal's authority is
-// never widened by request fields; the returned body is caller-owned.
-func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (result *Result, retErr error) {
+// executeOnce runs one attempt for req.Model; Execute adds the model
+// fallback around it.
+func (s *Service) executeOnce(ctx context.Context, p auth.Principal, req Request) (result *Result, retErr error) {
 	defer func() {
 		if req.Stream && retErr != nil && ctx.Err() != nil {
 			retErr = ctx.Err()
@@ -303,7 +307,7 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (r
 	up, err := s.transportFor(ctx, endpoint)
 	if err != nil {
 		permit.Release()
-		return nil, fmt.Errorf("transport for endpoint: %w", err)
+		return nil, &llm.NotDispatched{Err: fmt.Errorf("transport for endpoint: %w", err)}
 	}
 	if err := dispatchSupports(up, capability, req.Stream); err != nil {
 		permit.Release()
@@ -398,7 +402,7 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (r
 			permit.Release()
 			s.observeDispatchFailure(endpoint, err)
 			s.settleDispatchError(ctx, p, res, err, obs)
-			return nil, err
+			return nil, notSentError(obs, err)
 		}
 		// The permit stays held until the stream body actually closes —
 		// headers returning early never frees the active slot.
@@ -447,7 +451,7 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (r
 		if o.err != nil {
 			s.observeDispatchFailure(endpoint, o.err)
 			s.settleDispatchError(ctx, p, res, o.err, obs)
-			return nil, o.err
+			return nil, notSentError(obs, o.err)
 		}
 		s.observeDispatchSuccess(endpoint, time.Since(dstart))
 		if endpoint.Protocol == "confidential_sdk" {
@@ -506,6 +510,16 @@ func neverSent(obs *sendObserver, err error) bool {
 		return false
 	}
 	return llm.IsNotDispatched(err) || obs.any.Load()
+}
+
+// notSentError marks a provably never-sent dispatch failure as
+// llm.NotDispatched so callers (the model fallback) can tell it apart from a
+// failure the provider may have processed.
+func notSentError(obs *sendObserver, err error) error {
+	if !llm.IsNotDispatched(err) && neverSent(obs, err) {
+		return &llm.NotDispatched{Err: err}
+	}
+	return err
 }
 
 // settleDispatchError applies the once-only accounting decision for a
@@ -1127,6 +1141,10 @@ func (s *Service) PricedModelSelector(ctx context.Context, p auth.Principal, pin
 		candidates = list // repo already returns id-ordered, enabled rows
 	}
 
+	unavailable, err := s.UnavailableModels(ctx, p)
+	if err != nil {
+		return nil, err
+	}
 	aliases := map[string]bool{}
 	for _, e := range candidates {
 		if !e.Enabled || !capabilityAdvertised(e, capability) || !auth.EndpointAllowed(p, e.ID) {
@@ -1134,7 +1152,7 @@ func (s *Service) PricedModelSelector(ctx context.Context, p auth.Principal, pin
 		}
 		for _, cap := range e.Capabilities {
 			alias, ok := modelAliasOf(cap)
-			if !ok || !auth.ModelAllowed(p, alias) {
+			if !ok || !auth.ModelAllowed(p, alias) || unavailable[alias] {
 				continue
 			}
 			aliases[alias] = true

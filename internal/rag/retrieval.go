@@ -38,6 +38,25 @@ func (s *Service) SetUtilityModel(model string) {
 	s.utilityModel = strings.TrimSpace(model)
 }
 
+// SetDefaultModelResolver supplies the tenant default chat model, used for
+// query rewrite and section selection when no utility model is configured.
+func (s *Service) SetDefaultModelResolver(resolve func(ctx context.Context, tenantID string) (string, error)) {
+	s.defaultModel = resolve
+}
+
+// utilityModelFor returns UTILITY_MODEL, else the tenant default model.
+func (s *Service) utilityModelFor(ctx context.Context, tenantID string) string {
+	if s.utilityModel != "" || s.defaultModel == nil {
+		return s.utilityModel
+	}
+	model, err := s.defaultModel(ctx, tenantID)
+	if err != nil {
+		slog.Warn("rag: tenant default model lookup failed", "err", err)
+		return ""
+	}
+	return strings.TrimSpace(model)
+}
+
 type queryEmbeddingBinding struct {
 	model, prefix string
 	dims          int
@@ -57,15 +76,15 @@ func newQueryEmbeddingMemo() *queryEmbeddingMemo {
 	return &queryEmbeddingMemo{vectors: make(map[queryEmbeddingKey][]float64)}
 }
 
-func (s *Service) searchModels(input *SearchInput) error {
+func (s *Service) searchModels(ctx context.Context, tenantID string, input *SearchInput) error {
 	if input.Rewrite && strings.TrimSpace(input.RewriteModel) == "" {
-		input.RewriteModel = s.utilityModel
+		input.RewriteModel = s.utilityModelFor(ctx, tenantID)
 		if strings.TrimSpace(input.RewriteModel) == "" {
 			return ErrUtilityModelNotConfigured
 		}
 	}
 	if input.SelectSections && strings.TrimSpace(input.SectionModel) == "" {
-		input.SectionModel = s.utilityModel
+		input.SectionModel = s.utilityModelFor(ctx, tenantID)
 		if strings.TrimSpace(input.SectionModel) == "" {
 			return ErrUtilityModelNotConfigured
 		}
@@ -90,7 +109,7 @@ func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInpu
 	if err := validateSearchQueryMode(input.Query, input.Mode); err != nil {
 		return nil, err
 	}
-	if err := s.searchModels(&input); err != nil {
+	if err := s.searchModels(ctx, p.TenantID, &input); err != nil {
 		return nil, err
 	}
 	collection, err := s.GetCollection(ctx, p, strings.TrimSpace(input.CollectionID))
@@ -444,7 +463,7 @@ type SearchReadableOptions struct {
 
 func (s *Service) SearchReadableWithOptions(ctx context.Context, p auth.Principal, query string, mode QueryMode, collectionIDs []string, limit int, options SearchReadableOptions) (SearchReadableResult, error) {
 	input := SearchInput{Rewrite: options.Rewrite, SelectSections: options.SelectSections}
-	if err := s.searchModels(&input); err != nil {
+	if err := s.searchModels(ctx, p.TenantID, &input); err != nil {
 		return SearchReadableResult{}, err
 	}
 	if strings.TrimSpace(query) == "" {

@@ -753,10 +753,15 @@ func verifiable(e Endpoint) bool {
 
 // route picks the deterministic eligible endpoint for the resolved
 // capability: enabled, actor-allowlisted, capability-advertising and bound
-// to the requested model alias. Selection order is the repository's
-// deterministic id order — no load-based failover, which could replay a
-// possibly accepted request on another endpoint.
+// to the requested model alias, after the tenant's availability setting for
+// that model. Selection order is the repository's deterministic id order —
+// no load-based failover, which could replay a possibly accepted request on
+// another endpoint; Execute's configured model fallback only follows
+// failures where the request provably did not run.
 func (s *Service) route(ctx context.Context, p auth.Principal, req Request, capability string) (Endpoint, error) {
+	if err := s.checkModelAvailable(ctx, p, req.Model, capability); err != nil {
+		return Endpoint{}, err
+	}
 	var candidates []Endpoint
 	if req.EndpointID != "" {
 		e, err := s.endpoints.Get(ctx, p.TenantID, req.EndpointID)

@@ -358,9 +358,37 @@
     Enclava.openDrawer('/dashboard/partials/models/price-history?' + params.toString());
   }
 
+  // Models tab: each control PUTs one patch to /api/v1/models/settings/{m}.
+  // A refused write (e.g. fallback to itself) shows the API's own message
+  // and the section refreshes so the control reverts to stored state.
+  async function saveModelSetting(model, patch, verb) {
+    try {
+      await Enclava.api('PUT', '/api/v1/models/settings/' + encodeURIComponent(model), patch);
+      Enclava.toast('success', model + ': ' + verb);
+      Enclava.refresh();
+    } catch (err) {
+      Enclava.toast('error', (err && err.message) || 'Saving the model setting failed');
+      Enclava.refresh();
+    }
+  }
+
+  document.addEventListener('change', (e) => {
+    if (!(e.target instanceof Element)) return;
+    const el = e.target;
+    const model = el.dataset && el.dataset.model;
+    if (!model) return;
+    if (el.matches('[data-models-available]')) {
+      saveModelSetting(model, { available: el.checked }, el.checked ? 'available to people' : 'hidden from people');
+    } else if (el.matches('[data-models-default]') && el.checked) {
+      saveModelSetting(model, { default: true }, 'set as default');
+    } else if (el.matches('[data-models-fallback]')) {
+      saveModelSetting(model, { fallback_model: el.value }, el.value ? 'fallback set to ' + el.value : 'fallback cleared');
+    }
+  });
+
   document.addEventListener('click', (e) => {
     if (!(e.target instanceof Element)) return;
-    const trigger = e.target.closest('[data-action="models:endpoint"],[data-action="models:price"],[data-action="models:history"],[data-models-discover]');
+    const trigger = e.target.closest('[data-action="models:endpoint"],[data-action="models:price"],[data-action="models:history"],[data-action="models:clear-default"],[data-models-discover]');
     if (!trigger) return;
     switch (trigger.dataset.action) {
       case 'models:endpoint': {
@@ -374,6 +402,13 @@
       case 'models:history':
         openHistory(trigger);
         break;
+      case 'models:clear-default': {
+        const current = document.querySelector('[data-models-default]:checked');
+        if (current && current.dataset.model) {
+          saveModelSetting(current.dataset.model, { default: false }, 'default cleared');
+        }
+        break;
+      }
     }
     if (trigger.matches('[data-models-discover]')) {
       e.preventDefault();

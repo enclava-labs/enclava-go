@@ -154,6 +154,7 @@ type Service struct {
 	defaultEmbeddingModel      string
 	defaultEmbeddingDimensions int
 	utilityModel               string
+	defaultModel               func(ctx context.Context, tenantID string) (string, error)
 	indexRetirementSoak        time.Duration
 	artifacts                  *artifacts.Store
 	parser                     *extract.Parser

@@ -451,17 +451,20 @@ func (a *App) assistantDrawerData(ctx context.Context, p auth.Principal, id stri
 	// Models: priced + routable only — the shared selector already applies
 	// the caller's model/endpoint grants and complete price coverage on the
 	// route execution (unpinned routing, "" endpoint). Loaded for create and
-	// edit alike.
+	// edit alike; a new assistant starts on the tenant default model.
 	if a.executor != nil {
 		models, err := a.executor.PricedModelSelector(ctx, p, "")
 		if err != nil {
 			log.Printf("dashboard assistants: priced models: %v", err)
 		}
+		selected := ""
+		if data.Assistant != nil {
+			selected = data.Assistant.Model
+		} else if selected, err = a.executor.DefaultModel(ctx, p.TenantID); err != nil {
+			log.Printf("dashboard assistants: default model: %v", err)
+		}
 		for _, m := range models {
-			data.Models = append(data.Models, assistantModelOption{
-				ID:      m.ID,
-				Current: data.Assistant != nil && data.Assistant.Model == m.ID,
-			})
+			data.Models = append(data.Models, assistantModelOption{ID: m.ID, Current: selected != "" && m.ID == selected})
 		}
 	}
 	if data.Assistant != nil && data.Assistant.Model != "" && !data.modelsCurrent(data.Assistant.Model) {

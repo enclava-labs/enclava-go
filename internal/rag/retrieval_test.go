@@ -291,11 +291,17 @@ func TestSearchUtilityModel(t *testing.T) {
 	repo := &searchStubRepo{bindings: []IndexBinding{{QdrantCollection: "idx"}}}
 	svc := &Service{repo: repo, executor: exec, vectorStore: &retrievalVectors{}, authorizer: source.NewAuthorizer(repo, 0)}
 	input := SearchInput{Query: "hello", Mode: QueryLexical, Rewrite: true}
-	if err := svc.searchModels(&input); !errors.Is(err, ErrUtilityModelNotConfigured) {
+	if err := svc.searchModels(context.Background(), "t", &input); !errors.Is(err, ErrUtilityModelNotConfigured) {
 		t.Fatalf("missing model: %v", err)
 	}
+	// Without UTILITY_MODEL the tenant default model from the Models page applies.
+	svc.SetDefaultModelResolver(func(context.Context, string) (string, error) { return "tenant-default", nil })
+	defaulted := SearchInput{Query: "hello", Mode: QueryLexical, Rewrite: true}
+	if err := svc.searchModels(context.Background(), "t", &defaulted); err != nil || defaulted.RewriteModel != "tenant-default" {
+		t.Fatalf("tenant default not used: model=%q err=%v", defaulted.RewriteModel, err)
+	}
 	svc.SetUtilityModel("utility")
-	if err := svc.searchModels(&input); err != nil {
+	if err := svc.searchModels(context.Background(), "t", &input); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := svc.searchCollection(context.Background(), auth.Principal{TenantID: "t"}, Collection{}, input, newQueryEmbeddingMemo()); err != nil {

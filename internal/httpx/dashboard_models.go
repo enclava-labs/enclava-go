@@ -41,15 +41,29 @@ func modelsUnitKinds() []billing.UnitKind {
 // dashboardPageMeta so the layout serves static/pages/models.js — the old
 // page's pricing.js was never emitted, which is the bug class D-22 fixes.
 type modelsData struct {
-	Tab       string // "endpoints" | "pricing"
-	Endpoints []modelsEndpointRow
-	Rows      []modelsPriceRow
-	Empty     dashboardEmpty // zero-row state for the active tab (OA-37)
-	Error     string
+	Tab        string // "endpoints" | "catalog" | "pricing"
+	Endpoints  []modelsEndpointRow
+	Catalog    []modelsCatalogRow
+	HasDefault bool // a catalog model is the tenant default
+	Rows       []modelsPriceRow
+	Empty      dashboardEmpty // zero-row state for the active tab (OA-37)
+	Error      string
 }
 
 func (m modelsData) DashboardTitle() string  { return "Models" }
 func (m modelsData) DashboardModule() string { return "models" }
+
+// modelsCatalogRow is one Models-tab row: the chat-model alias plus its
+// served-by endpoints and the three tenant settings (availability, the
+// single default, the fallback alias).
+type modelsCatalogRow struct {
+	Model     string
+	Endpoints []string
+	Routable  bool
+	Available bool
+	Default   bool
+	Fallback  string
+}
 
 // modelsEndpointRow is one endpoints-table row. Assurance and health are
 // observed projections only — never inferred from protocol or provider type.
@@ -146,12 +160,14 @@ type modelsHistoryRow struct {
 	EffectiveFrom time.Time
 }
 
-// registerDashboardModelsRoutes mounts the page, both tabs, the two tab
-// fragments and the two drawers — every route under models.manage.
+// registerDashboardModelsRoutes mounts the page, all three tabs, the three
+// tab fragments and the two drawers — every route under models.manage.
 func (a *App) registerDashboardModelsRoutes() {
 	a.mux.HandleFunc("/dashboard/models", a.sessionAuth.requireCap(capModelsManage, a.modelsGetOnly(a.handleDashboardModelsPage)))
 	a.mux.HandleFunc("/dashboard/models/pricing", a.sessionAuth.requireCap(capModelsManage, a.modelsGetOnly(a.handleDashboardModelsPricingPage)))
+	a.mux.HandleFunc("/dashboard/models/catalog", a.sessionAuth.requireCap(capModelsManage, a.modelsGetOnly(a.handleDashboardModelsCatalogPage)))
 	a.mux.HandleFunc("/dashboard/partials/models/endpoints", a.sessionAuth.requireCap(capModelsManage, a.modelsGetOnly(a.handleDashboardModelsEndpointsPartial)))
+	a.mux.HandleFunc("/dashboard/partials/models/catalog", a.sessionAuth.requireCap(capModelsManage, a.modelsGetOnly(a.handleDashboardModelsCatalogPartial)))
 	a.mux.HandleFunc("/dashboard/partials/models/pricing", a.sessionAuth.requireCap(capModelsManage, a.modelsGetOnly(a.handleDashboardModelsPricingPartial)))
 	a.mux.HandleFunc("/dashboard/partials/models/endpoint-drawer", a.sessionAuth.requireCap(capModelsManage, a.modelsGetOnly(a.handleDashboardModelsEndpointDrawer)))
 	a.mux.HandleFunc("/dashboard/partials/models/price-history", a.sessionAuth.requireCap(capModelsManage, a.modelsGetOnly(a.handleDashboardModelsPriceHistory)))
@@ -177,8 +193,16 @@ func (a *App) handleDashboardModelsPricingPage(w http.ResponseWriter, r *http.Re
 	a.renderDashboard(w, r, "models", a.modelsPricingData(r))
 }
 
+func (a *App) handleDashboardModelsCatalogPage(w http.ResponseWriter, r *http.Request) {
+	a.renderDashboard(w, r, "models", a.modelsCatalogData(r))
+}
+
 func (a *App) handleDashboardModelsEndpointsPartial(w http.ResponseWriter, r *http.Request) {
 	a.renderDashboardFragment(w, r, "models", "models-endpoints", a.modelsEndpointsData(r))
+}
+
+func (a *App) handleDashboardModelsCatalogPartial(w http.ResponseWriter, r *http.Request) {
+	a.renderDashboardFragment(w, r, "models", "models-catalog", a.modelsCatalogData(r))
 }
 
 func (a *App) handleDashboardModelsPricingPartial(w http.ResponseWriter, r *http.Request) {
@@ -369,6 +393,49 @@ func modelsEndpointsEmpty(canManage bool) dashboardEmpty {
 		e.ActionDrawerURL = "/dashboard/partials/models/endpoint-drawer"
 	}
 	return e
+}
+
+// modelsCatalogEmpty names the Models tab's zero-row state; the action is
+// filled only when the caller can manage models (T-11-03-03).
+func modelsCatalogEmpty(canManage bool) dashboardEmpty {
+	e := dashboardEmpty{
+		Icon: "models",
+		Text: "No chat models yet — bind a model alias on an endpoint first.",
+	}
+	if canManage {
+		e.ActionDrawerLabel = "Add endpoint"
+		e.ActionDrawerURL = "/dashboard/partials/models/endpoint-drawer"
+	}
+	return e
+}
+
+// modelsCatalogData lists every chat model the tenant's endpoints serve with
+// its availability, default and fallback — the Models tab's settings table.
+func (a *App) modelsCatalogData(r *http.Request) modelsData {
+	data := modelsData{Tab: "catalog"}
+	p, _ := auth.PrincipalFromContext(r.Context())
+	caps, _ := capsFromContext(r.Context())
+	data.Empty = modelsCatalogEmpty(caps.ModelsManage)
+	if a.executor == nil {
+		data.Error = "Models are not configured on this deployment"
+		return data
+	}
+	catalog, err := a.executor.ModelCatalog(r.Context(), p.TenantID)
+	if err != nil {
+		log.Printf("models page: model catalog: %v", err)
+		data.Error = "Model list failed"
+		return data
+	}
+	for _, entry := range catalog {
+		if entry.Default {
+			data.HasDefault = true
+		}
+		data.Catalog = append(data.Catalog, modelsCatalogRow{
+			Model: entry.Model, Endpoints: entry.Endpoints, Routable: entry.Routable,
+			Available: entry.Available, Default: entry.Default, Fallback: entry.FallbackModel,
+		})
+	}
+	return data
 }
 
 func modelsPricingEmpty(canManage bool) dashboardEmpty {

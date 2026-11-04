@@ -12,8 +12,9 @@
   </div>{{end}}
 </header>
 <nav class="tabs" aria-label="Models sections">
-  <a class="tab{{if ne .Data.Tab "pricing"}} active{{end}}" href="/dashboard/models"{{if ne .Data.Tab "pricing"}} aria-current="page"{{end}}>Endpoints</a>
+  <a class="tab{{if eq .Data.Tab "endpoints"}} active{{end}}" href="/dashboard/models"{{if eq .Data.Tab "endpoints"}} aria-current="page"{{end}}>Endpoints</a>
+  <a class="tab{{if eq .Data.Tab "catalog"}} active{{end}}" href="/dashboard/models/catalog"{{if eq .Data.Tab "catalog"}} aria-current="page"{{end}}>Models</a>
   <a class="tab{{if eq .Data.Tab "pricing"}} active{{end}}" href="/dashboard/models/pricing"{{if eq .Data.Tab "pricing"}} aria-current="page"{{end}}>Pricing</a>
 </nav>
-{{if eq .Data.Tab "pricing"}}{{template "frag-models-pricing" .}}{{else}}{{template "frag-models-endpoints" .}}{{end}}
+{{if eq .Data.Tab "pricing"}}{{template "frag-models-pricing" .}}{{else if eq .Data.Tab "catalog"}}{{template "frag-models-catalog" .}}{{else}}{{template "frag-models-endpoints" .}}{{end}}
 {{end}}

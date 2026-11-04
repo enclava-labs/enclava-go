@@ -37,7 +37,8 @@ func modelAlias(capability string) (string, bool) {
 
 // permittedModels returns the distinct model aliases the principal may see:
 // enabled tenant endpoints, intersected with the actor's endpoint and model
-// allowlists. Other tenants' endpoints are never consulted.
+// allowlists, minus models the tenant withheld from people. Other tenants'
+// endpoints are never consulted.
 func (a *App) permittedModels(ctx context.Context, principal auth.Principal) ([]llm.Model, error) {
 	if a.endpoints == nil {
 		return nil, errors.New("endpoint store not configured")
@@ -46,6 +47,12 @@ func (a *App) permittedModels(ctx context.Context, principal auth.Principal) ([]
 	if err != nil {
 		return nil, err
 	}
+	unavailable := map[string]bool{}
+	if a.executor != nil {
+		if unavailable, err = a.executor.UnavailableModels(ctx, principal); err != nil {
+			return nil, err
+		}
+	}
 	aliases := map[string]struct{}{}
 	for _, e := range endpoints {
 		if !e.Enabled || !auth.EndpointAllowed(principal, e.ID) {
@@ -53,7 +60,7 @@ func (a *App) permittedModels(ctx context.Context, principal auth.Principal) ([]
 		}
 		for _, cap := range e.Capabilities {
 			alias, ok := modelAlias(cap)
-			if !ok || !auth.ModelAllowed(principal, alias) {
+			if !ok || !auth.ModelAllowed(principal, alias) || unavailable[alias] {
 				continue
 			}
 			aliases[alias] = struct{}{}
@@ -136,8 +143,13 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request, prin
 		return
 	}
 	if strings.TrimSpace(meta.Model) == "" {
-		WriteOpenAIError(w, http.StatusBadRequest, "model is required", "invalid_request_error", "missing_model")
-		return
+		// A request naming no model uses the tenant default from the Models page.
+		if def, err := a.executor.DefaultModel(r.Context(), principal.TenantID); err == nil && def != "" {
+			meta.Model = def
+		} else {
+			WriteOpenAIError(w, http.StatusBadRequest, "model is required", "invalid_request_error", "missing_model")
+			return
+		}
 	}
 	if len(meta.Messages) == 0 || string(meta.Messages) == "null" {
 		WriteOpenAIError(w, http.StatusBadRequest, "messages is required", "invalid_request_error", "missing_messages")
@@ -161,6 +173,9 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request, prin
 		return
 	}
 	defer func() { _ = res.Body.Close() }()
+	if res.FallbackFrom != "" {
+		w.Header().Set("X-Enclava-Fallback-From", res.FallbackFrom)
+	}
 	if meta.Stream {
 		a.proxyInferenceStream(w, r, res.Body)
 		return

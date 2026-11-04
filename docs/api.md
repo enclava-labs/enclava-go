@@ -337,6 +337,35 @@ curl -s -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
   "request_defaults":{"temperature":0.5,"chat_template_kwargs":{"enable_thinking":false}}}'
 ```
 
+### Default, availability and fallback
+
+The Models page's **Models** tab (and `GET /api/v1/models/settings`,
+`PUT /api/v1/models/settings/{model}`, scope `pricing.manage`) sets three things
+per chat model; embedding models are not covered because their vectors belong
+to each collection's index:
+
+```bash
+curl -s -H "authorization: Bearer $KEY" -H 'content-type: application/json' -X PUT \
+  $BASE/api/v1/models/settings/Qwen3.8-Flash-Next -d '{"default":true,"fallback_model":"dsv41"}'
+```
+
+- `default` — one per tenant. Used when nothing more specific names a model:
+  new assistants start on it, extraction uses it after the template and the
+  extraction settings, search rewrite and section selection use it when
+  `UTILITY_MODEL` is unset, and `/v1/chat/completions` requests without a
+  `model` get it.
+- `available` — `false` hides the model from people (model lists, assistant
+  pickers) and refuses their requests with `403`; principals with
+  `pricing.manage` or `platform.admin` can still use it to test.
+- `fallback_model` — another served chat model (`""` clears). A chat request
+  whose model has no enabled route, is unavailable, could not be sent to its
+  endpoint, or was refused with `404`, `408`, `429` or a `5xx` is retried once
+  on the fallback (a fallback's own fallback is followed at most once more,
+  and cycles stop). Each attempt is authorized, priced and billed as its own
+  model; failures after the request may have been processed are never
+  retried, and requests pinned to an endpoint never fall back. Responses
+  answered by a fallback carry `X-Enclava-Fallback-From: <requested model>`.
+
 ## Identity management
 
 `DELETE /api/v1/identities/users/{id}` requires `platform.admin` and returns
