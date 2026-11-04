@@ -319,6 +319,7 @@ func (s *Service) enqueueContent(ctx context.Context, principal auth.Principal, 
 			Subject:        jobs.Subject{ConnectionID: conn.ID, ObjectID: observation.ObjectRef.ObjectID, ObservedRevision: observation.ObjectRef.ObservedSeq},
 			InputRef:       observation.ArtifactRef.ID, InputHash: observation.ArtifactRef.SHA256,
 			Policy: map[string]any{"collection_id": conn.TargetCollectionID, "source_ref": observation.ObjectRef, "artifact_ref": observation.ArtifactRef, "source_kind": conn.Kind, "observation_payload": observation.Payload},
+			Lane:   jobs.LaneBackground,
 		})
 		if err != nil {
 			return fmt.Errorf("enqueue rag.ingest: %w", err)
@@ -500,7 +501,7 @@ func (s *Service) applyGrantSnapshot(ctx context.Context, principal auth.Princip
 		return err
 	}
 	key := fmt.Sprintf("%s:connector-v2:%s:%s:%d", OperationAccess, conn.ID, kind, revision)
-	_, _, err = s.jobs.Enqueue(ctx, principal, jobs.EnqueueRequest{TenantID: principal.TenantID, Operation: OperationAccess, IdempotencyKey: key, Subject: jobs.Subject{ConnectionID: conn.ID, ObservedRevision: revision}, InputRef: conn.ID, InputHash: fmt.Sprint(revision), Policy: map[string]any{"connection_id": conn.ID, "snapshot_kind": kind, "revision": revision}})
+	_, _, err = s.jobs.Enqueue(ctx, principal, jobs.EnqueueRequest{TenantID: principal.TenantID, Operation: OperationAccess, IdempotencyKey: key, Subject: jobs.Subject{ConnectionID: conn.ID, ObservedRevision: revision}, InputRef: conn.ID, InputHash: fmt.Sprint(revision), Policy: map[string]any{"connection_id": conn.ID, "snapshot_kind": kind, "revision": revision}, Lane: jobs.LaneBackground})
 	if err != nil {
 		return fmt.Errorf("enqueue rag.access: %w", err)
 	}

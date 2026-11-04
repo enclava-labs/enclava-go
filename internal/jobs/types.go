@@ -41,6 +41,16 @@ type Subject struct {
 	ObservedRevision int64  `json:"observed_revision,omitempty"`
 }
 
+// Lane partitions the queue: bulk background work (connector syncs and their
+// ingest/embed fan-out, access projections, re-embed scans) runs on its own
+// runner capacity so it can never starve interactive jobs.
+type Lane string
+
+const (
+	LaneInteractive Lane = "interactive"
+	LaneBackground  Lane = "background"
+)
+
 // EnqueueRequest is the immutable job-creation request. The idempotency
 // identity binds tenant, operation and the submitting principal/delegation/
 // credential/billing context — stored before a job ID is returned.
@@ -53,6 +63,7 @@ type EnqueueRequest struct {
 	InputHash      string
 	Policy         map[string]any
 	MaxAttempts    int
+	Lane           Lane // "" = LaneInteractive
 }
 
 // Job mirrors the durable schema, including the frozen initiating principal.
@@ -66,6 +77,7 @@ type Job struct {
 	InputRef          string
 	InputHash         string
 	Policy            map[string]any
+	Lane              Lane
 	PrincipalSnapshot json.RawMessage // frozen initiating identity
 	FenceToken        int64           // monotonic per lease grant
 	LeaseOwner        string

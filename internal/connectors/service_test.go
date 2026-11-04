@@ -146,6 +146,27 @@ func (f *connectorFixture) schedule(t *testing.T) SyncJob {
 	return job
 }
 
+// TestListSyncJobsSeesSyncBehindIngestFanOut: a sync's own ingest jobs are
+// newer than its connector.sync rows; the source's latest sync must still be
+// found (the Sources page derives "Syncing" from it).
+func TestListSyncJobsSeesSyncBehindIngestFanOut(t *testing.T) {
+	f := newConnectorFixture(t, &testAdapter{capabilities: AdapterCapabilities{Content: true}})
+	sync := f.schedule(t)
+	for i := range 30 {
+		if _, _, err := f.jobs.Enqueue(context.Background(), f.principal, jobs.EnqueueRequest{
+			TenantID: f.tenant, Operation: OperationIngest, IdempotencyKey: fmt.Sprintf("ingest-%d", i),
+			Subject:  jobs.Subject{ConnectionID: f.connection.ID, ObjectID: fmt.Sprintf("obj-%d", i), ObservedRevision: 1},
+			InputRef: "artifact", InputHash: "h", Lane: jobs.LaneBackground,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := f.svc.ListSyncJobs(context.Background(), f.principal, f.connection.ID, "", 1, 0)
+	if err != nil || len(got) != 1 || got[0].ConnectorSourceID != f.connection.ID || got[0].Status != JobStatusQueued {
+		t.Fatalf("latest sync job = %+v, %v (scheduled %s)", got, err, sync.ID)
+	}
+}
+
 func TestContentSyncPersistsFinalArtifactRefAndEnqueuesIngest(t *testing.T) {
 	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true}}
 	adapter.content = func(context.Context, source.Connection, Cursor, int) (ContentPage, error) {
@@ -175,7 +196,7 @@ func TestContentSyncPersistsFinalArtifactRefAndEnqueuesIngest(t *testing.T) {
 	if err != nil || meta.State != artifacts.StateFinal {
 		t.Fatalf("artifact was not finalized: %+v err=%v", meta, err)
 	}
-	queued, err := f.jobRows.ListConnectionJobs(context.Background(), f.connection.TenantID, f.connection.ID, jobs.StatusQueued, 20)
+	queued, err := f.jobRows.ListConnectionJobs(context.Background(), f.connection.TenantID, f.connection.ID, "", jobs.StatusQueued, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +235,7 @@ func TestPermissionOnlySyncAppliesCanonicalAccessWithoutContentIngest(t *testing
 	if err != nil || len(grants) != 1 || grants[0].SubjectID != "identity-native-user-1" {
 		t.Fatalf("canonical grants=%+v err=%v", grants, err)
 	}
-	queued, err := f.jobRows.ListConnectionJobs(context.Background(), f.connection.TenantID, f.connection.ID, jobs.StatusQueued, 20)
+	queued, err := f.jobRows.ListConnectionJobs(context.Background(), f.connection.TenantID, f.connection.ID, "", jobs.StatusQueued, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,7 +487,7 @@ func TestContentResyncReEnqueuesStrandedVersion(t *testing.T) {
 	if _, err := f.runNext(t); err != nil {
 		t.Fatal(err)
 	}
-	queued, err := f.jobRows.ListConnectionJobs(ctx, f.tenant, f.connection.ID, jobs.StatusQueued, 20)
+	queued, err := f.jobRows.ListConnectionJobs(ctx, f.tenant, f.connection.ID, "", jobs.StatusQueued, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -532,7 +553,7 @@ func TestContentMetadataChangeNewVersionReusesArtifact(t *testing.T) {
 	if artifacts != 1 {
 		t.Fatalf("metadata-only change must not create a new artifact, got %d", artifacts)
 	}
-	queued, err := f.jobRows.ListConnectionJobs(ctx, f.tenant, f.connection.ID, jobs.StatusQueued, 20)
+	queued, err := f.jobRows.ListConnectionJobs(ctx, f.tenant, f.connection.ID, "", jobs.StatusQueued, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -615,7 +636,7 @@ func TestSyncSourceEnqueuesIndependentSupportedStreams(t *testing.T) {
 	}
 	f := newConnectorFixture(t, adapter)
 	f.schedule(t)
-	rows, err := f.jobRows.ListConnectionJobs(context.Background(), f.connection.TenantID, f.connection.ID, jobs.StatusQueued, 20)
+	rows, err := f.jobRows.ListConnectionJobs(context.Background(), f.connection.TenantID, f.connection.ID, "", jobs.StatusQueued, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -904,7 +925,7 @@ func TestScheduledThenManualReplaysConnectorIngest(t *testing.T) {
 	if _, err := f.runNext(t); err != nil {
 		t.Fatalf("manual replay failed: %v", err)
 	}
-	rows, err := f.jobRows.ListConnectionJobs(ctx, f.tenant, f.connection.ID, "", 50)
+	rows, err := f.jobRows.ListConnectionJobs(ctx, f.tenant, f.connection.ID, "", "", 50)
 	if err != nil {
 		t.Fatal(err)
 	}

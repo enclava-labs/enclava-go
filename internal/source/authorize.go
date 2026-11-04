@@ -125,6 +125,17 @@ func (a *Authorizer) canReadSourceACL(ctx context.Context, p auth.Principal, obj
 	for _, group := range groups {
 		inGroup[group] = struct{}{}
 	}
+	return evalSourceACLGrants(ident.ID, inGroup, membershipKnown, grants)
+}
+
+// evalSourceACLGrants is the pure grant-evaluation half of canReadSourceACL:
+// given the principal's mapped source identity, its known group memberships
+// (membershipKnown=false means unproven) and every grant on the object's
+// ancestor chain at the evaluated revision, it returns the allow/deny
+// outcome. DENY WINS FIRST: any applicable deny grant for the mapped
+// identity or a group containing it denies outright, even when an allow
+// grant also exists. CanRead and CanReadMany share exactly this decision.
+func evalSourceACLGrants(identityID string, inGroup map[string]struct{}, membershipKnown bool, grants []SourceGrant) error {
 	allowed := false
 	for _, g := range grants {
 		var applies bool
@@ -132,7 +143,7 @@ func (a *Authorizer) canReadSourceACL(ctx context.Context, p auth.Principal, obj
 		case GrantSubjectAll:
 			applies = true
 		case GrantSubjectUser:
-			applies = ident.ID != "" && g.SubjectID == ident.ID
+			applies = identityID != "" && g.SubjectID == identityID
 		case GrantSubjectGroup:
 			if !membershipKnown {
 				if g.Effect == GrantEffectDeny {

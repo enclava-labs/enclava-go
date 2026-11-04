@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	// Budget windows use IANA zones; the alpine runtime image ships no zoneinfo.
@@ -277,8 +278,11 @@ func serve() error {
 	chatbotSvc.ConfigureRuns(postgres.NewChatbotRunsRepo(pgDB), jobsSvc, extractSvc, authSvc)
 	chatbotSvc.ConfigureMCP(chatbot.MCPRunTools{Executor: mcpExecutor, Authorizer: inferenceSvc})
 
-	// Worker: extract, preview and embed jobs use the same durable runner.
-	jobsRunner := jobs.NewRunner(jobsSvc, artifactStore, map[string]jobs.HandlerFunc{
+	// Workers: one durable queue, two lanes with their own capacity, so bulk
+	// connector work (syncs and their ingest/embed fan-out, access
+	// projections, re-embed scans) never starves uploads, extraction,
+	// previews or agent runs.
+	jobHandlers := map[string]jobs.HandlerFunc{
 		extract.OperationProcess:    extractSvc.JobHandler(),
 		extract.OperationVision:     extractSvc.JobHandler(),
 		extract.OperationPreview:    previewSvc.JobHandler(),
@@ -289,15 +293,27 @@ func serve() error {
 		rag.OperationReembedScan:    ragSvc.ReembedScanJobHandler(),
 		connectors.OperationSync:    connectorSvc.JobHandler(),
 		chatbot.RunOperation:        chatbotSvc.JobHandler(),
-	}, jobs.RunnerConfig{JobTimeout: cfg.JobTimeout})
+	}
+	runners := []*jobs.Runner{
+		jobs.NewRunner(jobsSvc, artifactStore, jobHandlers, jobs.RunnerConfig{JobTimeout: cfg.JobTimeout, Lane: jobs.LaneInteractive}),
+		jobs.NewRunner(jobsSvc, artifactStore, jobHandlers, jobs.RunnerConfig{JobTimeout: cfg.JobTimeout, Lane: jobs.LaneBackground}),
+	}
 	runnerCtx, stopRunner := context.WithCancel(context.Background())
 	go previewSvc.RunRetention(runnerCtx)
 	runnerDone := make(chan struct{})
 	go func() {
 		defer close(runnerDone)
-		if err := jobsRunner.Run(runnerCtx); err != nil {
-			log.Printf("jobs runner error: %v", err)
+		var wg sync.WaitGroup
+		for _, runner := range runners {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := runner.Run(runnerCtx); err != nil {
+					log.Printf("jobs runner error: %v", err)
+				}
+			}()
 		}
+		wg.Wait()
 	}()
 
 	go ragSvc.RunAccessBackfillLoop(runnerCtx, time.Minute)

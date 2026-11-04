@@ -706,27 +706,13 @@ func (r *RAGRepo) ListCollectionItems(ctx context.Context, tenantID, collectionI
 	return out, rows.Err()
 }
 
-// documentSelect projects the legacy-stable rag.Document JSON shape: object
+// documentColumns projects the legacy-stable rag.Document JSON shape: object
 // row + latest version + latest index generation state + chunk count.
 // latest_gen is scoped per (collection, object_version) so a generation in
 // one collection cannot mask another, the chunk count spans only that latest
 // generation of the listing collection, and a durable failed embed/ingest
 // job projects its real error text.
-const documentSelect = `
-	WITH latest_version AS (
-		SELECT DISTINCT ON (object_id) id, object_id, observed_seq, artifact_ref,
-		       content_sha256, byte_size, mime_type, original_filename, provenance
-		FROM source_object_versions
-		WHERE tenant_id = $1
-		ORDER BY object_id, observed_seq DESC
-	),
-	latest_gen AS (
-		SELECT DISTINCT ON (collection_id, object_version_id)
-		       collection_id, object_version_id, generation, state, warnings
-		FROM index_generations
-		WHERE tenant_id = $1
-		ORDER BY collection_id, object_version_id, generation DESC
-	)
+const documentColumns = `
 	SELECT o.id, ci.collection_id, o.kind, o.native_id, o.observed_seq,
 	       lv.id, lv.observed_seq, lv.artifact_ref, lv.content_sha256, lv.byte_size,
 	       lv.mime_type, lv.original_filename, lv.provenance,
@@ -736,35 +722,79 @@ const documentSelect = `
 	       (SELECT COUNT(*) FROM chunks k
 	        WHERE k.tenant_id = $1 AND k.object_version_id = lv.id
 	          AND k.collection_id = ci.collection_id AND k.generation = lg.generation),
-	       j.error->>'message', COALESCE(lg.warnings, '[]'::jsonb)
+	       j.error_message, COALESCE(lg.warnings, '[]'::jsonb)`
+
+// documentLookups resolves each row's latest version, latest generation and
+// durable failed job through index-keyed LATERAL subqueries.
+const documentLookups = `
+	LEFT JOIN LATERAL (
+		SELECT v.id, v.observed_seq, v.artifact_ref, v.content_sha256, v.byte_size,
+		       v.mime_type, v.original_filename, v.provenance
+		FROM source_object_versions v
+		WHERE v.tenant_id = $1 AND v.object_id = o.id
+		ORDER BY v.observed_seq DESC LIMIT 1
+	) lv ON true
+	LEFT JOIN LATERAL (
+		SELECT g.object_version_id, g.generation, g.state, g.warnings
+		FROM index_generations g
+		WHERE g.tenant_id = $1 AND g.collection_id = ci.collection_id
+		  AND g.object_version_id = lv.id
+		ORDER BY g.generation DESC LIMIT 1
+	) lg ON true
+	LEFT JOIN LATERAL (
+		SELECT j.id, j.error->>'message' AS error_message
+		FROM jobs j
+		WHERE j.tenant_id = $1
+		  AND j.operation IN ('` + rag.OperationEmbed + `', '` + rag.OperationIngest + `')
+		  AND j.input_ref = lg.object_version_id
+		  AND j.policy->>'generation' = lg.generation::text
+		  AND j.status = 'failed'
+		LIMIT 1
+	) j ON true`
+
+// documentSelect runs the lookups for every candidate row; use it when the
+// WHERE filter itself depends on the lookups (status ready/processing/
+// failed, failed-job listings).
+const documentSelect = documentColumns + `
 	FROM source_objects o
-	JOIN collection_items ci ON ci.tenant_id = o.tenant_id AND ci.object_id = o.id
-	LEFT JOIN latest_version lv ON lv.object_id = o.id
-	LEFT JOIN latest_gen lg ON lg.object_version_id = lv.id AND lg.collection_id = ci.collection_id
-	LEFT JOIN jobs j ON j.tenant_id = $1
-	     AND j.operation IN ('` + rag.OperationEmbed + `', '` + rag.OperationIngest + `')
-	     AND j.input_ref = lg.object_version_id
-	     AND j.policy->>'generation' = lg.generation::text
-	     AND j.status = 'failed'`
+	JOIN collection_items ci ON ci.tenant_id = o.tenant_id AND ci.object_id = o.id` + documentLookups
+
+// documentPageSelect opens a page CTE: callers append the base WHERE
+// predicate (object/collection-item columns only, never lookup columns),
+// ORDER BY o.first_seen_at DESC, o.id, ci.id and LIMIT/OFFSET, close it with
+// ")" and append documentPageTail so the expensive lookups run only for the
+// page's rows.
+const documentPageSelect = `
+	WITH page AS (
+		SELECT ci.id AS ci_id
+		FROM source_objects o
+		JOIN collection_items ci ON ci.tenant_id = o.tenant_id AND ci.object_id = o.id`
+
+const documentPageTail = documentColumns + `
+	FROM page
+	JOIN collection_items ci ON ci.tenant_id = $1 AND ci.id = page.ci_id
+	JOIN source_objects o ON o.tenant_id = ci.tenant_id AND o.id = ci.object_id` + documentLookups
 
 // documentStatusPredicate mirrors scanDocument's Go-side status derivation so
-// the repo filter and the service projection can never disagree.
-func documentStatusPredicate(status string) string {
+// the repo filter and the service projection can never disagree. needsLookups
+// reports whether the predicate references the lateral lookup columns (lg/j);
+// when false the filter can run inside a page CTE before any lookup exists.
+func documentStatusPredicate(status string) (predicate string, needsLookups bool) {
 	const (
 		removed = `(COALESCE(ci.removed_at, o.deleted_at, o.tombstoned_at) IS NOT NULL)`
 		failed  = `(j.id IS NOT NULL OR lg.state = 'failed')`
 	)
 	switch status {
 	case rag.DocumentStatusRemoved:
-		return removed
+		return removed, false
 	case rag.DocumentStatusFailed:
-		return `NOT ` + removed + ` AND ` + failed
+		return `NOT ` + removed + ` AND ` + failed, true
 	case rag.DocumentStatusReady:
-		return `NOT ` + removed + ` AND NOT ` + failed + ` AND lg.state = 'published'`
+		return `NOT ` + removed + ` AND NOT ` + failed + ` AND lg.state = 'published'`, true
 	case rag.DocumentStatusProcessing:
-		return `NOT ` + removed + ` AND NOT ` + failed + ` AND COALESCE(lg.state, 'staging') NOT IN ('published', 'failed')`
+		return `NOT ` + removed + ` AND NOT ` + failed + ` AND COALESCE(lg.state, 'staging') NOT IN ('published', 'failed')`, true
 	default:
-		return `NOT ` + removed
+		return `NOT ` + removed, false
 	}
 }
 
@@ -924,10 +954,17 @@ func (r *RAGRepo) ListDocuments(ctx context.Context, tenantID, collectionID, sta
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := r.db.SQL.QueryContext(ctx,
-		documentSelect+` WHERE o.tenant_id = $1 AND ci.collection_id = $2 AND `+documentStatusPredicate(status)+`
-		 ORDER BY o.first_seen_at DESC, o.id, ci.id LIMIT $3 OFFSET $4`,
-		tenantID, collectionID, limit, offset)
+	predicate, needsLookups := documentStatusPredicate(status)
+	const order = `ORDER BY o.first_seen_at DESC, o.id, ci.id`
+	var query string
+	if needsLookups {
+		query = documentSelect + ` WHERE o.tenant_id = $1 AND ci.collection_id = $2 AND ` + predicate + `
+		 ` + order + ` LIMIT $3 OFFSET $4`
+	} else {
+		query = documentPageSelect + ` WHERE o.tenant_id = $1 AND ci.collection_id = $2 AND ` + predicate + `
+		 ` + order + ` LIMIT $3 OFFSET $4)` + documentPageTail + ` ` + order
+	}
+	rows, err := r.db.SQL.QueryContext(ctx, query, tenantID, collectionID, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("list documents: %w", err)
 	}
@@ -963,15 +1000,42 @@ func (r *RAGRepo) ListTenantDocuments(ctx context.Context, tenantID string, limi
 		limit = 50
 	}
 	rows, err := r.db.SQL.QueryContext(ctx,
-		documentSelect+` WHERE o.tenant_id = $1
+		documentPageSelect+` WHERE o.tenant_id = $1
 		 AND COALESCE(ci.removed_at, o.deleted_at, o.tombstoned_at) IS NULL
-		 ORDER BY o.first_seen_at DESC, o.id, ci.id LIMIT $2 OFFSET $3`,
+		 ORDER BY o.first_seen_at DESC, o.id, ci.id LIMIT $2 OFFSET $3)`+documentPageTail+`
+		 ORDER BY o.first_seen_at DESC, o.id, ci.id`,
 		tenantID, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("list tenant documents: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	return collectDocuments(rows, tenantID)
+}
+
+// TenantDocumentObjectIDs returns one object id per live collection item of
+// the tenant — a document is an (object, collection) row, so duplicates are
+// kept. Raw building block for authorization batching; never served raw.
+func (r *RAGRepo) TenantDocumentObjectIDs(ctx context.Context, tenantID string) ([]string, error) {
+	rows, err := r.db.SQL.QueryContext(ctx, `
+		SELECT ci.object_id
+		FROM source_objects o
+		JOIN collection_items ci ON ci.tenant_id = o.tenant_id AND ci.object_id = o.id
+		WHERE o.tenant_id = $1
+		  AND ci.removed_at IS NULL AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL
+		ORDER BY ci.object_id`, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list tenant document ids: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // CountDocuments counts tenant documents; excludeRemoved drops the removed

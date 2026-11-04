@@ -118,7 +118,7 @@ func (s *Service) IngestJobHandler() jobs.HandlerFunc {
 		if err != nil {
 			return "", err
 		}
-		if err := s.enqueueEmbed(ctx, principal, collection, ref.ObjectID, versionID, ref.ObservedSeq, generation); err != nil {
+		if err := s.enqueueEmbed(ctx, principal, collection, ref.ObjectID, versionID, ref.ObservedSeq, generation, jobs.LaneBackground); err != nil {
 			return "", err
 		}
 		return versionID, nil

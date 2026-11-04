@@ -155,6 +155,7 @@ func (s *Service) Enqueue(ctx context.Context, p auth.Principal, req EnqueueRequ
 			InputRef:       req.InputRef,
 			InputHash:      req.InputHash,
 			Policy:         req.Policy,
+			Lane:           laneOrDefault(req.Lane),
 			MaxAttempts:    maxAttempts,
 		},
 		SubmitterKey: submitterKey(p),
@@ -208,7 +209,12 @@ func (c *Claim) AttemptID() string { return c.attemptID }
 // Expired running jobs with an unfinished dispatched attempt are swept to
 // unknown instead. Returns (nil,nil) when nothing is runnable.
 func (s *Service) Lease(ctx context.Context, workerID string, ttl time.Duration) (*Claim, error) {
-	cj, err := s.repo.Claim(ctx, workerID, ttl)
+	return s.LeaseLane(ctx, workerID, ttl, "")
+}
+
+// LeaseLane is Lease restricted to one lane ("" = any lane).
+func (s *Service) LeaseLane(ctx context.Context, workerID string, ttl time.Duration, lane Lane) (*Claim, error) {
+	cj, err := s.repo.Claim(ctx, workerID, ttl, lane)
 	if err != nil || cj == nil {
 		return nil, err
 	}
@@ -218,6 +224,13 @@ func (s *Service) Lease(ctx context.Context, workerID string, ttl time.Duration)
 		job:       cj.JobRow,
 		attemptID: cj.AttemptID,
 	}, nil
+}
+
+func laneOrDefault(lane Lane) Lane {
+	if lane == "" {
+		return LaneInteractive
+	}
+	return lane
 }
 
 // Heartbeat extends the claim's lease; ErrStaleFence when already lost.

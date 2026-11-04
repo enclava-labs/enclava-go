@@ -46,7 +46,7 @@ type Repository interface {
 type JobReader interface {
 	GetOwnedJob(ctx context.Context, tenantID, id, submitterKey string) (jobs.JobRow, error)
 	ListOwnedJobs(ctx context.Context, tenantID, submitterKey string, limit int) ([]jobs.JobRow, error)
-	ListConnectionJobs(ctx context.Context, tenantID, connectionID, status string, limit int) ([]jobs.JobRow, error)
+	ListConnectionJobs(ctx context.Context, tenantID, connectionID, operation, status string, limit int) ([]jobs.JobRow, error)
 }
 
 type CanonicalSourceRepository interface {
@@ -478,6 +478,7 @@ func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID str
 			InputRef:       conn.ID,
 			InputHash:      configHash,
 			Policy:         map[string]any{"connection_id": conn.ID, "stream": string(stream)},
+			Lane:           jobs.LaneBackground,
 		})
 		if err != nil {
 			return SyncJob{}, err
@@ -534,7 +535,7 @@ func (s *Service) ListSyncJobs(ctx context.Context, p auth.Principal, sourceID, 
 		// Scheduled syncs run under the scheduler's principal; a source-scoped
 		// listing must show them to the source's managers, not just the last
 		// manual submitter.
-		rows, err = s.jobRows.ListConnectionJobs(ctx, p.TenantID, wanted, status, limit+offset)
+		rows, err = s.jobRows.ListConnectionJobs(ctx, p.TenantID, wanted, OperationSync, status, limit+offset)
 	} else {
 		rows, err = s.jobRows.ListOwnedJobs(ctx, p.TenantID, jobs.SubmitterKey(p), limit*4+offset)
 	}

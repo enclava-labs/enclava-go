@@ -68,7 +68,8 @@ func (d dashboardSourcesData) DashboardTitle() string  { return "Sources" }
 func (d dashboardSourcesData) DashboardModule() string { return "sources" }
 
 // dashboardSourceRow is one rendered table row: real Source/SyncJob fields
-// only, plus server-resolved projections (collection name, next sync).
+// only, plus server-resolved projections (collection name, next sync, and the
+// IndexProgress rollup behind the progress bar and failure line).
 type dashboardSourceRow struct {
 	Source      connectors.Source
 	Provider    string // display label, e.g. "Slack"
@@ -82,10 +83,17 @@ type dashboardSourceRow struct {
 	NextEnabled bool
 	NextAt      time.Time
 
-	HasItems    bool
-	Items       int64
-	HasProgress bool
-	ProgressPct int
+	HasItems      bool
+	Items         int64
+	Indexed       int64
+	Failed        int64
+	Processing    int64
+	Fetching      bool   // the content stream is still listing items
+	FailureReason string // most common failed-item message, escaped at render
+	FailureCount  int64
+	NeedsBinding  bool // FailureReason points at an unlinked source identity
+	HasProgress   bool
+	ProgressPct   int
 }
 
 // sourceStatusFilter buckets rows for the filter chips (handler-side filter).
@@ -460,6 +468,28 @@ func (a *App) dashboardSourceRows(ctx context.Context, p auth.Principal) ([]dash
 		row.NextEnabled, row.NextAt = dashboardNextSync(src.Config, src.LastSyncAt, src.CreatedAt, src.IsEnabled)
 		row.HasProgress, row.ProgressPct = dashboardStatPercent(latest)
 		row.HasItems, row.Items = dashboardStatItems(latest)
+		if progress, err := a.connectorSvc.IndexProgress(ctx, p, src.ID); err == nil {
+			row.Fetching = progress.Fetching
+			row.HasItems = true
+			row.Items = progress.Items
+			row.Indexed = progress.Indexed
+			row.Failed = progress.Failed
+			row.Processing = progress.Processing
+			row.FailureReason = progress.FailureReason
+			row.FailureCount = progress.FailureCount
+			row.NeedsBinding = strings.Contains(progress.FailureReason, "bind their source identity")
+			if progress.Items > 0 {
+				row.HasProgress = true
+				row.ProgressPct = int((progress.Indexed + progress.Failed) * 100 / progress.Items)
+			}
+			if progress.Fetching || progress.Processing > 0 {
+				row.State = "syncing"
+			} else if progress.Failed > 0 && row.State == "healthy" {
+				row.State = "warning" // items that never indexed need someone's action
+			}
+		} else {
+			log.Printf("dashboard sources: index progress for %s: %v", src.ID, err)
+		}
 		if row.State == "syncing" {
 			anySyncing = true
 		}

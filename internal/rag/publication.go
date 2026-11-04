@@ -101,6 +101,7 @@ func (s *Service) EnqueueAccessBackfills(ctx context.Context) error {
 			IdempotencyKey: OperationAccessBackfill + ":" + tenantID + ":" + newID("fill"),
 			InputRef:       tenantID, InputHash: "backfill",
 			Policy: map[string]any{"tenant_id": tenantID},
+			Lane:   jobs.LaneBackground,
 		}); err != nil {
 			return err
 		}

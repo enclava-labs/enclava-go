@@ -95,6 +95,12 @@ type SourceRepository interface {
 	// AncestorObjectIDs returns the object and its complete, live ancestor chain.
 	// Missing, cross-connection, cyclic or over-depth chains return an error.
 	AncestorObjectIDs(ctx context.Context, tenantID, connectionID, objectID string, maxDepth int) ([]string, error)
+	// AncestorObjectIDsBatch resolves every object's complete, live ancestor
+	// chain in one query under the same rules as AncestorObjectIDs. Each
+	// returned key maps to that object's chain (the object first, parents
+	// last); an object whose chain is missing, cross-connection, cyclic or
+	// over-depth is simply absent from the map — CanRead denies identically.
+	AncestorObjectIDsBatch(ctx context.Context, tenantID, connectionID string, objectIDs []string, maxDepth int) (map[string][]string, error)
 	GrantsForObjects(ctx context.Context, tenantID, connectionID string, objectIDs []string, accessRevision int64) ([]SourceGrant, error)
 	BeginSnapshot(ctx context.Context, tenantID, connectionID, kind string, revision int64) error
 	// LatestCompleteRevision returns the newest COMPLETE snapshot revision

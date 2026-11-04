@@ -508,6 +508,132 @@ func TestDashboardSourcesUnmappedWarning(t *testing.T) {
 	}
 }
 
+// TestDashboardSourcesIndexProgress proves the per-source indexing rollup is
+// real: a still-listing sync shows found/indexed counts and keeps the table
+// polling, failed items surface the durable job's message, the unbound-
+// identity message upgrades to the User-bindings next step for an admin, and
+// a fully indexed source renders counts with no failure line.
+func TestDashboardSourcesIndexProgress(t *testing.T) {
+	f := newIdentityFixture(t)
+	ctx := context.Background()
+	sess, csrf := loginUser(t, f, "admin-progress@example.com",
+		[]string{auth.ScopePlatformAdmin, "connectors.manage", "rag", "rag.manage"}, "admin-pass")
+
+	rec := sessionDo(t, f.app, http.MethodPost, "/api/v1/rag/collections",
+		`{"name":"Progress library"}`, sess, csrf)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create collection: expected 201, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	collectionID, _ := decodeJSON(t, rec)["id"].(string)
+	if collectionID == "" {
+		t.Fatal("create collection: missing id")
+	}
+
+	made := map[string]string{}
+	for name, body := range map[string]string{
+		"slack": `{"type":"slack","name":"Progress chat","config":{"channel_id":"C789"},"credential_ref":"CONNECTOR_SLACK_PROGRESS","target_collection_id":"` + collectionID + `"}`,
+		"clean": `{"type":"github","name":"Done repo","config":{"owner":"enclava","repo":"done"},"target_collection_id":"` + collectionID + `"}`,
+	} {
+		rec := sessionDo(t, f.app, http.MethodPost, "/api/v1/connectors/sources", body, sess, csrf)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create %s source: expected 201, got %d body=%s", name, rec.Code, rec.Body.String())
+		}
+		id, _ := decodeJSON(t, rec)["id"].(string)
+		if id == "" {
+			t.Fatalf("create %s source: missing id in response", name)
+		}
+		made[name] = id
+	}
+
+	tenant := f.tenant
+	for _, seed := range []struct {
+		stmt string
+		args []any
+	}{
+		// Slack: one indexed item, one published item whose embed job failed
+		// (the unbound-identity denial), one still processing.
+		{`INSERT INTO source_objects (tenant_id, id, connection_id, kind, native_id, authorization_mode, observed_seq)
+		  VALUES ($1, 'prog_obj1', $2, 'message', 'slack:T1', 'source_acl', 1),
+		         ($1, 'prog_obj2', $2, 'message', 'slack:T2', 'source_acl', 1),
+		         ($1, 'prog_obj3', $2, 'message', 'slack:T3', 'source_acl', 1)`, []any{tenant, made["slack"]}},
+		{`INSERT INTO source_object_versions (tenant_id, id, object_id, observed_seq, artifact_ref, content_sha256, byte_size)
+		  VALUES ($1, 'prog_ver1', 'prog_obj1', 1, 'art1', 'sha1', 10),
+		         ($1, 'prog_ver2', 'prog_obj2', 1, 'art2', 'sha2', 10),
+		         ($1, 'prog_ver3', 'prog_obj3', 1, 'art3', 'sha3', 10)`, []any{tenant}},
+		{`INSERT INTO collection_items (tenant_id, id, collection_id, object_id)
+		  VALUES ($1, 'prog_ci1', $2, 'prog_obj1'), ($1, 'prog_ci2', $2, 'prog_obj2'), ($1, 'prog_ci3', $2, 'prog_obj3')`, []any{tenant, collectionID}},
+		{`INSERT INTO index_generations (tenant_id, id, collection_id, object_version_id, generation, state)
+		  VALUES ($1, 'prog_gen1', $2, 'prog_ver1', 1, 'published'),
+		         ($1, 'prog_gen2', $2, 'prog_ver2', 1, 'published'),
+		         ($1, 'prog_gen3', $2, 'prog_ver3', 1, 'staging')`, []any{tenant, collectionID}},
+		{`INSERT INTO jobs (tenant_id, id, operation, status, connection_id, idempotency_key, input_hash, input_ref, principal, submitter_key, policy, error)
+		  VALUES ($1, 'prog_embed_fail', 'rag.embed', 'failed', $2, 'prog-embed-1', 'h', 'prog_ver2',
+		          '{}'::jsonb, 'test-submitter', '{"generation":"1"}'::jsonb,
+		          '{"message":"the indexing user has no access to this item in the source; bind their source identity, then sync again"}'::jsonb)`, []any{tenant, made["slack"]}},
+		// GitHub: the only item published with no failed job — fully indexed.
+		{`INSERT INTO source_objects (tenant_id, id, connection_id, kind, native_id, authorization_mode, observed_seq)
+		  VALUES ($1, 'prog_obj9', $2, 'file', 'gh:done/readme.md', 'source_acl', 1)`, []any{tenant, made["clean"]}},
+		{`INSERT INTO source_object_versions (tenant_id, id, object_id, observed_seq, artifact_ref, content_sha256, byte_size)
+		  VALUES ($1, 'prog_ver9', 'prog_obj9', 1, 'art9', 'sha9', 10)`, []any{tenant}},
+		{`INSERT INTO collection_items (tenant_id, id, collection_id, object_id)
+		  VALUES ($1, 'prog_ci9', $2, 'prog_obj9')`, []any{tenant, collectionID}},
+		{`INSERT INTO index_generations (tenant_id, id, collection_id, object_version_id, generation, state)
+		  VALUES ($1, 'prog_gen9', $2, 'prog_ver9', 1, 'published')`, []any{tenant, collectionID}},
+	} {
+		if _, err := f.db.SQL.ExecContext(ctx, seed.stmt, seed.args...); err != nil {
+			t.Fatalf("seed progress rows: %v", err)
+		}
+	}
+
+	// A queued content-stream job keeps the slack source in Fetching.
+	jobsRepo := postgres.NewJobsRepo(f.db)
+	if _, _, err := jobsRepo.InsertJob(ctx, jobs.InsertRecord{
+		Job: jobs.Job{
+			TenantID:       tenant,
+			ID:             "prog_sync",
+			Operation:      connectors.OperationSync,
+			Subject:        jobs.Subject{ConnectionID: made["slack"]},
+			IdempotencyKey: "prog-sync-1",
+			InputHash:      "test-hash",
+			CreatedAt:      time.Now().UTC(),
+			UpdatedAt:      time.Now().UTC(),
+		},
+		SubmitterKey: "test-submitter",
+		Principal:    json.RawMessage(`{}`),
+		PolicyJSON:   []byte(`{"connection_id":"` + made["slack"] + `","stream":"content"}`),
+	}); err != nil {
+		t.Fatalf("seed queued content sync: %v", err)
+	}
+
+	rec = sessionDo(t, f.app, http.MethodGet, "/dashboard/sources", "", sess, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /dashboard/sources: expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	page := rec.Body.String()
+	for _, want := range []string{
+		"Fetching… 3 found · 1 indexed", // live counts while the stream lists
+		`aria-valuenow="66"`,            // (indexed+failed)/items = 2/3
+		"every 3s",                      // in-flight work keeps the poll alive
+		"1 item can't be indexed: your Slack account isn't linked to your Enclava user",
+		"link it in User bindings, then Sync now.",
+		`data-action="sources:bindings"`, // the admin's next step rides the row
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("sources page missing %q", want)
+		}
+	}
+	if strings.Contains(page, "not indexed") {
+		t.Fatal("bound-identity failure rendered the generic line instead of the actionable text")
+	}
+	if got := strings.Count(page, "isn't linked to your Enclava user"); got != 1 {
+		t.Fatalf("expected the bindings warning on exactly one row, got %d", got)
+	}
+	// The fully indexed row carries its item count and nothing else.
+	if !strings.Contains(page, `data-label="Items">1`) {
+		t.Fatal("fully indexed source missing its item count")
+	}
+}
+
 // TestDashboardSourcesCredentialsTab covers the access.manage-gated
 // Credentials tab and its API over the real store: the disabled notice
 // without ENCLAVA_SECRETS_KEY, write-only secrets, name conflicts, the

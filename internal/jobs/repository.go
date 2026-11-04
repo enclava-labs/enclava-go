@@ -79,8 +79,8 @@ type JobsRepository interface {
 	// running with an expired lease and no unfinished dispatched attempt),
 	// bumping fence_token, stamping lease_owner/lease_expires_at and
 	// inserting the job_attempts row. Returns (nil,nil) when nothing is
-	// runnable — callers poll again.
-	Claim(ctx context.Context, workerID string, ttl time.Duration) (*ClaimedJob, error)
+	// runnable — callers poll again. lane "" claims from every lane.
+	Claim(ctx context.Context, workerID string, ttl time.Duration, lane Lane) (*ClaimedJob, error)
 
 	// ExtendLease advances lease_expires_at only while owner+fence hold it.
 	ExtendLease(ctx context.Context, tenantID, jobID, owner string, fence int64, ttl time.Duration) (time.Time, error)

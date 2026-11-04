@@ -36,6 +36,7 @@ var _ InputResolver = (*artifacts.Store)(nil)
 type RunnerConfig struct {
 	WorkerID        string        // process-unique; "worker-<pid>-<rand>" when empty
 	Operations      []string      // claimable operations; empty = claim everything
+	Lane            Lane          // claimable lane; "" = every lane
 	Concurrency     int           // max simultaneous handlers; default 4
 	PollInterval    time.Duration // idle poll delay; default 500ms
 	LeaseTTL        time.Duration // lease duration per claim; default 30s
@@ -86,38 +87,26 @@ func (r *Runner) Run(ctx context.Context) error {
 	sem := make(chan struct{}, r.cfg.Concurrency)
 	var wg sync.WaitGroup
 	for {
-		select {
-		case <-ctx.Done():
-			wg.Wait()
-			return nil
-		default:
-		}
-		claim, err := r.svc.Lease(ctx, r.cfg.WorkerID, r.cfg.LeaseTTL)
-		if err != nil {
-			if ctx.Err() != nil {
-				wg.Wait()
-				return nil
-			}
-			if !sleep(ctx, r.cfg.PollInterval) {
-				wg.Wait()
-				return nil
-			}
-			continue
-		}
-		if claim == nil {
-			if !sleep(ctx, r.cfg.PollInterval) {
-				wg.Wait()
-				return nil
-			}
-			continue
-		}
+		// Take a slot before claiming: a claim never waits unheartbeated
+		// for capacity while its lease runs out.
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
-			// Never started: release so the job is requeued promptly.
-			_ = claim.Release(context.Background())
 			wg.Wait()
 			return nil
+		}
+		claim, err := r.svc.LeaseLane(ctx, r.cfg.WorkerID, r.cfg.LeaseTTL, r.cfg.Lane)
+		if err != nil || claim == nil {
+			<-sem
+			if err != nil && ctx.Err() != nil {
+				wg.Wait()
+				return nil
+			}
+			if !sleep(ctx, r.cfg.PollInterval) {
+				wg.Wait()
+				return nil
+			}
+			continue
 		}
 		wg.Add(1)
 		go func() {

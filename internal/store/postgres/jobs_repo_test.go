@@ -99,7 +99,7 @@ func TestJobsRepoClaimRaces(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			cj, err := r.Claim(ctx, fmt.Sprintf("%c", 'a'+i), time.Second)
+			cj, err := r.Claim(ctx, fmt.Sprintf("%c", 'a'+i), time.Second, "")
 			if err != nil {
 				t.Errorf("claim: %v", err)
 				return
@@ -133,6 +133,43 @@ func TestJobsRepoClaimRaces(t *testing.T) {
 	}
 }
 
+// TestJobsRepoClaimHonoursLanes: an interactive runner never takes background
+// work, however old, and vice versa; the any-lane claim keeps FIFO order.
+func TestJobsRepoClaimHonoursLanes(t *testing.T) {
+	db := RequireTestDB(t)
+	ctx := context.Background()
+	tenant := idTenantA
+	seedTenant(t, ctx, db, tenant)
+	r := NewJobsRepo(db)
+	insert := func(key string, lane jobs.Lane) {
+		t.Helper()
+		rec := jobs.InsertRecord{
+			Job:          jobs.Job{TenantID: tenant, ID: "job_" + key, Operation: "op", Status: jobs.StatusQueued, IdempotencyKey: key, InputHash: "h", Lane: lane, MaxAttempts: 3},
+			SubmitterKey: "sub-1", Principal: json.RawMessage(`{"actor":"a"}`), PolicyJSON: []byte(`{}`),
+		}
+		if _, _, err := r.InsertJob(ctx, rec); err != nil {
+			t.Fatalf("insert %s: %v", key, err)
+		}
+		time.Sleep(5 * time.Millisecond) // distinct submitted_at
+	}
+	insert("bulk-1", jobs.LaneBackground)
+	insert("bulk-2", jobs.LaneBackground)
+	insert("upload", "") // default lane
+
+	if cj, err := r.Claim(ctx, "interactive", time.Second, jobs.LaneInteractive); err != nil || cj == nil || cj.ID != "job_upload" {
+		t.Fatalf("interactive claim = %v, %v; want the newer interactive job", cj, err)
+	}
+	if cj, err := r.Claim(ctx, "interactive", time.Second, jobs.LaneInteractive); err != nil || cj != nil {
+		t.Fatalf("interactive runner took background work: %v, %v", cj, err)
+	}
+	if cj, err := r.Claim(ctx, "any", time.Second, ""); err != nil || cj == nil || cj.ID != "job_bulk-1" {
+		t.Fatalf("any-lane claim = %v, %v; want the oldest job", cj, err)
+	}
+	if cj, err := r.Claim(ctx, "background", time.Second, jobs.LaneBackground); err != nil || cj == nil || cj.ID != "job_bulk-2" {
+		t.Fatalf("background claim = %v, %v", cj, err)
+	}
+}
+
 // TestJobsRepoExpiredDispatchSweep proves Claim's first phase: an expired
 // running job whose dispatched attempt never finished is swept to unknown —
 // never re-leased.
@@ -144,7 +181,7 @@ func TestJobsRepoExpiredDispatchSweep(t *testing.T) {
 	r := NewJobsRepo(db)
 	job := insertJobRow(t, ctx, r, tenant, "k1", "op")
 
-	cj, err := r.Claim(ctx, "w1", 60*time.Millisecond)
+	cj, err := r.Claim(ctx, "w1", 60*time.Millisecond, "")
 	if err != nil || cj == nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -153,7 +190,7 @@ func TestJobsRepoExpiredDispatchSweep(t *testing.T) {
 	}
 	time.Sleep(80 * time.Millisecond)
 
-	cj2, err := r.Claim(ctx, "w2", time.Second)
+	cj2, err := r.Claim(ctx, "w2", time.Second, "")
 	if err != nil {
 		t.Fatalf("second claim: %v", err)
 	}
@@ -190,12 +227,12 @@ func TestJobsRepoUndispatchedReclaimReleases(t *testing.T) {
 	r := NewJobsRepo(db)
 	insertJobRow(t, ctx, r, tenant, "k1", "op")
 
-	cj, err := r.Claim(ctx, "w1", 60*time.Millisecond)
+	cj, err := r.Claim(ctx, "w1", 60*time.Millisecond, "")
 	if err != nil || cj == nil {
 		t.Fatalf("claim: %v", err)
 	}
 	time.Sleep(80 * time.Millisecond)
-	cj2, err := r.Claim(ctx, "w2", time.Second)
+	cj2, err := r.Claim(ctx, "w2", time.Second, "")
 	if err != nil || cj2 == nil {
 		t.Fatalf("reclaim: %v cj2=%v", err, cj2)
 	}
@@ -229,7 +266,7 @@ func TestJobsRepoRetryableRequeueBackoff(t *testing.T) {
 	r := NewJobsRepo(db)
 	job := insertJobRow(t, ctx, r, tenant, "k1", "op")
 
-	cj, err := r.Claim(ctx, "w1", time.Second)
+	cj, err := r.Claim(ctx, "w1", time.Second, "")
 	if err != nil || cj == nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -242,11 +279,11 @@ func TestJobsRepoRetryableRequeueBackoff(t *testing.T) {
 	if row.Status != jobs.StatusQueued {
 		t.Fatalf("retryable fail must requeue, got %q", row.Status)
 	}
-	if c, err := r.Claim(ctx, "w2", time.Second); err != nil || c != nil {
+	if c, err := r.Claim(ctx, "w2", time.Second, ""); err != nil || c != nil {
 		t.Fatalf("job inside backoff must not be claimable")
 	}
 	time.Sleep(140 * time.Millisecond)
-	c2, err := r.Claim(ctx, "w2", time.Second)
+	c2, err := r.Claim(ctx, "w2", time.Second, "")
 	if err != nil || c2 == nil {
 		t.Fatalf("job past backoff must be claimable: %v", err)
 	}
@@ -378,7 +415,7 @@ func TestJobsRepoActivityProgressRoundTrip(t *testing.T) {
 	counted := insertActorJob(t, ctx, r, tenant, "job_progress", "extract.process", jobs.StatusQueued, "actor-1")
 	blank := insertActorJob(t, ctx, r, tenant, "job_blank", "extract.process", jobs.StatusQueued, "actor-1")
 
-	cj, err := r.Claim(ctx, "w1", time.Second)
+	cj, err := r.Claim(ctx, "w1", time.Second, "")
 	if err != nil || cj == nil || cj.ID != counted.ID {
 		t.Fatalf("claim counted job: cj=%v err=%v", cj, err)
 	}

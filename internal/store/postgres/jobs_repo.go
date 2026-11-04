@@ -193,13 +193,13 @@ func (r *JobsRepo) InsertJob(ctx context.Context, rec jobs.InsertRecord) (*jobs.
 		INSERT INTO jobs (tenant_id, id, operation, status, connection_id,
 		                  object_id, observed_revision, idempotency_key,
 		                  input_hash, input_ref, principal, submitter_key,
-		                  policy, max_attempts)
-		VALUES ($1,$2,$3,'queued',$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13)`,
+		                  policy, max_attempts, lane)
+		VALUES ($1,$2,$3,'queued',$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,COALESCE(NULLIF($14, ''), 'interactive'))`,
 		rec.TenantID, rec.ID, rec.Operation,
 		nullString(rec.Subject.ConnectionID), nullString(rec.Subject.ObjectID),
 		nullInt64(rec.Subject.ObservedRevision), rec.IdempotencyKey,
 		rec.InputHash, nullString(rec.InputRef), rec.Principal,
-		rec.SubmitterKey, policy, rec.MaxAttempts)
+		rec.SubmitterKey, policy, rec.MaxAttempts, string(rec.Lane))
 	switch {
 	case err == nil:
 		return nil, false, nil
@@ -372,19 +372,18 @@ func (r *JobsRepo) ListManagedJobs(ctx context.Context, tenantID string, ops, st
 // ListConnectionJobs lists a connection's non-deleted jobs regardless of
 // submitter — scheduled syncs run under the scheduler's principal, and the
 // source's managers must still see them. Tenant + connection scoping is the
-// authorization boundary.
-func (r *JobsRepo) ListConnectionJobs(ctx context.Context, tenantID, connectionID, status string, limit int) ([]jobs.JobRow, error) {
+// authorization boundary. operation/status "" match any; filtering happens
+// before the limit, so a sync's thousands of ingest jobs never push its
+// connector.sync rows out of the window.
+func (r *JobsRepo) ListConnectionJobs(ctx context.Context, tenantID, connectionID, operation, status string, limit int) ([]jobs.JobRow, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	query := `
 		SELECT ` + jobColumns + ` FROM jobs
-		WHERE tenant_id = $1 AND connection_id = $2 AND deleted_at IS NULL`
-	args := []any{tenantID, connectionID}
-	if status != "" {
-		query += ` AND status = $3`
-		args = append(args, status)
-	}
+		WHERE tenant_id = $1 AND connection_id = $2 AND deleted_at IS NULL
+		  AND ($3 = '' OR operation = $3) AND ($4 = '' OR status = $4)`
+	args := []any{tenantID, connectionID, operation, status}
 	query += ` ORDER BY submitted_at DESC, id DESC LIMIT ` + strconv.Itoa(limit) //nolint:gosec // limit is an int, cannot inject SQL
 	rows, err := r.db.SQL.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -488,7 +487,7 @@ func (r *JobsRepo) ListDeletedExtractJobs(ctx context.Context) ([]jobs.JobRow, e
 //     not-before lease_expires_at, or running with an expired lease and no
 //     unfinished dispatched attempt), bumps fence_token, stamps the lease,
 //     closes any still-open prior attempts and inserts the new attempt row.
-func (r *JobsRepo) Claim(ctx context.Context, workerID string, ttl time.Duration) (*jobs.ClaimedJob, error) {
+func (r *JobsRepo) Claim(ctx context.Context, workerID string, ttl time.Duration, lane jobs.Lane) (*jobs.ClaimedJob, error) {
 	var out *jobs.ClaimedJob
 	err := WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
 		// 1. Expired-dispatch sweep → unknown (job + its open attempt).
@@ -534,6 +533,7 @@ func (r *JobsRepo) Claim(ctx context.Context, workerID string, ttl time.Duration
 				SELECT tenant_id, id FROM jobs c
 				WHERE c.cancel_requested_at IS NULL
 				  AND c.deleted_at IS NULL
+				  AND ($3 = '' OR c.lane = $3)
 				  AND (
 				    (c.status = 'queued'
 				     AND (c.lease_expires_at IS NULL OR c.lease_expires_at <= now()))
@@ -550,7 +550,7 @@ func (r *JobsRepo) Claim(ctx context.Context, workerID string, ttl time.Duration
 				FOR UPDATE SKIP LOCKED
 			)
 			RETURNING `+jobColumns,
-			workerID, fmt.Sprintf("%f seconds", ttl.Seconds())))
+			workerID, fmt.Sprintf("%f seconds", ttl.Seconds()), string(lane)))
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil // nothing runnable — not an error

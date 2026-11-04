@@ -70,9 +70,17 @@ type Repository interface {
 	ListDocuments(ctx context.Context, tenantID, collectionID, status string, limit, offset int) ([]Document, error)
 	ListFailedDocuments(ctx context.Context, tenantID string, limit, offset int) ([]Document, error)
 	ListTenantDocuments(ctx context.Context, tenantID string, limit, offset int) ([]Document, error)
+	// TenantDocumentObjectIDs returns one object id per live collection
+	// item (duplicates kept, liveness = ListTenantDocuments' projection) —
+	// the flat read CountDocuments authorizes instead of paging full rows.
+	TenantDocumentObjectIDs(ctx context.Context, tenantID string) ([]string, error)
 	CountDocuments(ctx context.Context, tenantID string, excludeRemoved bool) (int64, error)
 	LiveCollectionSourceIDs(ctx context.Context, tenantID, collectionID string) (map[string]struct{}, error)
 	GetDocument(ctx context.Context, tenantID, objectID string) (Document, error)
+	// GetObjects reads many canonical objects in one query — one map entry
+	// per found id, keyed by object id, same row projection as GetObject.
+	// A missing id has no entry; callers decide the not-found outcome.
+	GetObjects(ctx context.Context, tenantID string, ids []string) (map[string]source.Object, error)
 	CreateUploadIfNew(ctx context.Context, collectionID, actorID string, object source.Object, version source.ObjectVersion, excludedIDs []string) (string, error)
 	ListBlockLocators(ctx context.Context, tenantID string, blockIDs []string) (map[string]source.Locator, error)
 	ListPublishedGenerations(ctx context.Context, tenantID, collectionID string) ([]IndexGeneration, error)
@@ -243,15 +251,13 @@ func (s *Service) reembedPending(ctx context.Context, p auth.Principal, c Collec
 	if err != nil {
 		return err
 	}
-	for _, doc := range docs {
-		obj, err := s.repo.GetObject(ctx, p.TenantID, doc.ID)
-		if denied, failure := deniedOrFailed(err); failure != nil {
-			return failure
-		} else if denied {
-			continue
-		}
-		// Same rule as a manual reprocess: only documents the caller can read.
-		if denied, failure := deniedOrFailed(s.authorizer.CanRead(ctx, p, obj, source.ReadOptions{})); failure != nil {
+	// Same rule as a manual reprocess: only documents the caller can read.
+	readErrs, err := s.authorizeDocuments(ctx, p, docs)
+	if err != nil {
+		return err
+	}
+	for i, doc := range docs {
+		if denied, failure := deniedOrFailed(readErrs[i]); failure != nil {
 			return failure
 		} else if denied {
 			continue
@@ -288,6 +294,7 @@ func (s *Service) enqueueReembedScan(ctx context.Context, p auth.Principal, c Co
 		TenantID: p.TenantID, Operation: OperationReembedScan,
 		IdempotencyKey: fmt.Sprintf("rag.reembed_scan:%s:%s", c.ID, newID("scan")),
 		InputRef:       c.ID, Policy: map[string]any{"collection_id": c.ID},
+		Lane: jobs.LaneBackground,
 	})
 	return err
 }
@@ -333,8 +340,12 @@ func (s *Service) ReembedProgress(ctx context.Context, p auth.Principal, collect
 	for _, doc := range pendingDocs {
 		pendingIDs[doc.ID] = struct{}{}
 	}
-	for _, doc := range totalDocs {
-		if denied, failure := deniedOrFailed(s.authorizeDocumentRead(ctx, p, doc)); failure != nil {
+	readErrs, err := s.authorizeDocuments(ctx, p, totalDocs)
+	if err != nil {
+		return 0, 0, err
+	}
+	for i, doc := range totalDocs {
+		if denied, failure := deniedOrFailed(readErrs[i]); failure != nil {
 			return 0, 0, failure
 		} else if denied {
 			continue
@@ -353,7 +364,7 @@ func (s *Service) reembedDocument(ctx context.Context, p auth.Principal, c Colle
 	if err != nil {
 		return err
 	}
-	return s.enqueueEmbed(ctx, p, c, objectID, versionID, seq, gen)
+	return s.enqueueEmbed(ctx, p, c, objectID, versionID, seq, gen, jobs.LaneBackground)
 }
 
 // retireIndexes drops the collection's retired indexes that no live
@@ -720,13 +731,7 @@ func (s *Service) ListDocuments(ctx context.Context, p auth.Principal, collectio
 		// Removed rows are unknown to non-managers, not an error.
 		return []Document{}, nil
 	}
-	batch := 4 * limit
-	if batch < 50 {
-		batch = 50
-	}
-	if batch > 400 {
-		batch = 400
-	}
+	batch := 400
 	var authorized []Document
 	wanted := offset + limit
 	for rawOffset := 0; len(authorized) < wanted; {
@@ -737,11 +742,15 @@ func (s *Service) ListDocuments(ctx context.Context, p auth.Principal, collectio
 		if len(rows) == 0 {
 			break
 		}
-		for _, d := range rows {
+		readErrs, err := s.authorizeDocuments(ctx, p, rows)
+		if err != nil {
+			return nil, err
+		}
+		for i, d := range rows {
 			// Removed metadata is manage-gated above; live rows pass the
 			// same source authorization as every other content read.
 			if d.Status != DocumentStatusRemoved {
-				if err := s.authorizeDocumentRead(ctx, p, d); err != nil {
+				if err := readErrs[i]; err != nil {
 					if errors.Is(err, source.ErrDenied) {
 						continue
 					}
@@ -775,6 +784,58 @@ func (s *Service) authorizeDocumentRead(ctx context.Context, p auth.Principal, d
 	return s.authorizer.CanRead(ctx, p, obj, source.ReadOptions{})
 }
 
+// authorizeDocuments is the batch form of authorizeDocumentRead: one object
+// fetch for the whole document set plus CanReadMany, which costs a constant
+// number of queries per connection instead of several per document. Result
+// i applies to docs[i]; a document whose object row is missing yields the
+// same not-found outcome GetObject gives the single-read path.
+func (s *Service) authorizeDocuments(ctx context.Context, p auth.Principal, docs []Document) ([]error, error) {
+	ids := make([]string, 0, len(docs))
+	for _, d := range docs {
+		ids = append(ids, d.ID)
+	}
+	errsByID, err := s.authorizeObjectIDs(ctx, p, ids)
+	if err != nil {
+		return nil, err
+	}
+	errs := make([]error, len(docs))
+	for i, d := range docs {
+		errs[i] = errsByID[d.ID]
+	}
+	return errs, nil
+}
+
+// authorizeObjectIDs is the id-keyed core of authorizeDocuments: every
+// distinct id is fetched and authorized once, the outcome keyed by object
+// id so callers working over id lists (including duplicates) share it.
+func (s *Service) authorizeObjectIDs(ctx context.Context, p auth.Principal, ids []string) (map[string]error, error) {
+	objects, err := s.repo.GetObjects(ctx, p.TenantID, ids)
+	if err != nil {
+		return nil, err
+	}
+	errsByID := make(map[string]error, len(ids))
+	var batch []source.Object
+	var batchIDs []string
+	for _, id := range ids {
+		if _, done := errsByID[id]; done {
+			continue
+		}
+		obj, ok := objects[id]
+		if !ok {
+			errsByID[id] = source.ErrDenied
+			continue
+		}
+		errsByID[id] = source.ErrDenied // provisional until CanReadMany fills it
+		batch = append(batch, obj)
+		batchIDs = append(batchIDs, id)
+	}
+	readErrs := s.authorizer.CanReadMany(ctx, p, batch, source.ReadOptions{})
+	for j, id := range batchIDs {
+		errsByID[id] = readErrs[j]
+	}
+	return errsByID, nil
+}
+
 // ListFailedDocuments returns up to limit failed documents the caller may
 // read. The raw tenant-wide failure set is authorized BEFORE the limit, so
 // restricted failures filling the head cannot hide an authorized failure
@@ -786,13 +847,10 @@ func (s *Service) ListFailedDocuments(ctx context.Context, p auth.Principal, lim
 	if limit <= 0 {
 		limit = 20
 	}
-	batch := 4 * limit
-	if batch < 50 {
-		batch = 50
-	}
-	if batch > 400 {
-		batch = 400
-	}
+	// The failed filter recomputes every candidate per query, so one large
+	// scan batch avoids the O(N²) of paging small windows; the loop still
+	// covers tenants beyond it.
+	const batch = 5000
 	var authorized []Document
 	for rawOffset := 0; len(authorized) < limit; {
 		rows, err := s.repo.ListFailedDocuments(ctx, p.TenantID, batch, rawOffset)
@@ -802,8 +860,12 @@ func (s *Service) ListFailedDocuments(ctx context.Context, p auth.Principal, lim
 		if len(rows) == 0 {
 			break
 		}
-		for _, d := range rows {
-			if err := s.authorizeDocumentRead(ctx, p, d); err != nil {
+		readErrs, err := s.authorizeDocuments(ctx, p, rows)
+		if err != nil {
+			return nil, err
+		}
+		for i, d := range rows {
+			if err := readErrs[i]; err != nil {
 				if errors.Is(err, source.ErrDenied) {
 					continue
 				}
@@ -829,27 +891,31 @@ func (s *Service) CountDocuments(ctx context.Context, p auth.Principal) (int64, 
 	if err := requireTenant(p); err != nil {
 		return 0, err
 	}
+	ids, err := s.repo.TenantDocumentObjectIDs(ctx, p.TenantID)
+	if err != nil {
+		return 0, err
+	}
+	// Each returned id is one live collection item; authorizing each
+	// distinct object once keeps multi-collection reads counted per item.
 	var count int64
-	const batch = 200
-	for rawOffset := 0; ; rawOffset += batch {
-		rows, err := s.repo.ListTenantDocuments(ctx, p.TenantID, batch, rawOffset)
+	const chunk = 2000
+	for start := 0; start < len(ids); start += chunk {
+		end := start + chunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		readErrs, err := s.authorizeObjectIDs(ctx, p, ids[start:end])
 		if err != nil {
 			return 0, err
 		}
-		if len(rows) == 0 {
-			break
-		}
-		for _, d := range rows {
-			if err := s.authorizeDocumentRead(ctx, p, d); err != nil {
+		for _, id := range ids[start:end] {
+			if err := readErrs[id]; err != nil {
 				if errors.Is(err, source.ErrDenied) {
 					continue
 				}
 				return 0, err
 			}
 			count++
-		}
-		if len(rows) < batch {
-			break
 		}
 	}
 	return count, nil
@@ -954,7 +1020,7 @@ func (s *Service) ReprocessDocument(ctx context.Context, p auth.Principal, docum
 	if err != nil {
 		return UploadDocumentOutput{}, err
 	}
-	if err := s.enqueueEmbed(ctx, p, c, obj.ID, doc.ObjectVersionID, doc.ObservedSeq, gen); err != nil {
+	if err := s.enqueueEmbed(ctx, p, c, obj.ID, doc.ObjectVersionID, doc.ObservedSeq, gen, jobs.LaneInteractive); err != nil {
 		return UploadDocumentOutput{}, err
 	}
 	return UploadDocumentOutput{Document: doc}, nil
@@ -1074,7 +1140,7 @@ func (s *Service) persistUpload(ctx context.Context, p auth.Principal, c Collect
 	if err != nil {
 		return UploadDocumentOutput{}, err
 	}
-	if err := s.enqueueEmbed(ctx, p, c, obj.ID, versionID, ver.ObservedSeq, gen); err != nil {
+	if err := s.enqueueEmbed(ctx, p, c, obj.ID, versionID, ver.ObservedSeq, gen, jobs.LaneInteractive); err != nil {
 		return UploadDocumentOutput{}, err
 	}
 	doc, err := s.repo.GetDocument(ctx, p.TenantID, obj.ID)
@@ -1143,7 +1209,7 @@ func (s *Service) persistDocumentArtifact(ctx context.Context, p auth.Principal,
 	if err != nil {
 		return UploadDocumentOutput{}, err
 	}
-	if err := s.enqueueEmbed(ctx, p, c, obj.ID, versionID, ver.ObservedSeq, gen); err != nil {
+	if err := s.enqueueEmbed(ctx, p, c, obj.ID, versionID, ver.ObservedSeq, gen, jobs.LaneInteractive); err != nil {
 		return UploadDocumentOutput{}, err
 	}
 	doc, err := s.repo.GetDocument(ctx, p.TenantID, obj.ID)
@@ -1160,8 +1226,9 @@ func versionRowID(ver source.ObjectVersion) string {
 // enqueueEmbed stages the generation row and enqueues the fenced embed job.
 // The idempotency key binds (object, observed seq, generation) so replays of
 // the same version resolve to the same job and a reprocess (new generation)
-// is distinct work.
-func (s *Service) enqueueEmbed(ctx context.Context, p auth.Principal, c Collection, objectID, versionID string, seq, generation int64) error {
+// is distinct work. lane: interactive for uploads and reprocess, background
+// for connector ingest and re-embeds.
+func (s *Service) enqueueEmbed(ctx context.Context, p auth.Principal, c Collection, objectID, versionID string, seq, generation int64, lane jobs.Lane) error {
 	if err := s.repo.ReplaceVersionChunksAndStage(ctx, p.TenantID, c.ID, objectID, versionID, seq, generation, "" /* profile bound at attempt */, nil); err != nil {
 		return err
 	}
@@ -1185,6 +1252,7 @@ func (s *Service) enqueueEmbed(ctx context.Context, p auth.Principal, c Collecti
 			"embedding_model":          c.EmbeddingModel,
 			"chunk_profile_version_id": c.ChunkProfileVersionID,
 		},
+		Lane: lane,
 	})
 	return err
 }
