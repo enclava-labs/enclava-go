@@ -608,13 +608,35 @@ func (a *App) buildChatSources(ctx context.Context, p auth.Principal, raw string
 		if title == "" {
 			title = "Document"
 		}
+		location := evidenceLocationLine(res.Locations)
+		if location == "" {
+			// Messages and pages share one title (the channel or page); the
+			// passage's first line (e.g. "#general · Ana · 2026-05-08 09:42
+			// UTC") tells the rows apart.
+			if text, err := a.ragSvc.ReadEvidence(ctx, p, res.ID); err == nil {
+				location = passageHeadline(text.Content)
+			}
+		}
 		rows = append(rows, chatSourceRow{
 			EvidenceID: res.ID,
 			Title:      title,
 			Provider:   sourceProviderLabel(res.SourceKind),
-			Location:   evidenceLocationLine(res.Locations),
+			Location:   location,
 			OpenHref:   res.NativeLink,
 		})
 	}
 	return rows
+}
+
+// passageHeadline is the first non-empty line of a passage, at most 120 runes.
+func passageHeadline(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			if runes := []rune(line); len(runes) > 120 {
+				return string(runes[:119]) + "…"
+			}
+			return line
+		}
+	}
+	return ""
 }
