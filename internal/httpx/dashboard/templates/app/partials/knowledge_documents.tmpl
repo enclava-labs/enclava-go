@@ -28,7 +28,7 @@
       </thead>
       <tbody>
 {{range .Data.Docs}}        <tr>
-          <td data-label="Document"><b>{{.FileName}}</b>{{if .SourceURI}}<span class="subline">{{.SourceURI}}</span>{{end}}</td>
+          <td data-label="Document"><b>{{.FileName}}</b>{{if .OpenHref}}<span class="subline"><a href="{{.OpenHref}}" target="_blank" rel="noopener noreferrer">{{if .Provider}}Open in {{.Provider}}{{else}}Open in source{{end}}</a></span>{{else if .SourceURI}}<span class="subline">{{.SourceURI}}</span>{{end}}</td>
           <td data-label="Status">{{if dashboardNonTerminal .Status}}<span class="pulse" aria-hidden="true">●</span>{{end}}{{statusPill "document" .Status}}{{if .Warnings}} {{statusPill "document" "warning"}}{{range .Warnings}}<span class="subline">{{.}}</span>{{end}}{{end}}{{if .ErrorMessage}}{{$action := dashboardErrorAction .ErrorMessage $.Can}}<span class="subline">{{$action.Text}}{{if $action.Href}} <a href="{{$action.Href}}">{{if eq $action.Href "/dashboard/models/pricing"}}Set price{{else}}View details{{end}}</a>{{end}}</span>{{end}}</td>
           <td data-label="Updated">{{relTime .UpdatedAt}}</td>
 {{if $.Data.Writable}}          <td data-label="Actions">

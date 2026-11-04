@@ -269,6 +269,8 @@ type EvidenceRecord struct {
 type EvidenceResolution struct {
 	ID                string           `json:"id"`
 	Status            string           `json:"status"`
+	SourceKind        string           `json:"source_kind,omitempty"`
+	Title             string           `json:"title,omitempty"`
 	NativeLink        string           `json:"native_link,omitempty"`
 	RetainedCopyLabel string           `json:"retained_copy_label,omitempty"`
 	RetainedCopyURL   string           `json:"retained_copy_url,omitempty"`

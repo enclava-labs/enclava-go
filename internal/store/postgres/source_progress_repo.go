@@ -71,10 +71,8 @@ const sourceIndexProgressQuery = `
 	       COUNT(*) FILTER (WHERE gen_state = 'published' AND NOT failed),
 	       COUNT(*) FILTER (WHERE failed),
 	       COUNT(*) FILTER (WHERE NOT failed AND gen_state <> 'published'),
-	       r.message, r.n
-	FROM item_status
-	LEFT JOIN reasons r ON true
-	GROUP BY r.message, r.n`
+	       (SELECT message FROM reasons), (SELECT n FROM reasons)
+	FROM item_status`
 
 // SourceIndexProgress aggregates one connection's live collection items into
 // indexed/failed/processing buckets for connectors.Service.IndexProgress.

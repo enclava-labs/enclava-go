@@ -68,7 +68,7 @@ type knowledgeCollectionData struct {
 	Tabs             []dashboardTab
 	Tab              string // documents|sources|search|settings
 	Status           string // active document filter bucket
-	Docs             []rag.Document
+	Docs             []knowledgeDocRow
 	DocMore          bool
 	AnyProcessing    bool
 	ReembedPending   int64
@@ -269,8 +269,8 @@ func (a *App) handleDashboardKnowledgeCollection(w http.ResponseWriter, r *http.
 		if !ok {
 			return
 		}
-		data.Docs, data.DocMore = docs, more
-		data.AnyProcessing = knowledgeAnyProcessing(docs)
+		data.Docs, data.DocMore = knowledgeDocRows(docs), more
+		data.AnyProcessing = knowledgeAnyProcessing(data.Docs)
 	case "sources":
 		data.Sources = a.knowledgeCollectionSources(ctx, p, c.ID)
 	case "settings":
@@ -343,6 +343,26 @@ func (a *App) knowledgeDocuments(w http.ResponseWriter, ctx context.Context, p a
 	return docs, more, true
 }
 
+// knowledgeDocRow projects a document for the table: the source URI becomes
+// an outbound link only when it is a safe http(s) target.
+type knowledgeDocRow struct {
+	rag.Document
+	OpenHref string
+	Provider string // "" → "Open in source"
+}
+
+func knowledgeDocRows(docs []rag.Document) []knowledgeDocRow {
+	rows := make([]knowledgeDocRow, 0, len(docs))
+	for _, d := range docs {
+		rows = append(rows, knowledgeDocRow{
+			Document: d,
+			OpenHref: safeExternalLink(d.SourceURI),
+			Provider: sourceProviderLabel(d.SourceType),
+		})
+	}
+	return rows
+}
+
 // knowledgeCollectionSources is the client-side filter the plan specifies:
 // sources whose target collection is this id, read through the authorized
 // connector listing.
@@ -366,7 +386,7 @@ func (a *App) knowledgeCollectionSources(ctx context.Context, p auth.Principal, 
 
 // knowledgeAnyProcessing reports whether any row is non-terminal — the only
 // condition under which the fragment carries the 3s poll trigger.
-func knowledgeAnyProcessing(docs []rag.Document) bool {
+func knowledgeAnyProcessing(docs []knowledgeDocRow) bool {
 	for _, d := range docs {
 		if dashboardNonTerminal(d.Status) {
 			return true
@@ -489,9 +509,9 @@ func (a *App) handleDashboardKnowledgeDocuments(w http.ResponseWriter, r *http.R
 		Collection:     c,
 		Writable:       writable,
 		Status:         status,
-		Docs:           docs,
+		Docs:           knowledgeDocRows(docs),
 		DocMore:        more,
-		AnyProcessing:  knowledgeAnyProcessing(docs),
+		AnyProcessing:  knowledgeAnyProcessing(knowledgeDocRows(docs)),
 		ReembedPending: pending,
 		ReembedTotal:   total,
 		Empty:          knowledgeDocumentsEmpty(status, caps, writable),

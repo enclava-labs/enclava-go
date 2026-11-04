@@ -171,7 +171,7 @@ func TestAdminDocumentsPollingAndPriceAction(t *testing.T) {
 	}
 	render := func(status, message string, caps dashboardCaps) string {
 		t.Helper()
-		docs := []rag.Document{{FileName: "Example", Status: status, ErrorMessage: message}}
+		docs := knowledgeDocRows([]rag.Document{{FileName: "Example", Status: status, ErrorMessage: message}})
 		view := knowledgeCollectionData{Docs: docs, AnyProcessing: knowledgeAnyProcessing(docs)}
 		var out strings.Builder
 		if err := set.ExecuteTemplate(&out, "frag-knowledge-documents", dashboardView{Can: caps, Data: view}); err != nil {

@@ -1,0 +1,16 @@
+{{define "frag-chat-sources"}}{{/* Per-answer Sources list (D-17): one row
+     per evidence id the viewer can read — title, provider and location are
+     display-only; "Open in <Provider>" rides the resolved NativeLink and
+     "View evidence" opens the shared card (evidence:open). Unknown or
+     unreadable ids never reach the markup — the handler drops them. */}}
+{{if .Data}}<div class="sources" aria-label="Sources">
+  <div class="muted">Sources</div>
+  {{range .Data}}<div class="source-row">
+    <b>{{.Title}}</b>{{if .Provider}} <span class="muted">· {{.Provider}}</span>{{end}}
+    {{if .Location}}<div class="muted">{{.Location}}</div>{{end}}
+    <div class="row">
+      {{if .OpenHref}}<a class="btn ghost" href="{{.OpenHref}}" target="_blank" rel="noopener noreferrer">{{if .Provider}}Open in {{.Provider}}{{else}}Open in source{{end}}</a>{{end}}
+      <button type="button" class="btn" data-action="evidence:open" data-evidence-id="{{.EvidenceID}}">View evidence</button>
+    </div>
+  </div>{{end}}
+</div>{{end}}{{end}}

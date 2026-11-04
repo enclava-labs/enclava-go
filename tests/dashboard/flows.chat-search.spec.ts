@@ -62,6 +62,12 @@ test.describe('Chat run flow (member)', () => {
     await expect(panel).toBeVisible();
     await expect(panel.locator('.quote, .passage').first()).toBeVisible();
 
+    // Every grounded answer lists its sources under the bubble — citations
+    // or not: a resolved row carries title + View evidence.
+    const sources = page.locator('article.message .sources').first();
+    await expect(sources).toBeVisible();
+    await expect(sources.locator('.source-row [data-action="evidence:open"]').first()).toBeVisible();
+
     await page.reload();
     await expect(page).toHaveURL(new RegExp(`/dashboard/chat/${convID}$`));
     await expect(page.locator('#chatThread .bubble').first()).toBeVisible();

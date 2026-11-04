@@ -221,6 +221,16 @@ unless the ingest handoff is missing or title/URI/name/mime metadata changed
 (which creates a new version). Editing a source's config resets its stored
 listing checkpoint so the next sync re-lists from the start.
 
+Every synced item keeps a link to its original: Slack message (and thread
+reply) permalinks, GitHub issue/PR/comment URLs and file links pinned to the
+synced commit, Notion page links and `#<block>` anchors for blocks, Teams
+message links and Drive file links. `GET /api/v1/rag/evidence/{id}` returns
+it as `native_link` (plus `source_kind` and `title`); a GitHub file citation
+carries a `#L<start>-L<end>` anchor when the cited passage occurs exactly once
+in the retained file. Chat answers list their sources with these links
+whether or not the model wrote citation markers, and search results and
+Knowledge documents link out as well.
+
 ### Connector credentials
 
 Tenant administrators (`platform.admin` + `connectors.manage`) manage

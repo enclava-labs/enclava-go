@@ -12,6 +12,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +38,7 @@ func (a *App) registerDashboardChatRoutes() {
 	a.mux.HandleFunc("GET /dashboard/partials/evidence/{evidenceID}",
 		a.sessionAuth.requireCap(capSearch, a.handleDashboardEvidencePartial))
 	a.mux.HandleFunc("GET /dashboard/partials/evidence/", a.sessionAuth.renderDashboardNotFound)
+	a.mux.HandleFunc("GET /dashboard/partials/chat/sources", a.sessionAuth.requireCap(capSearch, a.handleDashboardChatSources))
 }
 
 // chatViewData is the page model; it implements dashboardPageMeta so the
@@ -541,4 +543,78 @@ func evidenceLocationLine(locators []source.Locator) string {
 		}
 	}
 	return strings.Join(parts, " · ")
+}
+
+// chatSourcesLimit caps the evidence ids one Sources block resolves.
+const chatSourcesLimit = 20
+
+// chatSourceRow is one resolved evidence item under an assistant answer.
+type chatSourceRow struct {
+	EvidenceID string
+	Title      string
+	Provider   string // "Slack"…; "" for uploads
+	Location   string
+	OpenHref   string // NativeLink, already scheme-checked in rag
+}
+
+// handleDashboardChatSources serves GET /dashboard/partials/chat/sources
+// ?ids=a,b,c — the per-answer sources list. Ids the viewer cannot read (and
+// ids past the cap) are silently omitted, never an error card.
+func (a *App) handleDashboardChatSources(w http.ResponseWriter, r *http.Request) {
+	p, _ := auth.PrincipalFromContext(r.Context())
+	if a.ragSvc == nil {
+		log.Printf("dashboard chat sources: rag service is not configured")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	rows := a.buildChatSources(r.Context(), p, strings.TrimSpace(r.URL.Query().Get("ids")))
+	a.renderDashboardFragment(w, r, "chat", "chat-sources", rows)
+}
+
+// buildChatSources resolves each id separately so one unreadable id never
+// denies the list; rows sharing a native link collapse to the first.
+func (a *App) buildChatSources(ctx context.Context, p auth.Principal, raw string) []chatSourceRow {
+	seen := map[string]struct{}{}
+	var rows []chatSourceRow
+	for i, id := range strings.Split(raw, ",") {
+		if i >= chatSourcesLimit {
+			break
+		}
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		resolved, err := a.ragSvc.ResolveEvidence(ctx, p, []string{id})
+		if err != nil {
+			if !errors.Is(err, source.ErrDenied) && !errors.Is(err, sql.ErrNoRows) {
+				log.Printf("dashboard chat sources %s: %s", strconv.Quote(id), strconv.Quote(err.Error()))
+			}
+			continue
+		}
+		if len(resolved) == 0 {
+			continue
+		}
+		res := resolved[0]
+		if res.NativeLink != "" {
+			if _, dup := seen[res.NativeLink]; dup {
+				continue
+			}
+			seen[res.NativeLink] = struct{}{}
+		}
+		title := strings.TrimSpace(res.Title)
+		if title == "" {
+			title = a.evidenceDocumentLabel(ctx, p.TenantID, res.Spans)
+		}
+		if title == "" {
+			title = "Document"
+		}
+		rows = append(rows, chatSourceRow{
+			EvidenceID: res.ID,
+			Title:      title,
+			Provider:   sourceProviderLabel(res.SourceKind),
+			Location:   evidenceLocationLine(res.Locations),
+			OpenHref:   res.NativeLink,
+		})
+	}
+	return rows
 }

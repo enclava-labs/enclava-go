@@ -183,3 +183,30 @@ func TestNotionAccessGrantsSelectedSubtree(t *testing.T) {
 		}
 	}
 }
+
+func TestNotionBlockURLsAnchorToEnclosingPage(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/pages/root", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "root", "url": "https://www.notion.so/root-page-abc", "last_edited_time": "t0", "properties": map[string]any{}})
+	})
+	mux.HandleFunc("/v1/blocks/root/children", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{
+			map[string]any{"id": "a1b2-c3d4", "type": "paragraph", "last_edited_time": "t1"},
+		}, "has_more": false})
+	})
+	adapter, conn := notionFixtureAdapter(t, mux)
+	page, err := adapter.Content(context.Background(), conn, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]ContentItem{}
+	for _, item := range page.Items {
+		byID[item.NativeID] = item
+	}
+	if byID["root"].URL != "https://www.notion.so/root-page-abc" {
+		t.Fatalf("page url = %q", byID["root"].URL)
+	}
+	if byID["a1b2-c3d4"].URL != "https://www.notion.so/root-page-abc#a1b2c3d4" {
+		t.Fatalf("block url = %q, want page url + dashless anchor", byID["a1b2-c3d4"].URL)
+	}
+}

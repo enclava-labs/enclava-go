@@ -17,6 +17,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +43,31 @@ var dashboardSourceProviders = []struct {
 	{"github", "GitHub", "command", "Repository files", false},
 	{"notion", "Notion", "file", "Pages and subpages", true},
 	{"google_drive", "Google Drive", "upload", "Shared folders", true},
+}
+
+// sourceProviderLabel maps a provenance source_kind to its display label;
+// uploads and unknown kinds have no provider ("", never jargon).
+func sourceProviderLabel(kind string) string {
+	for _, p := range dashboardSourceProviders {
+		if p.ID == strings.TrimSpace(kind) {
+			return p.Label
+		}
+	}
+	return ""
+}
+
+// safeExternalLink admits only http(s) targets for outbound "Open in …"
+// links rendered outside the rag service's own gate.
+func safeExternalLink(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "https", "http":
+		return parsed.String()
+	}
+	return ""
 }
 
 // dashboardSourcePermissions is the one-line permission model per provider

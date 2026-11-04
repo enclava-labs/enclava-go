@@ -22,6 +22,7 @@
       <div class="result-snippet">{{mark .Content $.Data.Query}}</div>
       {{if .EvidenceID}}<div class="row" style="margin-top:8px">
         <button type="button" class="btn" data-action="evidence:open" data-evidence-id="{{.EvidenceID}}">View evidence</button>
+        {{if .OpenHref}}<a class="btn ghost" href="{{.OpenHref}}" target="_blank" rel="noopener noreferrer">{{if .Provider}}Open in {{.Provider}}{{else}}Open in source{{end}}</a>{{end}}
         <a class="btn ghost" data-action="search:ask-about" data-evidence-id="{{.EvidenceID}}" href="/dashboard/chat?evidence={{urlquery .EvidenceID}}">Ask about this</a>
       </div>{{end}}
     </div>

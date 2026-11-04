@@ -2998,3 +2998,122 @@ func TestExtractionResultImportRequiresValidationAck(t *testing.T) {
 		t.Fatalf("imported document: %#v", out.Document)
 	}
 }
+
+// stageGitHubFileDoc stages a connector-synced file object whose chunk cites a
+// byte range of the retained original.
+func (f *fixture) stageGitHubFileDoc(t *testing.T, collection rag.Collection, objectID, fileBody, chunkText string) {
+	t.Helper()
+	ctx := context.Background()
+	writer, _, err := f.store.Begin(ctx, artifacts.Meta{
+		Ref: artifacts.Ref{TenantID: f.tenant, Kind: artifacts.KindOriginal}, MimeType: "text/plain",
+	}, time.Minute, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte(fileBody)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Finalize(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ref := writer.Ref()
+	if _, err := f.repo.UpsertObject(ctx, source.Object{
+		TenantID: f.tenant, ID: objectID, Kind: "file", NativeID: "github:conn:acme/docs:" + objectID + ".txt",
+		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: f.principal.ActorID,
+		Audience: []string{f.principal.ActorID, "*"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repo.InsertObjectVersion(ctx, f.tenant, source.ObjectVersion{
+		ObjectID: objectID, ObservedSeq: 1, ArtifactRef: ref.ID, SHA256: ref.SHA256,
+		ByteSize: int64(len(fileBody)), MimeType: "text/plain", OriginalFilename: objectID + ".txt",
+		Provenance: `{"source_kind":"github","title":"` + objectID + `.txt","source_uri":"https://github.com/acme/docs/blob/deadbeef/` + objectID + `.txt"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repo.AddCollectionItem(ctx, f.tenant, collection.ID, objectID, f.principal.ActorID); err != nil {
+		t.Fatal(err)
+	}
+	parsed := source.Document{
+		Ref: source.ObjectRef{TenantID: f.tenant, ObjectID: objectID, ObservedSeq: 1},
+		Blocks: []source.Block{
+			{ID: "blk_" + objectID, Ordinal: 0, Kind: "paragraph", Text: fileBody, ByteStart: 0, ByteEnd: len(fileBody)},
+		},
+	}
+	if err := f.repo.SaveParsedDocument(ctx, "rag-structured-v1", parsed); err != nil {
+		t.Fatal(err)
+	}
+	profileID, err := f.repo.EnsureChunkProfile(ctx, f.tenant, "rag-"+collection.ID+"-structured", 200, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunkID := "chk_" + objectID
+	chunks := []rag.DocumentChunk{{
+		ID: chunkID, DocumentID: objectID, CollectionID: collection.ID, Generation: 1,
+		ChunkIndex: 0, Content: chunkText, TokenCount: 4,
+		SpanRefs: []source.Span{{Ref: parsed.Ref, BlockID: "blk_" + objectID, ByteStart: 0, ByteEnd: len(chunkText)}},
+	}}
+	if err := f.repo.ReplaceVersionChunksAndStage(ctx, f.tenant, collection.ID, objectID, objectID+"#1", 1, 1, profileID, chunks); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repo.MarkGenerationState(ctx, f.tenant, collection.ID, objectID+"#1", 1, "published"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.vector.UpsertPoints(ctx, collection.QdrantCollection, []rag.QdrantPoint{{
+		ID: "pt_" + objectID, Payload: map[string]any{
+			"tenant_id": f.tenant, "document_id": objectID, "object_version_id": objectID + "#1",
+			"generation": int64(1), "chunk_id": chunkID, "file_name": objectID + ".txt",
+			"source_uri": "https://github.com/acme/docs/blob/deadbeef/" + objectID + ".txt",
+			"content":    chunkText, "access_enabled": true,
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResolveEvidenceGitHubLineAnchor(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	fileBody := "first line\nsecond line\nthird line\n"
+	f.stageGitHubFileDoc(t, c, "obj_gh", fileBody, "second line\nthird line\n")
+
+	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "second", Limit: 5})
+	if err != nil || len(results) == 0 || results[0].EvidenceID == "" {
+		t.Fatalf("search: %#v err=%v", results, err)
+	}
+	resolved, err := f.svc.ResolveEvidence(ctx, f.principal, []string{results[0].EvidenceID})
+	if err != nil || len(resolved) != 1 {
+		t.Fatalf("resolve: %#v err=%v", resolved, err)
+	}
+	res := resolved[0]
+	if res.NativeLink != "https://github.com/acme/docs/blob/deadbeef/obj_gh.txt#L2-L3" {
+		t.Fatalf("native link = %q, want #L2-L3 anchor", res.NativeLink)
+	}
+	if res.SourceKind != "github" || res.Title != "obj_gh.txt" {
+		t.Fatalf("source fields: %#v", res)
+	}
+}
+
+func TestResolveEvidenceNonGitHubLinkUnchanged(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	f.stageSearchDoc(t, c, "obj_up", "upload body for link test",
+		`{"source_kind":"upload","url":"https://files.example.test/doc/1"}`)
+
+	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "upload body", Limit: 5})
+	if err != nil || len(results) == 0 {
+		t.Fatalf("search: %#v err=%v", results, err)
+	}
+	resolved, err := f.svc.ResolveEvidence(ctx, f.principal, []string{results[0].EvidenceID})
+	if err != nil || len(resolved) != 1 {
+		t.Fatalf("resolve: %#v err=%v", resolved, err)
+	}
+	if resolved[0].NativeLink != "https://files.example.test/doc/1" {
+		t.Fatalf("native link mutated: %q", resolved[0].NativeLink)
+	}
+	if resolved[0].SourceKind != "upload" {
+		t.Fatalf("source kind = %q", resolved[0].SourceKind)
+	}
+}

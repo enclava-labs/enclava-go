@@ -74,6 +74,8 @@ type searchResultRow struct {
 	Content    string
 	SourceKind string
 	EvidenceID string
+	OpenHref   string // safe http(s) source link, "" otherwise
+	Provider   string // display label ("Slack"…); "" for uploads
 }
 
 // searchMode whitelist: invalid/absent falls back to hybrid (D-19 contract —
@@ -208,6 +210,8 @@ func (a *App) buildSearchView(w http.ResponseWriter, r *http.Request) (searchVie
 			Content:    res.Content,
 			SourceKind: res.SourceKind,
 			EvidenceID: res.EvidenceID,
+			OpenHref:   safeExternalLink(res.SourceURI),
+			Provider:   sourceProviderLabel(res.SourceKind),
 		})
 	}
 	view.Results = results

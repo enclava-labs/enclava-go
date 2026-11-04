@@ -212,8 +212,8 @@ func (a *NotionAdapter) traverse(ctx context.Context) ([]ContentItem, error) {
 func (a *NotionAdapter) traverseSelections(ctx context.Context, selections []notionSelection) ([]ContentItem, error) {
 	items := make([]ContentItem, 0)
 	seen := make(map[string]bool)
-	var walk func(string, string, string, string, int, bool) error
-	walk = func(id, parent, parentKind, title string, depth int, isPage bool) error {
+	var walk func(string, string, string, string, string, int, bool) error
+	walk = func(id, parent, parentKind, title, pageURL string, depth int, isPage bool) error {
 		if depth > a.maxDepth {
 			return nil
 		}
@@ -234,7 +234,7 @@ func (a *NotionAdapter) traverseSelections(ctx context.Context, selections []not
 			if page.ID != id || !validNotionPageURL(page.URL) {
 				return errors.New("notion returned malformed page")
 			}
-			pageURL := page.URL
+			pageURL = page.URL
 			title = ""
 			for _, raw := range page.Properties {
 				var property struct {
@@ -288,24 +288,25 @@ func (a *NotionAdapter) traverseSelections(ctx context.Context, selections []not
 					Type        string `json:"type"`
 					LastEdited  string `json:"last_edited_time"`
 					HasChildren bool   `json:"has_children"`
-					URL         string `json:"url"`
 				}
 				if err := json.Unmarshal(raw, &block); err != nil || block.ID == "" || block.Type == "" {
 					return errors.New("notion returned malformed block")
 				}
-				if !validNotionPageURL(block.URL) {
-					block.URL = ""
+				// Notion blocks have no own URL; the page anchor jumps to them.
+				blockURL := ""
+				if pageURL != "" {
+					blockURL = pageURL + "#" + strings.ReplaceAll(block.ID, "-", "")
 				}
 				if !seen["block:"+block.ID] {
 					seen["block:"+block.ID] = true
-					items = append(items, ContentItem{NativeID: block.ID, ParentNativeID: id, ParentKind: kind, Kind: "block", NativeRevision: block.LastEdited, Title: title, URL: block.URL, MIMEType: "application/json", Content: append([]byte(nil), raw...)})
+					items = append(items, ContentItem{NativeID: block.ID, ParentNativeID: id, ParentKind: kind, Kind: "block", NativeRevision: block.LastEdited, Title: title, URL: blockURL, MIMEType: "application/json", Content: append([]byte(nil), raw...)})
 					if len(items) > a.maxItems {
 						return errors.New("notion traversal exceeded configured item bound")
 					}
 				}
 				childPage := block.Type == "child_page"
 				if (block.HasChildren || childPage) && depth < a.maxDepth {
-					if err := walk(block.ID, id, kind, title, depth+1, childPage); err != nil {
+					if err := walk(block.ID, id, kind, title, pageURL, depth+1, childPage); err != nil {
 						return err
 					}
 				}
@@ -321,7 +322,7 @@ func (a *NotionAdapter) traverseSelections(ctx context.Context, selections []not
 		return nil
 	}
 	for _, sel := range selections {
-		if err := walk(sel.PageID, "", "", "", 0, true); err != nil {
+		if err := walk(sel.PageID, "", "", "", "", 0, true); err != nil {
 			return nil, fmt.Errorf("notion selected page %q: %w", sel.PageID, err)
 		}
 	}

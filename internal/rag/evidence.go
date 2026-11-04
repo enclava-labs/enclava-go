@@ -1,9 +1,11 @@
 package rag
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 
@@ -45,9 +47,19 @@ func (s *Service) ResolveEvidence(ctx context.Context, p auth.Principal, ids []s
 		}
 		var provenance map[string]any
 		_ = json.Unmarshal([]byte(version.Provenance), &provenance)
+		resolution.SourceKind = stringFromPayload(provenance, "source_kind")
+		resolution.Title = stringFromPayload(provenance, "title")
+		if resolution.Title == "" {
+			resolution.Title = version.OriginalFilename
+		}
 		resolution.NativeLink = safeNativeLink(stringFromPayload(provenance, "url"))
 		if resolution.NativeLink == "" {
 			resolution.NativeLink = safeNativeLink(stringFromPayload(provenance, "source_uri"))
+		}
+		if deep, err := s.githubDeepLink(ctx, p.TenantID, record, resolution.SourceKind, resolution.NativeLink); err != nil {
+			return nil, err
+		} else if deep != "" {
+			resolution.NativeLink = deep
 		}
 		locations, err := s.evidenceLocations(ctx, p.TenantID, record.SpanRefs)
 		if err != nil {
@@ -194,6 +206,53 @@ func (s *Service) authorizedEvidenceSource(ctx context.Context, p auth.Principal
 		return source.Object{}, source.ObjectVersion{}, err
 	}
 	return object, version, nil
+}
+
+// githubDeepLink turns a GitHub blob URL into a line anchor when the cited
+// chunk's text is byte-exact inside the retained original — anything less
+// exact (decoded transcodes, multi-block joins, missing artifact) keeps the
+// plain blob URL rather than guessing a line range.
+func (s *Service) githubDeepLink(ctx context.Context, tenantID string, record EvidenceRecord, kind, link string) (string, error) {
+	if s.artifacts == nil || kind != "github" || !strings.Contains(link, "/blob/") || strings.Contains(link, "#") {
+		return "", nil
+	}
+	chunks, err := s.repo.ListGenerationChunks(ctx, tenantID, record.CollectionID, record.ObjectVersionID, record.Generation)
+	if err != nil {
+		return "", err
+	}
+	var content string
+	for _, chunk := range chunks {
+		if chunk.ID == record.ChunkID && chunk.DocumentID == record.ObjectID {
+			content = chunk.Content
+			break
+		}
+	}
+	if content == "" {
+		return "", nil
+	}
+	version, err := s.repo.GetObjectVersion(ctx, tenantID, record.ObjectID, record.ObservedSeq)
+	if err != nil {
+		return "", nil // version not resolvable for anchoring; keep blob link
+	}
+	reader, err := s.artifacts.Read(ctx, artifacts.Ref{TenantID: tenantID, ID: version.ArtifactRef, Kind: artifacts.KindOriginal})
+	if err != nil {
+		return "", nil // no retained bytes, nothing to anchor against
+	}
+	defer func() { _ = reader.Close() }()
+	raw, err := readAll(reader)
+	if err != nil {
+		return "", nil
+	}
+	idx := bytes.Index(raw, []byte(content))
+	if idx < 0 || bytes.LastIndex(raw, []byte(content)) != idx {
+		return "", nil // must occur exactly once to anchor a unique range
+	}
+	startLine := bytes.Count(raw[:idx], []byte("\n")) + 1
+	endLine := bytes.Count(raw[:idx+len(content)-1], []byte("\n")) + 1
+	if startLine == endLine {
+		return fmt.Sprintf("%s#L%d", link, startLine), nil
+	}
+	return fmt.Sprintf("%s#L%d-L%d", link, startLine, endLine), nil
 }
 
 func safeNativeLink(raw string) string {

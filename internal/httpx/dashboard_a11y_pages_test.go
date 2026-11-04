@@ -535,10 +535,10 @@ func TestA11yAdminPages(t *testing.T) {
 		},
 		Tab:    "documents",
 		Status: "all",
-		Docs: []rag.Document{
+		Docs: knowledgeDocRows([]rag.Document{
 			{ID: "d1", FileName: "handbook.pdf", Status: "ready", UpdatedAt: now, CollectionID: "c1"},
 			{ID: "d2", FileName: "broken.pdf", Status: "failed", ErrorMessage: "required price missing: cached_input", UpdatedAt: now, CollectionID: "c1"},
-		},
+		}),
 		Sources:         []connectors.Source{{ID: "s1", Type: "slack", Name: "Workspace Slack", IsEnabled: true}},
 		Empty:           dashboardEmpty{Icon: "knowledge", Text: "No documents."},
 		SourcesEmpty:    dashboardEmpty{Icon: "sources", Text: "No sources."},
