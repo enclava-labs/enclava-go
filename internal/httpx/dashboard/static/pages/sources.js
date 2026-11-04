@@ -252,6 +252,12 @@
         }
         return;
       }
+      if (key === 'channel_id' && provider === 'slack') {
+        var pick = q('[data-slack-channels]');
+        var picked = pick && pick.selectedOptions && pick.selectedOptions[0];
+        scope.push('channel: ' + (picked && picked.value === value ? picked.textContent : String(value)));
+        return;
+      }
       if (key === 'channel_ids') {
         scope.push('channels: ' + Object.keys(value).map(function (team) {
           return team + ' → ' + value[team].join(', ');
@@ -260,6 +266,7 @@
       }
       scope.push(key + ': ' + (Array.isArray(value) ? value.join(', ') : String(value)));
     });
+    if (provider === 'slack' && !payload.config.channel_id) scope.unshift('channels: all the credential is a member of');
     var collection = q('[data-source-collection]');
     var option = collection && collection.selectedOptions && collection.selectedOptions[0];
     return [
@@ -582,12 +589,60 @@
     }
   });
 
+  // ── Slack channel picker: the chosen credential's member channels ───────
+
+  var SLACK_REF = /^CONNECTOR_SLACK_[A-Z0-9_]+$/;
+  var slackChannelsSeq = 0;
+  var slackChannelsTimer = null;
+
+  function slackChannelsStatus(text) {
+    var status = q('[data-slack-channels-status]');
+    if (status) status.textContent = text;
+  }
+
+  function loadSlackChannels(ref) {
+    var pick = q('[data-slack-channels]');
+    if (!pick) return;
+    var seq = ++slackChannelsSeq;
+    var keep = pick.value;
+    while (pick.options.length > 1) pick.remove(1); // option 0: all channels
+    if (!SLACK_REF.test(ref)) {
+      slackChannelsStatus('Choose a credential to list its channels — the bot only sees channels it was invited to.');
+      return;
+    }
+    slackChannelsStatus('Loading channels…');
+    Enclava.api('GET', '/api/v1/connectors/slack/channels?credential_ref=' + encodeURIComponent(ref))
+      .then(function (res) {
+        if (seq !== slackChannelsSeq) return;
+        var channels = (res && res.channels) || [];
+        channels.forEach(function (ch) {
+          var opt = document.createElement('option');
+          opt.value = ch.id;
+          opt.textContent = '#' + ch.name + (ch.is_private ? ' (private)' : '');
+          pick.appendChild(opt);
+        });
+        if (keep && Array.prototype.some.call(pick.options, function (o) { return o.value === keep; })) pick.value = keep;
+        slackChannelsStatus(channels.length
+          ? channels.length + (channels.length === 1 ? ' channel' : ' channels') + ' — invite the bot in Slack to add more.'
+          : 'The bot is in no channels yet — invite it to channels in Slack.');
+      })
+      .catch(function (err) {
+        if (seq !== slackChannelsSeq) return;
+        slackChannelsStatus('Could not list channels: ' + ((err && err.message) || 'request failed'));
+      });
+  }
+
   // Required-field gate: enable Continue only once the visible step is valid.
   document.addEventListener('input', function (e) {
     if (!(e.target instanceof Element)) return;
     var root = drawer();
     if (!root || !root.contains(e.target)) return;
     validateStep(currentStep(), currentProvider());
+    if (e.target.matches('[data-provider-fields="slack"] [data-credential]')) {
+      var ref = e.target.value.trim();
+      clearTimeout(slackChannelsTimer);
+      slackChannelsTimer = setTimeout(function () { loadSlackChannels(ref); }, 300);
+    }
   });
 
   // Wizard opens via ?new=1 (optionally preset with &collection={id}) — the

@@ -304,6 +304,7 @@ func (a *App) registerBaseRoutes() {
 	a.mux.HandleFunc("/api/v1/connectors/credentials", a.authenticated("connectors.manage", a.handleConnectorCredentials))
 	a.mux.HandleFunc("/api/v1/connectors/credentials/", a.authenticated("connectors.manage", a.handleConnectorCredentialByID))
 	a.mux.HandleFunc("/api/v1/connectors/oauth-apps/", a.authenticated("connectors.manage", a.handleConnectorOAuthApp))
+	a.mux.HandleFunc("/api/v1/connectors/slack/channels", a.authenticated("connectors.manage", a.handleSlackChannels))
 
 	a.mux.HandleFunc("/api/v1/admin/api-keys", a.authenticated("platform.admin", a.handleAdminAPIKeys))
 	a.mux.HandleFunc("/api/v1/admin/api-keys/", a.authenticated("platform.admin", a.handleAdminAPIKeyByID))

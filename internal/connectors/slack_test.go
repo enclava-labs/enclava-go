@@ -374,6 +374,28 @@ func TestSlackWithoutChannelSyncsEveryMemberChannel(t *testing.T) {
 	}
 }
 
+// TestSlackChannelsPickerListsMemberChannelsByName: the wizard's picker gets
+// the credential's channels sorted by name with their privacy, and only a
+// principal that may manage connectors can list them.
+func TestSlackChannelsPickerListsMemberChannelsByName(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/users.conversations" || r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Errorf("unexpected request %s", r.URL)
+		}
+		_, _ = fmt.Fprint(w, `{"ok":true,"channels":[{"id":"C2","name":"random","is_private":true},{"id":"C1","name":"general"}]}`)
+	}))
+	defer server.Close()
+	svc := &Service{secrets: fixedCredential("test-token")}
+	manager := auth.Principal{TenantID: "tenant", Scopes: map[string]struct{}{"connectors.manage": {}}}
+	got, err := svc.SlackChannels(context.Background(), manager, "CONNECTOR_SLACK_TEST", server.URL)
+	if err != nil || len(got) != 2 || got[0] != (SlackChannel{ID: "C1", Name: "general"}) || got[1] != (SlackChannel{ID: "C2", Name: "random", Private: true}) {
+		t.Fatalf("channels = %+v, %v", got, err)
+	}
+	if _, err := svc.SlackChannels(context.Background(), auth.Principal{TenantID: "tenant"}, "CONNECTOR_SLACK_TEST", server.URL); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("principal without connectors.manage: %v", err)
+	}
+}
+
 func TestNewSlackAdapterReleasesTokenOnlyForBoundTenantAndOrigin(t *testing.T) {
 	t.Setenv("SLACK_FIXTURE_TOKEN", "test-token")
 	t.Setenv("CONNECTOR_SLACK_UNBOUND", "leaked")

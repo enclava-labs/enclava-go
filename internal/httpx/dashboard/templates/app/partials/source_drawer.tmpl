@@ -44,16 +44,18 @@
   <div class="section-head"><h2>Connect and scope</h2></div>
 
   <div data-provider-fields="slack" hidden>
-    <label class="label" for="slack-channel">Channel ID <span class="muted">(optional)</span></label>
-    <input class="field" id="slack-channel" data-config="channel_id" autocomplete="off">
-    <span class="help">The ID Slack shows in channel details. Leave empty to sync every channel the credential is a member of — invite the bot to the channels you want.</span>
-    <label class="label" for="slack-limit">Item limit</label>
-    <input class="field" id="slack-limit" data-config="limit" data-type="number" type="number" min="1" inputmode="numeric">
-    <label class="label"><input type="checkbox" data-config="reconcile" data-type="bool" value="true"> Reconcile access on every sync</label>
     <label class="label" for="slack-credential">Credential reference</label>
     <input class="field" id="slack-credential" data-credential list="cred-slack" autocomplete="off" required>
     <datalist id="cred-slack">{{range index .Data.CredentialRefs "slack"}}<option value="{{.RefID}}">{{.Name}}</option>{{end}}</datalist>
     {{if not (index .Data.CredentialRefs "slack")}}<span class="help">No Slack credentials configured — <a href="/dashboard/sources/credentials">add one in Credentials</a> or bind a CONNECTOR_SLACK_* secret in server configuration.</span>{{end}}
+    <label class="label" for="slack-channel">Channel</label>
+    <select class="field" id="slack-channel" data-config="channel_id" data-slack-channels>
+      <option value="">All channels the credential is a member of</option>
+    </select>
+    <span class="help" data-slack-channels-status>Choose a credential to list its channels — the bot only sees channels it was invited to.</span>
+    <label class="label" for="slack-limit">Item limit</label>
+    <input class="field" id="slack-limit" data-config="limit" data-type="number" type="number" min="1" inputmode="numeric">
+    <label class="label"><input type="checkbox" data-config="reconcile" data-type="bool" value="true"> Reconcile access on every sync</label>
   </div>
 
   <div data-provider-fields="teams" hidden>

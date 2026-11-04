@@ -540,10 +540,34 @@ func (a *slackAdapter) channelAfter(ctx context.Context, conn source.Connection,
 	return "", nil
 }
 
-// loadChannels lists the public and private channels the credential is a
-// member of (users.conversations: bot and user tokens alike see exactly the
-// channels they can read) and caches their names for message headers.
+// loadChannels caches the member channels in ID order (the sync order) and
+// their names for message headers.
 func (a *slackAdapter) loadChannels(ctx context.Context) error {
+	channels, err := a.memberChannels(ctx)
+	if err != nil {
+		return err
+	}
+	for _, ch := range channels {
+		a.channels = append(a.channels, ch.ID)
+		a.setTitle(ch.ID, ch.Name)
+	}
+	sort.Strings(a.channels)
+	a.channelsLoaded = true
+	return nil
+}
+
+// SlackChannel is one channel a Slack credential is a member of.
+type SlackChannel struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Private bool   `json:"is_private"`
+}
+
+// memberChannels lists the public and private channels the credential is a
+// member of (users.conversations: bot and user tokens alike see exactly the
+// channels they can read), archived channels excluded.
+func (a *slackAdapter) memberChannels(ctx context.Context) ([]SlackChannel, error) {
+	var out []SlackChannel
 	cursor := ""
 	for pages := 0; pages < 100; pages++ {
 		q := url.Values{"types": {"public_channel,private_channel"}, "exclude_archived": {"true"}, "limit": {"200"}}
@@ -551,30 +575,48 @@ func (a *slackAdapter) loadChannels(ctx context.Context) error {
 			q.Set("cursor", cursor)
 		}
 		var data struct {
-			Channels []struct {
-				ID   string `json:"id"`
-				Name string `json:"name"`
-			} `json:"channels"`
+			Channels []SlackChannel `json:"channels"`
 			Metadata struct {
 				NextCursor string `json:"next_cursor"`
 			} `json:"response_metadata"`
 		}
 		if err := a.call(ctx, "users.conversations", q, &data); err != nil {
-			return err
+			return nil, err
 		}
 		for _, ch := range data.Channels {
 			if ch.ID != "" {
-				a.channels = append(a.channels, ch.ID)
-				a.setTitle(ch.ID, ch.Name)
+				out = append(out, ch)
 			}
 		}
 		if cursor = data.Metadata.NextCursor; cursor == "" {
-			sort.Strings(a.channels)
-			a.channelsLoaded = true
-			return nil
+			return out, nil
 		}
 	}
-	return errors.New("slack channel listing exceeded 100 pages")
+	return nil, errors.New("slack channel listing exceeded 100 pages")
+}
+
+// SlackChannels lists, by name, the channels a Slack credential is a member
+// of — the add-source wizard's channel picker. baseURL is the source's
+// optional config.base_url; the credential is still released only to its
+// bound origin.
+func (s *Service) SlackChannels(ctx context.Context, p auth.Principal, credentialRef, baseURL string) ([]SlackChannel, error) {
+	if !auth.HasScope(p, "connectors.manage") {
+		return nil, source.ErrDenied
+	}
+	conn := source.Connection{TenantID: p.TenantID, Kind: source.ConnectionSlack, CredentialRef: credentialRef, Config: map[string]any{}}
+	if baseURL = strings.TrimSpace(baseURL); baseURL != "" {
+		conn.Config["base_url"] = baseURL
+	}
+	adapter, err := NewSlackAdapter(conn, s.secrets)
+	if err != nil {
+		return nil, err
+	}
+	channels, err := adapter.(*slackAdapter).memberChannels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(channels, func(i, j int) bool { return channels[i].Name < channels[j].Name })
+	return channels, nil
 }
 
 // permalink builds Slack's canonical message link from the workspace URL,

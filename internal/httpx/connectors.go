@@ -211,3 +211,37 @@ func writeConnectorNotFoundOrError(w http.ResponseWriter, err error, code string
 	log.Printf("connector error: %v", err)
 	WriteOpenAIError(w, http.StatusInternalServerError, "internal server error", "server_error", code)
 }
+
+// handleSlackChannels lists the channels a Slack credential is a member of
+// for the add-source wizard's picker: GET
+// /api/v1/connectors/slack/channels?credential_ref=CONNECTOR_SLACK_…
+func (a *App) handleSlackChannels(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
+	if a.connectorSvc == nil {
+		WriteOpenAIError(w, http.StatusNotImplemented, "connectors are not configured", "server_error", "not_configured")
+		return
+	}
+	if r.Method != http.MethodGet {
+		WriteMethodNotAllowed(w)
+		return
+	}
+	setNoStoreHeaders(w)
+	q := r.URL.Query()
+	channels, err := a.connectorSvc.SlackChannels(r.Context(), principal, q.Get("credential_ref"), q.Get("base_url"))
+	if errors.Is(err, sourceapi.ErrDenied) {
+		WriteOpenAIError(w, http.StatusForbidden, "connectors.manage is required", "permission_error", "forbidden")
+		return
+	}
+	if errors.Is(err, auth.ErrSecretDenied) {
+		WriteOpenAIError(w, http.StatusBadRequest, "no Slack credential with this reference is available", "invalid_request_error", "slack_channels_unavailable")
+		return
+	}
+	if err != nil {
+		// Slack refusals (e.g. missing_scope) name the cause themselves.
+		WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "slack_channels_unavailable")
+		return
+	}
+	if channels == nil {
+		channels = []connectors.SlackChannel{}
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{"channels": channels})
+}

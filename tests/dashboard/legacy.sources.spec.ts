@@ -266,3 +266,50 @@ test('?new=1&collection={id} presets the destination step', async ({ page }) => 
   await drawer.getByRole('button', { name: 'Continue' }).click();
   await expect(drawer.locator('[data-source-collection]')).toHaveValue(collectionID);
 });
+
+test('Slack wizard offers the credential\'s channels in a dropdown', async ({ page }) => {
+  await login(page);
+  const { collectionID } = await ensureCollection(page);
+  // The channel list is Slack's answer for the credential; fulfil it locally.
+  const listed: string[] = [];
+  await page.route('**/api/v1/connectors/slack/channels*', async (route: Route) => {
+    listed.push(route.request().url());
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ channels: [
+        { id: 'C1', name: 'general', is_private: false },
+        { id: 'C2', name: 'random', is_private: true },
+      ] }),
+    });
+  });
+
+  const drawer = await openWizard(page);
+  await pickProvider(drawer, 'slack');
+  const pick = drawer.locator('#slack-channel');
+  await expect(pick.locator('option')).toHaveText(['All channels the credential is a member of']);
+  await drawer.locator('#slack-credential').fill('CONNECTOR_SLACK_SPEC');
+  await expect(pick.locator('option')).toHaveText(['All channels the credential is a member of', '#general', '#random (private)']);
+  await expect(drawer.locator('[data-slack-channels-status]')).toContainText('2 channels');
+  expect(listed.at(-1)).toContain('credential_ref=CONNECTOR_SLACK_SPEC');
+  await pick.selectOption('C2');
+
+  await drawer.getByRole('button', { name: 'Continue' }).click();
+  await drawer.getByRole('button', { name: 'Continue' }).click();
+  const createBodies: Record<string, unknown>[] = [];
+  await page.route('**/api/v1/connectors/sources', async (route: Route) => {
+    createBodies.push(JSON.parse(route.request().postData() ?? '{}'));
+    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ id: 'connsrc_slack_spec', type: 'slack', name: 'Spec slack' }) });
+  });
+  await page.route('**/api/v1/connectors/sources/*/sync', (route: Route) =>
+    route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ id: 'jobspec', status: 'queued' }) }));
+  await drawer.locator('[data-source-name]').fill('Spec slack');
+  await drawer.locator('[data-source-collection]').selectOption(collectionID);
+  await drawer.getByRole('button', { name: 'Continue' }).click(); // → review
+  await expect(drawer.locator('[data-source-review]')).toContainText('channel: #random (private)');
+  await drawer.getByRole('button', { name: 'Create source and sync' }).click();
+  await expect(drawer).not.toHaveClass(/open/, { timeout: 15000 });
+  expect(createBodies).toHaveLength(1);
+  expect(createBodies[0].credential_ref).toBe('CONNECTOR_SLACK_SPEC');
+  expect((createBodies[0].config as Record<string, unknown>).channel_id).toBe('C2');
+});

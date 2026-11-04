@@ -190,8 +190,10 @@ Slack sources need a `CONNECTOR_SLACK_*` `credential_ref` holding a token for
 `https://slack.com`. `config.channel_id` limits the source to one channel;
 without it the source syncs every public and private channel the token is a
 member of (`users.conversations`, archived channels excluded) — invite the
-bot to each channel to include. A channel left mid-sync is skipped. Required
-scopes:
+bot to each channel to include. A channel left mid-sync is skipped.
+`GET /api/v1/connectors/slack/channels?credential_ref=…` lists a credential's
+member channels (`{channels: [{id, name, is_private}]}`, by name) for the
+wizard's channel picker. Required scopes:
 `channels:history`/`groups:history` and `channels:read`/`groups:read` for
 public/private channels, plus `users:read` for author names and `files:read`
 for attachments. Every message and thread reply becomes one document headed
