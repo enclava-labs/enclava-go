@@ -44,9 +44,9 @@
   <div class="section-head"><h2>Connect and scope</h2></div>
 
   <div data-provider-fields="slack" hidden>
-    <label class="label" for="slack-channel">Channel ID</label>
-    <input class="field" id="slack-channel" data-config="channel_id" required>
-    <span class="help">One channel per source — the ID Slack shows in channel details.</span>
+    <label class="label" for="slack-channel">Channel ID <span class="muted">(optional)</span></label>
+    <input class="field" id="slack-channel" data-config="channel_id" autocomplete="off">
+    <span class="help">The ID Slack shows in channel details. Leave empty to sync every channel the credential is a member of — invite the bot to the channels you want.</span>
     <label class="label" for="slack-limit">Item limit</label>
     <input class="field" id="slack-limit" data-config="limit" data-type="number" type="number" min="1" inputmode="numeric">
     <label class="label"><input type="checkbox" data-config="reconcile" data-type="bool" value="true"> Reconcile access on every sync</label>

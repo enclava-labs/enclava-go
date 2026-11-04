@@ -629,13 +629,14 @@ func dashboardSourceScope(src connectors.Source) string {
 	list := func(key string) []string { return dashboardStringListFrom(cfg[key]) }
 	switch src.Type {
 	case connectors.SourceTypeSlack:
+		scope := "All member channels"
 		if ch := str("channel_id"); ch != "" {
-			scope := "#" + ch
-			if str("reconcile") == "true" {
-				scope += " · reconcile"
-			}
-			return scope
+			scope = "#" + ch
 		}
+		if str("reconcile") == "true" {
+			scope += " · reconcile"
+		}
+		return scope
 	case connectors.SourceTypeTeams:
 		teams := []string{}
 		if t := str("team_id"); t != "" {

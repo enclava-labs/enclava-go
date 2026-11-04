@@ -186,9 +186,12 @@ repositories. `POST /api/v1/connectors/sources/{id}/sync` starts a fresh manual
 sync; send the same `Idempotency-Key` header to retry the same submission.
 Syncing a disabled source returns 409.
 
-Slack sources require `config.channel_id` (one channel per source; invite the
-app's bot user to it) and a `CONNECTOR_SLACK_*` `credential_ref` holding a bot
-token for `https://slack.com`. Required scopes:
+Slack sources need a `CONNECTOR_SLACK_*` `credential_ref` holding a token for
+`https://slack.com`. `config.channel_id` limits the source to one channel;
+without it the source syncs every public and private channel the token is a
+member of (`users.conversations`, archived channels excluded) — invite the
+bot to each channel to include. A channel left mid-sync is skipped. Required
+scopes:
 `channels:history`/`groups:history` and `channels:read`/`groups:read` for
 public/private channels, plus `users:read` for author names and `files:read`
 for attachments. Every message and thread reply becomes one document headed

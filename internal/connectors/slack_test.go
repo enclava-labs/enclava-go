@@ -273,6 +273,107 @@ func TestSlackFileAccessUsesFilesShares(t *testing.T) {
 	}
 }
 
+// TestSlackWithoutChannelSyncsEveryMemberChannel: a source without
+// channel_id lists every channel the credential is a member of — content,
+// access and membership each walk them all — and skips one it has since
+// left instead of failing the sync.
+func TestSlackWithoutChannelSyncsEveryMemberChannel(t *testing.T) {
+	history := map[string]string{
+		"C1": `{"ok":true,"messages":[{"user":"U1","text":"second","ts":"2.000000"},{"user":"U1","text":"first","ts":"1.000000"}],"has_more":false}`,
+		"C2": `{"ok":true,"messages":[{"user":"U2","text":"elsewhere","ts":"3.000000"}],"has_more":false}`,
+	}
+	members := map[string]string{"C1": `["U1"]`, "C2": `["U1","U2"]`}
+	a, conn := newSlackTestAdapter(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		switch r.URL.Path {
+		case "/users.conversations":
+			if q.Get("types") != "public_channel,private_channel" || q.Get("exclude_archived") != "true" {
+				t.Errorf("users.conversations query = %v", q)
+			}
+			if q.Get("cursor") == "" {
+				_, _ = fmt.Fprint(w, `{"ok":true,"channels":[{"id":"C3","name":"left"},{"id":"C2","name":"random"}],"response_metadata":{"next_cursor":"p2"}}`)
+				return
+			}
+			_, _ = fmt.Fprint(w, `{"ok":true,"channels":[{"id":"C1","name":"general"}],"response_metadata":{"next_cursor":""}}`)
+		case "/conversations.history":
+			if body, ok := history[q.Get("channel")]; ok {
+				_, _ = fmt.Fprint(w, body)
+				return
+			}
+			_, _ = fmt.Fprint(w, `{"ok":false,"error":"not_in_channel"}`)
+		case "/conversations.members":
+			if list, ok := members[q.Get("channel")]; ok {
+				_, _ = fmt.Fprintf(w, `{"ok":true,"members":%s}`, list)
+				return
+			}
+			_, _ = fmt.Fprint(w, `{"ok":false,"error":"channel_not_found"}`)
+		case "/auth.test":
+			_, _ = fmt.Fprint(w, `{"ok":true,"url":"https://workspace.slack.com/"}`)
+		case "/users.list":
+			_, _ = fmt.Fprint(w, `{"ok":true,"members":[{"id":"U1","name":"alice"},{"id":"U2","name":"bob"}]}`)
+		default:
+			t.Errorf("unexpected endpoint %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	delete(conn.Config, "channel_id")
+	ctx := context.Background()
+
+	var items []string
+	var cursor Cursor
+	for pages := 0; ; pages++ {
+		page, err := a.Content(ctx, conn, cursor, 2)
+		if err != nil || pages > 10 || len(page.Items) > 2 {
+			t.Fatalf("content page %d = %+v, %v", pages, page, err)
+		}
+		for _, item := range page.Items {
+			items = append(items, item.NativeID+"#"+item.Title)
+		}
+		if cursor = page.NextCursor; cursor == "" {
+			break
+		}
+	}
+	if got := strings.Join(items, " "); got != "slack:C1:2.000000#general slack:C1:1.000000#general slack:C2:3.000000#random" {
+		t.Fatalf("content = %s", got)
+	}
+
+	var grants []string
+	cursor = ""
+	for pages := 0; ; pages++ {
+		page, err := a.Access(ctx, conn, cursor, 10)
+		if err != nil || pages > 10 || page.Completeness != CompletenessComplete {
+			t.Fatalf("access page %d = %+v, %v", pages, page, err)
+		}
+		for _, g := range page.Grants {
+			grants = append(grants, g.NativeObjectID+"/"+g.NativePrincipalID)
+		}
+		if cursor = page.NextCursor; cursor == "" {
+			break
+		}
+	}
+	if got := strings.Join(grants, " "); got != "slack:C1/U1 slack:C2/U1 slack:C2/U2" {
+		t.Fatalf("grants = %s", got)
+	}
+
+	var memberships []string
+	cursor = ""
+	for pages := 0; ; pages++ {
+		page, err := a.Membership(ctx, conn, cursor, 10)
+		if err != nil || pages > 10 || page.Completeness != CompletenessComplete {
+			t.Fatalf("membership page %d = %+v, %v", pages, page, err)
+		}
+		for _, m := range page.Memberships {
+			memberships = append(memberships, m.NativeGroupID+"/"+m.NativePrincipalID)
+		}
+		if cursor = page.NextCursor; cursor == "" {
+			break
+		}
+	}
+	if got := strings.Join(memberships, " "); got != "C1/U1 C2/U1 C2/U2" {
+		t.Fatalf("memberships = %s", got)
+	}
+}
+
 func TestNewSlackAdapterReleasesTokenOnlyForBoundTenantAndOrigin(t *testing.T) {
 	t.Setenv("SLACK_FIXTURE_TOKEN", "test-token")
 	t.Setenv("CONNECTOR_SLACK_UNBOUND", "leaked")
