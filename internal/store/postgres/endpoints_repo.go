@@ -30,19 +30,22 @@ var _ inference.EndpointRepository = (*EndpointsRepo)(nil)
 
 const endpointCols = `id, protocol, sdk_provider, base_origin, enclave_repo, credential_ref,
 	capabilities::text, assurance_mode, assurance_verified_at,
-	authorized_private, enabled`
+	authorized_private, enabled, COALESCE(config->'request_defaults', 'null'::jsonb)::text`
 
 func scanEndpoint(row rowScanner, tenantID string) (inference.Endpoint, error) {
 	var e inference.Endpoint
-	var caps string
+	var caps, defaults string
 	var verified sql.NullTime
 	err := row.Scan(&e.ID, &e.Protocol, &e.SDKProvider, &e.BaseOrigin, &e.EnclaveRepo, &e.CredentialRef,
-		&caps, &e.AssuranceMode, &verified, &e.AuthorizedPrivate, &e.Enabled)
+		&caps, &e.AssuranceMode, &verified, &e.AuthorizedPrivate, &e.Enabled, &defaults)
 	if err != nil {
 		return inference.Endpoint{}, err
 	}
 	if err := json.Unmarshal([]byte(caps), &e.Capabilities); err != nil {
 		return inference.Endpoint{}, fmt.Errorf("decode capabilities: %w", err)
+	}
+	if err := json.Unmarshal([]byte(defaults), &e.RequestDefaults); err != nil {
+		return inference.Endpoint{}, fmt.Errorf("decode request defaults: %w", err)
 	}
 	if verified.Valid {
 		tv := verified.Time
@@ -50,6 +53,20 @@ func scanEndpoint(row rowScanner, tenantID string) (inference.Endpoint, error) {
 	}
 	e.TenantID = tenantID
 	return e, nil
+}
+
+// endpointConfigPatch is the config fragment this repo owns; Update merges it
+// so other config keys survive.
+func endpointConfigPatch(e inference.Endpoint) (string, error) {
+	patch := map[string]any{}
+	if len(e.RequestDefaults) > 0 {
+		patch["request_defaults"] = e.RequestDefaults
+	}
+	raw, err := json.Marshal(patch)
+	if err != nil {
+		return "", fmt.Errorf("marshal endpoint config: %w", err)
+	}
+	return string(raw), nil
 }
 
 // validateEndpointOrigin enforces the origin contract: absolute https for
@@ -133,14 +150,18 @@ func (r *EndpointsRepo) Create(ctx context.Context, e inference.Endpoint) error 
 	if err != nil {
 		return fmt.Errorf("marshal capabilities: %w", err)
 	}
+	config, err := endpointConfigPatch(e)
+	if err != nil {
+		return err
+	}
 	_, err = r.db.ExecContext(ctx, `
 		INSERT INTO inference_endpoints
 			(tenant_id, id, protocol, sdk_provider, base_origin, enclave_repo, credential_ref, capabilities,
-			 assurance_mode, assurance_verified_at, authorized_private, enabled)
-		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+			 assurance_mode, assurance_verified_at, authorized_private, enabled, config)
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)`,
 		e.TenantID, e.ID, e.Protocol, e.SDKProvider, e.BaseOrigin, e.EnclaveRepo, e.CredentialRef,
 		string(caps), e.AssuranceMode, e.AssuranceVerifiedAt,
-		e.AuthorizedPrivate, e.Enabled)
+		e.AuthorizedPrivate, e.Enabled, config)
 	if err != nil {
 		return fmt.Errorf("create endpoint: %w", err)
 	}
@@ -157,15 +178,20 @@ func (r *EndpointsRepo) Update(ctx context.Context, e inference.Endpoint) error 
 	if err != nil {
 		return fmt.Errorf("marshal capabilities: %w", err)
 	}
+	config, err := endpointConfigPatch(e)
+	if err != nil {
+		return err
+	}
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE inference_endpoints SET
 			protocol = $3, sdk_provider = $4, base_origin = $5, enclave_repo = $6, credential_ref = $7,
 			capabilities = $8, assurance_mode = $9, assurance_verified_at = $10,
-			authorized_private = $11, enabled = $12, updated_at = now()
+			authorized_private = $11, enabled = $12, config = (config - 'request_defaults') || $13::jsonb,
+			updated_at = now()
 		WHERE tenant_id = $1::uuid AND id = $2`,
 		e.TenantID, e.ID, e.Protocol, e.SDKProvider, e.BaseOrigin, e.EnclaveRepo, e.CredentialRef,
 		string(caps), e.AssuranceMode, e.AssuranceVerifiedAt,
-		e.AuthorizedPrivate, e.Enabled)
+		e.AuthorizedPrivate, e.Enabled, config)
 	if err != nil {
 		return fmt.Errorf("update endpoint: %w", err)
 	}

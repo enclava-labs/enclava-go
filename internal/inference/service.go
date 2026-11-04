@@ -309,6 +309,7 @@ func (s *Service) Execute(ctx context.Context, p auth.Principal, req Request) (r
 		permit.Release()
 		return nil, err
 	}
+	applyRequestDefaults(info.root, endpoint, capability)
 	body, err := marshalPayload(info.root, upstreamModel, req)
 	if err != nil {
 		permit.Release()

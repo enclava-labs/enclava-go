@@ -10,6 +10,7 @@ package inference
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -502,6 +503,45 @@ func marshalPayload(root map[string]any, upstreamModel string, req Request) ([]b
 		return nil, fmt.Errorf("%w: unmarshalable payload", ErrDenied)
 	}
 	return body, nil
+}
+
+// requestDefaultsReserved are fields the gateway owns — routing, streaming,
+// the billed output bound and tool policy — so endpoint defaults never set them.
+var requestDefaultsReserved = map[string]bool{
+	"model": true, "messages": true, "input": true, "prompt": true, "stream": true, "stream_options": true,
+	"n": true, "max_tokens": true, "max_completion_tokens": true, "max_output_tokens": true,
+	"tools": true, "tool_choice": true, "functions": true, "function_call": true, "user": true,
+}
+
+// ValidateRequestDefaults rejects endpoint defaults that would override a
+// gateway-owned field or bloat every request.
+func ValidateRequestDefaults(defaults map[string]any) error {
+	for key := range defaults {
+		if requestDefaultsReserved[key] {
+			return fmt.Errorf("request_defaults may not set %q", key)
+		}
+	}
+	raw, err := json.Marshal(defaults)
+	if err != nil {
+		return errors.New("request_defaults must be a JSON object")
+	}
+	if len(raw) > 4096 {
+		return errors.New("request_defaults must encode to at most 4096 bytes")
+	}
+	return nil
+}
+
+// applyRequestDefaults adds the endpoint's defaults to a chat request for
+// every top-level field the caller left unset; caller-set fields win.
+func applyRequestDefaults(root map[string]any, e Endpoint, capability string) {
+	if capability != CapabilityChat && capability != CapabilityVision {
+		return
+	}
+	for key, value := range e.RequestDefaults {
+		if _, set := root[key]; !set && !requestDefaultsReserved[key] {
+			root[key] = value
+		}
+	}
 }
 
 // validateResponsesTarget restricts Responses dispatches to the bounded

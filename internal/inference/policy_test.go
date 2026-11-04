@@ -415,6 +415,50 @@ func TestModelFieldReplacedNotRespected(t *testing.T) {
 	}
 }
 
+// Endpoint request defaults (a local server's temperature and chat-template
+// switches) survive the repository round trip, fill only fields the caller
+// left unset, never set gateway-owned fields and stop applying once cleared.
+func TestEndpointRequestDefaultsFillUnsetChatFields(t *testing.T) {
+	f := newFx(t)
+	e := inference.Endpoint{
+		ID: "ep-1", TenantID: f.tenant, Protocol: "openai_compatible", BaseOrigin: "https://api.upstream.example",
+		Capabilities: []string{inference.CapabilityChat, "model:gpt-fast=gpt-4o-mini"}, Enabled: true,
+		RequestDefaults: map[string]any{"temperature": 0.5, "chat_template_kwargs": map[string]any{"enable_thinking": false}, "max_tokens": 7},
+	}
+	if err := f.endpoint.Create(f.ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	f.flatPrices(t)
+	send := func(payload string) map[string]any {
+		t.Helper()
+		res, err := f.svc.Execute(f.ctx, f.principal, f.chatRequest(payload))
+		if err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+		_ = res.Body.Close()
+		var sent map[string]any
+		if err := json.Unmarshal(f.upstream.lastBody, &sent); err != nil {
+			t.Fatal(err)
+		}
+		return sent
+	}
+	sent := send(`{"messages":[{"role":"user","content":"hi"}]}`)
+	kwargs, _ := sent["chat_template_kwargs"].(map[string]any)
+	if sent["temperature"] != 0.5 || kwargs["enable_thinking"] != false || sent["max_tokens"] == float64(7) {
+		t.Fatalf("defaults not applied as configured: %s", f.upstream.lastBody)
+	}
+	if sent = send(`{"messages":[{"role":"user","content":"hi"}],"temperature":0}`); sent["temperature"] != float64(0) || sent["chat_template_kwargs"] == nil {
+		t.Fatalf("caller temperature must win while other defaults apply: %s", f.upstream.lastBody)
+	}
+	e.RequestDefaults = nil
+	if err := f.endpoint.Update(f.ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	if sent = send(`{"messages":[{"role":"user","content":"hi"}]}`); sent["temperature"] != nil || sent["chat_template_kwargs"] != nil {
+		t.Fatalf("cleared defaults still applied: %s", f.upstream.lastBody)
+	}
+}
+
 // An uncapped chat request gets the injected default under the field the
 // routed model actually accepts: OpenAI reasoning models reject max_tokens
 // outright, so the cap goes in max_completion_tokens; OpenAI-compatible

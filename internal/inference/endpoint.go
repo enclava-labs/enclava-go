@@ -36,6 +36,10 @@ type Endpoint struct {
 	AssuranceVerifiedAt *time.Time
 	AuthorizedPrivate   bool
 	Enabled             bool
+	// RequestDefaults are operator-set top-level body fields (for example
+	// temperature or chat_template_kwargs) added to chat requests that do not
+	// set them; stored in the endpoint's config and exposed there by the API.
+	RequestDefaults map[string]any `json:"-"`
 }
 
 // EndpointRepository is the tenant-scoped persistence seam for Endpoint

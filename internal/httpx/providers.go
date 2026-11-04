@@ -27,6 +27,9 @@ type endpointRequest struct {
 	AssuranceVerified *bool    `json:"assurance_verified,omitempty"`
 	AuthorizedPrivate *bool    `json:"authorized_private,omitempty"`
 	IsEnabled         *bool    `json:"is_enabled,omitempty"`
+	// RequestDefaults replaces the endpoint's chat request defaults when
+	// present; {} clears them, absent keeps them.
+	RequestDefaults *map[string]any `json:"request_defaults,omitempty"`
 }
 
 // providerEndpointView keeps the /api/v1/providers list shape while carrying
@@ -42,6 +45,9 @@ func endpointView(e inference.Endpoint) providerEndpointView {
 	config := map[string]any{}
 	if e.AssuranceMode != "" {
 		config["assurance_mode"] = e.AssuranceMode
+	}
+	if len(e.RequestDefaults) > 0 {
+		config["request_defaults"] = e.RequestDefaults
 	}
 	return providerEndpointView{
 		Endpoint: e,
@@ -264,6 +270,9 @@ func endpointFromCreateRequest(tenantID string, req endpointRequest) (inference.
 	if req.IsEnabled != nil {
 		endpoint.Enabled = *req.IsEnabled
 	}
+	if req.RequestDefaults != nil {
+		endpoint.RequestDefaults = *req.RequestDefaults
+	}
 	if req.AssuranceVerified != nil && *req.AssuranceVerified {
 		return inference.Endpoint{}, errInvalidProvider("assurance_verified_at is set by observed verification only")
 	}
@@ -295,6 +304,9 @@ func endpointFromUpdateRequest(existing inference.Endpoint, req endpointRequest)
 	}
 	if req.AuthorizedPrivate != nil {
 		endpoint.AuthorizedPrivate = *req.AuthorizedPrivate
+	}
+	if req.RequestDefaults != nil {
+		endpoint.RequestDefaults = *req.RequestDefaults
 	}
 	if req.AssuranceVerified != nil && *req.AssuranceVerified {
 		return inference.Endpoint{}, errInvalidProvider("assurance_verified_at is set by observed verification only")
@@ -366,6 +378,9 @@ func validateEndpoint(e inference.Endpoint) (inference.Endpoint, error) {
 	if e.Protocol == "tinfoil" && e.EnclaveRepo == "" &&
 		inference.TinfoilEnclaveHost(e.BaseOrigin) != inference.DefaultTinfoilEnclave {
 		return inference.Endpoint{}, errInvalidProvider("a dedicated tinfoil enclave requires enclave_repo")
+	}
+	if err := inference.ValidateRequestDefaults(e.RequestDefaults); err != nil {
+		return inference.Endpoint{}, errInvalidProvider(err.Error())
 	}
 	return e, nil
 }

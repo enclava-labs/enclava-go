@@ -321,6 +321,22 @@ For a dedicated Tinfoil enclave, set `base_origin` to its HTTPS origin and
 `enclave_repo` to the trusted repository reference. The default router origin
 `https://inference.tinfoil.sh` uses automatic router configuration.
 
+`request_defaults` (create and update; returned under `config.request_defaults`)
+adds top-level fields to chat requests routed to the endpoint that do not set
+them — for example a local server's sampling and chat-template switches.
+Caller-set fields win, `{}` clears the defaults and an update without the field
+keeps them; gateway-owned fields (`model`, `messages`, `stream`,
+`stream_options`, `n`, `max_tokens`, `max_completion_tokens`, `tools`, …) are
+rejected:
+
+```bash
+curl -s -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  $BASE/api/v1/providers -d '{"id":"spark01-qwen","protocol":"openai_compatible",
+  "base_origin":"http://spark01:8888","authorized_private":true,
+  "capabilities":["chat/completions","model:Qwen3.8-Flash-Next=Qwen3.8-Flash-Next"],
+  "request_defaults":{"temperature":0.5,"chat_template_kwargs":{"enable_thinking":false}}}'
+```
+
 ## Identity management
 
 `DELETE /api/v1/identities/users/{id}` requires `platform.admin` and returns
