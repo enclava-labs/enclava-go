@@ -94,20 +94,6 @@ func TestGitHubContentPinsIdentityToConnectionAndRevision(t *testing.T) {
 	if page.Items[1].NativeID != "github:conn1:acme/docs:comment:102" || page.Items[2].NativeID != "github:conn1:acme/docs:review_comment:103" {
 		t.Fatalf("pull request comment IDs changed: %#v", page.Items)
 	}
-	access, err := g.Access(context.Background(), conn, "", 100)
-	if err != nil || len(access.Grants) != 2 || !access.Snapshot {
-		t.Fatalf("collaborators missing: %#v, %v", access, err)
-	}
-	for i, id := range []string{"alice", "42"} {
-		grant := access.Grants[i]
-		if grant.NativeObjectID != "github:conn1:acme/docs" || grant.NativeObjectKind != "repository" || grant.NativePrincipalID != id || grant.Scope != "read" || grant.Effect != "allow" {
-			t.Fatalf("invalid collaborator grant: %#v", grant)
-		}
-	}
-	members, err := g.Membership(context.Background(), conn, "", 100)
-	if err != nil || len(members.Memberships) != 2 || members.Memberships[0].NativeGroupID != "acme/docs" || members.Memberships[0].NativePrincipalID != "alice" {
-		t.Fatalf("collaborator membership missing: %#v, %v", members, err)
-	}
 	issueRevision = "2026-02-01T00:00:00Z"
 	updated, err := g.Content(context.Background(), conn, "", 100)
 	if err != nil {

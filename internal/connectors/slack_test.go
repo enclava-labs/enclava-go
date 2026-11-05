@@ -209,17 +209,6 @@ func TestSlackChannelTitleUnavailable(t *testing.T) {
 	}
 }
 
-func TestSlackMembershipDeniedIsIncomplete(t *testing.T) {
-	a, conn := newSlackTestAdapter(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = fmt.Fprint(w, `{"ok":false,"error":"not_in_channel"}`)
-	}))
-	page, err := a.Membership(context.Background(), conn, "", 10)
-	if err == nil || page.Completeness != CompletenessIncomplete {
-		t.Fatalf("page=%+v err=%v", page, err)
-	}
-}
-
 func TestSlackRateLimitWaitsThenGivesUp(t *testing.T) {
 	limitedFake := func(limited int32) *fakeSlack {
 		var remaining atomic.Int32
@@ -248,35 +237,9 @@ func TestSlackRateLimitWaitsThenGivesUp(t *testing.T) {
 	}
 }
 
-func TestSlackFileAccessUsesFilesShares(t *testing.T) {
-	a, conn := newSlackTestAdapter(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/conversations.members":
-			_, _ = fmt.Fprint(w, `{"ok":true,"members":["U1"]}`)
-		case "/users.list":
-			_, _ = fmt.Fprint(w, `{"ok":true,"members":[{"id":"U1","name":"alice","profile":{"display_name":"Alice"}}]}`)
-		case "/conversations.history":
-			_, _ = fmt.Fprint(w, `{"ok":true,"messages":[{"user":"U1","text":"attached","ts":"1.000001","files":[{"id":"F1"}]}],"has_more":false}`)
-		case "/files.info":
-			_, _ = fmt.Fprint(w, `{"ok":true,"file":{"id":"F1","shares":{"public":{"C2":[{"channel_id":"C2"}]}}}}`)
-		default:
-			t.Errorf("unexpected endpoint %s", r.URL.Path)
-			http.NotFound(w, r)
-		}
-	}))
-	page, err := a.Access(context.Background(), conn, "", 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(page.Grants) != 2 || page.Grants[0].NativeObjectID != "slack:C1" || page.Grants[0].NativeObjectKind != "channel" || page.Grants[0].Scope != "read" || page.Grants[0].Inherited || page.Grants[0].NativePrincipalName != "Alice" || page.Grants[1].NativeObjectID != "slack:file:F1" || page.Grants[1].NativeGroupID != "C2" {
-		t.Fatalf("file access was not sourced independently: %+v", page.Grants)
-	}
-}
-
 // TestSlackWithoutChannelSyncsEveryMemberChannel: a source without
-// channel_id lists every channel the credential is a member of — content,
-// access and membership each walk them all — and skips one it has since
-// left instead of failing the sync.
+// channel_id lists every channel the credential is a member of and skips
+// one it has since left instead of failing the sync.
 func TestSlackWithoutChannelSyncsEveryMemberChannel(t *testing.T) {
 	history := map[string]string{
 		"C1": `{"ok":true,"messages":[{"user":"U1","text":"second","ts":"2.000000"},{"user":"U1","text":"first","ts":"1.000000"}],"has_more":false}`,
@@ -335,42 +298,6 @@ func TestSlackWithoutChannelSyncsEveryMemberChannel(t *testing.T) {
 	}
 	if got := strings.Join(items, " "); got != "slack:C1:2.000000#general slack:C1:1.000000#general slack:C2:3.000000#random" {
 		t.Fatalf("content = %s", got)
-	}
-
-	var grants []string
-	cursor = ""
-	for pages := 0; ; pages++ {
-		page, err := a.Access(ctx, conn, cursor, 10)
-		if err != nil || pages > 10 || page.Completeness != CompletenessComplete {
-			t.Fatalf("access page %d = %+v, %v", pages, page, err)
-		}
-		for _, g := range page.Grants {
-			grants = append(grants, g.NativeObjectID+"/"+g.NativePrincipalID)
-		}
-		if cursor = page.NextCursor; cursor == "" {
-			break
-		}
-	}
-	if got := strings.Join(grants, " "); got != "slack:C1/U1 slack:C2/U1 slack:C2/U2" {
-		t.Fatalf("grants = %s", got)
-	}
-
-	var memberships []string
-	cursor = ""
-	for pages := 0; ; pages++ {
-		page, err := a.Membership(ctx, conn, cursor, 10)
-		if err != nil || pages > 10 || page.Completeness != CompletenessComplete {
-			t.Fatalf("membership page %d = %+v, %v", pages, page, err)
-		}
-		for _, m := range page.Memberships {
-			memberships = append(memberships, m.NativeGroupID+"/"+m.NativePrincipalID)
-		}
-		if cursor = page.NextCursor; cursor == "" {
-			break
-		}
-	}
-	if got := strings.Join(memberships, " "); got != "C1/U1 C2/U1 C2/U2" {
-		t.Fatalf("memberships = %s", got)
 	}
 }
 

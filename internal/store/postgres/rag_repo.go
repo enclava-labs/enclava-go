@@ -556,35 +556,6 @@ func (r *RAGRepo) DistinctIndexBindings(ctx context.Context, tenantID, collectio
 	return out, nil
 }
 
-// ListCollectionConnectionIDs returns the distinct connections that have
-// live objects in the collection — bounds the per-search token lookup to
-// connection count, never document count.
-func (r *RAGRepo) ListCollectionConnectionIDs(ctx context.Context, tenantID, collectionID string) ([]string, error) {
-	rows, err := r.db.SQL.QueryContext(ctx, `
-		SELECT DISTINCT o.connection_id
-		FROM collection_items ci
-		JOIN source_objects o ON o.tenant_id=ci.tenant_id AND o.id=ci.object_id
-		WHERE ci.tenant_id=$1 AND ci.collection_id=$2 AND ci.removed_at IS NULL
-		  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL
-		  AND o.connection_id <> ''`, tenantID, collectionID)
-	if err != nil {
-		return nil, fmt.Errorf("list collection connections: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	out := []string{}
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan collection connection: %w", err)
-		}
-		out = append(out, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate collection connections: %w", err)
-	}
-	return out, nil
-}
-
 // PublishedGenerationForVersion reports whether (version, generation) is
 // currently published in the collection through a live collection item —
 // the per-hit check that replaces listing every published generation.
@@ -661,28 +632,20 @@ func (r *RAGRepo) TenantsNeedingAccessBackfill(ctx context.Context) ([]string, e
 	return out, rows.Err()
 }
 
-func (r *RAGRepo) ProjectGenerationAccess(ctx context.Context, tenantID, collectionID, versionID string, generation int64, project func(int64) (int64, error)) error {
+// ProjectGenerationAccess runs project (which writes the generation's
+// search tokens) under a per-generation lock, then marks it projected.
+func (r *RAGRepo) ProjectGenerationAccess(ctx context.Context, tenantID, collectionID, versionID string, generation int64, project func() error) error {
 	return WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
 		key := fmt.Sprintf("rag-access:%s:%s:%s:%d", tenantID, collectionID, versionID, generation)
 		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key); err != nil {
 			return err
 		}
-		var current int64
-		if err := tx.QueryRowContext(ctx, `SELECT acl_revision FROM index_generations
-			WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3 AND generation=$4`,
-			tenantID, collectionID, versionID, generation).Scan(&current); err != nil {
+		if err := project(); err != nil {
 			return err
 		}
-		revision, err := project(current)
-		if err != nil {
-			return err
-		}
-		if revision < current {
-			return fmt.Errorf("access revision %d precedes %d", revision, current)
-		}
-		_, err = tx.ExecContext(ctx, `UPDATE index_generations SET access_projected=TRUE, acl_revision=$5
+		_, err := tx.ExecContext(ctx, `UPDATE index_generations SET access_projected=TRUE
 			WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3 AND generation=$4`,
-			tenantID, collectionID, versionID, generation, revision)
+			tenantID, collectionID, versionID, generation)
 		return err
 	})
 }
@@ -919,10 +882,10 @@ func (r *RAGRepo) CreateUploadIfNew(ctx context.Context, collectionID, actorID s
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO source_objects
-			    (tenant_id, id, kind, native_id, authorization_mode, owner_actor_id, audience, observed_seq)
-			VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,1)`,
+			    (tenant_id, id, kind, native_id, authorization_mode, owner_actor_id, observed_seq)
+			VALUES ($1,$2,$3,$4,$5,$6,1)`,
 			object.TenantID, object.ID, object.Kind, object.NativeID, object.AuthorizationMode,
-			nullableText(object.OwnerActorID), mustJSONList(object.Audience)); err != nil {
+			nullableText(object.OwnerActorID)); err != nil {
 			return fmt.Errorf("insert upload object: %w", err)
 		}
 		restrictions, err := json.Marshal(version.Restrictions)

@@ -61,23 +61,4 @@ func TestLiveSlack(t *testing.T) {
 	if !foundThread || !foundPermalink {
 		t.Fatalf("live channel lacks thread/permalink proof: thread=%v permalink=%v", foundThread, foundPermalink)
 	}
-	var memberCursor Cursor
-	memberCount := 0
-	for {
-		members, err := adapter.Membership(context.Background(), conn, memberCursor, 1)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if members.Completeness != CompletenessComplete {
-			t.Fatalf("incomplete live membership snapshot: %+v", members)
-		}
-		memberCount += len(members.Memberships)
-		memberCursor = members.NextCursor
-		if memberCursor == "" {
-			break
-		}
-	}
-	if memberCount == 0 {
-		t.Fatal("live Slack channel has no members")
-	}
 }

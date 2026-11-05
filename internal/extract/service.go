@@ -77,7 +77,7 @@ type Service struct {
 func (s *Service) SetSourceRepository(repo source.SourceRepository) {
 	s.sources = repo
 	if repo != nil {
-		s.authorizer = source.NewAuthorizer(repo, 0)
+		s.authorizer = source.NewAuthorizer(repo)
 	}
 }
 

@@ -22,36 +22,24 @@ const (
 	notionAPIOrigin = "https://api.notion.com"
 )
 
-type notionAudience struct {
-	ID      string
-	Members []string
-}
-
 type notionSelection struct {
-	PageID    string
-	Audiences []notionAudience
+	PageID string
 }
-
-func notionAudienceGroup(id string) string { return "notion:audience:" + id }
 
 type NotionAdapter struct {
-	baseURL                 string
-	token                   string
-	tenantID                string
-	connectionID            string
-	selections              []notionSelection
-	maxDepth                int
-	maxItems                int
-	client                  *http.Client
-	requestMu               sync.Mutex
-	nextRequest             time.Time
-	snapshotMu              sync.Mutex
-	contentSnapshot         []ContentItem
-	contentSnapshotReady    bool
-	accessSnapshot          []AccessGrant
-	accessSnapshotReady     bool
-	membershipSnapshot      []AccessGrant
-	membershipSnapshotReady bool
+	baseURL              string
+	token                string
+	tenantID             string
+	connectionID         string
+	selections           []notionSelection
+	maxDepth             int
+	maxItems             int
+	client               *http.Client
+	requestMu            sync.Mutex
+	nextRequest          time.Time
+	snapshotMu           sync.Mutex
+	contentSnapshot      []ContentItem
+	contentSnapshotReady bool
 }
 
 // NewNotionAdapter builds a publisher-selected Notion adapter. Traversal is
@@ -116,43 +104,13 @@ func notionSelections(raw any) ([]notionSelection, error) {
 			return nil, errors.New("notion selected page IDs must be non-empty and unique")
 		}
 		seen[id] = true
-		rawAudiences, ok := value["audiences"].([]any)
-		if !ok || len(rawAudiences) == 0 {
-			return nil, fmt.Errorf("notion selected page %q must assign at least one audience", id)
-		}
-		sel := notionSelection{PageID: id}
-		audienceSeen := map[string]bool{}
-		for _, rawAudience := range rawAudiences {
-			entry, ok := rawAudience.(map[string]any)
-			if !ok {
-				return nil, fmt.Errorf("notion selected page %q audiences must include IDs and members", id)
-			}
-			name := strings.TrimSpace(stringFromAny(entry["id"]))
-			rawMembers, ok := entry["members"].([]any)
-			if name == "" || audienceSeen[name] || !ok {
-				return nil, fmt.Errorf("notion selected page %q has an invalid or duplicate audience", id)
-			}
-			audienceSeen[name] = true
-			audience := notionAudience{ID: name}
-			memberSeen := map[string]bool{}
-			for _, rawMember := range rawMembers {
-				member := strings.TrimSpace(stringFromAny(rawMember))
-				if member == "" || memberSeen[member] {
-					return nil, fmt.Errorf("notion audience %q has an empty or duplicate member", name)
-				}
-				memberSeen[member] = true
-				audience.Members = append(audience.Members, member)
-			}
-			sel.Audiences = append(sel.Audiences, audience)
-		}
-		out = append(out, sel)
+		out = append(out, notionSelection{PageID: id})
 	}
 	return out, nil
 }
 
 func (a *NotionAdapter) Capabilities() AdapterCapabilities {
-	return AdapterCapabilities{Content: true, Access: true, Membership: true,
-		UnsupportedScopes: []string{"native Notion sharing is not mirrored; readers need their own Notion access to open native URLs"}}
+	return AdapterCapabilities{Content: true}
 }
 
 func (a *NotionAdapter) validateConnection(conn source.Connection) error {
@@ -329,144 +287,7 @@ func (a *NotionAdapter) traverseSelections(ctx context.Context, selections []not
 	return items, nil
 }
 
-func (a *NotionAdapter) Access(ctx context.Context, conn source.Connection, cursor Cursor, limit int) (AccessPage, error) {
-	if err := a.validateConnection(conn); err != nil {
-		return AccessPage{}, err
-	}
-	offset, err := notionOffset(cursor, limit)
-	if err != nil {
-		return AccessPage{}, err
-	}
-	a.snapshotMu.Lock()
-	defer a.snapshotMu.Unlock()
-	if cursor != "" && !a.accessSnapshotReady {
-		offset = 0
-	}
-	if cursor == "" || !a.accessSnapshotReady {
-		a.accessSnapshotReady = false
-		all := make([]AccessGrant, 0)
-		seen := make(map[AccessGrant]struct{})
-		for _, sel := range a.selections {
-			var root struct {
-				ID string `json:"id"`
-			}
-			err := a.get(ctx, "/pages/"+url.PathEscape(sel.PageID), &root)
-			if err != nil && !notionAccessLost(err) {
-				return AccessPage{}, err
-			}
-			effect := "allow"
-			items := []ContentItem{{NativeID: sel.PageID, Kind: "page"}}
-			if err != nil {
-				effect = "deny"
-			} else {
-				items, err = a.traverseSelections(ctx, []notionSelection{sel})
-				if err != nil {
-					return AccessPage{}, err
-				}
-			}
-			for _, item := range items {
-				for _, audience := range sel.Audiences {
-					grant := AccessGrant{NativeObjectID: item.NativeID, NativeObjectKind: item.Kind, NativeGroupID: notionAudienceGroup(audience.ID), Scope: "read", Effect: effect}
-					if _, ok := seen[grant]; !ok {
-						seen[grant] = struct{}{}
-						all = append(all, grant)
-					}
-				}
-			}
-		}
-		a.accessSnapshot = all
-		a.accessSnapshotReady = true
-	}
-	all := a.accessSnapshot
-	start, end, next, err := notionBounds(offset, limit, len(all))
-	if err != nil {
-		return AccessPage{}, err
-	}
-	return AccessPage{Grants: all[start:end], NextCursor: next, Completeness: CompletenessComplete, Snapshot: true}, nil
-}
-
-func notionAccessLost(err error) bool { return errors.Is(err, errNotionAccessLost) }
-
 var errNotionAccessLost = errors.New("notion publisher access lost")
-
-func (a *NotionAdapter) Membership(ctx context.Context, conn source.Connection, cursor Cursor, limit int) (MembershipPage, error) {
-	if err := a.validateConnection(conn); err != nil {
-		return MembershipPage{}, err
-	}
-	offset, err := notionOffset(cursor, limit)
-	if err != nil {
-		return MembershipPage{}, err
-	}
-	a.snapshotMu.Lock()
-	defer a.snapshotMu.Unlock()
-	if cursor != "" && !a.membershipSnapshotReady {
-		offset = 0
-	}
-	if cursor == "" || !a.membershipSnapshotReady {
-		a.membershipSnapshotReady = false
-		for _, sel := range a.selections {
-			var root struct {
-				ID string `json:"id"`
-			}
-			if err := a.get(ctx, "/pages/"+url.PathEscape(sel.PageID), &root); err != nil {
-				return MembershipPage{Completeness: CompletenessIncomplete}, fmt.Errorf("revalidate selected Notion page %q: %w", sel.PageID, err)
-			}
-			if root.ID != sel.PageID {
-				return MembershipPage{Completeness: CompletenessIncomplete}, errors.New("notion returned a mismatched selected page")
-			}
-		}
-		all := make([]AccessGrant, 0)
-		seen := make(map[AccessGrant]struct{})
-		for _, sel := range a.selections {
-			for _, audience := range sel.Audiences {
-				for _, member := range audience.Members {
-					grant := AccessGrant{NativeGroupID: notionAudienceGroup(audience.ID), NativePrincipalID: member}
-					if _, ok := seen[grant]; !ok {
-						seen[grant] = struct{}{}
-						all = append(all, grant)
-					}
-				}
-			}
-		}
-		a.membershipSnapshot = all
-		a.membershipSnapshotReady = true
-	}
-	all := a.membershipSnapshot
-	start, end, next, err := notionBounds(offset, limit, len(all))
-	if err != nil {
-		return MembershipPage{}, err
-	}
-	return MembershipPage{Memberships: all[start:end], NextCursor: next, Completeness: CompletenessComplete, Snapshot: true}, nil
-}
-
-func notionOffset(cursor Cursor, limit int) (int, error) {
-	if limit < 1 || limit > 100 {
-		return 0, errors.New("notion page limit must be between 1 and 100")
-	}
-	if cursor == "" {
-		return 0, nil
-	}
-	offset, err := strconv.Atoi(string(cursor))
-	if err != nil || offset < 0 {
-		return 0, errors.New("invalid notion cursor")
-	}
-	return offset, nil
-}
-
-func notionBounds(offset, limit, count int) (int, int, Cursor, error) {
-	if offset > count {
-		return 0, 0, "", errors.New("notion cursor exceeds snapshot")
-	}
-	end := offset + limit
-	if end > count {
-		end = count
-	}
-	var next Cursor
-	if end < count {
-		next = Cursor(strconv.Itoa(end))
-	}
-	return offset, end, next, nil
-}
 
 func (a *NotionAdapter) waitRateLimit(ctx context.Context) error {
 	a.requestMu.Lock()

@@ -107,10 +107,10 @@ func TestOperationalConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.SourceAccessMaxStale != 168*time.Hour || cfg.JobTimeout != 2*time.Hour || cfg.IndexRetirementSoak != 24*time.Hour || cfg.UtilityModel != "" || cfg.MetricsToken != "" || cfg.MetricsAuthDisabled {
+	if cfg.JobTimeout != 2*time.Hour || cfg.IndexRetirementSoak != 24*time.Hour || cfg.UtilityModel != "" || cfg.MetricsToken != "" || cfg.MetricsAuthDisabled {
 		t.Fatalf("unexpected operational defaults: %+v", cfg)
 	}
-	for _, key := range []string{"SOURCE_ACCESS_MAX_STALE", "JOB_TIMEOUT", "INDEX_RETIREMENT_SOAK"} {
+	for _, key := range []string{"JOB_TIMEOUT", "INDEX_RETIREMENT_SOAK"} {
 		t.Run(key, func(t *testing.T) {
 			t.Setenv(key, "-1s")
 			if _, err := Load(); err == nil {
@@ -362,7 +362,6 @@ func clearConfigEnv(t *testing.T) {
 		"BOOTSTRAP_API_KEY_MIN_LENGTH",
 		"ENCLAVA_DATA_DIR",
 		"SESSION_TTL",
-		"SOURCE_ACCESS_MAX_STALE",
 		"JOB_TIMEOUT",
 		"INDEX_RETIREMENT_SOAK",
 		"UTILITY_MODEL",

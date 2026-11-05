@@ -24,7 +24,6 @@ import (
 const (
 	OperationEmbed          = "rag.embed"
 	OperationIngest         = "rag.ingest"
-	OperationAccess         = "rag.access"
 	OperationAccessBackfill = "rag.access_backfill"
 	OperationReembedScan    = "rag.reembed_scan"
 )
@@ -110,14 +109,13 @@ type Repository interface {
 	// Search reads bindings and connections without enumerating documents,
 	// then checks each hit against its published generation.
 	DistinctIndexBindings(ctx context.Context, tenantID, collectionID string) ([]IndexBinding, error)
-	ListCollectionConnectionIDs(ctx context.Context, tenantID, collectionID string) ([]string, error)
 	PublishedGenerationForVersion(ctx context.Context, tenantID, collectionID, versionID string, generation int64) (bool, error)
 	CurrentPublishedGeneration(ctx context.Context, tenantID, collectionID, objectID, versionID string) (int64, error)
 	// Access-projection backlog: published generations whose index points
 	// predate the acl/published projection, their marker flip, and the
 	// tenants that still need the backfill job.
 	ListUnprojectedGenerations(ctx context.Context, tenantID string, limit int) ([]IndexGeneration, error)
-	ProjectGenerationAccess(ctx context.Context, tenantID, collectionID, versionID string, generation int64, project func(int64) (int64, error)) error
+	ProjectGenerationAccess(ctx context.Context, tenantID, collectionID, versionID string, generation int64, project func() error) error
 	TenantsNeedingAccessBackfill(ctx context.Context) ([]string, error)
 	RecordKnowledgeImport(ctx context.Context, tenantID, collectionID, importRef, objectID, kind string) error
 	GetStoredResult(ctx context.Context, tenantID, jobID string) (StoredResult, error)
@@ -187,7 +185,7 @@ func NewService(repo Repository, vectorStore VectorStore, executor Executor, def
 		artifacts:             artifactStore,
 		parser:                extract.NewParser(artifactStore),
 		jobs:                  jobSvc,
-		authorizer:            source.NewAuthorizer(repo, 0),
+		authorizer:            source.NewAuthorizer(repo),
 		maxUploadMB:           512,
 	}
 }
@@ -197,8 +195,6 @@ func NewService(repo Repository, vectorStore VectorStore, executor Executor, def
 func (s *Service) SetDefaultEmbeddingDimensions(n int) { s.defaultEmbeddingDimensions = n }
 
 func (s *Service) SetIndexRetirementSoak(d time.Duration) { s.indexRetirementSoak = d }
-
-func (s *Service) SetSourceAccessMaxStale(d time.Duration) { s.authorizer.MaxStale = d }
 
 // DefaultEmbedding reports the deployment default model and its vector size.
 func (s *Service) DefaultEmbedding() (string, int) {
@@ -1089,13 +1085,9 @@ func (s *Service) processNewDocument(ctx context.Context, p auth.Principal, c Co
 }
 
 func (s *Service) persistUpload(ctx context.Context, p auth.Principal, c Collection, input UploadDocumentInput, ref artifacts.Ref, sourceType, sourceID string) (UploadDocumentOutput, error) {
-	audience := append([]string{p.ActorID}, c.Audience...)
-	if len(input.Audience) > 0 {
-		audience = input.Audience
-	}
 	obj := source.Object{
 		TenantID: p.TenantID, ID: newID("ragdoc"), Kind: sourceType, NativeID: sourceID,
-		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: p.ActorID, Audience: audience,
+		AuthorizationMode: source.AuthorizationCollection, OwnerActorID: p.ActorID,
 	}
 	kind := input.ProvenanceKind
 	if kind == "" {
@@ -1153,12 +1145,8 @@ func (s *Service) persistUpload(ctx context.Context, p auth.Principal, c Collect
 func (s *Service) persistDocumentArtifact(ctx context.Context, p auth.Principal, c Collection, input UploadDocumentInput, ref artifacts.Ref, sourceType, sourceID string) (UploadDocumentOutput, error) {
 	// Imports and source-identity updates retain their existing versioning path.
 
-	// Audience-mode object: the uploader plus the collection's audience can
-	// read; collection manage rights gate mutation.
-	audience := append([]string{p.ActorID}, c.Audience...)
-	if len(input.Audience) > 0 {
-		audience = input.Audience
-	}
+	// Collection-mode object: readable by the principals that can read the
+	// collection; the uploader owns the row for mutation bookkeeping.
 	objectID := input.ObjectID
 	if objectID == "" {
 		objectID = newID("ragdoc")
@@ -1168,9 +1156,8 @@ func (s *Service) persistDocumentArtifact(ctx context.Context, p auth.Principal,
 		ID:                objectID,
 		Kind:              sourceType,
 		NativeID:          sourceID,
-		AuthorizationMode: source.AuthorizationAudience,
+		AuthorizationMode: source.AuthorizationCollection,
 		OwnerActorID:      p.ActorID,
-		Audience:          audience,
 		ObservedSeq:       0,
 	})
 	if err != nil {
@@ -1339,13 +1326,6 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		s.retireIndexes(ctx, job.TenantID, c.ID)
 		return versionRowID(ver), nil
 	}
-	accessRevision := int64(0)
-	if obj.ConnectionID != "" {
-		accessRevision, _, err = s.repo.LatestCompleteRevision(ctx, job.TenantID, obj.ConnectionID, source.SnapshotGrants)
-		if err != nil {
-			return "", err
-		}
-	}
 	profileVersionID := stringFromPayload(job.Policy, "chunk_profile_version_id")
 	if profileVersionID == "" {
 		// Queued before the freeze landed: fall back to the collection's
@@ -1505,7 +1485,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 			"generation": generation, "chunk_id": chunkID, "chunk_index": chunk.ChunkIndex,
 			"content": chunkText, "search_text": searchTexts[i], "file_name": ver.OriginalFilename,
 			"source_type": obj.Kind, "source_id": obj.NativeID, "source_uri": sourceURI,
-			"metadata": docMetadata, "access_revision": accessRevision, "access_enabled": true,
+			"metadata": docMetadata, "access_enabled": true,
 			"published": false,
 		}
 		spanPayload := make([]map[string]any, 0, len(structuredChunks[i].Spans))
@@ -1565,28 +1545,22 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	if err := s.vectorStore.UpsertPoints(ctx, c.QdrantCollection, points); err != nil {
 		return "", retryVectorError(err)
 	}
-	err = s.repo.ProjectGenerationAccess(ctx, job.TenantID, c.ID, versionRowID(ver), generation, func(currentRevision int64) (int64, error) {
+	err = s.repo.ProjectGenerationAccess(ctx, job.TenantID, c.ID, versionRowID(ver), generation, func() error {
 		object, err := s.repo.GetObject(ctx, job.TenantID, obj.ID)
 		if err != nil {
-			return 0, err
+			return err
 		}
-		tokens, revision, err := s.authorizer.ReadTokens(ctx, object)
+		tokens, err := s.authorizer.ReadTokens(ctx, object)
 		if err != nil {
-			return 0, err
-		}
-		if revision < currentRevision {
-			return 0, errors.New("rag: access revision moved backwards")
+			return err
 		}
 		if err := s.vectorStore.SetPayload(ctx, c.QdrantCollection, map[string]any{"must": []map[string]any{
 			{"key": "object_version_id", "match": map[string]any{"value": versionRowID(ver)}},
 			{"key": "generation", "match": map[string]any{"value": generation}},
-		}}, map[string]any{"acl": tokens, "acl_revision": revision, "published": true}); err != nil {
-			return 0, retryVectorError(err)
+		}}, map[string]any{"acl": tokens, "published": true}); err != nil {
+			return retryVectorError(err)
 		}
-		if err := s.repo.PublishGenerationFenced(ctx, job.TenantID, c.ID, obj.ID, versionRowID(ver), generation, claim.JobID, claim.Owner, claim.AttemptID(), claim.FenceToken); err != nil {
-			return 0, err
-		}
-		return revision, nil
+		return s.repo.PublishGenerationFenced(ctx, job.TenantID, c.ID, obj.ID, versionRowID(ver), generation, claim.JobID, claim.Owner, claim.AttemptID(), claim.FenceToken)
 	})
 	if errors.Is(err, ErrGenerationSuperseded) {
 		// A newer generation published first: drop what this one wrote.
@@ -1659,21 +1633,9 @@ func (s *Service) embed(ctx context.Context, p auth.Principal, model string, dim
 // forged flag.
 
 func collectionReadable(c Collection, p auth.Principal) bool {
-	if auth.HasScope(p, "platform.admin") {
-		return true
-	}
-	if !c.IsActive {
-		return false
-	}
-	if c.OwnerActorID != "" && c.OwnerActorID == p.ActorID {
-		return true
-	}
-	for _, aud := range c.Audience {
-		if aud == "*" || aud == p.ActorID {
-			return true
-		}
-	}
-	return false
+	return source.CollectionReadable(source.CollectionAccess{
+		ID: c.ID, OwnerActorID: c.OwnerActorID, Audience: c.Audience, IsActive: c.IsActive,
+	}, p)
 }
 
 // CollectionWritable reports whether p can mutate collection c (owner or

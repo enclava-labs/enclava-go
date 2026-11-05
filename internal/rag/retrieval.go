@@ -173,13 +173,7 @@ func (s *Service) searchCollection(ctx context.Context, p auth.Principal, collec
 		}
 		return bindings[i].QueryPrefix < bindings[j].QueryPrefix
 	})
-	// The prefilter token set is bounded by the collection's connections,
-	// never by its documents.
-	connectionIDs, err := s.repo.ListCollectionConnectionIDs(ctx, p.TenantID, collection.ID)
-	if err != nil {
-		return nil, err
-	}
-	tokens, err := s.authorizer.QueryTokens(ctx, p, connectionIDs)
+	tokens, err := s.authorizer.QueryTokens(ctx, p)
 	if err != nil {
 		return nil, err
 	}

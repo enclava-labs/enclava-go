@@ -37,11 +37,4 @@ func TestLiveTeams(t *testing.T) {
 	if len(page.Items) == 0 {
 		t.Fatal("configured team and chat returned no messages")
 	}
-	members, err := adapter.Membership(context.Background(), connection, "", 100)
-	if err != nil {
-		t.Fatalf("Graph team/channel membership access: %v", err)
-	}
-	if members.Completeness != CompletenessComplete {
-		t.Fatalf("membership completeness = %q", members.Completeness)
-	}
 }

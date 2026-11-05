@@ -107,7 +107,7 @@ func TestSourceIdentityIsolation(t *testing.T) {
 			INSERT INTO source_objects
 			    (tenant_id, id, connection_id, kind, native_id,
 			     authorization_mode, observed_seq)
-			VALUES ($1, $2, $3, 'repo', 'acme/widgets', 'source_acl', 1)`,
+			VALUES ($1, $2, $3, 'repo', 'acme/widgets', 'collection', 1)`,
 			idTenantA, id, connID)
 		return err
 	}
@@ -154,7 +154,7 @@ func TestCrossTenantVersionRejected(t *testing.T) {
 	if _, err := db.SQL.ExecContext(ctx, `
 		INSERT INTO source_objects
 		    (tenant_id, id, connection_id, kind, native_id, authorization_mode, observed_seq)
-		VALUES ($1, 'obj_a', 'conn_a', 'repo', 'acme/widgets', 'source_acl', 1)`,
+		VALUES ($1, 'obj_a', 'conn_a', 'repo', 'acme/widgets', 'collection', 1)`,
 		idTenantA); err != nil {
 		t.Fatalf("insert object: %v", err)
 	}
@@ -219,118 +219,5 @@ func TestObservedVersionsInsertOnly(t *testing.T) {
 	// Reusing (tenant_id, object_id, observed_seq) conflicts.
 	if err := insertVersion("v4", 1, "sha_c"); err == nil {
 		t.Fatalf("duplicate (object, observed_seq) insert was accepted")
-	}
-}
-
-// TestAccessSnapshotRevisionIsolation proves incomplete snapshots are
-// distinguishable and that memberships/grants keyed to a higher incomplete
-// revision can never shadow the last complete revision's data.
-func TestAccessSnapshotRevisionIsolation(t *testing.T) {
-	db := RequireTestDB(t)
-	ctx := context.Background()
-
-	seedTenant(t, ctx, db, idTenantA)
-	seedConnection(t, ctx, db, idTenantA, "conn_a", "github")
-
-	if _, err := db.SQL.ExecContext(ctx, `
-		INSERT INTO source_objects
-		    (tenant_id, id, connection_id, kind, native_id, authorization_mode, observed_seq)
-		VALUES ($1, 'obj_a', 'conn_a', 'repo', 'acme/widgets', 'source_acl', 1)`,
-		idTenantA); err != nil {
-		t.Fatalf("insert object: %v", err)
-	}
-	if _, err := db.SQL.ExecContext(ctx, `
-		INSERT INTO source_identities (tenant_id, id, connection_id, source_user_native_id)
-		VALUES ($1, 'sid_u1', 'conn_a', 'u1')`, idTenantA); err != nil {
-		t.Fatalf("insert source identity: %v", err)
-	}
-	if _, err := db.SQL.ExecContext(ctx, `
-		INSERT INTO source_groups (tenant_id, id, connection_id, source_group_native_id, name)
-		VALUES ($1, 'grp_1', 'conn_a', 'g1', 'devs')`, idTenantA); err != nil {
-		t.Fatalf("insert source group: %v", err)
-	}
-
-	// Revision 1 completes; revision 2 starts but stays incomplete.
-	if _, err := db.SQL.ExecContext(ctx, `
-		INSERT INTO access_snapshots (tenant_id, id, connection_id, kind, revision, completed_at, status)
-		VALUES
-		  ($1, 'snap_m1', 'conn_a', 'membership', 1, now(), 'complete'),
-		  ($1, 'snap_g1', 'conn_a', 'grants',     1, now(), 'complete'),
-		  ($1, 'snap_m2', 'conn_a', 'membership', 2, NULL,  'incomplete'),
-		  ($1, 'snap_g2', 'conn_a', 'grants',     2, NULL,  'incomplete')`,
-		idTenantA); err != nil {
-		t.Fatalf("insert snapshots: %v", err)
-	}
-
-	// Memberships: u1 in devs at complete rev 1; the incomplete rev 2 row is
-	// a partial observation and must not displace it.
-	if _, err := db.SQL.ExecContext(ctx, `
-		INSERT INTO source_group_memberships
-		    (tenant_id, id, group_id, source_identity_id, access_revision)
-		VALUES ($1, 'm1', 'grp_1', 'sid_u1', 1)`, idTenantA); err != nil {
-		t.Fatalf("insert membership rev 1: %v", err)
-	}
-	if _, err := db.SQL.ExecContext(ctx, `
-		INSERT INTO source_group_memberships
-		    (tenant_id, id, group_id, source_identity_id, access_revision)
-		VALUES ($1, 'm2', 'grp_1', 'sid_u1', 2)`, idTenantA); err != nil {
-		t.Fatalf("insert membership rev 2: %v", err)
-	}
-
-	// Grants keyed to each revision are queryable independently.
-	if _, err := db.SQL.ExecContext(ctx, `
-		INSERT INTO source_grants
-		    (tenant_id, id, object_id, subject_type, source_group_id, effect, access_revision)
-		VALUES
-		  ($1, 'gr1', 'obj_a', 'group', 'grp_1', 'allow', 1),
-		  ($1, 'gr2', 'obj_a', 'group', 'grp_1', 'deny',  2)`,
-		idTenantA); err != nil {
-		t.Fatalf("insert grants: %v", err)
-	}
-
-	// Incomplete revision is distinguishable.
-	var incomplete int
-	if err := db.SQL.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM access_snapshots WHERE tenant_id = $1 AND status = 'incomplete'",
-		idTenantA).Scan(&incomplete); err != nil {
-		t.Fatalf("count incomplete snapshots: %v", err)
-	}
-	if incomplete != 2 {
-		t.Fatalf("expected 2 incomplete snapshots, got %d", incomplete)
-	}
-
-	// The authorizer read shape: the latest COMPLETE membership revision
-	// still returns the rev-1 set; incomplete rev 2 does not shadow it.
-	var members int
-	if err := db.SQL.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM source_group_memberships m
-		JOIN access_snapshots s
-		  ON s.tenant_id = m.tenant_id
-		 AND s.connection_id = 'conn_a'
-		 AND s.kind = 'membership'
-		 AND s.revision = m.access_revision
-		WHERE m.tenant_id = $1 AND s.status = 'complete'`,
-		idTenantA).Scan(&members); err != nil {
-		t.Fatalf("memberships at complete revisions: %v", err)
-	}
-	if members != 1 {
-		t.Fatalf("expected exactly the rev-1 membership at complete revisions, got %d", members)
-	}
-
-	// Grants at a complete revision remain queryable by revision.
-	var allow int
-	if err := db.SQL.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM source_grants g
-		JOIN access_snapshots s
-		  ON s.tenant_id = g.tenant_id
-		 AND s.connection_id = 'conn_a'
-		 AND s.kind = 'grants'
-		 AND s.revision = g.access_revision
-		WHERE g.tenant_id = $1 AND s.status = 'complete' AND g.effect = 'allow'`,
-		idTenantA).Scan(&allow); err != nil {
-		t.Fatalf("grants at complete revisions: %v", err)
-	}
-	if allow != 1 {
-		t.Fatalf("expected the rev-1 allow grant, got %d", allow)
 	}
 }

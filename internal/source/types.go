@@ -16,16 +16,21 @@ const (
 
 // Object authorization modes.
 const (
-	// AuthorizationOwner: explicit owner/audience grants (uploads, generated).
+	// AuthorizationOwner: readable only by the object's owner actor.
 	AuthorizationOwner = "owner"
-	// AuthorizationAudience: object shared to a named audience.
-	AuthorizationAudience = "audience"
-	// AuthorizationSourceACL: effective grants come from source-native ACLs.
-	AuthorizationSourceACL = "source_acl"
-	// AuthorizationPublishedAudience: Notion publisher model per D-07 — a
-	// publisher with verified access explicitly assigns Enclava audiences.
-	AuthorizationPublishedAudience = "published_audience"
+	// AuthorizationCollection: readable by the principals that can read a
+	// collection containing the object.
+	AuthorizationCollection = "collection"
 )
+
+// CollectionAccess is the read-relevant state of a knowledge collection,
+// consumed by the shared collection read rule.
+type CollectionAccess struct {
+	ID           string
+	OwnerActorID string
+	Audience     []string
+	IsActive     bool
+}
 
 // Connection is a tenant-scoped configured source connection.
 type Connection struct {
@@ -63,7 +68,6 @@ type Object struct {
 	ParentObjectID    string
 	AuthorizationMode string // Authorization* const set
 	OwnerActorID      string
-	Audience          []string
 	UpstreamRevision  *string
 	ObservedSeq       int64
 	DeletedAt         *time.Time
@@ -82,83 +86,6 @@ type ObjectVersion struct {
 	UpstreamRevision *string
 	Provenance       string // source-native provenance, when available
 	Restrictions     []SourceRestriction
-}
-
-// SourceIdentity binds a source-native principal to a tenant identity through
-// an explicit verified tenant-and-connection-scoped mapping. ID is the
-// tenant-scoped row identity grants/memberships reference; NativeID is the
-// source-native user ID.
-type SourceIdentity struct {
-	TenantID     string
-	ConnectionID string
-	SourceKind   string
-	ID           string
-	NativeID     string
-	DisplayName  string // provider login/display name, when the adapter reports one
-	MappedUserID string
-}
-
-// SourceGroup is a source-native group within a connection. ID is the
-// tenant-scoped row identity; NativeID the source-native group ID.
-type SourceGroup struct {
-	TenantID     string
-	ConnectionID string
-	SourceKind   string
-	ID           string
-	NativeID     string
-	Name         string
-}
-
-// SourceGroupMembership records source-native group membership. MemberID is
-// the source_identities row ID (tenant, connection-scoped), not a native ID.
-type SourceGroupMembership struct {
-	TenantID       string
-	ConnectionID   string
-	GroupID        string
-	MemberID       string // source_identities.id
-	AccessRevision int64  // snapshot revision under which this was observed
-}
-
-// Grant subjects and effects.
-const (
-	GrantSubjectUser  = "user"
-	GrantSubjectAll   = "all"
-	GrantSubjectGroup = "group"
-
-	GrantEffectAllow = "allow"
-	GrantEffectDeny  = "deny"
-)
-
-// SourceGrant is a revision-qualified source-native effective grant.
-// Deny overrides allow within the same authoritative snapshot. SubjectID is
-// a source_identities.id for GrantSubjectUser, source_groups.id for
-// GrantSubjectGroup.
-type SourceGrant struct {
-	TenantID       string
-	ConnectionID   string // snapshot scope the grant was observed under
-	ObjectID       string
-	SubjectKind    string // GrantSubject* const set
-	SubjectID      string // source_identities.id or source_groups.id
-	Effect         string // GrantEffect* const set
-	AccessRevision int64
-}
-
-// AccessSnapshot kinds.
-const (
-	SnapshotContent    = "content"
-	SnapshotGrants     = "grants"
-	SnapshotMembership = "membership"
-)
-
-// AccessSnapshot marks a completed, authoritative observation of access data.
-// An incomplete snapshot is never authoritative and cannot remove unseen
-// objects or grants.
-type AccessSnapshot struct {
-	TenantID     string
-	ConnectionID string
-	Kind         string // Snapshot* const set
-	Revision     int64
-	CompletedAt  *time.Time // nil while incomplete
 }
 
 // Restriction subjects.

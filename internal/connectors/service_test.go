@@ -25,8 +25,6 @@ import (
 type testAdapter struct {
 	capabilities AdapterCapabilities
 	content      func(context.Context, source.Connection, Cursor, int) (ContentPage, error)
-	access       func(context.Context, source.Connection, Cursor, int) (AccessPage, error)
-	membership   func(context.Context, source.Connection, Cursor, int) (MembershipPage, error)
 }
 
 func (a *testAdapter) Capabilities() AdapterCapabilities { return a.capabilities }
@@ -35,18 +33,6 @@ func (a *testAdapter) Content(ctx context.Context, c source.Connection, cursor C
 		return ContentPage{}, errors.New("unexpected content request")
 	}
 	return a.content(ctx, c, cursor, limit)
-}
-func (a *testAdapter) Access(ctx context.Context, c source.Connection, cursor Cursor, limit int) (AccessPage, error) {
-	if a.access == nil {
-		return AccessPage{}, errors.New("unexpected access request")
-	}
-	return a.access(ctx, c, cursor, limit)
-}
-func (a *testAdapter) Membership(ctx context.Context, c source.Connection, cursor Cursor, limit int) (MembershipPage, error) {
-	if a.membership == nil {
-		return MembershipPage{}, errors.New("unexpected membership request")
-	}
-	return a.membership(ctx, c, cursor, limit)
 }
 
 type connectorFixture struct {
@@ -206,217 +192,6 @@ func TestContentSyncPersistsFinalArtifactRefAndEnqueuesIngest(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("rag.ingest not durably queued: %+v", queued)
-	}
-}
-
-func TestPermissionOnlySyncAppliesCanonicalAccessWithoutContentIngest(t *testing.T) {
-	adapter := &testAdapter{capabilities: AdapterCapabilities{Access: true}}
-	adapter.access = func(context.Context, source.Connection, Cursor, int) (AccessPage, error) {
-		return AccessPage{Grants: []AccessGrant{{NativeObjectID: "doc-1", NativeObjectKind: "document", NativePrincipalID: "native-user-1", Scope: "read", Effect: source.GrantEffectAllow}}, Completeness: CompletenessComplete, Snapshot: true}, nil
-	}
-	f := newConnectorFixture(t, adapter)
-	object, err := f.sourceRepo.UpsertObject(context.Background(), source.Object{TenantID: f.connection.TenantID, ConnectionID: f.connection.ID, ID: "object-doc-1", Kind: "document", NativeID: "doc-1", AuthorizationMode: source.AuthorizationSourceACL, ObservedSeq: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	user := testdb.SeedUser(t, f.db, f.connection.TenantID, "mapped@example.test", nil)
-	if err := f.sourceRepo.InsertSourceIdentity(context.Background(), source.SourceIdentity{TenantID: f.connection.TenantID, ConnectionID: f.connection.ID, SourceKind: f.connection.Kind, ID: "identity-native-user-1", NativeID: "native-user-1", MappedUserID: user.ID}); err != nil {
-		t.Fatal(err)
-	}
-	f.schedule(t)
-	if _, err := f.runNext(t); err != nil {
-		t.Fatal(err)
-	}
-	revision, _, err := f.sourceRepo.LatestCompleteRevision(context.Background(), f.connection.TenantID, f.connection.ID, source.SnapshotGrants)
-	if err != nil {
-		t.Fatal(err)
-	}
-	grants, err := f.sourceRepo.GrantsForObjects(context.Background(), f.connection.TenantID, f.connection.ID, []string{object.ID}, revision)
-	if err != nil || len(grants) != 1 || grants[0].SubjectID != "identity-native-user-1" {
-		t.Fatalf("canonical grants=%+v err=%v", grants, err)
-	}
-	queued, err := f.jobRows.ListConnectionJobs(context.Background(), f.connection.TenantID, f.connection.ID, "", jobs.StatusQueued, 20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	foundAccess, foundIngest := false, false
-	for _, item := range queued {
-		foundAccess = foundAccess || item.Operation == OperationAccess
-		foundIngest = foundIngest || item.Operation == OperationIngest
-	}
-	if !foundAccess || foundIngest {
-		t.Fatalf("permission-only handoff mismatch: %+v", queued)
-	}
-}
-
-func TestCanonicalAccessSnapshotsFollowAtoBtoA(t *testing.T) {
-	grants := []string{source.GrantEffectAllow, source.GrantEffectDeny, source.GrantEffectAllow}
-	call := 0
-	adapter := &testAdapter{capabilities: AdapterCapabilities{Access: true}}
-	adapter.access = func(context.Context, source.Connection, Cursor, int) (AccessPage, error) {
-		effect := grants[call]
-		call++
-		return AccessPage{Grants: []AccessGrant{{NativeObjectID: "doc-1", NativeObjectKind: "document", NativePrincipalID: "native-user-1", Scope: "read", Effect: effect}}, Completeness: CompletenessComplete, Snapshot: true}, nil
-	}
-	f := newConnectorFixture(t, adapter)
-	object, err := f.sourceRepo.UpsertObject(context.Background(), source.Object{TenantID: f.connection.TenantID, ConnectionID: f.connection.ID, ID: "object-doc-1", Kind: "document", NativeID: "doc-1", AuthorizationMode: source.AuthorizationSourceACL, ObservedSeq: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	user := testdb.SeedUser(t, f.db, f.connection.TenantID, "mapped@example.test", nil)
-	if err := f.sourceRepo.InsertSourceIdentity(context.Background(), source.SourceIdentity{TenantID: f.connection.TenantID, ConnectionID: f.connection.ID, SourceKind: f.connection.Kind, ID: "identity-native-user-1", NativeID: "native-user-1", MappedUserID: user.ID}); err != nil {
-		t.Fatal(err)
-	}
-	for i, effect := range grants {
-		if _, err := f.svc.SyncSourceWindowed(context.Background(), f.principal, f.connection.ID, int64(i+1)); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := f.runNext(t); err != nil {
-			t.Fatal(err)
-		}
-		revision, _, err := f.sourceRepo.LatestCompleteRevision(context.Background(), f.connection.TenantID, f.connection.ID, source.SnapshotGrants)
-		if err != nil {
-			t.Fatal(err)
-		}
-		current, err := f.sourceRepo.GrantsForObjects(context.Background(), f.connection.TenantID, f.connection.ID, []string{object.ID}, revision)
-		if err != nil || len(current) != 1 || current[0].Effect != effect {
-			t.Fatalf("snapshot %d effect=%q grants=%+v err=%v", i, effect, current, err)
-		}
-	}
-}
-
-func TestSlackParentGrantBeforeContentAndIdentityBinding(t *testing.T) {
-	ctx := context.Background()
-	adapter := &testAdapter{capabilities: AdapterCapabilities{Access: true}}
-	adapter.access = func(context.Context, source.Connection, Cursor, int) (AccessPage, error) {
-		return AccessPage{Grants: []AccessGrant{
-			{NativeObjectID: "slack:C123", NativeObjectKind: "channel", NativePrincipalID: "U-mapped", NativeGroupID: "C123", Scope: "read", Effect: source.GrantEffectAllow},
-			{NativeObjectID: "slack:C123", NativeObjectKind: "channel", NativePrincipalID: "U-unmapped", NativeGroupID: "C123", Scope: "read", Effect: source.GrantEffectAllow},
-		}, Completeness: CompletenessComplete, Snapshot: true}, nil
-	}
-	f := newConnectorFixture(t, adapter)
-	user := testdb.SeedUser(t, f.db, f.tenant, "slack-mapped@example.test", nil)
-	if err := f.sourceRepo.InsertSourceIdentity(ctx, source.SourceIdentity{TenantID: f.tenant, ConnectionID: f.connection.ID, SourceKind: f.connection.Kind, ID: "mapped-slack", NativeID: "U-mapped", MappedUserID: user.ID}); err != nil {
-		t.Fatal(err)
-	}
-	f.schedule(t)
-	if _, err := f.runNext(t); err != nil {
-		t.Fatal(err)
-	}
-	parent, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "channel", "slack:C123")
-	if err != nil {
-		t.Fatalf("grant did not create channel stub: %v", err)
-	}
-	if _, err := f.sourceRepo.SourceIdentityForNativeID(ctx, f.tenant, f.connection.ID, "U-unmapped"); !errors.Is(err, source.ErrDenied) {
-		t.Fatalf("unmapped source identity resolved as authorized: %v", err)
-	}
-	if err := f.sourceRepo.BeginSnapshot(ctx, f.tenant, f.connection.ID, source.SnapshotMembership, 1); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.sourceRepo.WithTx(ctx, func(tx source.Tx) error {
-		return f.sourceRepo.ApplyMembershipSnapshot(ctx, tx, f.tenant, f.connection.ID, 1, nil, 0)
-	}); err != nil {
-		t.Fatal(err)
-	}
-	adapter.capabilities = AdapterCapabilities{Content: true}
-	adapter.content = func(context.Context, source.Connection, Cursor, int) (ContentPage, error) {
-		return ContentPage{Items: []ContentItem{
-			{NativeID: "slack:C123", Kind: "channel", Text: "channel"},
-			{NativeID: "slack:C123:thread-1", ParentNativeID: "slack:C123", ParentKind: "channel", Kind: "message", Text: "thread message"},
-			{NativeID: "slack:C123:reply-1", ParentNativeID: "slack:C123:thread-1", ParentKind: "message", Kind: "message", Text: "thread reply"},
-		}, Completeness: CompletenessComplete}, nil
-	}
-	if _, err := f.svc.SyncSourceWindowed(ctx, f.principal, f.connection.ID, 2); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.runNext(t); err != nil {
-		t.Fatal(err)
-	}
-	observedParent, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "channel", "slack:C123")
-	if err != nil || observedParent.ID != parent.ID {
-		t.Fatalf("channel stub was not reused: %+v err=%v", observedParent, err)
-	}
-	child, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "message", "slack:C123:thread-1")
-	if err != nil || child.ParentObjectID != parent.ID {
-		t.Fatalf("thread parent = %+v, err=%v", child, err)
-	}
-	reply, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "message", "slack:C123:reply-1")
-	if err != nil || reply.ParentObjectID != child.ID {
-		t.Fatalf("reply parent = %+v, err=%v", reply, err)
-	}
-	authorizer := source.NewAuthorizer(f.sourceRepo, 0)
-	mapped := f.principal
-	mapped.UserID, mapped.ActorID = user.ID, user.ID
-	if err := authorizer.CanRead(ctx, mapped, child, source.ReadOptions{}); err != nil {
-		t.Fatalf("mapped channel member cannot read thread: %v", err)
-	}
-	if err := authorizer.CanRead(ctx, mapped, reply, source.ReadOptions{}); err != nil {
-		t.Fatalf("mapped channel member cannot read nested reply: %v", err)
-	}
-	other := testdb.SeedUser(t, f.db, f.tenant, "slack-unmapped@example.test", nil)
-	unbound := f.principal
-	unbound.UserID, unbound.ActorID = other.ID, other.ID
-	if err := authorizer.CanRead(ctx, unbound, child, source.ReadOptions{}); !errors.Is(err, source.ErrDenied) {
-		t.Fatalf("unmapped user read thread: %v", err)
-	}
-	if err := authorizer.CanRead(ctx, unbound, reply, source.ReadOptions{}); !errors.Is(err, source.ErrDenied) {
-		t.Fatalf("unmapped user read nested reply: %v", err)
-	}
-	admin := f.principal
-	admin.Scopes[auth.ScopePlatformAdmin] = struct{}{}
-	if _, err := f.svc.BindSourcePrincipal(ctx, admin, BindSourcePrincipalInput{ConnectionID: f.connection.ID, NativeUserID: "U-unmapped", MappedUserID: other.ID, VerificationEvidence: "verified in Slack"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := authorizer.CanRead(ctx, unbound, child, source.ReadOptions{}); err != nil {
-		t.Fatalf("newly mapped channel member cannot read thread: %v", err)
-	}
-	if err := authorizer.CanRead(ctx, unbound, reply, source.ReadOptions{}); err != nil {
-		t.Fatalf("newly mapped channel member cannot read nested reply: %v", err)
-	}
-}
-
-func TestSubjectlessDenyOverridesDirectAllow(t *testing.T) {
-	ctx := context.Background()
-	adapter := &testAdapter{capabilities: AdapterCapabilities{Access: true}}
-	adapter.access = func(context.Context, source.Connection, Cursor, int) (AccessPage, error) {
-		return AccessPage{Grants: []AccessGrant{
-			{NativeObjectID: "doc-1", NativeObjectKind: "document", NativePrincipalID: "native-user", Scope: "read", Effect: source.GrantEffectAllow},
-			{NativeObjectID: "doc-1", NativeObjectKind: "document", Scope: "provider-restriction", Effect: source.GrantEffectDeny},
-		}, Completeness: CompletenessComplete, Snapshot: true}, nil
-	}
-	f := newConnectorFixture(t, adapter)
-	user := testdb.SeedUser(t, f.db, f.tenant, "deny-test@example.test", nil)
-	if err := f.sourceRepo.InsertSourceIdentity(ctx, source.SourceIdentity{TenantID: f.tenant, ConnectionID: f.connection.ID, SourceKind: f.connection.Kind, ID: "deny-test-identity", NativeID: "native-user", MappedUserID: user.ID}); err != nil {
-		t.Fatal(err)
-	}
-	f.schedule(t)
-	if _, err := f.runNext(t); err != nil {
-		t.Fatal(err)
-	}
-	object, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "document", "doc-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	revision, _, err := f.sourceRepo.LatestCompleteRevision(ctx, f.tenant, f.connection.ID, source.SnapshotGrants)
-	if err != nil {
-		t.Fatal(err)
-	}
-	grants, err := f.sourceRepo.GrantsForObjects(ctx, f.tenant, f.connection.ID, []string{object.ID}, revision)
-	if err != nil {
-		t.Fatal(err)
-	}
-	foundDeny, foundAllow := false, false
-	for _, grant := range grants {
-		foundDeny = foundDeny || grant.SubjectKind == source.GrantSubjectAll && grant.SubjectID == "" && grant.Effect == source.GrantEffectDeny
-		foundAllow = foundAllow || grant.SubjectID == "deny-test-identity" && grant.Effect == source.GrantEffectAllow
-	}
-	if !foundDeny || !foundAllow {
-		t.Fatalf("missing persisted all-subject deny or direct allow: %+v", grants)
-	}
-	principal := f.principal
-	principal.ActorID, principal.UserID = user.ID, user.ID
-	if err := source.NewAuthorizer(f.sourceRepo, 0).CanRead(ctx, principal, object, source.ReadOptions{}); !errors.Is(err, source.ErrDenied) {
-		t.Fatalf("subjectless deny did not override direct allow: %v", err)
 	}
 }
 
@@ -609,7 +384,7 @@ func TestIncompleteContentListingDoesNotDeleteUnseenObjects(t *testing.T) {
 		return ContentPage{Completeness: CompletenessIncomplete, Snapshot: true}, nil
 	}
 	f := newConnectorFixture(t, adapter)
-	old, err := f.sourceRepo.UpsertObject(context.Background(), source.Object{TenantID: f.connection.TenantID, ConnectionID: f.connection.ID, ID: "object-old", Kind: "document", NativeID: "old", AuthorizationMode: source.AuthorizationSourceACL, ObservedSeq: 1})
+	old, err := f.sourceRepo.UpsertObject(context.Background(), source.Object{TenantID: f.connection.TenantID, ConnectionID: f.connection.ID, ID: "object-old", Kind: "document", NativeID: "old", AuthorizationMode: source.AuthorizationCollection, ObservedSeq: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -626,31 +401,26 @@ func TestIncompleteContentListingDoesNotDeleteUnseenObjects(t *testing.T) {
 	}
 }
 
-func TestSyncSourceEnqueuesIndependentSupportedStreams(t *testing.T) {
-	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true, Access: true}}
-	adapter.content = func(context.Context, source.Connection, Cursor, int) (ContentPage, error) {
-		return ContentPage{Completeness: CompletenessComplete}, nil
-	}
-	adapter.access = func(context.Context, source.Connection, Cursor, int) (AccessPage, error) {
-		return AccessPage{Completeness: CompletenessIncomplete}, nil
-	}
-	f := newConnectorFixture(t, adapter)
+func TestSyncSourceEnqueuesContentStream(t *testing.T) {
+	f := newConnectorFixture(t, &testAdapter{capabilities: AdapterCapabilities{Content: true}})
 	f.schedule(t)
 	rows, err := f.jobRows.ListConnectionJobs(context.Background(), f.connection.TenantID, f.connection.ID, "", jobs.StatusQueued, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	streams := map[string]bool{}
+	syncs := 0
 	for _, row := range rows {
 		if row.Operation == OperationSync {
-			streams[stringFromAny(row.Policy["stream"])] = true
+			syncs++
+			if stringFromAny(row.Policy["stream"]) != string(StreamContent) {
+				t.Fatalf("unexpected stream job: %v", row.Policy["stream"])
+			}
 		}
 	}
-	if !streams[string(StreamContent)] || !streams[string(StreamAccess)] {
-		t.Fatalf("missing independently queued stream jobs: %v", streams)
+	if syncs != 1 {
+		t.Fatalf("content stream jobs = %d, want 1", syncs)
 	}
 }
-
 func TestCreateSourceStillRejectsUnsafeCredentialsAndPrivateOrigins(t *testing.T) {
 	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true}}
 	f := newConnectorFixture(t, adapter)
@@ -983,5 +753,34 @@ func TestConnectorSyncRejectsDisabledCreator(t *testing.T) {
 	f.schedule(t)
 	if _, err := f.runNext(t); err == nil || !strings.Contains(err.Error(), "connector creator authorization") {
 		t.Fatalf("disabled creator sync error = %v", err)
+	}
+}
+
+func TestContentSyncCreatesCollectionModeObjectsWithParents(t *testing.T) {
+	ctx := context.Background()
+	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true}}
+	adapter.content = func(context.Context, source.Connection, Cursor, int) (ContentPage, error) {
+		return ContentPage{Items: []ContentItem{
+			{NativeID: "slack:C123", Kind: "channel", Text: "channel"},
+			{NativeID: "slack:C123:thread-1", ParentNativeID: "slack:C123", ParentKind: "channel", Kind: "message", Text: "thread message"},
+			{NativeID: "slack:C123:reply-1", ParentNativeID: "slack:C123:thread-1", ParentKind: "message", Kind: "message", Text: "thread reply"},
+		}, Completeness: CompletenessComplete}, nil
+	}
+	f := newConnectorFixture(t, adapter)
+	f.schedule(t)
+	if _, err := f.runNext(t); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "channel", "slack:C123")
+	if err != nil || parent.AuthorizationMode != source.AuthorizationCollection {
+		t.Fatalf("channel object = %+v, err=%v", parent, err)
+	}
+	child, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "message", "slack:C123:thread-1")
+	if err != nil || child.ParentObjectID != parent.ID || child.AuthorizationMode != source.AuthorizationCollection {
+		t.Fatalf("thread parent = %+v, err=%v", child, err)
+	}
+	reply, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "message", "slack:C123:reply-1")
+	if err != nil || reply.ParentObjectID != child.ID {
+		t.Fatalf("reply parent = %+v, err=%v", reply, err)
 	}
 }

@@ -27,8 +27,7 @@ These checklists summarize the shared implementation boundaries; they do not rep
 ## When you change connector content or permissions
 
 - In `internal/connectors`, finalize durable bytes and enqueue ingestion before advancing a content checkpoint.
-- Preserve content, grant and membership completeness and snapshot semantics; incomplete snapshots must not remove unseen grants or become authoritative.
-- Skip and count unmapped principals rather than granting them access; do not infer identity from email alone. Recheck source authorization at serving and publication boundaries.
+- Recheck collection authorization at serving and publication boundaries.
 
 ## When you add an outbound HTTP client
 
@@ -40,19 +39,19 @@ These checklists summarize the shared implementation boundaries; they do not rep
 
 ## When you add a search filter
 
-- Apply tenant, generation and access candidate filters to every relevant index branch, then recheck authoritative PostgreSQL/source authorization before returning results or expanding context. See `internal/rag` and `internal/source/authorize.go`.
+- Apply tenant, generation and access candidate filters to every relevant index branch, then recheck authoritative PostgreSQL/collection authorization before returning results or expanding context. See `internal/rag` and `internal/source`.
 
 ## Acting user and accounting
 
-A principal carries the verified tenant, actor, credential and billing subject; source ACLs are not conferred by a connector credential. The precise inputs still determine which source checks apply. See `internal/auth/service.go`, `internal/jobs/service.go`, `internal/chatbot/runs.go`, `internal/connectors/service.go`, and `internal/rag/ingest.go`.
+A principal carries the verified tenant, actor, credential and billing subject; collection access is not conferred by a connector credential. The precise inputs still determine which checks apply. See `internal/auth/service.go`, `internal/jobs/service.go`, `internal/chatbot/runs.go`, `internal/connectors/service.go`, and `internal/rag/ingest.go`.
 
-| Surface | Acting principal | Source ACLs | Billing subject |
+| Surface | Acting principal | Collection access | Billing subject |
 |---|---|---|---|
-| Dashboard session | Verified session user | Session user's applicable source grants | Session user |
-| API key | Verified key owner, user or service account | Key owner's applicable source grants | User or service-account owner; credential fallback for a nonconforming ownerless record |
-| Service-account key | Verified service-account actor; delegation can further constrain authority | Service account's applicable grants, subject to delegation | Service account, or delegating user for delegated authority |
-| Assistant run worker | Frozen submitter refreshed against current authority | Caller source ACLs; caller and assistant owner must both access selected collections | Submitter's billing subject |
-| Extraction job worker | Frozen submitting principal | Owned uploaded input; source restrictions apply to referenced inputs | Submitter's billing subject |
-| Connector sync worker | Frozen submitter; scheduled sync uses source creator tenant and actor | Provider observations maintain source grants; sync credentials do not grant readers access | Frozen subject if supplied; scheduled creator principal has no explicit billing subject |
-| Ingest/embed worker | Frozen initiating principal, including connector sync submitter | Object revision and publication checks apply; readers are separately source-authorized | Frozen billing subject, if supplied |
+| Dashboard session | Verified session user | Session user's readable collections | Session user |
+| API key | Verified key owner, user or service account | Key owner's readable collections | User or service-account owner; credential fallback for a nonconforming ownerless record |
+| Service-account key | Verified service-account actor; delegation can further constrain authority | Service account's readable collections, subject to delegation | Service account, or delegating user for delegated authority |
+| Assistant run worker | Frozen submitter refreshed against current authority | Caller and assistant owner must both access selected collections | Submitter's billing subject |
+| Extraction job worker | Frozen submitting principal | Owned uploaded input; collection restrictions apply to referenced inputs | Submitter's billing subject |
+| Connector sync worker | Frozen submitter; scheduled sync uses source creator tenant and actor | Sync writes into the target collection; sync credentials do not grant readers access | Frozen subject if supplied; scheduled creator principal has no explicit billing subject |
+| Ingest/embed worker | Frozen initiating principal, including connector sync submitter | Object revision and publication checks apply; readers are separately collection-authorized | Frozen billing subject, if supplied |
 | MCP tool call | Run caller, with assistant-owner scope checks | Input references are authorized for the caller; assistant owner must also satisfy tool scopes | Run caller's billing subject for model calls; MCP tool calls do not themselves create model usage |

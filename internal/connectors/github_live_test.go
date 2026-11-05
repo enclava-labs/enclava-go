@@ -67,11 +67,4 @@ func TestLiveGitHub(t *testing.T) {
 			t.Fatalf("second pass introduced identity %s", item.NativeID)
 		}
 	}
-	access, err := adapter.Access(context.Background(), conn, "", 100)
-	if err != nil {
-		t.Fatalf("collaborator listing/capability: %v", err)
-	}
-	if access.Completeness != CompletenessComplete {
-		t.Fatalf("access completeness=%q", access.Completeness)
-	}
 }

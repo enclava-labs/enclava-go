@@ -72,7 +72,7 @@ func TestRetrievalEval(t *testing.T) {
 		}
 	}
 	sources := postgres.NewSourceRepo(db)
-	executor, err := inference.NewService(inference.Deps{Endpoints: endpoints, Sources: sources, Authorizer: source.NewAuthorizer(sources, 0), Billing: billing.NewService(billingRepo), Secrets: resolver, Artifacts: postgres.NewArtifactRepo(db)})
+	executor, err := inference.NewService(inference.Deps{Endpoints: endpoints, Sources: sources, Authorizer: source.NewAuthorizer(sources), Billing: billing.NewService(billingRepo), Secrets: resolver, Artifacts: postgres.NewArtifactRepo(db)})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -29,7 +29,7 @@ func TestDashboardChatSourcesPartial(t *testing.T) {
 	}
 	collection, err := f.app.ragSvc.CreateCollection(ctx, auth.Principal{
 		TenantID: f.tenant, ActorID: ownerID, UserID: ownerID, ActorKind: auth.ActorKindUser,
-	}, rag.CreateCollectionInput{Name: "src-docs", ACL: map[string]any{"public": true}})
+	}, rag.CreateCollectionInput{Name: "src-docs", ACL: map[string]any{"public": false}})
 	if err != nil {
 		t.Fatalf("seed collection: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestDashboardChatSourcesPartial(t *testing.T) {
 		t.Fatalf("unreadable id leaked a row: %s", body)
 	}
 
-	// A member outside the object's audience sees an empty block, never an
+	// A user who cannot open the collection sees an empty block, never an
 	// error card.
 	otherSess, otherCSRF := loginUser(t, f.identityFixture, "chat-src-other@example.com", []string{"chatbot", "rag"}, "chat-pass")
 	rec = f.chatGet(t, otherSess, otherCSRF, "/dashboard/partials/chat/sources?ids="+evidenceID)

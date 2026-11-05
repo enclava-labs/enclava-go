@@ -85,15 +85,13 @@ chunk, and `truncated:` markers when a document exceeds the 4,096-chunk cap
 
 Search prefilters indexed points by their `acl` access tokens and `published`
 flag, rather than enumerating every published document. Caller tokens cover
-the actor, delegated actor, tenant-wide access, mapped source identities and
-source groups from a complete membership snapshot. Every hit is re-authorized
+the actor, delegated actor and tenant-wide access. Every hit is re-authorized
 against PostgreSQL for the object, version, document status and current
 published generation before results, evidence, locations or facets are
-produced, so revocations and temporary connection disablement take effect
-immediately. Each index fetches up to four times the per-index result limit,
-capped at 200 points per round, for at most three rounds (the initial round
-and two extra rounds); fewer results can be returned when post-checks discard
-hits.
+produced, so revocations take effect immediately. Each index fetches up to
+four times the per-index result limit, capped at 200 points per round, for
+at most three rounds (the initial round and two extra rounds); fewer results
+can be returned when post-checks discard hits.
 
 `POST /api/v1/rag/search` has no per-collection or aggregate 2,000-document
 bound. It returns `search_scope_too_large` when more than 20 distinct
@@ -108,11 +106,10 @@ pool bounded at twice the maximum `limit`; when the pool is exhausted the
 response has no `next_cursor`. A malformed cursor is a 400.
 
 Access tokens are written at embedding and refreshed before publication.
-Complete grants snapshots re-project connector objects with revision fencing.
-The durable `rag.access_backfill` job backfills older points, triggered at
-startup and periodically; points without the projection remain searchable
-through the authoritative post-check. Temporary connection disablement is
-enforced by that post-check, not by the tokens.
+Collection-scoped objects carry the tenant-wide token; collection membership
+is enforced by the authoritative post-check. The durable `rag.access_backfill`
+job backfills older points, triggered at startup and periodically; points
+without the projection remain searchable through the post-check.
 
 Query embedding and rewrite send only the query to their models. Section
 selection sends the source references of its candidate results with the model
@@ -166,11 +163,10 @@ repeating a `PUT` that failed midway finishes the re-embedding it started.
 `GET /api/v1/connectors/sources`, `GET/PUT/DELETE
 /api/v1/connectors/sources/{id}` manage it (scope `connectors.manage`). The
 source's `target_collection_id` routes synced documents into a knowledge
-collection; reads then pass through the source's ACL snapshot in addition
-to collection membership. Source views report `unmapped_principals` — provider
-accounts without an Enclava identity binding get no access until an
-administrator binds the observed identity. Its observed grants and memberships
-then apply without another sync.
+collection. Permissions are per collection: everyone who can open the
+collection can read everything the source syncs — the source's own
+permissions do not apply, so sync sensitive scope into restricted
+collections.
 
 Each source names its credential by `credential_ref`: either a
 `CONNECTOR_<PROVIDER>_*` reference bound in `SECRET_BINDINGS` by the operator
@@ -180,9 +176,8 @@ administrator added under **Sources → Credentials** (see below).
 GitHub sources require `config.owner` and `config.repo`. A nonempty GitHub
 `credential_ref` must be a `CONNECTOR_GITHUB_*` credential for the GitHub API
 origin.
-Public repository content can sync without a credential, but collaborator and
-membership lookup requires a credential with push access even for public
-repositories. `POST /api/v1/connectors/sources/{id}/sync` starts a fresh manual
+Public repository content can sync without a credential.
+`POST /api/v1/connectors/sources/{id}/sync` starts a fresh manual
 sync; send the same `Idempotency-Key` header to retry the same submission.
 Syncing a disabled source returns 409.
 
@@ -202,19 +197,12 @@ to Slack; join/leave notices are skipped. Slack rate limits are waited out
 using `Retry-After` (up to five times per call).
 
 Connector sync workers resolve the source creator's current user grants and
-billing identity for ingest and embedding. A missing or disabled creator fails
-the job; model and endpoint access must be granted to that creator. Indexing
-also needs the creator's own source access: on a new source the first sync's
-items fail with "the indexing user has no access to this item in the source"
-until the creator's observed identity is bound. Bind it, then sync again —
-every sync retries items whose indexing failed.
+billing identity for ingest and embedding. A missing or disabled creator
+fails the job; model and endpoint access must be granted to that creator.
+Every sync retries items whose indexing failed.
 
-Grants inherit down container hierarchies (Slack channels, GitHub
-repositories, Teams channels and chats); group grants additionally require
-the reader's group membership from a fresh membership snapshot. Drive files
-flagged copy/download-restricted sync a deny-everyone grant and are denied
-for every reader. A complete access snapshot expires after
-`SOURCE_ACCESS_MAX_STALE` (default `168h`) for grants and memberships alike.
+Drive files flagged copy/download-restricted for readers are skipped by the
+content stream and never synced.
 
 Sync dedupes on content hash: unchanged bytes reuse the artifact and version
 unless the ingest handoff is missing or title/URI/name/mime metadata changed

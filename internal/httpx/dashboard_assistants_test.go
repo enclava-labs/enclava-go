@@ -72,7 +72,7 @@ func newAssistantsFixture(t *testing.T) *assistantsFixture {
 	executor, err := inference.NewService(inference.Deps{
 		Endpoints:  endpoints,
 		Sources:    sourceRepo,
-		Authorizer: source.NewAuthorizer(sourceRepo, time.Hour),
+		Authorizer: source.NewAuthorizer(sourceRepo),
 		Billing:    billing.NewService(brepo),
 	})
 	if err != nil {

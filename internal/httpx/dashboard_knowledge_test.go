@@ -76,21 +76,8 @@ func (f *knowledgeFixture) member(t *testing.T, email string) (session, csrf *ht
 // manager logs a rag+rag.manage+connectors.manage session in.
 func (f *knowledgeFixture) manager(t *testing.T, email string) (session, csrf *http.Cookie) {
 	t.Helper()
-	session, csrf, _ = f.managerWithID(t, email)
-	return session, csrf
-}
-
-// managerWithID is manager plus the actor id document audiences must carry.
-func (f *knowledgeFixture) managerWithID(t *testing.T, email string) (session, csrf *http.Cookie, actorID string) {
-	t.Helper()
-	session, csrf = loginUserWithGrants(t, f.identityFixture, email,
+	return loginUserWithGrants(t, f.identityFixture, email,
 		[]string{"rag", "rag.manage", "connectors.manage"}, auth.ResourceGrants{}, "know-pass")
-	if err := f.db.SQL.QueryRowContext(context.Background(),
-		`SELECT id::text FROM users WHERE tenant_id = $1::uuid AND email = $2`,
-		f.tenant, email).Scan(&actorID); err != nil {
-		t.Fatalf("read manager id: %v", err)
-	}
-	return session, csrf, actorID
 }
 
 func (f *knowledgeFixture) collection(t *testing.T, name string, audience []string) rag.Collection {
@@ -107,19 +94,15 @@ func (f *knowledgeFixture) collection(t *testing.T, name string, audience []stri
 	return c
 }
 
-// stageDoc persists an audience object + first version + collection item
-// with no published generation — the row renders as Processing.
-func (f *knowledgeFixture) stageDoc(t *testing.T, collection rag.Collection, objectID, fileName string, audience []string) {
+// stageDoc persists a collection-mode object + first version + collection
+// item with no published generation — the row renders as Processing.
+func (f *knowledgeFixture) stageDoc(t *testing.T, collection rag.Collection, objectID, fileName string) {
 	t.Helper()
 	ctx := context.Background()
 	owner := "knowledge_admin"
-	if len(audience) > 0 {
-		owner = audience[0]
-	}
 	if _, err := f.repo.UpsertObject(ctx, source.Object{
 		TenantID: f.tenant, ID: objectID, Kind: "document", NativeID: "native-" + objectID,
-		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: owner,
-		Audience: audience,
+		AuthorizationMode: source.AuthorizationCollection, OwnerActorID: owner,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -183,11 +166,11 @@ func TestDashboardKnowledgeList(t *testing.T) {
 // sees Sources + Settings.
 func TestDashboardKnowledgeCollectionTabs(t *testing.T) {
 	f := newKnowledgeFixture(t)
-	sess, csrf, memberID := f.member(t, "know-tabs-member@example.test")
+	sess, csrf, _ := f.member(t, "know-tabs-member@example.test")
 	col := f.collection(t, "Policies", []string{"*"})
-	mgr, mgrCSRF, mgrID := f.managerWithID(t, "know-tabs-manager@example.test")
-	f.stageDoc(t, col, "obj_tab", "Policy.pdf", []string{memberID})
-	f.stageDoc(t, col, "obj_tab2", "Handbook.pdf", []string{mgrID})
+	mgr, mgrCSRF := f.manager(t, "know-tabs-manager@example.test")
+	f.stageDoc(t, col, "obj_tab", "Policy.pdf")
+	f.stageDoc(t, col, "obj_tab2", "Handbook.pdf")
 
 	base := "/dashboard/knowledge/" + col.ID
 	page := f.get(t, sess, csrf, base)
@@ -266,32 +249,29 @@ func TestDashboardKnowledgeMemberDenials(t *testing.T) {
 	}
 }
 
-// TestDashboardKnowledgeMemberDocumentRows covers OA-21 row privacy: a
-// collection shared with the member contains one member-readable and one
-// restricted document — member markup lists the readable row and never
-// leaks the denied document's title.
+// TestDashboardKnowledgeMemberDocumentRows covers collection-level row
+// privacy: the member lists every document of a collection shared with
+// them, and a collection they cannot open never leaks its titles.
 func TestDashboardKnowledgeMemberDocumentRows(t *testing.T) {
 	f := newKnowledgeFixture(t)
 	sess, csrf, memberID := f.member(t, "know-rows@example.test")
 	col := f.collection(t, "Shared", []string{memberID})
-	f.stageDoc(t, col, "obj_shared", "Shared-Report.pdf", []string{memberID})
-	f.stageDoc(t, col, "obj_secret", "Secret-Dossier.pdf", []string{"other_actor"})
+	f.stageDoc(t, col, "obj_shared", "Shared-Report.pdf")
+	secret := f.collection(t, "Secret", []string{"other_actor"})
+	f.stageDoc(t, secret, "obj_secret", "Secret-Dossier.pdf")
 
-	base := "/dashboard/knowledge/" + col.ID
-	page := f.get(t, sess, csrf, base+"/documents")
-	if page.Code != http.StatusOK {
+	page := f.get(t, sess, csrf, "/dashboard/knowledge/"+col.ID+"/documents")
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "Shared-Report.pdf") {
 		t.Fatalf("member documents = %d body=%s", page.Code, page.Body.String())
 	}
-	body := page.Body.String()
-	if !strings.Contains(body, "Shared-Report.pdf") {
-		t.Fatal("member must see the readable document")
-	}
-	if strings.Contains(body, "Secret-Dossier.pdf") {
-		t.Fatal("denied document title leaked into member markup")
-	}
 	partial := f.get(t, sess, csrf, "/dashboard/partials/knowledge/documents?collection="+col.ID)
-	if partial.Code != http.StatusOK || !strings.Contains(partial.Body.String(), "Shared-Report.pdf") || strings.Contains(partial.Body.String(), "Secret-Dossier.pdf") {
+	if partial.Code != http.StatusOK || !strings.Contains(partial.Body.String(), "Shared-Report.pdf") {
 		t.Fatalf("documents partial = %d body=%s", partial.Code, partial.Body.String())
+	}
+	for _, path := range []string{"/dashboard/knowledge/" + secret.ID + "/documents", "/dashboard/partials/knowledge/documents?collection=" + secret.ID} {
+		if got := f.get(t, sess, csrf, path); got.Code == http.StatusOK || strings.Contains(got.Body.String(), "Secret-Dossier.pdf") {
+			t.Fatalf("unshared collection %s = %d body=%s", path, got.Code, got.Body.String())
+		}
 	}
 }
 
@@ -299,8 +279,7 @@ func TestDashboardKnowledgeReembedProgressAndWarnings(t *testing.T) {
 	f := newKnowledgeFixture(t)
 	sess, csrf, memberID := f.member(t, "know-progress@example.test")
 	col := f.collection(t, "Progress", []string{"*"})
-	f.stageDoc(t, col, "obj_progress", "Report.txt", []string{memberID})
-	f.stageDoc(t, col, "obj_progress_secret", "Secret.txt", []string{"other_actor"})
+	f.stageDoc(t, col, "obj_progress", "Report.txt")
 
 	ctx := context.Background()
 	if _, err := f.db.SQL.ExecContext(ctx, `
@@ -308,15 +287,13 @@ func TestDashboardKnowledgeReembedProgressAndWarnings(t *testing.T) {
 		f.tenant, col.ID, memberID); err != nil {
 		t.Fatalf("set collection owner: %v", err)
 	}
-	for _, objectID := range []string{"obj_progress", "obj_progress_secret"} {
-		if _, err := f.db.SQL.ExecContext(ctx, `
-			INSERT INTO index_generations
-				(tenant_id, id, collection_id, object_version_id, generation, state, qdrant_collection, warnings)
-			SELECT $1, 'gen_' || $3, $2, id, 1, 'published', 'old_index', '["Truncated <script>alert(1)</script>"]'::jsonb
-			FROM source_object_versions WHERE tenant_id=$1 AND object_id=$3`,
-			f.tenant, col.ID, objectID); err != nil {
-			t.Fatalf("insert generation: %v", err)
-		}
+	if _, err := f.db.SQL.ExecContext(ctx, `
+		INSERT INTO index_generations
+			(tenant_id, id, collection_id, object_version_id, generation, state, qdrant_collection, warnings)
+		SELECT $1, 'gen_obj_progress', $2, id, 1, 'published', 'old_index', '["Truncated <script>alert(1)</script>"]'::jsonb
+		FROM source_object_versions WHERE tenant_id=$1 AND object_id='obj_progress'`,
+		f.tenant, col.ID); err != nil {
+		t.Fatalf("insert generation: %v", err)
 	}
 
 	base := "/dashboard/knowledge/" + col.ID

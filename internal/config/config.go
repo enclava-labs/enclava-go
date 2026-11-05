@@ -41,7 +41,6 @@ type Config struct {
 	// default model get unless they choose one; 0 = the model's full output.
 	DefaultEmbeddingDimensions int
 	ConnectorSyncInterval      time.Duration
-	SourceAccessMaxStale       time.Duration
 	JobTimeout                 time.Duration
 	UtilityModel               string
 	IndexRetirementSoak        time.Duration
@@ -135,7 +134,6 @@ func Load() (Config, error) {
 		QdrantURL:               strings.TrimSpace(getEnv("QDRANT_URL", "http://localhost:6333")),
 		DefaultEmbeddingModel:   strings.TrimSpace(getEnv("DEFAULT_EMBEDDING_MODEL", "qwen3-embedding-4b")),
 		ConnectorSyncInterval:   getEnvDuration("CONNECTOR_SYNC_INTERVAL", 0),
-		SourceAccessMaxStale:    168 * time.Hour,
 		JobTimeout:              2 * time.Hour,
 		UtilityModel:            strings.TrimSpace(getEnv("UTILITY_MODEL", "")),
 		IndexRetirementSoak:     24 * time.Hour,
@@ -168,9 +166,8 @@ func Load() (Config, error) {
 		ExtractMaxOutputTokens:          getEnvInt64("EXTRACT_MAX_OUTPUT_TOKENS", 0),
 	}
 	for name, target := range map[string]*time.Duration{
-		"SOURCE_ACCESS_MAX_STALE": &cfg.SourceAccessMaxStale,
-		"JOB_TIMEOUT":             &cfg.JobTimeout,
-		"INDEX_RETIREMENT_SOAK":   &cfg.IndexRetirementSoak,
+		"JOB_TIMEOUT":           &cfg.JobTimeout,
+		"INDEX_RETIREMENT_SOAK": &cfg.IndexRetirementSoak,
 	} {
 		if raw := os.Getenv(name); raw != "" {
 			value, err := time.ParseDuration(raw)

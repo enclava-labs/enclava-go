@@ -1,10 +1,8 @@
 /* sources.js — Sources page module (OA-23, plan 09-02).
  *
  * Owns: the five-step add-source wizard served into the shared #drawer by
- * GET /dashboard/partials/sources/drawer, the table row actions, and the
- * access.manage-gated user-bindings drawer. Every write goes through
- * window.Enclava.api against /api/v1/connectors/* (D-17) — the dashboard
- * handlers render only.
+ * GET /dashboard/partials/sources/drawer and the table row actions. Every
+ * write goes through
  *
  * Wizard state lives in the DOM (visible pane, selected tile), so a drawer
  * re-open always starts clean and no module state can go stale. Config
@@ -129,13 +127,6 @@
     return config;
   }
 
-  function collectAudiences() {
-    return qa('[data-audience-row]').map(function (row) {
-      var id = row.querySelector('[data-audience-id]').value.trim();
-      var members = fieldList(row.querySelector('[data-audience-members]').value);
-      return { id: id, members: members };
-    }).filter(function (a) { return a.id !== '' && a.members.length > 0; });
-  }
 
   function collectPayload(provider, step) {
     var group = q('[data-provider-fields="' + provider + '"]');
@@ -153,9 +144,8 @@
     };
     if (provider === 'notion' && step >= 3) {
       var pages = fieldList((q('[data-notion-pages]') || {}).value);
-      var audiences = collectAudiences();
       payload.config.selected_pages = pages.map(function (pageID) {
-        return { page_id: pageID, audiences: audiences };
+        return { page_id: pageID };
       });
     }
     return payload;
@@ -181,7 +171,7 @@
         return true;
       case 3:
         if (provider !== 'notion') return true;
-        return fieldList((q('[data-notion-pages]') || {}).value).length > 0 && collectAudiences().length > 0;
+        return fieldList((q('[data-notion-pages]') || {}).value).length > 0;
       case 4:
         return ((q('[data-source-name]') || {}).value || '').trim() !== '' &&
           ((q('[data-source-collection]') || {}).value || '') !== '';
@@ -247,9 +237,6 @@
       var value = payload.config[key];
       if (key === 'selected_pages') {
         scope.push('pages: ' + value.map(function (p) { return p.page_id; }).join(', '));
-        if (value.length && value[0].audiences.length) {
-          scope.push('audiences: ' + value[0].audiences.map(function (a) { return a.id; }).join(', '));
-        }
         return;
       }
       if (key === 'channel_id' && provider === 'slack') {
@@ -363,40 +350,6 @@
       .catch(function (err) { reportError(err, id); });
   }
 
-  function bindingsURL(id) {
-    return '/dashboard/partials/sources/bindings?source=' + encodeURIComponent(id);
-  }
-
-  function bindUser(button) {
-    var root = drawer();
-    var payload = {
-      source_user_native_id: ((root.querySelector('[data-bind-native]') || {}).value || '').trim(),
-      mapped_user_id: ((root.querySelector('[data-bind-mapped]') || {}).value || '').trim(),
-      verification_evidence: ((root.querySelector('[data-bind-evidence]') || {}).value || '').trim(),
-    };
-    if (!payload.source_user_native_id || !payload.mapped_user_id || !payload.verification_evidence) {
-      var slot = root.querySelector('[data-wizard-error]');
-      if (slot) { slot.textContent = 'Native user, mapped user and verification evidence are required.'; slot.hidden = false; }
-      return;
-    }
-    Enclava.api('POST', '/api/v1/connectors/sources/' + encodeURIComponent(button.dataset.sourceId) + '/bindings', payload)
-      .then(function () {
-        Enclava.toast('success', 'User bound');
-        return Enclava.openDrawer(bindingsURL(button.dataset.sourceId));
-      })
-      .catch(function (err) { reportError(err, button.dataset.sourceId); });
-  }
-
-  function unbindUser(button) {
-    Enclava.api('DELETE', '/api/v1/connectors/sources/' + encodeURIComponent(button.dataset.sourceId) +
-      '/bindings/' + encodeURIComponent(button.dataset.bindingId))
-      .then(function () {
-        Enclava.toast('success', 'Binding revoked');
-        return Enclava.openDrawer(bindingsURL(button.dataset.sourceId));
-      })
-      .catch(function (err) { reportError(err, button.dataset.sourceId); });
-  }
-
 
   function saveCredential() {
     var section = q('[data-source-edit]');
@@ -498,15 +451,6 @@
   }
   // ── Events ───────────────────────────────────────────────────────────────
 
-  function addAudienceRow() {
-    var list = q('#notion-audiences');
-    if (!list) return;
-    var first = list.querySelector('[data-audience-row]');
-    var row = first.cloneNode(true);
-    Array.prototype.forEach.call(row.querySelectorAll('input'), function (input) { input.value = ''; });
-    list.appendChild(row);
-    validateStep(currentStep(), currentProvider());
-  }
 
   document.addEventListener('click', function (e) {
     if (!(e.target instanceof Element)) return;
@@ -541,25 +485,6 @@
       case 'sources:toggle':
         toggleEnabled(trigger);
         break;
-      case 'sources:bindings':
-        Enclava.openDrawer(bindingsURL(trigger.dataset.sourceId));
-        break;
-      case 'sources:bind':
-        bindUser(trigger);
-        break;
-      case 'sources:unbind':
-        unbindUser(trigger);
-        break;
-      case 'sources:audience-add':
-        addAudienceRow();
-        break;
-      case 'sources:audience-remove': {
-        var row = trigger.closest('[data-audience-row]');
-        if (qa('[data-audience-row]').length > 1) row.remove();
-        else Array.prototype.forEach.call(row.querySelectorAll('input'), function (i) { i.value = ''; });
-        validateStep(currentStep(), currentProvider());
-        break;
-      }
       case 'creds:add':
         credsAdd(trigger.dataset.provider);
         break;

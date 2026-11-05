@@ -28,7 +28,6 @@ import (
 	"enclava-go/internal/jobs"
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
-	"enclava-go/internal/source"
 )
 
 // ── rendered-DOM audit core ───────────────────────────────────────────────
@@ -577,9 +576,6 @@ func TestA11yAdminPages(t *testing.T) {
 		EditSource:     &connectors.Source{ID: "s1", Type: "slack", Name: "Workspace Slack", CredentialRef: "cred/slack-1"},
 	}
 	auditRendered(t, "sources frag-sources-drawer edit", renderFrag(t, "sources", "sources-drawer", edit, adminCaps))
-	bindings := dashboardSourceBindingsData{SourceID: "s1", SourceName: "Workspace Slack",
-		Bindings: []source.SourceIdentity{{ID: "b1", NativeID: "U123", MappedUserID: "u1"}}}
-	auditRendered(t, "sources frag-sources-bindings", renderFrag(t, "sources", "sources-bindings", bindings, adminCaps))
 
 	assistants := assistantsPageData{
 		Table: assistantsTableData{Rows: []assistantRow{{

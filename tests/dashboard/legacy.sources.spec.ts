@@ -118,8 +118,8 @@ test('wizard creates a GitHub source and chains the real first sync', async ({ p
   await pickProvider(drawer, 'github');
   await drawer.locator('#github-owner').fill('enclava');
   await drawer.locator('#github-repo').fill('docs');
-  // Step 3 access copy for GitHub (repo collaborators) then destination.
-  await expect(drawer.locator('[data-provider-access="github"]')).toContainText('collaborator');
+  // Step 3 states the collection read rule for GitHub, then destination.
+  await expect(drawer.locator('[data-provider-access="github"]')).toContainText('Everyone who can open the target collection');
   await drawer.getByRole('button', { name: 'Continue' }).click();
 
   const createdID = observeCreatedSource(page);

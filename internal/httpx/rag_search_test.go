@@ -152,17 +152,16 @@ func seedRAGDocumentsApp(t *testing.T) ragDocsFixture {
 	return f
 }
 
-// stageEvidenceObject persists an audience object + version in the fixture
-// tenant/collection, stages one published generation with a span-backed
-// chunk and saves an evidence row for it — the real retained-chunk shape the
-// passage route reads.
+// stageEvidenceObject persists a collection-mode object + version in the
+// fixture tenant/collection, stages one published generation with a
+// span-backed chunk and saves an evidence row for it — the real
+// retained-chunk shape the passage route reads.
 func (f ragDocsFixture) stageEvidenceObject(t *testing.T, objectID, audienceOwnerID string) string {
 	t.Helper()
 	ctx := context.Background()
 	if _, err := f.repo.UpsertObject(ctx, source.Object{
 		TenantID: f.tenant, ID: objectID, Kind: "upload", NativeID: "up_" + objectID,
-		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: audienceOwnerID,
-		Audience: []string{audienceOwnerID},
+		AuthorizationMode: source.AuthorizationCollection, OwnerActorID: audienceOwnerID,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +237,12 @@ func TestRAGEvidencePassageRoute(t *testing.T) {
 		t.Fatalf("passage payload mismatch: %#v", payload)
 	}
 
-	// Unknown, forbidden and other-tenant requests share one public 404.
+	// Unknown, forbidden (collection no longer shared with the member) and
+	// other-tenant requests share one public 404.
+	owner := auth.Principal{TenantID: f.tenant, ActorID: f.ownerID, UserID: f.ownerID, ActorKind: auth.ActorKindUser}
+	if _, err := f.svc.UpdateCollection(context.Background(), owner, f.collectionID, rag.UpdateCollectionInput{ACL: map[string]any{"public": false}}); err != nil {
+		t.Fatal(err)
+	}
 	forbidden := f.request(http.MethodGet, "/api/v1/rag/evidence/"+evidenceID+"/passage", f.memberKey)
 	unknown := f.request(http.MethodGet, "/api/v1/rag/evidence/ev_does_not_exist/passage", f.ownerKey)
 	foreign := f.request(http.MethodGet, "/api/v1/rag/evidence/"+evidenceID+"/passage", f.otherKey)
@@ -308,13 +312,13 @@ func TestRAGDocumentListStatusRoute(t *testing.T) {
 			t.Fatalf("status %s envelope mismatch: %#v", status, envelope)
 		}
 	}
-	// A member without the object audience lists nothing — no titles, no
-	// counts — while removed stays unknown (silently empty, not an error).
-	for _, status := range []string{"all", "removed"} {
-		got := f.request(http.MethodGet, "/api/v1/rag/collections/"+f.collectionID+"/documents?status="+status, f.memberKey)
-		if got.Code != http.StatusOK || !strings.Contains(got.Body.String(), `"documents":[]`) {
-			t.Fatalf("member %s list = %d body=%s", status, got.Code, got.Body.String())
-		}
+	// A member who can read the collection lists its documents; removed
+	// stays unknown to non-managers (silently empty, not an error).
+	if got := f.request(http.MethodGet, "/api/v1/rag/collections/"+f.collectionID+"/documents?status=all", f.memberKey); got.Code != http.StatusOK || !strings.Contains(got.Body.String(), `"id":"obj_shared"`) {
+		t.Fatalf("member all list = %d body=%s", got.Code, got.Body.String())
+	}
+	if got := f.request(http.MethodGet, "/api/v1/rag/collections/"+f.collectionID+"/documents?status=removed", f.memberKey); got.Code != http.StatusOK || !strings.Contains(got.Body.String(), `"documents":[]`) {
+		t.Fatalf("member removed list = %d body=%s", got.Code, got.Body.String())
 	}
 
 	// Soft delete keeps the management Removed view and drops member reads.
@@ -458,16 +462,15 @@ func seedReadableSearchApp(t *testing.T) readableSearchFixture {
 	return f
 }
 
-// stageReadableDoc persists an audience object + published generation with
-// one chunk and registers its point with the stub store.
+// stageReadableDoc persists a collection-mode object + published generation
+// with one chunk and registers its point with the stub store.
 func stageReadableDoc(t *testing.T, db *postgres.DB, vector *readableSearchStore, svc *rag.Service, tenant, ownerID string, collection rag.Collection, objectID, content, provenance string) {
 	t.Helper()
 	ctx := context.Background()
 	repo := postgres.NewRAGRepo(db)
 	if _, err := repo.UpsertObject(ctx, source.Object{
 		TenantID: tenant, ID: objectID, Kind: "document", NativeID: "native-" + objectID,
-		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: ownerID,
-		Audience: []string{ownerID},
+		AuthorizationMode: source.AuthorizationCollection, OwnerActorID: ownerID,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -588,10 +591,12 @@ func TestRAGReadableSearchRoute(t *testing.T) {
 		}
 	}
 
-	// A member without any audience grant gets empty results, not leaks.
+	// A member reads exactly what the collections they can open hold: both
+	// public collections, never the outsider's private one.
 	memberView := searchReadable(f, f.memberKey, `{"query":"corpus","mode":"lexical"}`)
-	if memberView.Code != http.StatusOK || strings.Contains(memberView.Body.String(), "corpus") || strings.Contains(memberView.Body.String(), `"facets":[{`) {
-		t.Fatalf("member readable search = %d body=%s", memberView.Code, memberView.Body.String())
+	if body := memberView.Body.String(); memberView.Code != http.StatusOK || !strings.Contains(body, "readable alpha corpus") ||
+		!strings.Contains(body, "readable beta corpus") || strings.Contains(body, "secret") {
+		t.Fatalf("member readable search = %d body=%s", memberView.Code, body)
 	}
 
 	// Corpus size never bounds a search; the explicit request bound that

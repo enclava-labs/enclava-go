@@ -39,19 +39,18 @@
 {{if .Fetching}}            <span class="subline">Fetching…</span>
 {{end}}{{else}}            {{statusPill "source" .State}}
 {{end}}{{if .LastError}}            {{$fix := dashboardErrorAction .LastError $.Can}}<span class="subline">Sync failed: {{.LastError}}. {{if $fix.Href}}{{if eq $fix.Href "/dashboard/sources"}}<a href="/dashboard/sources?edit={{.Source.ID}}">{{$fix.Label}}</a>{{else}}<a href="{{$fix.Href}}">{{$fix.Label}}</a>{{end}}{{else}}Check the source configuration and retry the sync.{{end}}</span>
-{{end}}{{if gt .Failed 0}}            {{if .NeedsBinding}}<span class="subline">{{count .FailureCount}} {{if eq .FailureCount 1}}item{{else}}items{{end}} can't be indexed: your {{.Provider}} account isn't linked to your Enclava user — link it in User bindings, then Sync now.</span>{{else}}<span class="subline">{{if .FailureReason}}{{count .FailureCount}} not indexed: {{.FailureReason}}{{else}}{{count .Failed}} not indexed{{end}}</span>{{end}}
+{{end}}{{if gt .Failed 0}}            <span class="subline">{{if .FailureReason}}{{count .FailureCount}} not indexed: {{.FailureReason}}{{else}}{{count .Failed}} not indexed{{end}}</span>
 {{end}}          </td>
           <td data-label="Last sync">{{relTime .Source.LastSyncAt}}</td>
           <td data-label="Next sync">{{if .NextEnabled}}{{relTime .NextAt}}{{else}}—{{end}}</td>
           <td data-label="Items">{{if .HasItems}}{{count .Items}}{{else}}—{{end}}</td>
-          <td data-label="Permissions">{{.Permissions}}{{if gt .Source.UnmappedPrincipals 0}}<span class="subline">{{if eq .Source.UnmappedPrincipals 1}}1 source account has no Enclava binding and gets no access{{else}}{{.Source.UnmappedPrincipals}} source accounts have no Enclava binding and get no access{{end}}</span>{{end}}</td>
+          <td data-label="Permissions">{{.Permissions}}</td>
           <td data-label="Actions">
             <span class="row">
 {{if $.Can.SourcesManage}}              <button type="button" class="btn" data-action="sources:sync" data-source-id="{{.Source.ID}}">{{icon "refresh"}}Sync now</button>
               <button type="button" class="btn" data-action="sources:toggle" data-source-id="{{.Source.ID}}" data-enabled="{{.Source.IsEnabled}}">{{if .Source.IsEnabled}}Pause{{else}}Resume{{end}}</button>
               <button type="button" class="btn danger" data-action="confirm" data-confirm="Delete source {{.Source.Name}}?" data-source-id="{{.Source.ID}}" data-source-del="1">Delete</button>{{end}}
-{{if $.Can.AccessManage}}              <button type="button" class="btn" data-action="sources:bindings" data-source-id="{{.Source.ID}}">{{icon "users"}}User bindings</button>
-{{end}}            </span>
+            </span>
           </td>
         </tr>
 {{end}}      </tbody>

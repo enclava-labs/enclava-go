@@ -284,7 +284,7 @@ func TestEmbeddingExecutorIntegration(t *testing.T) {
 	executor, err := inference.NewService(inference.Deps{
 		Endpoints:  endpoints,
 		Sources:    sources,
-		Authorizer: source.NewAuthorizer(sources, 0),
+		Authorizer: source.NewAuthorizer(sources),
 		Billing:    billing.NewService(billingRepo),
 		Secrets:    resolver,
 		Artifacts:  postgres.NewArtifactRepo(db),

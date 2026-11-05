@@ -131,7 +131,7 @@ test.describe('Sources — add-source wizard (flow 4)', () => {
     const cred = drawer.locator('#github-credential');
     await expect(drawer.locator('#cred-github option[value="CONNECTOR_GITHUB_E2E"]')).toHaveCount(1);
     await cred.fill('CONNECTOR_GITHUB_E2E');
-    await expect(drawer.locator('[data-provider-access="github"]')).toContainText('collaborator');
+    await expect(drawer.locator('[data-provider-access="github"]')).toContainText('Everyone who can open the target collection');
     await drawer.getByRole('button', { name: 'Continue' }).click();
     await drawer.getByRole('button', { name: 'Continue' }).click();
 

@@ -190,7 +190,7 @@ func serve() error {
 	inferenceSvc, err := inference.NewService(inference.Deps{
 		Endpoints:     endpointsRepo,
 		Sources:       sourceRepo,
-		Authorizer:    source.NewAuthorizer(sourceRepo, cfg.SourceAccessMaxStale),
+		Authorizer:    source.NewAuthorizer(sourceRepo),
 		Billing:       billingSvc,
 		Secrets:       secretResolver,
 		Artifacts:     artifactRepo,
@@ -241,12 +241,10 @@ func serve() error {
 	qdrantClient := rag.NewQdrantClient(cfg.QdrantURL, cfg.UpstreamTimeout)
 	ragSvc := rag.NewService(ragRepo, qdrantClient, inferenceSvc, cfg.DefaultEmbeddingModel, artifactStore, jobsSvc)
 	ragSvc.SetDefaultEmbeddingDimensions(cfg.DefaultEmbeddingDimensions)
-	ragSvc.SetSourceAccessMaxStale(cfg.SourceAccessMaxStale)
 	ragSvc.SetUtilityModel(cfg.UtilityModel)
 	ragSvc.SetDefaultModelResolver(inferenceSvc.DefaultModel)
 	ragSvc.SetIndexRetirementSoak(cfg.IndexRetirementSoak)
 	previewSvc := extract.NewPreviewService(chunkProfilesRepo, jobsRepoPG, jobsSvc, artifactStore, sourceRepo, cfg.MaxUploadSizeMB)
-	previewSvc.SetSourceAccessMaxStale(cfg.SourceAccessMaxStale)
 	// Dashboard-managed credentials first, SECRET_BINDINGS as the fallback.
 	credentialSvc, err := credentials.NewService(postgres.NewCredentialsRepo(pgDB), cfg.SecretsKey, secretResolver, cfg.PublicBaseURL)
 	if err != nil {
@@ -288,7 +286,6 @@ func serve() error {
 		extract.OperationPreview:    previewSvc.JobHandler(),
 		rag.OperationEmbed:          ragSvc.JobHandler(),
 		rag.OperationIngest:         ragSvc.IngestJobHandler(),
-		rag.OperationAccess:         ragSvc.AccessJobHandler(),
 		rag.OperationAccessBackfill: ragSvc.AccessBackfillJobHandler(),
 		rag.OperationReembedScan:    ragSvc.ReembedScanJobHandler(),
 		connectors.OperationSync:    connectorSvc.JobHandler(),

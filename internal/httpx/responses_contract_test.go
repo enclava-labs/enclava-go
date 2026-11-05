@@ -152,7 +152,7 @@ func newResponsesFx(t *testing.T) *responsesFx {
 	svc, err := inference.NewService(inference.Deps{
 		Endpoints:  erepo,
 		Sources:    srepo,
-		Authorizer: source.NewAuthorizer(srepo, 0),
+		Authorizer: source.NewAuthorizer(srepo),
 		Billing:    billing.NewService(brepo),
 		Artifacts:  arepo,
 	}, inference.WithTransportFactory(func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {

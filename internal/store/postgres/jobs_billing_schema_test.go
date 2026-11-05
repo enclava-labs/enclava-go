@@ -280,7 +280,7 @@ func seedSourceVersion(t *testing.T, ctx context.Context, db *DB, tenant, connID
 	if _, err := db.SQL.ExecContext(ctx, `
 		INSERT INTO source_objects (tenant_id, id, connection_id, kind, native_id,
 		                            authorization_mode, observed_seq)
-		VALUES ($1, $2, $3, 'repo', 'acme/doc.md', 'source_acl', 1)`,
+		VALUES ($1, $2, $3, 'repo', 'acme/doc.md', 'collection', 1)`,
 		tenant, objID, connID); err != nil {
 		t.Fatalf("seed source_object %s: %v", objID, err)
 	}

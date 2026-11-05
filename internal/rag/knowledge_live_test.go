@@ -20,13 +20,12 @@ import (
 const liveCorpus = "legal exception orchid chat transcript retention memorandum"
 
 type corpusAdapter struct {
-	granted  bool
 	content  string
 	revision string
 }
 
 func (a *corpusAdapter) Capabilities() connectors.AdapterCapabilities {
-	return connectors.AdapterCapabilities{Content: true, Access: true, Membership: true}
+	return connectors.AdapterCapabilities{Content: true}
 }
 func (a *corpusAdapter) Content(context.Context, source.Connection, connectors.Cursor, int) (connectors.ContentPage, error) {
 	return connectors.ContentPage{Items: []connectors.ContentItem{{
@@ -34,19 +33,6 @@ func (a *corpusAdapter) Content(context.Context, source.Connection, connectors.C
 		Filename: "corpus.txt", MIMEType: "text/plain", Content: []byte(a.content),
 		URL: "https://fixture.invalid/corpus-document",
 	}}, Completeness: connectors.CompletenessComplete, Snapshot: true}, nil
-}
-func (a *corpusAdapter) Access(context.Context, source.Connection, connectors.Cursor, int) (connectors.AccessPage, error) {
-	page := connectors.AccessPage{Completeness: connectors.CompletenessComplete, Snapshot: true}
-	if a.granted {
-		page.Grants = []connectors.AccessGrant{{
-			NativeObjectID: "corpus-document", NativeObjectKind: "document",
-			NativePrincipalID: "fixture-user", Scope: "read", Effect: source.GrantEffectAllow,
-		}}
-	}
-	return page, nil
-}
-func (*corpusAdapter) Membership(context.Context, source.Connection, connectors.Cursor, int) (connectors.MembershipPage, error) {
-	return connectors.MembershipPage{Completeness: connectors.CompletenessComplete, Snapshot: true}, nil
 }
 
 func TestLiveKnowledgeCorpusSyncPublicationRetrievalAndRevocation(t *testing.T) {
@@ -96,14 +82,18 @@ func TestLiveKnowledgeCorpusSyncPublicationRetrievalAndRevocation(t *testing.T) 
 	if err := sourceRepo.CreateConnection(ctx, connection); err != nil {
 		t.Fatalf("create fixture connection: %v", err)
 	}
-	if err := sourceRepo.InsertSourceIdentity(ctx, source.SourceIdentity{
-		TenantID: tenant, ConnectionID: connection.ID, SourceKind: connection.Kind,
-		ID: "identity-live-corpus-user", NativeID: "fixture-user", MappedUserID: user.ID,
-	}); err != nil {
-		t.Fatalf("bind fixture source principal: %v", err)
+	reader := testdb.SeedUserWithGrants(t, db, tenant, "knowledge-live-reader@example.test", []string{"rag"}, auth.ResourceGrants{
+		Models: auth.Allowlist{All: true}, Endpoints: auth.Allowlist{All: true},
+	})
+	readerP := auth.Principal{
+		TenantID: tenant, ActorID: reader.ID, ActorKind: auth.ActorKindUser, UserID: reader.ID,
+		CredentialID: "knowledge-live-reader-key", CredentialKind: auth.CredentialKindAPIKey,
+		BillingSubjectID: reader.ID, BillingSubjectKind: auth.BillingSubjectUser,
+		AllowedModelsAll: true, AllowedEndpointsAll: true,
+		Scopes: map[string]struct{}{"rag": {}},
 	}
 
-	adapter := &corpusAdapter{granted: true, content: liveCorpus, revision: "fixture-v1"}
+	adapter := &corpusAdapter{content: liveCorpus, revision: "fixture-v1"}
 	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepo)
 	connectorSvc.SetPrincipalResolver(auth.NewService(postgres.NewIdentityRepo(db), "").PrincipalForActor)
 	connectorSvc.SetSyncDependencies(connectors.AdapterFactories{
@@ -151,20 +141,18 @@ func TestLiveKnowledgeCorpusSyncPublicationRetrievalAndRevocation(t *testing.T) 
 		t.Fatalf("manual sync did not publish the updated document: %#v err=%v", manual, err)
 	}
 
-	adapter.granted = false
-	if _, _, err := jobsSvc.Enqueue(ctx, p, jobs.EnqueueRequest{
-		TenantID: tenant, Operation: connectors.OperationSync, IdempotencyKey: "live-revoke-grant",
-		Subject: jobs.Subject{ConnectionID: connection.ID}, InputRef: connection.ID, InputHash: "revoke",
-		Policy: map[string]any{"connection_id": connection.ID, "stream": string(connectors.StreamAccess)},
-	}); err != nil {
-		t.Fatalf("enqueue grant revocation sync: %v", err)
+	// Access follows the collection: a reader of the public collection finds
+	// the synced document; making the collection private revokes it.
+	if shared, err := ragSvc.Search(ctx, readerP, rag.SearchInput{CollectionID: collection.ID, Query: "orchid legal exception", Mode: rag.QueryHybrid, Limit: 5}); err != nil || len(shared) == 0 {
+		t.Fatalf("collection reader did not find the synced document: %#v err=%v", shared, err)
 	}
-	runLiveKnowledgeJobs(t, ctx, jobsSvc, connectorSvc, ragSvc)
-	revokedResults, err := ragSvc.Search(ctx, p, rag.SearchInput{CollectionID: collection.ID, Query: "orchid legal exception", Mode: rag.QueryHybrid, Limit: 5})
-	if err != nil || len(revokedResults) != 0 {
-		t.Fatalf("revoked source remained searchable: %#v err=%v", revokedResults, err)
+	if _, err := ragSvc.UpdateCollection(ctx, p, collection.ID, rag.UpdateCollectionInput{ACL: map[string]any{"public": false}}); err != nil {
+		t.Fatalf("make collection private: %v", err)
 	}
-	_, revokedEvidenceErr := ragSvc.ResolveEvidence(ctx, p, []string{hybrid[0].EvidenceID})
+	if revokedResults, err := ragSvc.Search(ctx, readerP, rag.SearchInput{CollectionID: collection.ID, Query: "orchid legal exception", Mode: rag.QueryHybrid, Limit: 5}); !errors.Is(err, source.ErrDenied) || len(revokedResults) != 0 {
+		t.Fatalf("revoked reader still searches the collection: %#v err=%v", revokedResults, err)
+	}
+	_, revokedEvidenceErr := ragSvc.ResolveEvidence(ctx, readerP, []string{hybrid[0].EvidenceID})
 	if !errors.Is(revokedEvidenceErr, unknownEvidenceErr) {
 		t.Fatalf("revoked and unknown evidence outcomes differ: revoked=%v unknown=%v", revokedEvidenceErr, unknownEvidenceErr)
 	}
@@ -176,7 +164,6 @@ func runLiveKnowledgeJobs(t *testing.T, ctx context.Context, jobsSvc *jobs.Servi
 		connectors.OperationSync: connectorSvc.JobHandler(),
 		rag.OperationIngest:      ragSvc.IngestJobHandler(),
 		rag.OperationEmbed:       ragSvc.JobHandler(),
-		rag.OperationAccess:      ragSvc.AccessJobHandler(),
 	}
 	for range 32 {
 		claim, err := jobsSvc.Lease(ctx, "knowledge-live-worker", time.Minute)

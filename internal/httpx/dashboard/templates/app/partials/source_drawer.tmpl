@@ -1,8 +1,8 @@
 {{define "frag-sources-drawer"}}{{/* Add-source wizard (OA-23, plan 09-02):
      five steps, provider-conditional fields, credential refs filtered
-     server-side per provider, Notion published-audiences editor. Markup only
-     (D-20) — static/pages/sources.js drives every interaction via
-     data-action delegation and writes through Enclava.api (D-17). */}}
+     server-side per provider. Markup only (D-20) — static/pages/sources.js
+     drives every interaction via data-action delegation and writes through
+     Enclava.api (D-17). */}}
 {{if .Data.EditSource}}
 <div class="drawer-head">
   <h2>Reconnect {{.Data.EditSource.Name}}</h2>
@@ -96,13 +96,13 @@
     <label class="label" for="github-credential">Credential reference</label>
     <input class="field" id="github-credential" data-credential list="cred-github" autocomplete="off">
     <datalist id="cred-github">{{range index .Data.CredentialRefs "github"}}<option value="{{.RefID}}">{{.Name}}</option>{{end}}</datalist>
-    <span class="help">Public repository content can sync without a credential. Collaborator and membership lookup still requires a CONNECTOR_GITHUB_* credential binding with push access, even for public repositories; without it only content syncs. Manage stored credentials in <a href="/dashboard/sources/credentials">Credentials</a>.</span>
+    <span class="help">Public repository content can sync without a credential. Manage stored credentials in <a href="/dashboard/sources/credentials">Credentials</a>.</span>
   </div>
 
   <div data-provider-fields="notion" hidden>
     <label class="label" for="notion-pages">Page IDs</label>
     <textarea class="field" id="notion-pages" data-notion-pages rows="2" placeholder="page id per line" required></textarea>
-    <span class="help">Each selected page syncs with its published audiences (next step).</span>
+    <span class="help">Each selected page syncs into the target collection.</span>
     <label class="label" for="notion-depth">Max depth</label>
     <input class="field" id="notion-depth" data-config="max_depth" data-type="number" type="number" min="1" max="8" inputmode="numeric" placeholder="3">
     <label class="label" for="notion-max-pages">Max pages</label>
@@ -140,28 +140,19 @@
 <div class="section" data-step-pane="3" hidden>
   <div class="section-head"><h2>Access</h2></div>
   <div data-provider-access="slack" hidden>
-    <p class="muted">Slack sources mirror the workspace membership the connected app can see — readers keep their own Slack access to open native URLs.</p>
+    <p class="muted">Everyone who can open the target collection can read everything this source syncs.</p>
   </div>
   <div data-provider-access="teams" hidden>
-    <p class="muted">Teams sources mirror standard, private and shared channel membership plus the configured chats — readers keep their own Teams access.</p>
+    <p class="muted">Everyone who can open the target collection can read everything this source syncs.</p>
   </div>
   <div data-provider-access="github" hidden>
-    <p class="muted">GitHub sources mirror repository collaborator grants. Collaborator and membership lookup requires a credential binding with push access even for public repositories; without it only content syncs.</p>
+    <p class="muted">Everyone who can open the target collection can read everything this source syncs.</p>
   </div>
   <div data-provider-access="notion" hidden>
-    <p class="muted">Notion sources grant only the <b>published audiences</b> configured below, applied to every selected page. Selecting a page never grants access by itself.</p>
-    <div class="stack" id="notion-audiences">
-      <div class="row" data-audience-row>
-        <input class="field" data-audience-id placeholder="Audience name" aria-label="Audience name">
-        <input class="field" data-audience-members placeholder="Enclava user IDs, comma separated" aria-label="Audience members">
-        <button type="button" class="iconbtn" data-action="sources:audience-remove" aria-label="Remove audience">{{icon "x"}}<span class="visually-hidden">Remove audience</span></button>
-      </div>
-    </div>
-    <button type="button" class="btn" data-action="sources:audience-add">{{icon "plus"}}Add audience</button>
-    <span class="field-error" data-wizard-error hidden></span>
+    <p class="muted">Everyone who can open the target collection can read everything this source syncs.</p>
   </div>
   <div data-provider-access="google_drive" hidden>
-    <p class="muted">Drive sources mirror Drive sharing and folder inheritance — content stays readable only to people Drive already shares it with.</p>
+    <p class="muted">Everyone who can open the target collection can read everything this source syncs. Drive files that readers cannot copy or download are not synced.</p>
   </div>
 </div>
 
@@ -197,38 +188,3 @@
 {{end}}
 {{end}}
 
-{{define "frag-sources-bindings"}}{{/* Verified source-user bindings drawer —
-     served under access.manage only (platform.admin inner gate on the API). */}}
-<div class="drawer-head">
-  <h2>User bindings</h2>
-  <button type="button" class="iconbtn" data-action="close-drawer" aria-label="Close drawer">{{icon "x"}}<span class="visually-hidden">Close</span></button>
-</div>
-<p class="muted">Verified mappings from {{if .Data.SourceName}}“{{.Data.SourceName}}”{{else}}this source{{end}}'s native users to Enclava users. Bindings decide whose access a source-native grant can widen.</p>
-{{if gt .Data.Source.UnmappedPrincipals 0}}<p class="help">{{if eq .Data.Source.UnmappedPrincipals 1}}1 source account has no Enclava binding and gets no access{{else}}{{.Data.Source.UnmappedPrincipals}} source accounts have no Enclava binding and get no access{{end}}</p>{{end}}
-<div class="stack">
-  {{range .Data.Bindings}}  <div class="row">
-    <code>{{.NativeID}}</code>{{if and .DisplayName (ne .DisplayName .NativeID)}} <span>{{.DisplayName}}</span>{{end}}
-    {{if .MappedUserID}}<span>→ <code>{{or (index $.Data.UserLabels .MappedUserID) .MappedUserID}}</code></span>
-    <button type="button" class="btn danger" data-action="sources:unbind" data-source-id="{{$.Data.SourceID}}" data-binding-id="{{.ID}}">Revoke</button>
-    {{else}}<span class="muted">unbound</span>{{end}}
-  </div>
-  {{else}}  <p class="muted">No observed source users yet — bindings appear after the source's first access sync.</p>
-  {{end}}
-</div>
-<div class="section">
-  <div class="section-head"><h2>Bind a user</h2></div>
-  <label class="label" for="bind-native">Observed native user ID</label>
-  <input class="field" id="bind-native" data-bind-native list="bind-native-ids" autocomplete="off" required>
-  <datalist id="bind-native-ids">{{range .Data.Bindings}}{{if not .MappedUserID}}<option value="{{.NativeID}}">{{.DisplayName}}</option>{{end}}{{end}}</datalist>
-  <label class="label" for="bind-mapped">Enclava user ID</label>
-  <input class="field" id="bind-mapped" data-bind-mapped list="bind-users" autocomplete="off" required>
-  <datalist id="bind-users">{{range .Data.Users}}<option value="{{.ID}}">{{.Email}}</option>{{end}}</datalist>
-  <label class="label" for="bind-evidence">Administrator verification evidence</label>
-  <input class="field" id="bind-evidence" data-bind-evidence required>
-  <span class="help">Where the verification is recorded (ticket, request, review).</span>
-  <div class="row">
-    <button type="button" class="btn primary" data-action="sources:bind" data-source-id="{{.Data.SourceID}}">Bind user</button>
-  </div>
-  <span class="field-error" data-wizard-error hidden></span>
-</div>
-{{end}}

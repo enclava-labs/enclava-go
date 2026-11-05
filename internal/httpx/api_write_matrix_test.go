@@ -76,8 +76,8 @@ func TestAPIWriteMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed delete collection 2: %v", err)
 	}
-	// Reprocess stays owner-bound through CanRead on the object's audience;
-	// its collection must not be one the delete rows consume.
+	// Reprocess needs read access to the document's collection; its
+	// collection must not be one the delete rows consume.
 	reprocColl, err := f.ragSvc.CreateCollection(ctx, manager.principal,
 		rag.CreateCollectionInput{Name: "Manager-owned reprocess", ChunkSize: rag.DefaultChunkSize, ChunkOverlap: rag.DefaultChunkOverlap})
 	if err != nil {
@@ -173,7 +173,7 @@ func TestAPIWriteMatrix(t *testing.T) {
 			verify:  statusIs(http.StatusAccepted, http.StatusOK)},
 		{name: "rag reprocess document", method: http.MethodPost,
 			path:    func(*matrixFixture) string { return "/api/v1/rag/documents/" + reprocDoc.Document.ID + "/reprocess" },
-			allowed: roles(roleManager), deny404: true, // owner-bound: CanRead on the object's audience excludes the platform admin too
+			allowed: roles(roleAdmin, roleManager), deny404: true, // collection read: the owning manager and the platform admin
 			verify: statusIs(http.StatusAccepted)},
 		{name: "rag delete document", method: http.MethodDelete,
 			path:    func(*matrixFixture) string { return "/api/v1/rag/documents/" + outDel.Document.ID },

@@ -124,7 +124,7 @@ type DriveAdapter struct{ service *Service }
 func NewGDriveAdapter(service *Service) Adapter { return DriveAdapter{service: service} }
 
 func (DriveAdapter) Capabilities() AdapterCapabilities {
-	return AdapterCapabilities{Content: true, Access: true, UnsupportedScopes: []string{"membership"}}
+	return AdapterCapabilities{Content: true}
 }
 
 func (a DriveAdapter) request(ctx context.Context, c source.Connection, method, endpoint string) (*http.Response, error) {
@@ -254,7 +254,7 @@ func (a DriveAdapter) driveFiles(ctx context.Context, c source.Connection, state
 		}
 		state.Start = token
 	}
-	q := url.Values{"q": {"'" + strings.ReplaceAll(driveRoot(c), "'", "\\'") + "' in parents and trashed = false"}, "pageSize": {strconv.Itoa(limit)}, "fields": {"nextPageToken,files(id,name,mimeType,webViewLink,modifiedTime,headRevisionId,parents,shortcutDetails)"}, "supportsAllDrives": {"true"}, "includeItemsFromAllDrives": {"true"}}
+	q := url.Values{"q": {"'" + strings.ReplaceAll(driveRoot(c), "'", "\\'") + "' in parents and trashed = false"}, "pageSize": {strconv.Itoa(limit)}, "fields": {"nextPageToken,files(id,name,mimeType,webViewLink,modifiedTime,headRevisionId,parents,shortcutDetails,copyRequiresWriterPermission,downloadRestrictions(itemDownloadRestriction(restrictedForReaders,restrictedForWriters)))"}, "supportsAllDrives": {"true"}, "includeItemsFromAllDrives": {"true"}}
 	if driveID := driveSharedID(c); driveID != "" {
 		q.Set("corpora", "drive")
 		q.Set("driveId", driveID)
@@ -280,7 +280,7 @@ func (a DriveAdapter) driveFiles(ctx context.Context, c source.Connection, state
 	}
 	page := ContentPage{Completeness: CompletenessComplete, Snapshot: listing.Next == ""}
 	for _, f := range listing.Files {
-		if !driveTypeAllowed(c, f.MimeType) {
+		if !driveTypeAllowed(c, f.MimeType) || driveReaderRestricted(f) {
 			continue
 		}
 		item, err := a.driveItem(ctx, c, f)
@@ -321,14 +321,27 @@ func (a DriveAdapter) driveFiles(ctx context.Context, c source.Connection, state
 }
 
 type driveFile struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	MimeType     string   `json:"mimeType"`
-	WebViewLink  string   `json:"webViewLink"`
-	ModifiedTime string   `json:"modifiedTime"`
-	Revision     string   `json:"headRevisionId"`
-	Parents      []string `json:"parents"`
-	Trashed      bool     `json:"trashed"`
+	ID                           string   `json:"id"`
+	Name                         string   `json:"name"`
+	MimeType                     string   `json:"mimeType"`
+	WebViewLink                  string   `json:"webViewLink"`
+	ModifiedTime                 string   `json:"modifiedTime"`
+	Revision                     string   `json:"headRevisionId"`
+	Parents                      []string `json:"parents"`
+	Trashed                      bool     `json:"trashed"`
+	CopyRequiresWriterPermission *bool    `json:"copyRequiresWriterPermission"`
+	DownloadRestrictions         struct {
+		Item struct {
+			RestrictedForReaders *bool `json:"restrictedForReaders"`
+		} `json:"itemDownloadRestriction"`
+	} `json:"downloadRestrictions"`
+}
+
+// driveReaderRestricted: the file forbids readers from copying or
+// downloading, so it is skipped — collection access can no longer deny it.
+func driveReaderRestricted(f driveFile) bool {
+	return (f.CopyRequiresWriterPermission != nil && *f.CopyRequiresWriterPermission) ||
+		(f.DownloadRestrictions.Item.RestrictedForReaders != nil && *f.DownloadRestrictions.Item.RestrictedForReaders)
 }
 
 func appendDriveID(ids []string, id string) []string {
@@ -401,7 +414,7 @@ func (a DriveAdapter) driveStartToken(ctx context.Context, c source.Connection) 
 }
 
 func (a DriveAdapter) driveChanges(ctx context.Context, c source.Connection, state driveCursor, limit int) (ContentPage, error) {
-	q := url.Values{"pageToken": {state.Token}, "pageSize": {strconv.Itoa(limit)}, "supportsAllDrives": {"true"}, "includeItemsFromAllDrives": {"true"}, "fields": {"nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,webViewLink,modifiedTime,headRevisionId,parents,trashed))"}}
+	q := url.Values{"pageToken": {state.Token}, "pageSize": {strconv.Itoa(limit)}, "supportsAllDrives": {"true"}, "includeItemsFromAllDrives": {"true"}, "fields": {"nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,webViewLink,modifiedTime,headRevisionId,parents,trashed,copyRequiresWriterPermission,downloadRestrictions(itemDownloadRestriction(restrictedForReaders,restrictedForWriters))))"}}
 	if driveID := driveSharedID(c); driveID != "" {
 		q.Set("driveId", driveID)
 	}
@@ -462,7 +475,7 @@ func (a DriveAdapter) driveChanges(ctx context.Context, c source.Connection, sta
 			}
 			continue
 		}
-		if !driveTypeAllowed(c, change.File.MimeType) {
+		if !driveTypeAllowed(c, change.File.MimeType) || driveReaderRestricted(change.File) {
 			if inScope {
 				state.Removed = appendDriveID(state.Removed, id)
 				state.InScope = removeDriveID(state.InScope, id)
@@ -631,114 +644,4 @@ func driveColumn(n int) string {
 		n /= 26
 	}
 	return string(b[i:])
-}
-
-func (a DriveAdapter) Access(ctx context.Context, c source.Connection, cursor Cursor, limit int) (AccessPage, error) {
-	if limit <= 0 || limit > drivePageSize {
-		return AccessPage{}, errors.New("google_drive page limit must be between 1 and 100")
-	}
-	base, root := driveBase(c), driveRoot(c)
-	if base == "" || root == "" {
-		return AccessPage{Completeness: CompletenessIncomplete}, errors.New("google_drive access scope is not configured")
-	}
-	q := url.Values{"q": {"'" + strings.ReplaceAll(root, "'", "\\'") + "' in parents and trashed = false"}, "pageSize": {strconv.Itoa(limit)}, "fields": {"nextPageToken,files(id,driveId,inheritedPermissionsDisabled,copyRequiresWriterPermission,downloadRestrictions(itemDownloadRestriction(restrictedForReaders,restrictedForWriters)),permissions(id,type,emailAddress,domain,role,permissionDetails(inherited,inheritedFrom,permissionType,role)))"}, "supportsAllDrives": {"true"}, "includeItemsFromAllDrives": {"true"}}
-	if driveID := driveSharedID(c); driveID != "" {
-		q.Set("corpora", "drive")
-		q.Set("driveId", driveID)
-	}
-	if cursor != "" {
-		q.Set("pageToken", string(cursor))
-	}
-	resp, err := a.request(ctx, c, http.MethodGet, base+"/files?"+q.Encode())
-	if err != nil {
-		return AccessPage{Completeness: CompletenessIncomplete}, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	b, err := readDriveBody(resp)
-	if err != nil {
-		return AccessPage{Completeness: CompletenessIncomplete}, err
-	}
-	var payload struct {
-		Next  string `json:"nextPageToken"`
-		Files []struct {
-			ID                           string `json:"id"`
-			DriveID                      string `json:"driveId"`
-			InheritedPermissionsDisabled *bool  `json:"inheritedPermissionsDisabled"`
-			CopyRequiresWriterPermission *bool  `json:"copyRequiresWriterPermission"`
-			DownloadRestrictions         struct {
-				Item struct {
-					RestrictedForReaders *bool `json:"restrictedForReaders"`
-					RestrictedForWriters *bool `json:"restrictedForWriters"`
-				} `json:"itemDownloadRestriction"`
-			} `json:"downloadRestrictions"`
-			Permissions []struct {
-				ID, Type, EmailAddress, Domain, Role string
-				Details                              []struct {
-					Inherited                           bool `json:"inherited"`
-					InheritedFrom, PermissionType, Role string
-				} `json:"permissionDetails"`
-			} `json:"permissions"`
-		} `json:"files"`
-	}
-	if err := json.Unmarshal(b, &payload); err != nil {
-		return AccessPage{Completeness: CompletenessIncomplete}, err
-	}
-	page := AccessPage{Completeness: CompletenessComplete, Snapshot: payload.Next == "", NextCursor: Cursor(payload.Next)}
-	for _, f := range payload.Files {
-		if f.Permissions == nil {
-			page.Completeness = CompletenessIncomplete
-		}
-		if f.ID == "" {
-			return AccessPage{Completeness: CompletenessIncomplete}, errors.New("google_drive permission file is missing id")
-		}
-		if f.DriveID != "" && (f.InheritedPermissionsDisabled == nil || f.CopyRequiresWriterPermission == nil || f.DownloadRestrictions.Item.RestrictedForReaders == nil || f.DownloadRestrictions.Item.RestrictedForWriters == nil) {
-			page.Completeness = CompletenessIncomplete
-		}
-		if (f.CopyRequiresWriterPermission != nil && *f.CopyRequiresWriterPermission) ||
-			(f.DownloadRestrictions.Item.RestrictedForReaders != nil && *f.DownloadRestrictions.Item.RestrictedForReaders) ||
-			(f.DownloadRestrictions.Item.RestrictedForWriters != nil && *f.DownloadRestrictions.Item.RestrictedForWriters) {
-			page.Grants = append(page.Grants, AccessGrant{NativeObjectID: f.ID, Scope: "copy_download_restricted", Effect: "deny"})
-		}
-		for _, p := range f.Permissions {
-			if p.Type == "" || p.ID == "" || p.Role == "" {
-				page.Completeness = CompletenessIncomplete
-				continue
-			}
-			inherited, role := false, p.Role
-			for _, d := range p.Details {
-				if d.Inherited {
-					inherited = true
-					if d.Role != "" {
-						role = d.Role
-					}
-				}
-			}
-			grant := AccessGrant{NativeObjectID: f.ID, NativePrincipalID: p.EmailAddress, Scope: role, Effect: "allow", Inherited: inherited}
-			switch p.Type {
-			case "user":
-				if grant.NativePrincipalID == "" {
-					grant.NativePrincipalID = p.ID
-				}
-			case "group":
-				grant.NativePrincipalID = ""
-				grant.NativeGroupID = firstNonEmpty(p.EmailAddress, p.ID)
-			case "domain":
-				grant.NativePrincipalID = p.Domain
-			case "anyone":
-				grant.NativePrincipalID = "anyone"
-			default:
-				page.Completeness = CompletenessIncomplete
-				continue
-			}
-			page.Grants = append(page.Grants, grant)
-		}
-	}
-	if page.Completeness != CompletenessComplete {
-		page.Snapshot, page.NextCursor = false, ""
-	}
-	return page, nil
-}
-
-func (DriveAdapter) Membership(context.Context, source.Connection, Cursor, int) (MembershipPage, error) {
-	return MembershipPage{Completeness: CompletenessIncomplete}, errors.New("google_drive membership enumeration requires an explicitly authorized directory integration")
 }

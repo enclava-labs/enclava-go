@@ -197,7 +197,6 @@ type UploadDocumentInput struct {
 	InputArtifact  string                     `json:"-"`
 	ResultJobID    string                     `json:"-"`
 	ResultArtifact string                     `json:"-"`
-	Audience       []string                   `json:"-"`
 	Restrictions   []source.SourceRestriction `json:"-"`
 	ObjectID       string                     `json:"-"`
 }

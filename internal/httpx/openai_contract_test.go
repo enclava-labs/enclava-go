@@ -131,7 +131,7 @@ func newOpenAIContractFixture(t *testing.T) *openaiFx {
 	svc, err := inference.NewService(inference.Deps{
 		Endpoints:  erepo,
 		Sources:    srepo,
-		Authorizer: source.NewAuthorizer(srepo, 0),
+		Authorizer: source.NewAuthorizer(srepo),
 		Billing:    billing.NewService(brepo),
 		Artifacts:  arepo,
 	}, inference.WithTransportFactory(func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {
@@ -517,7 +517,7 @@ func TestOfficialSDKInProcessContract(t *testing.T) {
 	svc, err := inference.NewService(inference.Deps{
 		Endpoints:  f.erepo,
 		Sources:    srepo,
-		Authorizer: source.NewAuthorizer(srepo, 0),
+		Authorizer: source.NewAuthorizer(srepo),
 		Billing:    billing.NewService(f.brepo),
 		Artifacts:  postgres.NewArtifactRepo(f.db),
 	}, inference.WithTransportFactory(func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {

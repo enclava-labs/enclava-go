@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -106,7 +105,7 @@ func newExecutor(t *testing.T, db *postgres.DB, tenant string, upstream inferenc
 	svc, err := inference.NewService(inference.Deps{
 		Endpoints:  postgres.NewEndpointsRepo(db),
 		Sources:    sources,
-		Authorizer: source.NewAuthorizer(sources, 0),
+		Authorizer: source.NewAuthorizer(sources),
 		Billing:    billing.NewService(billingRepo),
 		Artifacts:  postgres.NewArtifactRepo(db),
 	}, inference.WithTransportFactory(func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {
@@ -389,6 +388,18 @@ func (f *fixture) collection(t *testing.T) rag.Collection {
 	})
 	if err != nil {
 		t.Fatalf("create collection: %v", err)
+	}
+	return c
+}
+
+// privateCollection is readable only by its owner (f.principal).
+func (f *fixture) privateCollection(t *testing.T) rag.Collection {
+	t.Helper()
+	c, err := f.svc.CreateCollection(context.Background(), f.principal, rag.CreateCollectionInput{
+		Name: "Private", ChunkSize: 100, ChunkOverlap: 10, ACL: map[string]any{"public": false},
+	})
+	if err != nil {
+		t.Fatalf("create private collection: %v", err)
 	}
 	return c
 }
@@ -1602,31 +1613,32 @@ func TestLexicalSearchSkipsEmbeddingAndRechecksRevocation(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 	c := f.collection(t)
-	upload, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{FileName: "secret.txt", MimeType: "text/plain", Bytes: []byte("private-copper-aster content")})
-	if err != nil {
+	if _, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{FileName: "secret.txt", MimeType: "text/plain", Bytes: []byte("private-copper-aster content")}); err != nil {
 		t.Fatal(err)
 	}
 	f.runNextJob(t)
+	member := newScopedUser(t, f, "member-lexical@example.test", "rag")
 	calls := f.embedding.calls
-	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "private copper", Mode: rag.QueryLexical})
+	results, err := f.svc.Search(ctx, member, rag.SearchInput{CollectionID: c.ID, Query: "private copper", Mode: rag.QueryLexical})
 	if err != nil || len(results) == 0 {
 		t.Fatalf("lexical-only retrieval: %#v err=%v", results, err)
 	}
 	if f.embedding.calls != calls {
 		t.Fatalf("lexical-only search called embedding executor: before=%d after=%d", calls, f.embedding.calls)
 	}
-	if _, err := f.db.SQL.ExecContext(ctx, `UPDATE source_objects SET audience='[]'::jsonb WHERE tenant_id=$1 AND id=$2`, f.tenant, upload.Document.ID); err != nil {
+	// Revoke the member's collection access: search, context and evidence
+	// all re-check at read time.
+	if _, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{ACL: map[string]any{"public": false}}); err != nil {
 		t.Fatal(err)
 	}
-	revoked, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "private copper", Mode: rag.QueryLexical})
-	if err != nil || len(revoked) != 0 {
-		t.Fatalf("revoked result leaked: %#v err=%v", revoked, err)
+	if revoked, err := f.svc.Search(ctx, member, rag.SearchInput{CollectionID: c.ID, Query: "private copper", Mode: rag.QueryLexical}); !errors.Is(err, source.ErrDenied) {
+		t.Fatalf("revoked search = %#v err=%v, want ErrDenied", revoked, err)
 	}
-	contextResult, err := f.svc.BuildContext(ctx, f.principal, results, 200)
+	contextResult, err := f.svc.BuildContext(ctx, member, results, 200)
 	if err != nil || strings.Contains(contextResult.Text, "private-copper-aster") || !contextResult.NeighborWithheld {
 		t.Fatalf("revoked context was not withheld: %#v err=%v", contextResult, err)
 	}
-	if _, err := f.svc.ResolveEvidence(ctx, f.principal, []string{results[0].EvidenceID}); !errors.Is(err, source.ErrDenied) {
+	if _, err := f.svc.ResolveEvidence(ctx, member, []string{results[0].EvidenceID}); !errors.Is(err, source.ErrDenied) {
 		t.Fatalf("revoked evidence did not resolve as not found: %v", err)
 	}
 }
@@ -1841,7 +1853,7 @@ func TestKnowledgeImportReservationSurvivesCrashAfterObjectCreation(t *testing.T
 	}
 	object := source.Object{
 		TenantID: f.tenant, ID: reservedID, Kind: "generated", NativeID: "crashed-result",
-		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: f.principal.ActorID, Audience: []string{f.principal.ActorID},
+		AuthorizationMode: source.AuthorizationCollection, OwnerActorID: f.principal.ActorID,
 	}
 	if _, err := f.repo.UpsertObject(ctx, object); err != nil {
 		t.Fatalf("create imported object: %v", err)
@@ -1889,7 +1901,7 @@ func TestImportArtifactInheritsSourceRestrictions(t *testing.T) {
 	ref := writer.Ref()
 	object, err := f.repo.UpsertObject(ctx, source.Object{
 		TenantID: f.tenant, ID: "source_import_fixture", Kind: "upload", NativeID: "import-source",
-		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: f.principal.ActorID, Audience: []string{f.principal.ActorID},
+		AuthorizationMode: source.AuthorizationOwner, OwnerActorID: f.principal.ActorID,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1956,27 +1968,28 @@ func TestServiceListDocumentsAuthorizedPagination(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 	c := f.collection(t)
+	private := f.privateCollection(t)
 	member := newScopedUser(t, f, "member-list@example.test", "rag")
 	manager := newScopedUser(t, f, "manager-list@example.test", "rag", "rag.manage")
 
-	// Three shared documents (explicit member audience) interleaved with two
-	// restricted ones (uploader-only audience). Object audiences match exact
-	// actor IDs — collection visibility never widens source reads.
+	// Three documents in the public collection interleaved with two in the
+	// owner's private one: a document is readable exactly when a collection
+	// containing it is.
 	shared, restricted := []string{}, []string{}
 	for i, spec := range []struct {
-		name     string
-		audience []string
-		ids      *[]string
+		name       string
+		collection string
+		ids        *[]string
 	}{
-		{"shared-a.txt", []string{f.principal.ActorID, member.ActorID}, &shared},
-		{"restricted-a.txt", []string{f.principal.ActorID}, &restricted},
-		{"shared-b.txt", []string{f.principal.ActorID, member.ActorID}, &shared},
-		{"shared-c.txt", []string{f.principal.ActorID, member.ActorID}, &shared},
-		{"restricted-b.txt", []string{f.principal.ActorID}, &restricted},
+		{"shared-a.txt", c.ID, &shared},
+		{"restricted-a.txt", private.ID, &restricted},
+		{"shared-b.txt", c.ID, &shared},
+		{"shared-c.txt", c.ID, &shared},
+		{"restricted-b.txt", private.ID, &restricted},
 	} {
-		out, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
+		out, err := f.svc.UploadDocument(ctx, f.principal, spec.collection, rag.UploadDocumentInput{
 			FileName: spec.name, MimeType: "text/plain",
-			Bytes: []byte(fmt.Sprintf("enclava document %d content", i)), Audience: spec.audience,
+			Bytes: []byte(fmt.Sprintf("enclava document %d content", i)),
 		})
 		if err != nil {
 			t.Fatalf("upload %s: %v", spec.name, err)
@@ -1984,9 +1997,9 @@ func TestServiceListDocumentsAuthorizedPagination(t *testing.T) {
 		*spec.ids = append(*spec.ids, out.Document.ID)
 	}
 
-	listIDs := func(p auth.Principal, status string, limit, offset int) []string {
+	listIDs := func(p auth.Principal, collectionID, status string, limit, offset int) []string {
 		t.Helper()
-		docs, err := f.svc.ListDocuments(ctx, p, c.ID, status, limit, offset)
+		docs, err := f.svc.ListDocuments(ctx, p, collectionID, status, limit, offset)
 		if err != nil {
 			t.Fatalf("list documents: %v", err)
 		}
@@ -1997,11 +2010,11 @@ func TestServiceListDocumentsAuthorizedPagination(t *testing.T) {
 		return ids
 	}
 
-	// Member pagination describes the AUTHORIZED set: denied rows never
-	// consume page slots and no restricted title leaks.
+	// Member pagination walks the readable collection without repeats or
+	// running past its end.
 	seen := map[string]bool{}
 	for _, offset := range []int{0, 2, 4} {
-		page := listIDs(member, rag.DocumentStatusAll, 2, offset)
+		page := listIDs(member, c.ID, rag.DocumentStatusAll, 2, offset)
 		if len(page) > 2 {
 			t.Fatalf("page larger than limit: %#v", page)
 		}
@@ -2010,28 +2023,25 @@ func TestServiceListDocumentsAuthorizedPagination(t *testing.T) {
 				t.Fatalf("document %s repeated across pages", id)
 			}
 			seen[id] = true
-			for _, denied := range restricted {
-				if id == denied {
-					t.Fatalf("restricted document %s leaked to member page %d", id, offset)
-				}
-			}
 		}
 	}
 	if len(seen) != len(shared) {
 		t.Fatalf("member pages saw %d documents, want the %d shared ones: %#v", len(seen), len(shared), seen)
 	}
-	if beyond := listIDs(member, rag.DocumentStatusAll, 2, len(shared)); len(beyond) != 0 {
+	if beyond := listIDs(member, c.ID, rag.DocumentStatusAll, 2, len(shared)); len(beyond) != 0 {
 		t.Fatalf("authorized pagination ran past the authorized set: %#v", beyond)
 	}
 
-	// rag.manage never bypasses source authorization: a manage-scoped caller
-	// without audience membership sees nothing — no titles, no counts.
-	if got := listIDs(manager, rag.DocumentStatusAll, 50, 0); len(got) != 0 {
-		t.Fatalf("manage-scoped caller saw %d unauthorized documents: %#v", len(got), got)
+	// rag.manage never bypasses collection permissions: the private
+	// collection is denied to the member and the manage-scoped caller alike.
+	for _, p := range []auth.Principal{member, manager} {
+		if _, err := f.svc.ListDocuments(ctx, p, private.ID, rag.DocumentStatusAll, 50, 0); !errors.Is(err, source.ErrDenied) {
+			t.Fatalf("private collection listed for %s: %v", p.ActorID, err)
+		}
 	}
-	// The owner (and audience member) sees everything.
-	if got := listIDs(f.principal, rag.DocumentStatusAll, 50, 0); len(got) != len(shared)+len(restricted) {
-		t.Fatalf("owner saw %d documents, want %d: %#v", len(got), len(shared)+len(restricted), got)
+	// The owner sees both collections.
+	if got := len(listIDs(f.principal, c.ID, rag.DocumentStatusAll, 50, 0)) + len(listIDs(f.principal, private.ID, rag.DocumentStatusAll, 50, 0)); got != len(shared)+len(restricted) {
+		t.Fatalf("owner saw %d documents, want %d", got, len(shared)+len(restricted))
 	}
 
 	// Unknown statuses are caller errors, and removed rows are unknown to
@@ -2039,7 +2049,7 @@ func TestServiceListDocumentsAuthorizedPagination(t *testing.T) {
 	if _, err := f.svc.ListDocuments(ctx, f.principal, c.ID, "bogus", 10, 0); !errors.Is(err, rag.ErrInvalidInput) {
 		t.Fatalf("unknown status must be ErrInvalidInput, got %v", err)
 	}
-	if removed := listIDs(member, rag.DocumentStatusRemoved, 10, 0); len(removed) != 0 {
+	if removed := listIDs(member, c.ID, rag.DocumentStatusRemoved, 10, 0); len(removed) != 0 {
 		t.Fatalf("removed rows leaked to member: %#v", removed)
 	}
 
@@ -2048,7 +2058,7 @@ func TestServiceListDocumentsAuthorizedPagination(t *testing.T) {
 	if err := f.svc.DeleteDocument(ctx, f.principal, shared[0]); err != nil {
 		t.Fatalf("delete document: %v", err)
 	}
-	if got := listIDs(member, rag.DocumentStatusAll, 50, 0); len(got) != len(shared)-1 {
+	if got := listIDs(member, c.ID, rag.DocumentStatusAll, 50, 0); len(got) != len(shared)-1 {
 		t.Fatalf("member still lists removed document: %#v", got)
 	}
 	removedDocs, err := f.svc.ListDocuments(ctx, f.principal, c.ID, rag.DocumentStatusRemoved, 10, 0)
@@ -2068,22 +2078,21 @@ func TestServiceFailedDocumentsAndCountAreAuthorized(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 	c := f.collection(t)
+	private := f.privateCollection(t)
 
 	member := newScopedUser(t, f, "member-fail@example.test", "rag")
 	manager := newScopedUser(t, f, "manager-fail@example.test", "rag", "rag.manage")
-	// One restricted failure (uploader-only audience) and one shared failure
-	// (member audience); whitespace-only payloads fail the embed with "no
+	// One failure in the owner's private collection and one in the public
+	// collection; whitespace-only payloads fail the embed with "no
 	// extractable text".
-	_, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
-		FileName: "restricted-fail.txt", MimeType: "text/plain",
-		Bytes: []byte("   \n"), Audience: []string{f.principal.ActorID},
+	_, err := f.svc.UploadDocument(ctx, f.principal, private.ID, rag.UploadDocumentInput{
+		FileName: "restricted-fail.txt", MimeType: "text/plain", Bytes: []byte("   \n"),
 	})
 	if err != nil {
 		t.Fatalf("upload restricted failure: %v", err)
 	}
 	sharedDoc, err := f.svc.UploadDocument(ctx, f.principal, c.ID, rag.UploadDocumentInput{
 		FileName: "shared-fail.txt", MimeType: "text/plain", Bytes: []byte("  \t\n"),
-		Audience: []string{f.principal.ActorID, member.ActorID},
 	})
 	if err != nil {
 		t.Fatalf("upload shared failure: %v", err)
@@ -2091,36 +2100,30 @@ func TestServiceFailedDocumentsAndCountAreAuthorized(t *testing.T) {
 	f.runNextJobExpectingFailure(t)
 	f.runNextJobExpectingFailure(t)
 
-	failedDocs, err := f.svc.ListDocuments(ctx, f.principal, c.ID, rag.DocumentStatusFailed, 10, 0)
-	if err != nil || len(failedDocs) != 2 {
-		t.Fatalf("owner failed list: %v %#v", err, failedDocs)
-	}
-	for _, d := range failedDocs {
-		if d.Status != rag.DocumentStatusFailed || d.ErrorMessage == "" {
+	for _, id := range []string{c.ID, private.ID} {
+		failedDocs, err := f.svc.ListDocuments(ctx, f.principal, id, rag.DocumentStatusFailed, 10, 0)
+		if err != nil || len(failedDocs) != 1 {
+			t.Fatalf("owner failed list: %v %#v", err, failedDocs)
+		}
+		if d := failedDocs[0]; d.Status != rag.DocumentStatusFailed || d.ErrorMessage == "" {
 			t.Fatalf("failed row must carry the job error: %#v", d)
 		}
-	}
-	if ready, err := f.svc.ListDocuments(ctx, f.principal, c.ID, rag.DocumentStatusReady, 10, 0); err != nil || len(ready) != 0 {
-		t.Fatalf("failed rows must not surface as ready: %v %#v", err, ready)
+		if ready, err := f.svc.ListDocuments(ctx, f.principal, id, rag.DocumentStatusReady, 10, 0); err != nil || len(ready) != 0 {
+			t.Fatalf("failed rows must not surface as ready: %v %#v", err, ready)
+		}
 	}
 
-	// Authorized failure aggregates: the restricted failure is absent for the
-	// member AND for the manage-scoped caller — rag.manage never bypasses,
-	// and without any audience membership the manager sees no failure at all.
-	assertAuthorizedFailures := func(p auth.Principal, wantID string) {
-		t.Helper()
+	// Authorized failure aggregates: the private collection's failure is
+	// absent for the member AND the manage-scoped caller — rag.manage never
+	// bypasses collection permissions.
+	for _, p := range []auth.Principal{member, manager} {
 		failed, err := f.svc.ListFailedDocuments(ctx, p, 10)
 		if err != nil {
 			t.Fatalf("list failed documents: %v", err)
 		}
-		if len(failed) != 1 || failed[0].ID != wantID {
-			t.Fatalf("authorized failures = %#v, want only %s", failed, wantID)
+		if len(failed) != 1 || failed[0].ID != sharedDoc.Document.ID {
+			t.Fatalf("authorized failures = %#v, want only %s", failed, sharedDoc.Document.ID)
 		}
-	}
-	assertAuthorizedFailures(member, sharedDoc.Document.ID)
-	managerFailed, err := f.svc.ListFailedDocuments(ctx, manager, 10)
-	if err != nil || len(managerFailed) != 0 {
-		t.Fatalf("manage-scoped caller must see no unauthorized failures: %v %#v", err, managerFailed)
 	}
 	ownerFailed, err := f.svc.ListFailedDocuments(ctx, f.principal, 10)
 	if err != nil || len(ownerFailed) != 2 {
@@ -2128,17 +2131,13 @@ func TestServiceFailedDocumentsAndCountAreAuthorized(t *testing.T) {
 	}
 
 	// The authorized document count matches the authorized list for every
-	// role — restricted rows never count.
-	count, err := f.svc.CountDocuments(ctx, member)
-	if err != nil || count != 1 {
-		t.Fatalf("member count = %d, %v (want the 1 shared document)", count, err)
+	// role — rows in unreadable collections never count.
+	for _, p := range []auth.Principal{member, manager} {
+		if count, err := f.svc.CountDocuments(ctx, p); err != nil || count != 1 {
+			t.Fatalf("count for %s = %d, %v (want the 1 shared document)", p.ActorID, count, err)
+		}
 	}
-	managerCount, err := f.svc.CountDocuments(ctx, manager)
-	if err != nil || managerCount != 0 {
-		t.Fatalf("manage-scoped count = %d, %v; manage must not bypass source ACLs", managerCount, err)
-	}
-	ownerCount, err := f.svc.CountDocuments(ctx, f.principal)
-	if err != nil || ownerCount != 2 {
+	if ownerCount, err := f.svc.CountDocuments(ctx, f.principal); err != nil || ownerCount != 2 {
 		t.Fatalf("owner count = %d, %v (want 2)", ownerCount, err)
 	}
 }
@@ -2154,8 +2153,7 @@ func (f *fixture) stageSearchDoc(t *testing.T, collection rag.Collection, object
 	ctx := context.Background()
 	if _, err := f.repo.UpsertObject(ctx, source.Object{
 		TenantID: f.tenant, ID: objectID, Kind: "document", NativeID: "native-" + objectID,
-		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: f.principal.ActorID,
-		Audience: []string{f.principal.ActorID, "*"},
+		AuthorizationMode: source.AuthorizationCollection, OwnerActorID: f.principal.ActorID,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -2388,11 +2386,11 @@ func TestSearchBeyondDocumentBound(t *testing.T) {
 	for i := range 3 {
 		f.stageSearchDoc(t, collection, fmt.Sprintf("obj_w_%d", i), fmt.Sprintf("bounded work %d", i), `{}`)
 	}
-	// 2,100 published audience-* generations with no index points: they
-	// define the aggregate binding but can never reach the post-check.
+	// 2,100 published collection-mode generations with no index points:
+	// they define the aggregate binding but can never reach the post-check.
 	for i, stmt := range []string{
-		`INSERT INTO source_objects (tenant_id, id, kind, native_id, authorization_mode, audience, observed_seq)
-		 SELECT $1, 'bulk_' || g, 'document', 'bulk_' || g, 'audience', '["*"]'::jsonb, 1
+		`INSERT INTO source_objects (tenant_id, id, kind, native_id, authorization_mode, observed_seq)
+		 SELECT $1, 'bulk_' || g, 'document', 'bulk_' || g, 'collection', 1
 		 FROM generate_series(1, 2100) g`,
 		`INSERT INTO source_object_versions (tenant_id, id, object_id, observed_seq, artifact_ref, content_sha256, byte_size, provenance)
 		 SELECT $1, id || '#1', id, 1, 'art_' || id, 'sha_' || id, 10, '{}'::jsonb
@@ -2777,9 +2775,8 @@ func TestAccessBackfillProjectsLegacyPoints(t *testing.T) {
 	if payload == nil || payload["published"] != true {
 		t.Fatalf("backfill must set published: %#v", payload)
 	}
-	acl, ok := payload["acl"].([]string)
-	if !ok || len(acl) != 2 || !slices.Contains(acl, "actor:"+f.principal.ActorID) || !slices.Contains(acl, "tenant") {
-		t.Fatalf("backfilled acl = %#v, want actor+tenant tokens", payload["acl"])
+	if acl, ok := payload["acl"].([]string); !ok || !reflect.DeepEqual(acl, []string{"tenant"}) {
+		t.Fatalf("backfilled acl = %#v, want the tenant token", payload["acl"])
 	}
 	var projectedAfter int
 	if err := f.db.SQL.QueryRowContext(ctx,
@@ -2902,36 +2899,6 @@ func TestAccessBackfillLoopResumesInterruptedJob(t *testing.T) {
 	}
 }
 
-func TestBackfillDoesNotOverwriteNewerProjection(t *testing.T) {
-	f := newFixture(t)
-	ctx := context.Background()
-	c := f.collection(t)
-	f.stageSearchDoc(t, c, "obj_revision", "revision test", `{}`)
-	if _, err := f.db.SQL.ExecContext(ctx, `UPDATE index_generations SET acl_revision=5 WHERE tenant_id=$1 AND collection_id=$2`, f.tenant, c.ID); err != nil {
-		t.Fatal(err)
-	}
-	for _, point := range f.vector.points[c.QdrantCollection] {
-		point.Payload["acl"] = []string{"newer"}
-		point.Payload["acl_revision"] = int64(5)
-		point.Payload["published"] = true
-	}
-	if err := f.svc.EnqueueAccessBackfills(ctx); err != nil {
-		t.Fatal(err)
-	}
-	claim, err := f.jobs.Lease(ctx, "worker", time.Minute)
-	if err != nil || claim == nil {
-		t.Fatalf("lease: %v", err)
-	}
-	if _, err := f.svc.AccessBackfillJobHandler()(ctx, claim, nil); err != nil {
-		t.Fatal(err)
-	}
-	for _, point := range f.vector.points[c.QdrantCollection] {
-		if !reflect.DeepEqual(point.Payload["acl"], []string{"newer"}) || point.Payload["acl_revision"] != int64(5) {
-			t.Fatalf("newer payload overwritten: %#v", point.Payload)
-		}
-	}
-}
-
 // TestExtractionResultImportRequiresValidationAck: a succeeded extract job
 // whose stored result carries validation_errors is refused until the caller
 // explicitly acknowledges them; a clean result imports without the flag.
@@ -3019,8 +2986,7 @@ func (f *fixture) stageGitHubFileDoc(t *testing.T, collection rag.Collection, ob
 	ref := writer.Ref()
 	if _, err := f.repo.UpsertObject(ctx, source.Object{
 		TenantID: f.tenant, ID: objectID, Kind: "file", NativeID: "github:conn:acme/docs:" + objectID + ".txt",
-		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: f.principal.ActorID,
-		Audience: []string{f.principal.ActorID, "*"},
+		AuthorizationMode: source.AuthorizationCollection, OwnerActorID: f.principal.ActorID,
 	}); err != nil {
 		t.Fatal(err)
 	}

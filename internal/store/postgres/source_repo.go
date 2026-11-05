@@ -211,7 +211,7 @@ func (r *SourceRepo) SetSyncState(ctx context.Context, tenantID, id string, sync
 func (r *SourceRepo) UpsertObject(ctx context.Context, o source.Object) (source.Object, error) {
 	mode := o.AuthorizationMode
 	if mode == "" {
-		mode = source.AuthorizationSourceACL
+		mode = source.AuthorizationCollection
 	}
 	var connID any
 	conflict := "(tenant_id, connection_id, kind, native_id) DO NOTHING"
@@ -226,12 +226,12 @@ func (r *SourceRepo) UpsertObject(ctx context.Context, o source.Object) (source.
 	err := r.db.SQL.QueryRowContext(ctx, `
 		INSERT INTO source_objects
 		    (tenant_id, id, connection_id, kind, native_id, parent_object_id,
-		     authorization_mode, owner_actor_id, audience, upstream_revision, observed_seq)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
+		     authorization_mode, owner_actor_id, upstream_revision, observed_seq)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT `+conflict+`
 		RETURNING id`,
 		o.TenantID, o.ID, connID, o.Kind, o.NativeID, nullableText(o.ParentObjectID),
-		mode, nullableText(o.OwnerActorID), mustJSONList(o.Audience),
+		mode, nullableText(o.OwnerActorID),
 		nilIfNilStr(o.UpstreamRevision), o.ObservedSeq).Scan(&id)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -274,14 +274,6 @@ func nilIfNilStr(s *string) any {
 	return *s
 }
 
-func mustJSONList(values []string) []byte {
-	b, err := jsonList(values)
-	if err != nil {
-		return []byte("[]")
-	}
-	return b
-}
-
 func (r *SourceRepo) objectByNativeID(ctx context.Context, tenantID, connectionID, kind, nativeID string) (source.Object, error) {
 	var id string
 	var err error
@@ -305,17 +297,16 @@ func (r *SourceRepo) objectByNativeID(ctx context.Context, tenantID, connectionI
 func (r *SourceRepo) GetObject(ctx context.Context, tenantID, id string) (source.Object, error) {
 	var o source.Object
 	var connID, parent, owner sql.NullString
-	var audience []byte
 	var upstream sql.NullString
 	var deleted, tombstoned sql.NullTime
 	err := r.db.SQL.QueryRowContext(ctx, `
 		SELECT tenant_id::text, id, connection_id, kind, native_id, parent_object_id,
-		       authorization_mode, owner_actor_id, audience, upstream_revision,
+		       authorization_mode, owner_actor_id, upstream_revision,
 		       observed_seq, deleted_at, tombstoned_at
 		FROM source_objects WHERE tenant_id = $1 AND id = $2`,
 		tenantID, id).Scan(
 		&o.TenantID, &o.ID, &connID, &o.Kind, &o.NativeID, &parent,
-		&o.AuthorizationMode, &owner, &audience, &upstream,
+		&o.AuthorizationMode, &owner, &upstream,
 		&o.ObservedSeq, &deleted, &tombstoned)
 	if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
 		return source.Object{}, source.ErrDenied
@@ -326,7 +317,6 @@ func (r *SourceRepo) GetObject(ctx context.Context, tenantID, id string) (source
 	o.ConnectionID = connID.String
 	o.ParentObjectID = parent.String
 	o.OwnerActorID = owner.String
-	o.Audience = scanJSONList(audience)
 	if upstream.Valid {
 		s := upstream.String
 		o.UpstreamRevision = &s
@@ -577,405 +567,6 @@ func (r *SourceRepo) IngestFailed(ctx context.Context, tenantID, collectionID, o
 		return false, fmt.Errorf("check ingest failure: %w", err)
 	}
 	return failed, nil
-}
-
-// ---------------------------------------------------------------------
-// Identities, groups, memberships
-
-func (r *SourceRepo) InsertSourceIdentity(ctx context.Context, id source.SourceIdentity) error {
-	_, err := r.db.SQL.ExecContext(ctx, `
-		INSERT INTO source_identities
-		    (tenant_id, id, connection_id, source_user_native_id, display_name, mapped_user_id)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		ON CONFLICT (tenant_id, connection_id, source_user_native_id)
-		DO UPDATE SET mapped_user_id = EXCLUDED.mapped_user_id,
-		    display_name = COALESCE(NULLIF(EXCLUDED.display_name, ''), source_identities.display_name)`,
-		id.TenantID, id.ID, id.ConnectionID, id.NativeID, id.DisplayName, nullableText(id.MappedUserID))
-	if err != nil {
-		return fmt.Errorf("upsert source identity: %w", err)
-	}
-	return nil
-}
-
-// ObserveSourceIdentity records a provider-native principal seen during
-// access/membership ingestion. It never touches an existing mapping, so a
-// sync racing an administrator bind cannot clear it.
-func (r *SourceRepo) ObserveSourceIdentity(ctx context.Context, id source.SourceIdentity) error {
-	_, err := r.db.SQL.ExecContext(ctx, `
-		INSERT INTO source_identities
-		    (tenant_id, id, connection_id, source_user_native_id, display_name)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (tenant_id, connection_id, source_user_native_id)
-		DO UPDATE SET display_name = COALESCE(NULLIF(EXCLUDED.display_name, ''), source_identities.display_name)`,
-		id.TenantID, id.ID, id.ConnectionID, id.NativeID, id.DisplayName)
-	if err != nil {
-		return fmt.Errorf("observe source identity: %w", err)
-	}
-	return nil
-}
-
-func (r *SourceRepo) SourceIdentitiesForConnection(ctx context.Context, tenantID, connectionID string) ([]source.SourceIdentity, error) {
-	rows, err := r.db.SQL.QueryContext(ctx, `SELECT tenant_id::text,id,connection_id,source_user_native_id,display_name,COALESCE(mapped_user_id,'') FROM source_identities WHERE tenant_id=$1 AND connection_id=$2 ORDER BY source_user_native_id`, tenantID, connectionID)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	out := []source.SourceIdentity{}
-	for rows.Next() {
-		var row source.SourceIdentity
-		if err := rows.Scan(&row.TenantID, &row.ID, &row.ConnectionID, &row.NativeID, &row.DisplayName, &row.MappedUserID); err != nil {
-			return nil, err
-		}
-		out = append(out, row)
-	}
-	return out, rows.Err()
-}
-
-func (r *SourceRepo) SourceIdentityByID(ctx context.Context, tenantID, id string) (source.SourceIdentity, error) {
-	var row source.SourceIdentity
-	err := r.db.SQL.QueryRowContext(ctx, `SELECT tenant_id::text,id,connection_id,source_user_native_id,display_name,COALESCE(mapped_user_id,'') FROM source_identities WHERE tenant_id=$1 AND id=$2`, tenantID, id).Scan(&row.TenantID, &row.ID, &row.ConnectionID, &row.NativeID, &row.DisplayName, &row.MappedUserID)
-	if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
-		return source.SourceIdentity{}, source.ErrDenied
-	}
-	return row, err
-}
-
-func (r *SourceRepo) UserExists(ctx context.Context, tenantID, userID string) (bool, error) {
-	var exists bool
-	err := r.db.SQL.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE tenant_id=$1 AND id=$2 AND status='active')`, tenantID, userID).Scan(&exists)
-	return exists, err
-}
-
-func (r *SourceRepo) InsertSourceGroup(ctx context.Context, g source.SourceGroup) error {
-	_, err := r.db.SQL.ExecContext(ctx, `
-		INSERT INTO source_groups
-		    (tenant_id, id, connection_id, source_group_native_id, name)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (tenant_id, connection_id, source_group_native_id)
-		DO UPDATE SET name = EXCLUDED.name`,
-		g.TenantID, g.ID, g.ConnectionID, g.NativeID, g.Name)
-	if err != nil {
-		return fmt.Errorf("upsert source group: %w", err)
-	}
-	return nil
-}
-
-func (r *SourceRepo) InsertSourceMembership(ctx context.Context, m source.SourceGroupMembership) error {
-	rowID := fmt.Sprintf("ms:%s:%s:%d", m.GroupID, m.MemberID, m.AccessRevision)
-	_, err := r.db.SQL.ExecContext(ctx, `
-		INSERT INTO source_group_memberships
-		    (tenant_id, id, group_id, source_identity_id, access_revision)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (tenant_id, id) DO NOTHING`,
-		m.TenantID, rowID, m.GroupID, m.MemberID, m.AccessRevision)
-	if err != nil {
-		return fmt.Errorf("insert membership: %w", err)
-	}
-	return nil
-}
-
-// SourceIdentityForUser resolves an Enclava user to the connection-scoped
-// source identity. Missing mapping denies — unknown mappings never become
-// company-wide access.
-func (r *SourceRepo) SourceIdentityForUser(ctx context.Context, tenantID, connectionID, userID string) (source.SourceIdentity, error) {
-	var id source.SourceIdentity
-	var mapped sql.NullString
-	err := r.db.SQL.QueryRowContext(ctx, `
-		SELECT tenant_id::text, id, connection_id, source_user_native_id, display_name, mapped_user_id
-		FROM source_identities
-		WHERE tenant_id = $1 AND connection_id = $2 AND mapped_user_id = $3`,
-		tenantID, connectionID, userID).Scan(
-		&id.TenantID, &id.ID, &id.ConnectionID, &id.NativeID, &id.DisplayName, &mapped)
-	if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
-		return source.SourceIdentity{}, source.ErrDenied
-	}
-	if err != nil {
-		return source.SourceIdentity{}, fmt.Errorf("source identity for user: %w", err)
-	}
-	id.MappedUserID = mapped.String
-	return id, nil
-}
-
-// GroupIDsForIdentity reads memberships at the revision checked by the authorizer.
-func (r *SourceRepo) GroupIDsForIdentity(ctx context.Context, tenantID, connectionID, sourceIdentityID string, revision int64) ([]string, error) {
-	rows, err := r.db.SQL.QueryContext(ctx, `
-		SELECT m.group_id FROM (
-			SELECT revision FROM access_snapshots
-			WHERE tenant_id = $1 AND connection_id = $2 AND kind = 'membership' AND status = 'complete'
-			ORDER BY revision DESC LIMIT 1
-		) s
-		LEFT JOIN (
-			SELECT m.group_id, m.access_revision FROM source_group_memberships m
-			JOIN source_groups g ON g.tenant_id = m.tenant_id AND g.id = m.group_id
-			WHERE m.tenant_id = $1 AND g.connection_id = $2 AND m.source_identity_id = $3
-		) m ON m.access_revision = s.revision
-		WHERE s.revision = $4`, tenantID, connectionID, sourceIdentityID, revision)
-	if err != nil {
-		return nil, fmt.Errorf("group memberships: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	out := []string{}
-	found := false
-	for rows.Next() {
-		found = true
-		var g sql.NullString
-		if err := rows.Scan(&g); err != nil {
-			return nil, fmt.Errorf("scan membership: %w", err)
-		}
-		if g.Valid {
-			out = append(out, g.String)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if !found {
-		return nil, source.ErrDenied
-	}
-	return out, nil
-}
-
-// ---------------------------------------------------------------------
-// Grants and snapshots
-
-// AncestorObjectIDs returns the object and its complete, valid parent chain.
-func (r *SourceRepo) AncestorObjectIDs(ctx context.Context, tenantID, connectionID, objectID string, maxDepth int) ([]string, error) {
-	if maxDepth < 0 {
-		return nil, source.ErrDenied
-	}
-	rows, err := r.db.SQL.QueryContext(ctx, `
-		WITH RECURSIVE ancestors AS (
-			SELECT $3::text AS id, o.parent_object_id, 0 AS depth,
-			       (o.id IS NOT NULL AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL) AS valid
-			FROM (SELECT 1) seed
-			LEFT JOIN source_objects o ON o.tenant_id = $1 AND o.connection_id = $2 AND o.id = $3
-			UNION ALL
-			SELECT a.parent_object_id, o.parent_object_id, a.depth + 1,
-			       (o.id IS NOT NULL AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL)
-			FROM ancestors a
-			LEFT JOIN source_objects o ON o.tenant_id = $1 AND o.connection_id = $2 AND o.id = a.parent_object_id
-			WHERE a.valid AND a.parent_object_id IS NOT NULL AND a.depth <= $4
-		)
-		SELECT id, depth, valid FROM ancestors`, tenantID, connectionID, objectID, maxDepth)
-	if err != nil {
-		return nil, fmt.Errorf("ancestor objects: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	ids := []string{}
-	seen := map[string]struct{}{}
-	for rows.Next() {
-		var id string
-		var depth int
-		var valid bool
-		if err := rows.Scan(&id, &depth, &valid); err != nil {
-			return nil, fmt.Errorf("scan ancestor: %w", err)
-		}
-		if _, exists := seen[id]; !valid || depth > maxDepth || exists {
-			return nil, source.ErrDenied
-		}
-		seen[id] = struct{}{}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return ids, nil
-}
-
-// GrantsForObjects reads revision-qualified grants for a connection's objects in one query.
-func (r *SourceRepo) GrantsForObjects(ctx context.Context, tenantID, connectionID string, objectIDs []string, accessRevision int64) ([]source.SourceGrant, error) {
-	rows, err := r.db.SQL.QueryContext(ctx, `
-		SELECT g.object_id, g.subject_type, g.source_identity_id, g.source_group_id,
-		       g.effect, g.access_revision
-		FROM (
-			SELECT revision FROM access_snapshots
-			WHERE tenant_id = $1 AND connection_id = $2 AND kind = 'grants' AND status = 'complete'
-			ORDER BY revision DESC LIMIT 1
-		) s
-		LEFT JOIN (
-			SELECT g.* FROM source_grants g
-			JOIN source_objects o ON o.tenant_id = g.tenant_id AND o.id = g.object_id
-			WHERE g.tenant_id = $1 AND o.connection_id = $2 AND g.object_id = ANY($3)
-		) g ON g.access_revision = s.revision
-		WHERE s.revision = $4`, tenantID, connectionID, objectIDs, accessRevision)
-	if err != nil {
-		return nil, fmt.Errorf("grants for objects: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	out := []source.SourceGrant{}
-	found := false
-	for rows.Next() {
-		found = true
-		var objectID, kind, userID, groupID, effect sql.NullString
-		var revision sql.NullInt64
-		if err := rows.Scan(&objectID, &kind, &userID, &groupID, &effect, &revision); err != nil {
-			return nil, fmt.Errorf("scan grant: %w", err)
-		}
-		if !objectID.Valid {
-			continue
-		}
-		g := source.SourceGrant{TenantID: tenantID, ConnectionID: connectionID,
-			ObjectID: objectID.String, SubjectKind: kind.String, Effect: effect.String, AccessRevision: revision.Int64}
-		if g.SubjectKind == source.GrantSubjectGroup {
-			g.SubjectID = groupID.String
-		} else {
-			g.SubjectID = userID.String
-		}
-		out = append(out, g)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if !found {
-		return nil, source.ErrDenied
-	}
-	return out, nil
-}
-
-// BeginSnapshot records an incomplete (never authoritative) snapshot row.
-func (r *SourceRepo) BeginSnapshot(ctx context.Context, tenantID, connectionID, kind string, revision int64) error {
-	_, err := r.db.SQL.ExecContext(ctx, `
-		INSERT INTO access_snapshots (tenant_id, id, connection_id, kind, revision, status)
-		VALUES ($1, $2, $3, $4, $5, 'incomplete')
-		ON CONFLICT (tenant_id, connection_id, kind, revision) DO NOTHING`,
-		tenantID, snapshotRowID(connectionID, kind, revision), connectionID, kind, revision)
-	if err != nil {
-		return fmt.Errorf("begin snapshot: %w", err)
-	}
-	return nil
-}
-
-func snapshotRowID(connectionID, kind string, revision int64) string {
-	return fmt.Sprintf("%s:%s:%d", connectionID, kind, revision)
-}
-
-// LatestCompleteRevision returns the newest complete snapshot revision and
-// its completion time, or source.ErrDenied when none exists.
-func (r *SourceRepo) LatestCompleteRevision(ctx context.Context, tenantID, connectionID, kind string) (int64, time.Time, error) {
-	var rev int64
-	var completedAt time.Time
-	err := r.db.SQL.QueryRowContext(ctx, `
-		SELECT revision, completed_at FROM access_snapshots
-		WHERE tenant_id = $1 AND connection_id = $2 AND kind = $3 AND status = 'complete'
-		ORDER BY revision DESC LIMIT 1`,
-		tenantID, connectionID, kind).Scan(&rev, &completedAt)
-	if errors.Is(err, sql.ErrNoRows) || isInvalidUUID(err) {
-		return 0, time.Time{}, source.ErrDenied
-	}
-	if err != nil {
-		return 0, time.Time{}, fmt.Errorf("latest complete revision: %w", err)
-	}
-	return rev, completedAt, nil
-}
-
-// ApplyAccessSnapshot atomically records a grants observation: insert
-// revision-qualified grant rows, mark the snapshot complete, then delete
-// grant rows unseen at the now-complete revision. A snapshot that was never
-// completed (partial pagination) removes nothing.
-func (r *SourceRepo) ApplyAccessSnapshot(ctx context.Context, tx source.Tx, tenantID, connectionID string, revision int64, grants []source.SourceGrant, unmappedSubjects int) error {
-	seen := make(map[string]struct{}, len(grants))
-	for i, g := range grants {
-		var userID, groupID any
-		switch g.SubjectKind {
-		case source.GrantSubjectGroup:
-			groupID = g.SubjectID
-		case source.GrantSubjectUser:
-			userID = g.SubjectID
-		}
-		key := fmt.Sprintf("%s|%s|%s|%s", g.ObjectID, g.SubjectKind, g.SubjectID, g.Effect)
-		if _, dup := seen[key]; dup {
-			continue
-		}
-		seen[key] = struct{}{}
-		rowID := fmt.Sprintf("gr:%s:%d:%d", connectionID, revision, i)
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO source_grants
-			    (tenant_id, id, object_id, subject_type, source_identity_id,
-			     source_group_id, effect, access_revision)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-			ON CONFLICT (tenant_id, id) DO NOTHING`,
-			tenantID, rowID, g.ObjectID, g.SubjectKind, userID, groupID,
-			g.Effect, revision); err != nil {
-			return fmt.Errorf("apply grant %s: %w", rowID, err)
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE access_snapshots
-		SET status = 'complete', completed_at = now(), unmapped_subjects = $4
-		WHERE tenant_id = $1 AND connection_id = $2 AND kind = 'grants'
-		  AND revision = $3 AND status = 'incomplete'`,
-		tenantID, connectionID, revision, unmappedSubjects); err != nil {
-		return fmt.Errorf("complete grants snapshot: %w", err)
-	}
-	// Retire grant rows on this connection's objects that were not
-	// re-observed at this now-complete revision. Only a complete snapshot
-	// reaches this statement; an incomplete revision deletes nothing.
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM source_grants g
-		USING source_objects o
-		WHERE o.tenant_id = g.tenant_id AND o.id = g.object_id
-		  AND g.tenant_id = $1 AND o.connection_id = $2
-		  AND g.access_revision < $3
-		  AND NOT EXISTS (
-		      SELECT 1 FROM source_grants n
-		      WHERE n.tenant_id = g.tenant_id AND n.object_id = g.object_id
-		        AND n.subject_type = g.subject_type
-		        AND COALESCE(n.source_identity_id,'') = COALESCE(g.source_identity_id,'')
-		        AND COALESCE(n.source_group_id,'') = COALESCE(g.source_group_id,'')
-		        AND n.effect = g.effect AND n.access_revision = $3)`,
-		tenantID, connectionID, revision); err != nil {
-		return fmt.Errorf("prune unseen grants: %w", err)
-	}
-	return nil
-}
-
-// ApplyMembershipSnapshot atomically records a membership observation and
-// retires membership rows unseen at the now-complete revision.
-func (r *SourceRepo) ApplyMembershipSnapshot(ctx context.Context, tx source.Tx, tenantID, connectionID string, revision int64, memberships []source.SourceGroupMembership, unmappedSubjects int) error {
-	type member struct {
-		groupID string
-		member  string
-	}
-	seen := make(map[member]struct{}, len(memberships))
-	for _, m := range memberships {
-		key := member{groupID: m.GroupID, member: m.MemberID}
-		if _, dup := seen[key]; dup {
-			continue
-		}
-		seen[key] = struct{}{}
-		rowID := fmt.Sprintf("ms:%s:%s:%d", m.GroupID, m.MemberID, revision)
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO source_group_memberships
-			    (tenant_id, id, group_id, source_identity_id, access_revision)
-			VALUES ($1, $2, $3, $4, $5)
-			ON CONFLICT (tenant_id, id) DO NOTHING`,
-			tenantID, rowID, m.GroupID, m.MemberID, revision); err != nil {
-			return fmt.Errorf("apply membership %s: %w", rowID, err)
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE access_snapshots
-		SET status = 'complete', completed_at = now(), unmapped_subjects = $4
-		WHERE tenant_id = $1 AND connection_id = $2 AND kind = 'membership'
-		  AND revision = $3 AND status = 'incomplete'`,
-		tenantID, connectionID, revision, unmappedSubjects); err != nil {
-		return fmt.Errorf("complete membership snapshot: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM source_group_memberships m
-		USING source_groups g
-		WHERE g.tenant_id = m.tenant_id AND g.id = m.group_id
-		  AND m.tenant_id = $1 AND g.connection_id = $2
-		  AND m.access_revision < $3
-		  AND NOT EXISTS (
-		      SELECT 1 FROM source_group_memberships n
-		      WHERE n.tenant_id = m.tenant_id AND n.group_id = m.group_id
-		        AND n.source_identity_id = m.source_identity_id
-		        AND n.access_revision = $3)`,
-		tenantID, connectionID, revision); err != nil {
-		return fmt.Errorf("prune unseen memberships: %w", err)
-	}
-	return nil
 }
 
 // ---------------------------------------------------------------------

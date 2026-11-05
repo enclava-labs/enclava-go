@@ -199,7 +199,7 @@ func (f *fx) build(t *testing.T) {
 	svc, err := inference.NewService(inference.Deps{
 		Endpoints:     f.endpoint,
 		Sources:       f.sources,
-		Authorizer:    source.NewAuthorizer(f.sources, time.Hour),
+		Authorizer:    source.NewAuthorizer(f.sources),
 		Billing:       billingSeam,
 		Artifacts:     f.artifact,
 		Conversations: f.conversations,
@@ -864,7 +864,7 @@ func TestConfidentialEndpointVerifiesBeforeDispatch(t *testing.T) {
 	att.resp = []byte(`{"usage":{"prompt_tokens":5,"completion_tokens":2}}`)
 	svc, err := inference.NewService(inference.Deps{
 		Endpoints: f.endpoint, Sources: f.sources,
-		Authorizer: source.NewAuthorizer(f.sources, time.Hour),
+		Authorizer: source.NewAuthorizer(f.sources),
 		Billing:    f.billing, Artifacts: f.artifact,
 	}, inference.WithTransportFactory(
 		func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {
@@ -949,7 +949,7 @@ func TestRealAdapterEndToEnd(t *testing.T) {
 
 	svc, err := inference.NewService(inference.Deps{
 		Endpoints: f.endpoint, Sources: f.sources,
-		Authorizer: source.NewAuthorizer(f.sources, time.Hour),
+		Authorizer: source.NewAuthorizer(f.sources),
 		Billing:    f.billing, Artifacts: f.artifact,
 	})
 	if err != nil {
@@ -987,7 +987,7 @@ func TestExecuteConfidentialSDKOfflineDemo(t *testing.T) {
 	f.priceFor(t, e.ID, inference.CapabilityChat, billing.UnitInput, 1, 1)
 	f.priceFor(t, e.ID, inference.CapabilityChat, billing.UnitOutput, 1, 1)
 	svc, err := inference.NewService(inference.Deps{
-		Endpoints: f.endpoint, Sources: f.sources, Authorizer: source.NewAuthorizer(f.sources, time.Hour),
+		Endpoints: f.endpoint, Sources: f.sources, Authorizer: source.NewAuthorizer(f.sources),
 		Billing: f.billing, Artifacts: f.artifact,
 	})
 	if err != nil {
@@ -1036,7 +1036,7 @@ func TestExecuteConfidentialSDKStreamFailsClosedForE2EERoute(t *testing.T) {
 	f.priceFor(t, e.ID, inference.CapabilityChat, billing.UnitInput, 1, 1)
 	f.priceFor(t, e.ID, inference.CapabilityChat, billing.UnitOutput, 1, 1)
 	svc, err := inference.NewService(inference.Deps{
-		Endpoints: f.endpoint, Sources: f.sources, Authorizer: source.NewAuthorizer(f.sources, time.Hour),
+		Endpoints: f.endpoint, Sources: f.sources, Authorizer: source.NewAuthorizer(f.sources),
 		Billing: f.billing, Artifacts: f.artifact,
 	})
 	if err != nil {
@@ -1088,7 +1088,7 @@ func TestExecuteConfidentialSDKOfflineDemoEmbeddings(t *testing.T) {
 	}
 	f.priceFor(t, e.ID, inference.CapabilityEmbeddings, billing.UnitInput, 1, 1)
 	svc, err := inference.NewService(inference.Deps{
-		Endpoints: f.endpoint, Sources: f.sources, Authorizer: source.NewAuthorizer(f.sources, time.Hour),
+		Endpoints: f.endpoint, Sources: f.sources, Authorizer: source.NewAuthorizer(f.sources),
 		Billing: f.billing, Artifacts: f.artifact,
 	})
 	if err != nil {
@@ -1137,7 +1137,7 @@ func TestExecuteConfidentialSDKOfflineDemoResponsesLifecycle(t *testing.T) {
 	f.priceFor(t, e.ID, inference.CapabilityResponses, billing.UnitInput, 1, 1)
 	f.priceFor(t, e.ID, inference.CapabilityResponses, billing.UnitOutput, 1, 1)
 	svc, err := inference.NewService(inference.Deps{
-		Endpoints: f.endpoint, Sources: f.sources, Authorizer: source.NewAuthorizer(f.sources, time.Hour),
+		Endpoints: f.endpoint, Sources: f.sources, Authorizer: source.NewAuthorizer(f.sources),
 		Billing: f.billing, Artifacts: f.artifact,
 	})
 	if err != nil {
@@ -1638,7 +1638,7 @@ func TestConnectionRefusedReleasesHold(t *testing.T) {
 
 	svc, err := inference.NewService(inference.Deps{
 		Endpoints: f.endpoint, Sources: f.sources,
-		Authorizer: source.NewAuthorizer(f.sources, time.Hour),
+		Authorizer: source.NewAuthorizer(f.sources),
 		Billing:    f.billing, Artifacts: f.artifact,
 	})
 	if err != nil {
@@ -1933,7 +1933,7 @@ func TestOutputBoundDerivedFromPayload(t *testing.T) {
 	// A zero configured default injects nothing and holds the operation bound.
 	svc, err := inference.NewService(inference.Deps{
 		Endpoints: f.endpoint, Sources: f.sources,
-		Authorizer: source.NewAuthorizer(f.sources, time.Hour),
+		Authorizer: source.NewAuthorizer(f.sources),
 		Billing:    f.billing, Artifacts: f.artifact,
 	}, inference.WithTransportFactory(
 		func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {
@@ -1975,7 +1975,7 @@ func TestUnsupportedStreamRefusedBeforeReserve(t *testing.T) {
 	up := &noStreamUpstream{}
 	svc, err := inference.NewService(inference.Deps{
 		Endpoints: f.endpoint, Sources: f.sources,
-		Authorizer: source.NewAuthorizer(f.sources, time.Hour),
+		Authorizer: source.NewAuthorizer(f.sources),
 		Billing:    f.billing, Artifacts: f.artifact,
 	}, inference.WithTransportFactory(
 		func(ctx context.Context, e inference.Endpoint, credential string) (inference.Upstream, error) {

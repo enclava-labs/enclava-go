@@ -330,7 +330,7 @@ func newExtractService(t *testing.T, db *postgres.DB, tenant string, artRepo *po
 	exec, err := inference.NewService(inference.Deps{
 		Endpoints:  endpoints,
 		Sources:    sources,
-		Authorizer: source.NewAuthorizer(sources, 0),
+		Authorizer: source.NewAuthorizer(sources),
 		Billing:    billing.NewService(billingRepo),
 		Artifacts:  artRepo,
 	}, inference.WithTransportFactory(

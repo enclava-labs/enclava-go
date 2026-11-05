@@ -46,7 +46,7 @@ const activityLimit = 50
 func managedActivityOps(caps dashboardCaps) []string {
 	var ops []string
 	if caps.KnowledgeManage {
-		ops = append(ops, rag.OperationEmbed, rag.OperationIngest, rag.OperationAccess)
+		ops = append(ops, rag.OperationEmbed, rag.OperationIngest)
 	}
 	if caps.SourcesManage {
 		ops = append(ops, connectors.OperationSync)
@@ -65,7 +65,7 @@ func managedActivityOps(caps dashboardCaps) []string {
 func memberActivityOps(caps dashboardCaps) []string {
 	var ops []string
 	if caps.Search {
-		ops = append(ops, rag.OperationEmbed, rag.OperationIngest, rag.OperationAccess)
+		ops = append(ops, rag.OperationEmbed, rag.OperationIngest)
 	}
 	if caps.SourcesManage {
 		ops = append(ops, connectors.OperationSync)

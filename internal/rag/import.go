@@ -57,8 +57,8 @@ func (s *Service) ImportArtifact(ctx context.Context, p auth.Principal, input Im
 	return s.importBytes(ctx, p, input.CollectionID, input.ArtifactRef, "upload", UploadDocumentInput{
 		FileName: version.OriginalFilename, MimeType: version.MimeType, Bytes: data,
 		SourceType: "import", SourceID: input.ArtifactRef, ProvenanceKind: "upload",
-		InputArtifact: input.ArtifactRef, Audience: []string{p.ActorID},
-		Restrictions: []source.SourceRestriction{restrictions},
+		InputArtifact: input.ArtifactRef,
+		Restrictions:  []source.SourceRestriction{restrictions},
 	})
 }
 
@@ -144,7 +144,7 @@ func (s *Service) ImportStoredResult(ctx context.Context, p auth.Principal, inpu
 		FileName: fileName, MimeType: mimeType, Bytes: data,
 		SourceType: "generated", SourceID: input.ResultJobID, ProvenanceKind: "generated",
 		InputArtifact: result.InputRef, ResultJobID: input.ResultJobID,
-		ResultArtifact: result.ResultRef, Audience: []string{p.ActorID}, Restrictions: restrictions,
+		ResultArtifact: result.ResultRef, Restrictions: restrictions,
 	})
 }
 

@@ -3,24 +3,20 @@ package source
 import (
 	"context"
 	"errors"
-	"time"
 
 	"enclava-go/internal/auth"
 )
 
 // Authorizer is the single fail-closed decision point every source read must
 // pass before exposing titles, metadata, links or content (AUTH-05/AUTH-06).
-// Unknown, forbidden, stale-grant and tombstoned inputs all return ErrDenied —
-// callers cannot distinguish them.
+// Unknown, forbidden and tombstoned inputs all return ErrDenied — callers
+// cannot distinguish them.
 type Authorizer struct {
 	repo SourceRepository
-	// MaxStale bounds the age of complete grant and membership snapshots.
-	// Zero means unbounded.
-	MaxStale time.Duration
 }
 
-func NewAuthorizer(repo SourceRepository, maxStale time.Duration) *Authorizer {
-	return &Authorizer{repo: repo, MaxStale: maxStale}
+func NewAuthorizer(repo SourceRepository) *Authorizer {
+	return &Authorizer{repo: repo}
 }
 
 // CanRead decides whether principal p may read obj under opts. Denial is
@@ -49,124 +45,42 @@ func (a *Authorizer) CanRead(ctx context.Context, p auth.Principal, obj Object, 
 			return nil
 		}
 		return ErrDenied
-	case AuthorizationAudience, AuthorizationPublishedAudience:
-		// Published audiences are explicit publisher-assigned Enclava
-		// audiences; upstream access loss arrives via object/connection
-		// status, handled above.
-		if contains(obj.Audience, p.ActorID) || contains(obj.Audience, "*") {
-			return nil
+	case AuthorizationCollection:
+		collections, err := a.repo.CollectionsForObjects(ctx, obj.TenantID, []string{obj.ID})
+		if err != nil {
+			return err
+		}
+		for _, c := range collections[obj.ID] {
+			if CollectionReadable(c, p) {
+				return nil
+			}
 		}
 		return ErrDenied
-	case AuthorizationSourceACL:
-		return a.canReadSourceACL(ctx, p, obj, opts)
 	default:
 		return ErrDenied
 	}
 }
 
-func contains(list []string, v string) bool {
-	for _, item := range list {
-		if item == v {
+// CollectionReadable is THE collection read rule: platform admins read
+// everything; other principals read an active collection they own or whose
+// audience lists their actor id or "*". The Authorizer applies it to every
+// collection containing an object; collection APIs apply it directly.
+func CollectionReadable(access CollectionAccess, p auth.Principal) bool {
+	if auth.HasScope(p, "platform.admin") {
+		return true
+	}
+	if !access.IsActive {
+		return false
+	}
+	if access.OwnerActorID != "" && access.OwnerActorID == p.ActorID {
+		return true
+	}
+	for _, aud := range access.Audience {
+		if aud == "*" || aud == p.ActorID {
 			return true
 		}
 	}
 	return false
-}
-
-// canReadSourceACL evaluates effective source grants at the latest complete,
-// non-stale grants snapshot. DENY WINS FIRST: any applicable deny grant for
-// the mapped source identity or a group containing it denies outright, even
-// when an allow grant also exists.
-func (a *Authorizer) canReadSourceACL(ctx context.Context, p auth.Principal, obj Object, opts ReadOptions) error {
-	if obj.ConnectionID == "" {
-		return ErrDenied
-	}
-	now := opts.Now
-	if now.IsZero() {
-		now = time.Now()
-	}
-	rev, completedAt, err := a.repo.LatestCompleteRevision(ctx, obj.TenantID, obj.ConnectionID, SnapshotGrants)
-	if err != nil || completedAt.IsZero() || completedAt.After(now) || (a.MaxStale > 0 && now.Sub(completedAt) > a.MaxStale) {
-		return ErrDenied
-	}
-	objectIDs, err := a.repo.AncestorObjectIDs(ctx, obj.TenantID, obj.ConnectionID, obj.ID, 8)
-	if err != nil {
-		return ErrDenied
-	}
-	grants, err := a.repo.GrantsForObjects(ctx, obj.TenantID, obj.ConnectionID, objectIDs, rev)
-	if err != nil {
-		return ErrDenied
-	}
-	mappedUser := p.UserID
-	if mappedUser == "" {
-		mappedUser = p.ActorID
-	}
-	ident, err := a.repo.SourceIdentityForUser(ctx, obj.TenantID, obj.ConnectionID, mappedUser)
-	if err != nil && !errors.Is(err, ErrDenied) {
-		return ErrDenied
-	}
-	hasGroups := false
-	for _, g := range grants {
-		if g.SubjectKind == GrantSubjectGroup {
-			hasGroups = true
-			break
-		}
-	}
-	var groups []string
-	membershipKnown := false
-	if hasGroups && ident.ID != "" {
-		membershipRev, membershipAt, err := a.repo.LatestCompleteRevision(ctx, obj.TenantID, obj.ConnectionID, SnapshotMembership)
-		if err == nil && !membershipAt.IsZero() && !membershipAt.After(now) && (a.MaxStale <= 0 || now.Sub(membershipAt) <= a.MaxStale) {
-			groups, err = a.repo.GroupIDsForIdentity(ctx, obj.TenantID, obj.ConnectionID, ident.ID, membershipRev)
-			membershipKnown = err == nil
-		}
-	}
-	inGroup := make(map[string]struct{}, len(groups))
-	for _, group := range groups {
-		inGroup[group] = struct{}{}
-	}
-	return evalSourceACLGrants(ident.ID, inGroup, membershipKnown, grants)
-}
-
-// evalSourceACLGrants is the pure grant-evaluation half of canReadSourceACL:
-// given the principal's mapped source identity, its known group memberships
-// (membershipKnown=false means unproven) and every grant on the object's
-// ancestor chain at the evaluated revision, it returns the allow/deny
-// outcome. DENY WINS FIRST: any applicable deny grant for the mapped
-// identity or a group containing it denies outright, even when an allow
-// grant also exists. CanRead and CanReadMany share exactly this decision.
-func evalSourceACLGrants(identityID string, inGroup map[string]struct{}, membershipKnown bool, grants []SourceGrant) error {
-	allowed := false
-	for _, g := range grants {
-		var applies bool
-		switch g.SubjectKind {
-		case GrantSubjectAll:
-			applies = true
-		case GrantSubjectUser:
-			applies = identityID != "" && g.SubjectID == identityID
-		case GrantSubjectGroup:
-			if !membershipKnown {
-				if g.Effect == GrantEffectDeny {
-					return ErrDenied
-				}
-				continue
-			}
-			_, applies = inGroup[g.SubjectID]
-		}
-		if !applies {
-			continue
-		}
-		if g.Effect == GrantEffectDeny {
-			return ErrDenied
-		}
-		if g.Effect == GrantEffectAllow {
-			allowed = true
-		}
-	}
-	if !allowed {
-		return ErrDenied
-	}
-	return nil
 }
 
 // CanReadVersion additionally verifies the version exists and inherits the
@@ -288,163 +202,48 @@ func (a *Authorizer) checkNarrowing(ctx context.Context, obj Object, requested *
 // projected".
 const TokenNone = "none"
 
-// ReadTokens computes allow-path tokens and returns the grants revision used
-// for source ACLs (zero when no snapshot was used).
-// Owner and audience tokens mirror CanRead's allow paths; source ACL tokens
-// include grants on the object and its ancestors at the latest complete,
-// non-stale grants revision. Disabled connections retain their tokens so
-// re-enabling them does not require re-projection. Denies and connection
-// status are enforced by the authoritative read-time post-check.
-func (a *Authorizer) ReadTokens(ctx context.Context, obj Object) ([]string, int64, error) {
+// ReadTokens computes allow-path tokens. Collection-mode objects project
+// only "tenant": the collection scoping plus the authoritative read-time
+// post-check enforce access. Disabled connections retain their tokens so
+// re-enabling them does not require re-projection; connection status is
+// enforced by the read-time post-check.
+func (a *Authorizer) ReadTokens(ctx context.Context, obj Object) ([]string, error) {
 	if obj.DeletedAt != nil || obj.TombstonedAt != nil {
-		return []string{TokenNone}, 0, nil
+		return []string{TokenNone}, nil
 	}
 	if obj.ConnectionID != "" {
 		_, err := a.repo.GetConnection(ctx, obj.TenantID, obj.ConnectionID)
 		if err != nil {
 			if errors.Is(err, ErrDenied) {
-				return []string{TokenNone}, 0, nil
+				return []string{TokenNone}, nil
 			}
-			return nil, 0, err
+			return nil, err
 		}
 	}
 	switch obj.AuthorizationMode {
 	case AuthorizationOwner:
 		if obj.OwnerActorID == "" {
-			return []string{TokenNone}, 0, nil
+			return []string{TokenNone}, nil
 		}
-		return []string{"actor:" + obj.OwnerActorID}, 0, nil
-	case AuthorizationAudience, AuthorizationPublishedAudience:
-		tokens := make([]string, 0, len(obj.Audience))
-		for _, id := range obj.Audience {
-			if id == "*" {
-				tokens = append(tokens, "tenant")
-			} else {
-				tokens = append(tokens, "actor:"+id)
-			}
-		}
-		if len(tokens) == 0 {
-			return []string{TokenNone}, 0, nil
-		}
-		return tokens, 0, nil
-	case AuthorizationSourceACL:
-		return a.sourceACLTokens(ctx, obj)
+		return []string{"actor:" + obj.OwnerActorID}, nil
+	case AuthorizationCollection:
+		return []string{"tenant"}, nil
 	default:
-		return []string{TokenNone}, 0, nil
+		return []string{TokenNone}, nil
 	}
-}
-
-// sourceACLTokens projects every ALLOW grant visible at the same snapshot
-// canReadSourceACL evaluates — same revision freshness bound and ancestor
-// chain (max depth 8), deny rows ignored.
-func (a *Authorizer) sourceACLTokens(ctx context.Context, obj Object) ([]string, int64, error) {
-	none := []string{TokenNone}
-	if obj.ConnectionID == "" {
-		return none, 0, nil
-	}
-	now := time.Now()
-	rev, completedAt, err := a.repo.LatestCompleteRevision(ctx, obj.TenantID, obj.ConnectionID, SnapshotGrants)
-	if err != nil || completedAt.IsZero() || completedAt.After(now) || (a.MaxStale > 0 && now.Sub(completedAt) > a.MaxStale) {
-		if err != nil && !errors.Is(err, ErrDenied) {
-			return nil, 0, err
-		}
-		return none, 0, nil
-	}
-	objectIDs, err := a.repo.AncestorObjectIDs(ctx, obj.TenantID, obj.ConnectionID, obj.ID, 8)
-	if err != nil {
-		if errors.Is(err, ErrDenied) {
-			return none, 0, nil
-		}
-		return nil, 0, err
-	}
-	grants, err := a.repo.GrantsForObjects(ctx, obj.TenantID, obj.ConnectionID, objectIDs, rev)
-	if err != nil {
-		if errors.Is(err, ErrDenied) {
-			return none, 0, nil
-		}
-		return nil, 0, err
-	}
-	seen := map[string]struct{}{}
-	tokens := []string{}
-	for _, g := range grants {
-		if g.Effect != GrantEffectAllow {
-			continue
-		}
-		var token string
-		switch g.SubjectKind {
-		case GrantSubjectAll:
-			token = "tenant"
-		case GrantSubjectUser:
-			if g.SubjectID == "" {
-				continue
-			}
-			token = "sid:" + g.SubjectID
-		case GrantSubjectGroup:
-			if g.SubjectID == "" {
-				continue
-			}
-			token = "sgrp:" + g.SubjectID
-		}
-		if token == "" {
-			continue
-		}
-		if _, dup := seen[token]; !dup {
-			seen[token] = struct{}{}
-			tokens = append(tokens, token)
-		}
-	}
-	if len(tokens) == 0 {
-		return none, rev, nil
-	}
-	return tokens, rev, nil
 }
 
 // QueryTokens computes the prefilter token set one principal matches:
-// "actor:<ActorID>", "actor:<DelegatedByActorID>" when delegated and
-// "tenant", plus for every listed connection the principal's mapped source
-// identity ("sid:<identity>") and that identity's group ids ("sgrp:<id>")
-// from the latest complete, non-stale membership snapshot — connections
-// without a usable snapshot contribute no group tokens, consistent with
-// canReadSourceACL treating unknown membership as unproven.
-func (a *Authorizer) QueryTokens(ctx context.Context, p auth.Principal, connectionIDs []string) ([]string, error) {
+// "tenant", "actor:<ActorID>" and "actor:<DelegatedByActorID>" when
+// delegated. No repo access is needed — collection scoping and the
+// read-time post-check do the filtering.
+func (a *Authorizer) QueryTokens(_ context.Context, p auth.Principal) ([]string, error) {
 	tokens := []string{"tenant"}
 	if p.ActorID != "" {
 		tokens = append(tokens, "actor:"+p.ActorID)
 	}
 	if p.DelegatedByActorID != "" {
 		tokens = append(tokens, "actor:"+p.DelegatedByActorID)
-	}
-	mappedUser := p.UserID
-	if mappedUser == "" {
-		mappedUser = p.ActorID
-	}
-	now := time.Now()
-	for _, connectionID := range connectionIDs {
-		ident, err := a.repo.SourceIdentityForUser(ctx, p.TenantID, connectionID, mappedUser)
-		if err != nil {
-			if errors.Is(err, ErrDenied) {
-				continue
-			}
-			return nil, err
-		}
-		if ident.ID == "" {
-			continue
-		}
-		tokens = append(tokens, "sid:"+ident.ID)
-		membershipRev, membershipAt, err := a.repo.LatestCompleteRevision(ctx, p.TenantID, connectionID, SnapshotMembership)
-		if err != nil || membershipAt.IsZero() || membershipAt.After(now) || (a.MaxStale > 0 && now.Sub(membershipAt) > a.MaxStale) {
-			if err != nil && !errors.Is(err, ErrDenied) {
-				return nil, err
-			}
-			continue
-		}
-		groups, err := a.repo.GroupIDsForIdentity(ctx, p.TenantID, connectionID, ident.ID, membershipRev)
-		if err != nil {
-			continue // unknown membership: no group tokens, as the authorizer
-		}
-		for _, groupID := range groups {
-			tokens = append(tokens, "sgrp:"+groupID)
-		}
 	}
 	return tokens, nil
 }

@@ -2,7 +2,6 @@ package connectors
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -112,145 +111,8 @@ func TestTeamsAdapterPagesChannelRepliesAndChats(t *testing.T) {
 	if messageRequests != 3 {
 		t.Fatalf("messages requests = %d, want 3 (429 retry + two pages)", messageRequests)
 	}
-	members, err := a.Membership(context.Background(), connection, "", 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(members.Memberships) != 2 || members.Snapshot || members.NextCursor != "2" || members.Memberships[0].NativePrincipalID != "directory:entra-user" {
-		t.Fatalf("first membership page = %#v", members)
-	}
-	members, err = a.Membership(context.Background(), connection, members.NextCursor, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(members.Memberships) != 2 || !members.Snapshot || members.Memberships[0].Scope != "member" {
-		t.Fatalf("terminal membership page = %#v", members)
-	}
-	access, err := a.Access(context.Background(), connection, "", 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := map[string]struct{ kind, principal, group string }{
-		"team":     {"teams_team", "directory:entra-user", "team"},
-		"channel":  {"teams_channel", "directory:private-user", "channel"},
-		"channel2": {"teams_channel", "directory:shared-user", "channel2"},
-		"channel3": {"teams_channel", "", "team"},
-		"chat":     {"teams_chat", "directory:chat-user", "chat"},
-	}
-	for _, grant := range access.Grants {
-		expected, ok := want[grant.NativeObjectID]
-		if !ok || expected.kind != grant.NativeObjectKind || expected.principal != grant.NativePrincipalID || expected.group != grant.NativeGroupID || grant.Scope != "member" {
-			t.Fatalf("unexpected grant: %#v", grant)
-		}
-		delete(want, grant.NativeObjectID)
-	}
-	if len(want) != 0 {
-		t.Fatalf("missing grants: %#v", want)
-	}
 	if len(requests) == 0 {
 		t.Fatal("no Graph requests")
-	}
-}
-
-func TestTeamsStandardChannelAccessStaysWithinBound(t *testing.T) {
-	var members strings.Builder
-	members.WriteString(`{"value":[`)
-	for i := range 501 {
-		if i > 0 {
-			members.WriteString(",")
-		}
-		fmt.Fprintf(&members, `{"id":"member-%d","userId":"user-%d","tenantId":"directory"}`, i, i)
-	}
-	members.WriteString(`]}`)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/v1/teams/team/members":
-			_, _ = io.WriteString(w, members.String())
-		case "/v1/teams/team/channels":
-			_, _ = io.WriteString(w, `{"value":[{"id":"channel","membershipType":"standard"}]}`)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-	resolver, err := auth.NewSecretResolver([]auth.SecretBinding{{RefID: "teams-fixture", TenantID: "tenant", Purpose: auth.SecretPurposeConnector, EnvName: "TEAMS_FIXTURE_SECRET", Origins: []string{server.URL}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("TEAMS_FIXTURE_SECRET", "sentinel")
-	transport := teamsRoundTripper(func(r *http.Request) (*http.Response, error) {
-		if strings.HasPrefix(r.URL.Host, "login.microsoftonline.com") {
-			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"access_token":"fixture-token"}`)), Request: r}, nil
-		}
-		r.URL.Scheme = "http"
-		r.URL.Host = strings.TrimPrefix(server.URL, "http://")
-		return http.DefaultTransport.RoundTrip(r)
-	})
-	connection := source.Connection{TenantID: "tenant", ID: "conn", Kind: source.ConnectionTeams, CredentialRef: "teams-fixture", Config: map[string]any{"tenant_id": "directory", "client_id": "client", "graph_base_url": server.URL + "/v1", "team_id": "team"}}
-	adapter, err := NewTeamsAdapter(connection, resolver)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a := adapter.(*TeamsAdapter)
-	a.client = &http.Client{Transport: transport}
-	var grants []AccessGrant
-	cursor := Cursor("")
-	for {
-		page, err := a.Access(context.Background(), connection, cursor, 100)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(page.Grants) > 100 {
-			t.Fatalf("access page exceeded limit: %d grants", len(page.Grants))
-		}
-		grants = append(grants, page.Grants...)
-		cursor = page.NextCursor
-		if cursor == "" {
-			if !page.Snapshot {
-				t.Fatal("terminal access page is not a snapshot")
-			}
-			break
-		}
-	}
-	// 501 member rows plus one inherited team-group grant for the channel.
-	if len(grants) != 502 {
-		t.Fatalf("total access grants = %d, want 502", len(grants))
-	}
-	channelGrant := 0
-	for _, grant := range grants {
-		if grant.NativeObjectID == "channel" {
-			channelGrant++
-			if grant.NativePrincipalID != "" || grant.NativeGroupID != "team" || grant.NativeObjectKind != "teams_channel" || grant.Effect != "allow" {
-				t.Fatalf("standard channel grant = %#v", grant)
-			}
-		}
-	}
-	if channelGrant != 1 {
-		t.Fatalf("standard channel grants = %d, want 1", channelGrant)
-	}
-	var memberships []AccessGrant
-	cursor = ""
-	for {
-		page, err := a.Membership(context.Background(), connection, cursor, 100)
-		if err != nil {
-			t.Fatal(err)
-		}
-		memberships = append(memberships, page.Memberships...)
-		cursor = page.NextCursor
-		if cursor == "" {
-			if !page.Snapshot {
-				t.Fatal("terminal membership page is not a snapshot")
-			}
-			break
-		}
-	}
-	if len(memberships) != 501 {
-		t.Fatalf("total memberships = %d, want 501", len(memberships))
-	}
-	for _, member := range memberships {
-		if member.NativeGroupID != "team" || member.NativePrincipalID == "" {
-			t.Fatalf("team membership row = %#v", member)
-		}
 	}
 }
 

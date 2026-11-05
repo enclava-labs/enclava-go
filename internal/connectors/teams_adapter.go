@@ -51,7 +51,7 @@ func NewTeamsAdapter(connection source.Connection, resolver CredentialResolver) 
 
 func (a *TeamsAdapter) Capabilities() AdapterCapabilities {
 	return AdapterCapabilities{
-		Content: true, Access: true, Membership: true,
+		Content: true,
 		UnsupportedScopes: []string{
 			"app-only access does not impersonate users",
 			"chat messages use bounded complete reconciliation; no deletion-aware app-only delta",
@@ -61,7 +61,6 @@ func (a *TeamsAdapter) Capabilities() AdapterCapabilities {
 		},
 	}
 }
-
 func (a *TeamsAdapter) token(ctx context.Context) (string, error) {
 	a.tokenMu.Lock()
 	defer a.tokenMu.Unlock()
@@ -374,150 +373,4 @@ func allowedTeamChannel(config map[string]any, team, channel string) bool {
 		}
 	}
 	return false
-}
-
-func (a *TeamsAdapter) Membership(ctx context.Context, c source.Connection, cursor Cursor, limit int) (MembershipPage, error) {
-	return a.enumerateMembers(ctx, c, cursor, limit, true)
-}
-func (a *TeamsAdapter) Access(ctx context.Context, c source.Connection, cursor Cursor, limit int) (AccessPage, error) {
-	page, err := a.enumerateMembers(ctx, c, cursor, limit, false)
-	return AccessPage{Grants: page.Memberships, NextCursor: page.NextCursor, Completeness: page.Completeness, Snapshot: page.Snapshot}, err
-}
-func (a *TeamsAdapter) enumerateMembers(ctx context.Context, c source.Connection, cursor Cursor, limit int, membership bool) (MembershipPage, error) {
-	if c.ID != a.connection.ID || c.Kind != source.ConnectionTeams {
-		return MembershipPage{}, errors.New("teams adapter connection mismatch")
-	}
-	if limit < 1 || limit > 100 {
-		return MembershipPage{}, errors.New("teams page limit must be between 1 and 100")
-	}
-	offset := 0
-	if cursor != "" {
-		n, err := strconv.Atoi(string(cursor))
-		if err != nil || n < 0 {
-			return MembershipPage{}, errors.New("invalid teams membership cursor")
-		}
-		offset = n
-	}
-	token, err := a.token(ctx)
-	if err != nil {
-		return MembershipPage{}, err
-	}
-	grants := make([]AccessGrant, 0)
-	appendGrant := func(grant AccessGrant) error {
-		if len(grants) == teamsMaxItems {
-			return errors.New("teams membership listing exceeded configured bound")
-		}
-		grants = append(grants, grant)
-		return nil
-	}
-	for _, team := range a.selectedTeams() {
-		members, err := a.list(ctx, token, a.baseURL+"/teams/"+teamsID(team)+"/members?$top=100", teamsMaxItems)
-		if err != nil {
-			return MembershipPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list team %s members: %w", team, err)
-		}
-		for _, raw := range members {
-			var m struct {
-				ID       string `json:"id"`
-				UserID   string `json:"userId"`
-				TenantID string `json:"tenantId"`
-			}
-			if err := json.Unmarshal(raw, &m); err != nil || (m.ID == "" && m.UserID == "") {
-				return MembershipPage{}, errors.New("teams member payload is malformed")
-			}
-			principal := teamsPrincipalID(m.TenantID, firstNonEmpty(m.UserID, m.ID))
-			if err := appendGrant(AccessGrant{NativeObjectID: team, NativeObjectKind: "teams_team", NativePrincipalID: principal, NativeGroupID: team, Scope: "member", Effect: "allow"}); err != nil {
-				return MembershipPage{Completeness: CompletenessIncomplete}, err
-			}
-		}
-		channels, err := a.list(ctx, token, a.baseURL+"/teams/"+teamsID(team)+"/channels?$top=100", teamsMaxItems)
-		if err != nil {
-			return MembershipPage{Completeness: CompletenessIncomplete}, err
-		}
-		for _, raw := range channels {
-			var ch struct {
-				ID             string `json:"id"`
-				MembershipType string `json:"membershipType"`
-			}
-			if err := json.Unmarshal(raw, &ch); err != nil || ch.ID == "" {
-				return MembershipPage{}, errors.New("teams channel payload is malformed")
-			}
-			if !allowedTeamChannel(a.connection.Config, team, ch.ID) {
-				continue
-			}
-			if ch.MembershipType == "standard" {
-				// Standard channels inherit team access: one grant on the team
-				// group instead of duplicating every member row per channel.
-				if !membership {
-					if err := appendGrant(AccessGrant{NativeObjectID: ch.ID, NativeObjectKind: "teams_channel", NativeGroupID: team, Scope: "member", Effect: "allow"}); err != nil {
-						return MembershipPage{Completeness: CompletenessIncomplete}, err
-					}
-				}
-				continue
-			}
-			if ch.MembershipType != "private" && ch.MembershipType != "shared" {
-				return MembershipPage{Completeness: CompletenessIncomplete}, fmt.Errorf("unsupported teams channel membership type %q", ch.MembershipType)
-			}
-			path := "members"
-			if ch.MembershipType == "shared" {
-				path = "allMembers"
-			}
-			endpoint := a.baseURL + "/teams/" + teamsID(team) + "/channels/" + teamsID(ch.ID) + "/" + path + "?$top=100"
-			users, err := a.list(ctx, token, endpoint, teamsMaxItems)
-			if err != nil {
-				return MembershipPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list %s channel %s members via %s: %w", ch.MembershipType, ch.ID, path, err)
-			}
-			for _, raw := range users {
-				var u struct {
-					ID       string `json:"id"`
-					UserID   string `json:"userId"`
-					TenantID string `json:"tenantId"`
-				}
-				if err := json.Unmarshal(raw, &u); err != nil || (u.ID == "" && u.UserID == "") {
-					return MembershipPage{}, errors.New("teams channel member payload is malformed")
-				}
-				principal := teamsPrincipalID(u.TenantID, firstNonEmpty(u.UserID, u.ID))
-				if err := appendGrant(AccessGrant{NativeObjectID: ch.ID, NativeObjectKind: "teams_channel", NativePrincipalID: principal, NativeGroupID: ch.ID, Scope: "member", Effect: "allow"}); err != nil {
-					return MembershipPage{Completeness: CompletenessIncomplete}, err
-				}
-			}
-		}
-	}
-	for _, chat := range a.selectedChats() {
-		users, err := a.list(ctx, token, a.baseURL+"/chats/"+teamsID(chat)+"/members?$top=100", teamsMaxItems)
-		if err != nil {
-			return MembershipPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list configured chat %s members (Chat.Read.All/ChatMember.Read.All required): %w", chat, err)
-		}
-		for _, raw := range users {
-			var u struct {
-				ID       string `json:"id"`
-				UserID   string `json:"userId"`
-				TenantID string `json:"tenantId"`
-			}
-			if err := json.Unmarshal(raw, &u); err != nil || (u.ID == "" && u.UserID == "") {
-				return MembershipPage{}, errors.New("teams chat member payload is malformed")
-			}
-			if err := appendGrant(AccessGrant{NativeObjectID: chat, NativeObjectKind: "teams_chat", NativePrincipalID: teamsPrincipalID(u.TenantID, firstNonEmpty(u.UserID, u.ID)), NativeGroupID: chat, Scope: "member", Effect: "allow"}); err != nil {
-				return MembershipPage{Completeness: CompletenessIncomplete}, err
-			}
-		}
-	}
-	if offset > len(grants) {
-		return MembershipPage{}, errors.New("teams membership cursor exceeds listing")
-	}
-	end := offset + limit
-	if end > len(grants) {
-		end = len(grants)
-	}
-	page := MembershipPage{Memberships: grants[offset:end], Completeness: CompletenessComplete, Snapshot: end == len(grants)}
-	if end < len(grants) {
-		page.NextCursor = Cursor(strconv.Itoa(end))
-	}
-	return page, nil
-}
-
-func teamsPrincipalID(tenantID, userID string) string {
-	if tenantID != "" {
-		return tenantID + ":" + userID
-	}
-	return userID
 }

@@ -78,17 +78,13 @@ func TestGDriveAdapterPagesAndExportsGoogleDoc(t *testing.T) {
 	}
 }
 
-func TestGDriveAdapterReadsEverySheetAndRestrictions(t *testing.T) {
+func TestGDriveAdapterReadsEverySheet(t *testing.T) {
 	ranges := map[string]bool{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/drive/changes/startPageToken":
 			_, _ = fmt.Fprint(w, `{"startPageToken":"sheet-start"}`)
 		case r.URL.Path == "/drive/files":
-			if strings.Contains(r.URL.Query().Get("fields"), "permissions(") {
-				_, _ = fmt.Fprint(w, `{"files":[{"id":"book","driveId":"shared-drive-1","inheritedPermissionsDisabled":false,"copyRequiresWriterPermission":true,"downloadRestrictions":{"itemDownloadRestriction":{"restrictedForReaders":true,"restrictedForWriters":false}},"permissions":[{"id":"user:1","type":"user","emailAddress":"a@example.test","role":"reader","permissionDetails":[{"inherited":true,"inheritedFrom":"shared-drive-1","role":"reader"}]}]}]}`)
-				return
-			}
 			_, _ = fmt.Fprint(w, `{"files":[{"id":"book","name":"Book","mimeType":"application/vnd.google-apps.spreadsheet","webViewLink":"https://drive.google.com/open?id=book","headRevisionId":"rev"}]}`)
 		case r.URL.Path == "/sheets/spreadsheets/book":
 			_, _ = fmt.Fprint(w, `{"sheets":[{"properties":{"sheetId":7,"title":"North","gridProperties":{"rowCount":2,"columnCount":2}}},{"properties":{"sheetId":8,"title":"South","gridProperties":{"rowCount":1,"columnCount":1}}}]}`)
@@ -123,41 +119,6 @@ func TestGDriveAdapterReadsEverySheetAndRestrictions(t *testing.T) {
 	}
 	if workbook.NativeMIME != driveGoogleSheet || workbook.ExportMIME != "application/json" || len(workbook.Sheets) != 2 || workbook.Sheets[0].SheetID != 7 || workbook.Sheets[1].Title != "South" || workbook.Sheets[0].Values[1][1] != "N4" || !ranges["North"] || !ranges["South"] {
 		t.Fatalf("workbook = %#v ranges=%v", workbook, ranges)
-	}
-	access, err := a.Access(context.Background(), c, "", 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if access.Completeness != CompletenessComplete || !access.Snapshot || access.NextCursor != "" || len(access.Grants) != 2 {
-		t.Fatalf("restricted access = %#v", access)
-	}
-	deny := access.Grants[0]
-	if deny.NativeObjectID != "book" || deny.NativeObjectKind != "" || deny.NativePrincipalID != "" || deny.NativeGroupID != "" || deny.Scope != "copy_download_restricted" || deny.Effect != "deny" {
-		t.Fatalf("restriction deny = %#v", deny)
-	}
-	grant := access.Grants[1]
-	if grant.Effect != "allow" || !grant.Inherited || grant.NativePrincipalID != "a@example.test" || grant.NativeObjectKind != "" || grant.Scope != "reader" {
-		t.Fatalf("shared-drive grant = %#v", grant)
-	}
-}
-
-func TestGDriveUnrestrictedAccessUsesRoleScope(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, `{"files":[{"id":"doc","permissions":[{"id":"u","type":"user","emailAddress":"a@example.test","role":"writer","permissionDetails":[{"inherited":true,"inheritedFrom":"parent","role":"writer"}]},{"id":"g","type":"group","emailAddress":"team@example.test","role":"reader"}]}]}`)
-	}))
-	defer server.Close()
-	c := source.Connection{Kind: SourceTypeGoogleDrive, CredentialRef: "CONNECTOR_GOOGLE_DRIVE_TOKEN", Config: map[string]any{"base_url": server.URL, "folder_id": "root"}}
-	page, err := NewGDriveAdapter(driveTestService(server)).Access(context.Background(), c, "", 10)
-	if err != nil || page.Completeness != CompletenessComplete || !page.Snapshot || len(page.Grants) != 2 {
-		t.Fatalf("access = %#v, error = %v", page, err)
-	}
-	grant := page.Grants[0]
-	if grant.NativeObjectID != "doc" || grant.NativeObjectKind != "" || grant.Scope != "writer" || !grant.Inherited {
-		t.Fatalf("grant = %#v", grant)
-	}
-	group := page.Grants[1]
-	if group.NativeObjectID != "doc" || group.NativeObjectKind != "" || group.NativePrincipalID != "" || group.NativeGroupID != "team@example.test" || group.Scope != "reader" {
-		t.Fatalf("group grant = %#v", group)
 	}
 }
 
@@ -244,18 +205,6 @@ func TestGDriveTerminalDeltaReturnsDurableCheckpoint(t *testing.T) {
 	}
 }
 
-func TestGDriveAccessMissingPermissionsIsIncomplete(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, `{"files":[{"id":"hidden"}]}`)
-	}))
-	defer server.Close()
-	c := source.Connection{Kind: SourceTypeGoogleDrive, CredentialRef: "CONNECTOR_GOOGLE_DRIVE_TOKEN", Config: map[string]any{"base_url": server.URL, "folder_id": "root"}}
-	page, err := NewGDriveAdapter(driveTestService(server)).Access(context.Background(), c, "", 10)
-	if err != nil || page.Completeness != CompletenessIncomplete || page.Snapshot {
-		t.Fatalf("access page=%#v error=%v", page, err)
-	}
-}
-
 func TestGDriveOversizedFileFailsExplicitly(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -285,5 +234,33 @@ func TestDriveTypeAllowlist(t *testing.T) {
 	connection.Config["mime_types"] = []any{}
 	if !driveTypeAllowed(connection, "image/png") {
 		t.Fatal("empty Drive type allowlist must preserve default all-types behavior")
+	}
+}
+
+func TestGDriveReaderRestrictedFileIsSkipped(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/drive/changes/startPageToken":
+			_, _ = fmt.Fprint(w, `{"startPageToken":"start"}`)
+		case "/drive/files":
+			if !strings.Contains(r.URL.Query().Get("fields"), "copyRequiresWriterPermission") {
+				t.Errorf("listing did not request restriction fields: %s", r.URL.Query().Get("fields"))
+			}
+			_, _ = fmt.Fprint(w, `{"files":[{"id":"locked","name":"locked.pdf","mimeType":"application/pdf","copyRequiresWriterPermission":true},{"id":"ndr","name":"ndr.pdf","mimeType":"application/pdf","downloadRestrictions":{"itemDownloadRestriction":{"restrictedForReaders":true}}},{"id":"open","name":"open.pdf","mimeType":"application/pdf"}]}`)
+		case "/drive/files/open":
+			_, _ = w.Write([]byte("open bytes"))
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	c := source.Connection{Kind: SourceTypeGoogleDrive, CredentialRef: "CONNECTOR_GOOGLE_DRIVE_TOKEN", Config: map[string]any{"base_url": server.URL + "/drive", "folder_id": "root"}}
+	page, err := NewGDriveAdapter(driveTestService(server)).Content(context.Background(), c, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].NativeID != "open" {
+		t.Fatalf("restricted files were not skipped: %#v", page.Items)
 	}
 }

@@ -1,7 +1,7 @@
 {{define "content"}}{{/* Sources page (OA-23, plan 09-02) — sources.manage.
-     The Credentials tab sits behind access.manage (platform.admin) like the
-     bindings drawer; its markup lives in the frag-sources-credentials
-     partial so htmx can refresh it. */}}
+     The Credentials tab sits behind access.manage (platform.admin); its
+     markup lives in the frag-sources-credentials partial so htmx can
+     refresh it. */}}
 {{template "page-head" .}}
 <nav class="tabs" aria-label="Sources sections">
   <a class="tab{{if eq .Data.Tab "sources"}} active{{end}}" href="/dashboard/sources"{{if eq .Data.Tab "sources"}} aria-current="page"{{end}}>Sources</a>

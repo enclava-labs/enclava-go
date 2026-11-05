@@ -155,17 +155,16 @@ func (f *searchFixture) collection(t *testing.T, name string, audience []string)
 	return c
 }
 
-// stageSearchDoc persists an audience object + published generation with one
-// span-backed chunk and registers its point — the same real retained-chunk
-// shape the JSON search route seeds.
+// stageSearchDoc persists a collection-mode object + published generation
+// with one span-backed chunk and registers its point — the same real
+// retained-chunk shape the JSON search route seeds.
 func (f *searchFixture) stageSearchDoc(t *testing.T, collection rag.Collection, objectID, fileName, content, provenance string, audience []string) {
 	t.Helper()
 	ctx := context.Background()
 	repo := postgres.NewRAGRepo(f.db)
 	if _, err := repo.UpsertObject(ctx, source.Object{
 		TenantID: f.tenant, ID: objectID, Kind: "document", NativeID: "native-" + objectID,
-		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: audience[0],
-		Audience: audience,
+		AuthorizationMode: source.AuthorizationCollection, OwnerActorID: audience[0],
 	}); err != nil {
 		t.Fatal(err)
 	}

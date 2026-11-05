@@ -1,7 +1,7 @@
 // dashboard_sources_test.go — Sources page + add-source wizard coverage
 // (OA-23, plan 09-02): per-role route gating, real table projections, the
-// five-provider drawer markup, the independently access.manage-gated
-// bindings drawer and the unmapped-principals warning on both surfaces.
+// five-provider drawer markup and the single collection read rule rendered
+// in the Permissions column and the wizard's Access step.
 //
 // Obsolete-file handoff for plan 09-10 — this page replaces the old
 // connectors dashboard. Delete then, in the same change:
@@ -53,7 +53,6 @@ func TestDashboardSourcesMemberDenied(t *testing.T) {
 	for _, path := range []string{
 		"/dashboard/partials/sources/table",
 		"/dashboard/partials/sources/drawer",
-		"/dashboard/partials/sources/bindings?source=connsrc_x",
 	} {
 		rec := sessionDo(t, f.app, http.MethodGet, path, "", sess, csrf)
 		if rec.Code != http.StatusForbidden {
@@ -137,28 +136,31 @@ func TestDashboardSourcesTableRows(t *testing.T) {
 	}
 	page := rec.Body.String()
 	for _, want := range []string{
-		"Docs repo",          // source name
-		"Help desk",          // source name
-		"Archive sync",       // source name
-		"GitHub",             // provider subline
-		"Slack",              // provider subline
-		"#C123",              // slack scope from config
-		"enclava/docs@HEAD",  // github scope from config
-		"Docs library",       // resolved collection name
-		"Workspace ACLs",     // slack permission model
-		"Repo collaborators", // github permission model
-		"Ready",              // healthy pill (slack, no jobs)
-		"Paused",             // paused pill
-		"Syncing",            // queued job row
-		"every 3s",           // poll only while a row is syncing
-		"Add source",         // header action
+		"Docs repo",         // source name
+		"Help desk",         // source name
+		"Archive sync",      // source name
+		"GitHub",            // provider subline
+		"Slack",             // provider subline
+		"#C123",             // slack scope from config
+		"enclava/docs@HEAD", // github scope from config
+		"Docs library",      // resolved collection name
+		"Ready",             // healthy pill (slack, no jobs)
+		"Paused",            // paused pill
+		"Syncing",           // queued job row
+		"every 3s",          // poll only while a row is syncing
+		"Add source",        // header action
+		// The single read rule: readers of the destination collection, and
+		// only they, can read what the source syncs — named when resolved,
+		// generic otherwise.
+		"Everyone who can open Docs library can read everything this source syncs.",
+		"Everyone who can open the collection can read everything this source syncs.",
 	} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("page output missing %q", want)
 		}
 	}
 	if strings.Contains(page, "User bindings") {
-		t.Fatal("manager markup must not carry the access.manage bindings action")
+		t.Fatal("sources markup must not carry a bindings action")
 	}
 	if !strings.Contains(page, `href="/dashboard/sources?status=syncing"`) {
 		t.Fatal("page output missing the filter chips")
@@ -216,7 +218,6 @@ func TestDashboardSourcesTableStateProjection(t *testing.T) {
 		"credential refused",                // the concrete failure is visible beside its next step
 		`href="/dashboard/sources?edit=s3"`, // Reconnect deep-links the failing row
 		"every 3s",                          // poll rides along with any syncing row
-		"User bindings",                     // AccessManage gate open in this view
 		"1,284",                             // items count when stats report it
 	} {
 		if !strings.Contains(rendered, want) {
@@ -262,19 +263,28 @@ func TestDashboardSourcesTableStateProjection(t *testing.T) {
 	}
 }
 
-func TestDashboardSourcesBindingsGate(t *testing.T) {
+// TestDashboardSourcesCollectionRule pins the single read rule: every row
+// explains that the destination collection's readers are the only readers,
+// and no bindings surface (action or partial) remains — even for a tenant
+// administrator.
+func TestDashboardSourcesCollectionRule(t *testing.T) {
 	f := newIdentityFixture(t)
-	sess, csrf := loginUser(t, f, "manager@example.com", []string{"connectors.manage", "rag"}, "manager-pass")
+	sess, csrf := loginUser(t, f, "manager@example.com", []string{"connectors.manage", "rag", "rag.manage"}, "manager-pass")
 
-	rec := sessionDo(t, f.app, http.MethodPost, "/api/v1/connectors/sources",
-		`{"type":"github","name":"Bindings repo","config":{"owner":"enclava","repo":"b"}}`, sess, csrf)
+	rec := sessionDo(t, f.app, http.MethodPost, "/api/v1/rag/collections",
+		`{"name":"Shared library"}`, sess, csrf)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create collection: expected 201, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	collectionID, _ := decodeJSON(t, rec)["id"].(string)
+
+	rec = sessionDo(t, f.app, http.MethodPost, "/api/v1/connectors/sources",
+		`{"type":"github","name":"Rule repo","config":{"owner":"enclava","repo":"b"},"target_collection_id":"`+collectionID+`"}`, sess, csrf)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create source: expected 201, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	sourceID, _ := decodeJSON(t, rec)["id"].(string)
 
-	// Manager (sources.manage without access.manage): row actions exist, the
-	// bindings action and partial do not.
 	rec = sessionDo(t, f.app, http.MethodGet, "/dashboard/sources", "", sess, csrf)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("manager page: expected 200, got %d", rec.Code)
@@ -285,31 +295,41 @@ func TestDashboardSourcesBindingsGate(t *testing.T) {
 			t.Fatalf("manager page missing row action %q", want)
 		}
 	}
-	if strings.Contains(page, "User bindings") {
-		t.Fatal("manager markup rendered the access.manage bindings action")
+	if !strings.Contains(page, "Everyone who can open Shared library can read everything this source syncs.") {
+		t.Fatal("sources page missing the collection read rule")
 	}
-	rec = sessionDo(t, f.app, http.MethodGet, "/dashboard/partials/sources/bindings?source="+sourceID, "", sess, csrf)
-	if rec.Code != http.StatusForbidden || strings.TrimSpace(rec.Body.String()) != "" {
-		t.Fatalf("manager bindings partial: expected empty 403, got %d body=%q", rec.Code, rec.Body.String())
+	for _, gone := range []string{"User bindings", `sources:bindings`, "source accounts have no Enclava binding", "isn't linked to your Enclava user"} {
+		if strings.Contains(page, gone) {
+			t.Fatalf("sources page still renders bindings/unmapped surface %q", gone)
+		}
 	}
 
-	// Tenant administrator (platform.admin + connectors.manage): the action
-	// and the independently gated partial render.
+	// Tenant administrator (platform.admin + connectors.manage): same rule,
+	// still no bindings action, and the old bindings partial is simply gone.
 	adminSess, adminCSRF := loginUser(t, f, "admin-manager@example.com",
 		[]string{auth.ScopePlatformAdmin, "connectors.manage", "rag"}, "admin-pass")
 	rec = sessionDo(t, f.app, http.MethodGet, "/dashboard/sources", "", adminSess, adminCSRF)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "User bindings") {
-		t.Fatalf("admin page: expected the bindings action, got %d", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin page: expected 200, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Everyone who can open Shared library can read everything this source syncs.") {
+		t.Fatal("admin page missing the collection read rule")
+	}
+	if strings.Contains(rec.Body.String(), "User bindings") {
+		t.Fatal("admin markup still renders a bindings action")
 	}
 	rec = sessionDo(t, f.app, http.MethodGet, "/dashboard/partials/sources/bindings?source="+sourceID, "", adminSess, adminCSRF)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("admin bindings partial: expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code == http.StatusOK {
+		t.Fatal("bindings partial still serves — it must be gone")
 	}
-	body := rec.Body.String()
-	for _, want := range []string{"Bindings repo", "Bind a user", "Observed native user ID", "verification evidence"} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("bindings partial missing %q", want)
-		}
+
+	// The wizard's Access step states the same rule for every provider.
+	rec = sessionDo(t, f.app, http.MethodGet, "/dashboard/partials/sources/drawer", "", sess, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("drawer: expected 200, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Everyone who can open the target collection can read everything this source syncs.") {
+		t.Fatal("wizard missing the collection read rule")
 	}
 }
 
@@ -355,16 +375,20 @@ func TestDashboardSourcesDrawerProviders(t *testing.T) {
 			t.Fatalf("drawer missing the %s credential empty state", provider)
 		}
 	}
-	for _, want := range []string{
-		"Collaborator and membership lookup still requires a CONNECTOR_GITHUB_* credential binding with push access",
-		"without it only content syncs",
-	} {
-		if !strings.Contains(drawer, want) {
-			t.Fatalf("drawer missing GitHub credential guidance %q", want)
+	// The Access step states the single collection rule per provider and the
+	// Notion published-audiences editor is gone.
+	for _, provider := range []string{"slack", "teams", "github", "notion", "google_drive"} {
+		if !strings.Contains(drawer, `data-provider-access="`+provider+`"`) {
+			t.Fatalf("drawer missing the %s access pane", provider)
 		}
 	}
-	if !strings.Contains(drawer, `data-action="sources:audience-add"`) {
-		t.Fatal("drawer missing the Notion published-audiences editor")
+	if !strings.Contains(drawer, "Everyone who can open the target collection can read everything this source syncs.") {
+		t.Fatal("drawer missing the collection read rule")
+	}
+	for _, gone := range []string{`data-action="sources:audience-add"`, "data-audience-row", "published audiences"} {
+		if strings.Contains(drawer, gone) {
+			t.Fatalf("drawer still renders removed audience surface %q", gone)
+		}
 	}
 
 	// With refs bound server-side, only the provider's own ref IDs render.
@@ -398,121 +422,10 @@ func TestDashboardSourcesDrawerProviders(t *testing.T) {
 	}
 }
 
-// TestDashboardSourcesUnmappedWarning proves the "source accounts have no
-// Enclava binding" copy is driven by the real snapshot projection: it
-// surfaces in the sources table's Permissions cell and inside the
-// access.manage-gated bindings drawer when the latest complete snapshots
-// reference unbound accounts, and stays hidden at zero. Assertions pin
-// rendered text only — never markup around the interpolated count.
-func TestDashboardSourcesUnmappedWarning(t *testing.T) {
-	f := newIdentityFixture(t)
-	ctx := context.Background()
-	// Production wires observations in main.go's SetSyncDependencies; the
-	// shared fixture leaves it off (ListSources/GetSource then report zero),
-	// so wire the real repos here before any source rows are read.
-	f.app.connectorSvc.SetSyncDependencies(connectors.AdapterFactories{},
-		postgres.NewConnectorObservationsRepo(f.db), nil, postgres.NewSourceRepo(f.db))
-	sess, csrf := loginUser(t, f, "admin-bindings@example.com",
-		[]string{auth.ScopePlatformAdmin, "connectors.manage", "rag"}, "admin-pass")
-
-	// Two real sources: one seeded with unmapped principals, one clean.
-	made := map[string]string{}
-	for name, body := range map[string]string{
-		"warn":  `{"type":"slack","name":"Unmapped chat","config":{"channel_id":"C456"},"credential_ref":"CONNECTOR_SLACK_UNMAPPED"}`,
-		"clean": `{"type":"github","name":"Mapped repo","config":{"owner":"enclava","repo":"mapped"}}`,
-	} {
-		rec := sessionDo(t, f.app, http.MethodPost, "/api/v1/connectors/sources", body, sess, csrf)
-		if rec.Code != http.StatusCreated {
-			t.Fatalf("create %s source: expected 201, got %d body=%s", name, rec.Code, rec.Body.String())
-		}
-		id, _ := decodeJSON(t, rec)["id"].(string)
-		if id == "" {
-			t.Fatalf("create %s source: missing id in response", name)
-		}
-		made[name] = id
-	}
-
-	// Distinct unbound accounts in the latest complete snapshot per kind: a is
-	// in both grants rev 2 and membership rev 1 (counted once), b and c in one
-	// each; d is only in superseded rev 1 and e only in incomplete rev 3 → 3.
-	tenant, conn := f.tenant, made["warn"]
-	for _, seed := range []struct {
-		stmt string
-		args []any
-	}{
-		{`INSERT INTO access_snapshots (tenant_id, id, connection_id, kind, revision, status)
-		  VALUES ($1, 'snap_g1', $2, 'grants', 1, 'complete'), ($1, 'snap_g2', $2, 'grants', 2, 'complete'),
-		         ($1, 'snap_g3', $2, 'grants', 3, 'incomplete'), ($1, 'snap_m1', $2, 'membership', 1, 'complete'),
-		         ($1, 'snap_c1', $2, 'content', 1, 'complete')`, []any{tenant, conn}},
-		{`INSERT INTO source_objects (tenant_id, id, connection_id, kind, native_id, authorization_mode, observed_seq)
-		  VALUES ($1, 'obj_warn', $2, 'channel', 'slack:C456', 'source_acl', 1)`, []any{tenant, conn}},
-		{`INSERT INTO source_groups (tenant_id, id, connection_id, source_group_native_id, name)
-		  VALUES ($1, 'grp_warn', $2, 'C456', 'C456')`, []any{tenant, conn}},
-		{`INSERT INTO source_identities (tenant_id, id, connection_id, source_user_native_id, display_name, mapped_user_id)
-		  VALUES ($1, 'sid_a', $2, 'UA', 'Alice Slack', NULL), ($1, 'sid_b', $2, 'UB', '', NULL), ($1, 'sid_c', $2, 'UC', '', NULL),
-		         ($1, 'sid_d', $2, 'UD', '', NULL), ($1, 'sid_e', $2, 'UE', '', NULL),
-		         ($1, 'sid_f', $2, 'UF', '', (SELECT id FROM users WHERE tenant_id = $1 AND email = 'admin-bindings@example.com'))`, []any{tenant, conn}},
-		{`INSERT INTO source_grants (tenant_id, id, object_id, subject_type, source_identity_id, effect, access_revision)
-		  SELECT $1, 'grant_' || s.id, 'obj_warn', 'user', s.id, 'allow', s.rev
-		  FROM (VALUES ('sid_a', 2), ('sid_b', 2), ('sid_d', 1), ('sid_e', 3), ('sid_f', 2)) AS s(id, rev)`, []any{tenant}},
-		{`INSERT INTO source_group_memberships (tenant_id, id, group_id, source_identity_id, access_revision)
-		  SELECT $1, 'member_' || s.id, 'grp_warn', s.id, 1 FROM (VALUES ('sid_a'), ('sid_c')) AS s(id)`, []any{tenant}},
-	} {
-		if _, err := f.db.SQL.ExecContext(ctx, seed.stmt, seed.args...); err != nil {
-			t.Fatalf("seed access snapshots: %v", err)
-		}
-	}
-	const warning = "3 source accounts have no Enclava binding and get no access"
-
-	// Table page: the warn row carries the Permissions-cell subline; the
-	// clean row proves zero hides it — exactly one occurrence across both.
-	rec := sessionDo(t, f.app, http.MethodGet, "/dashboard/sources", "", sess, csrf)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /dashboard/sources: expected 200, got %d body=%s", rec.Code, rec.Body.String())
-	}
-	page := rec.Body.String()
-	if !strings.Contains(page, warning) {
-		t.Fatalf("table page missing the unmapped-principals warning %q", warning)
-	}
-	if got := strings.Count(page, "source accounts have no Enclava binding"); got != 1 {
-		t.Fatalf("expected the warning on exactly one row, got %d", got)
-	}
-
-	// Bindings drawer (access.manage-gated): same warning, same zero hiding.
-	rec = sessionDo(t, f.app, http.MethodGet,
-		"/dashboard/partials/sources/bindings?source="+made["warn"], "", sess, csrf)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("warn bindings partial: expected 200, got %d body=%s", rec.Code, rec.Body.String())
-	}
-	body := rec.Body.String()
-	if !strings.Contains(body, warning) {
-		t.Fatalf("bindings drawer missing the unmapped-principals warning %q", warning)
-	}
-	// Observed names and pickers spare the admin from hunting raw IDs; the
-	// bound account (sid_f) is shown by email and left out of the picker.
-	for _, want := range []string{"Alice Slack", `<option value="UA">Alice Slack</option>`, ">admin-bindings@example.com</option>", "→ <code>admin-bindings@example.com</code>"} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("bindings drawer missing %q", want)
-		}
-	}
-	if strings.Contains(body, `<option value="UF">`) {
-		t.Fatal("bound account offered in the unbound picker")
-	}
-	rec = sessionDo(t, f.app, http.MethodGet,
-		"/dashboard/partials/sources/bindings?source="+made["clean"], "", sess, csrf)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("clean bindings partial: expected 200, got %d body=%s", rec.Code, rec.Body.String())
-	}
-	if body := rec.Body.String(); strings.Contains(body, "source accounts have no Enclava binding") {
-		t.Fatal("clean source rendered the unmapped-principals warning")
-	}
-}
-
 // TestDashboardSourcesIndexProgress proves the per-source indexing rollup is
 // real: a still-listing sync shows found/indexed counts and keeps the table
-// polling, failed items surface the durable job's message, the unbound-
-// identity message upgrades to the User-bindings next step for an admin, and
-// a fully indexed source renders counts with no failure line.
+// polling, failed items surface the durable job's generic "not indexed"
+// line, and a fully indexed source renders counts with no failure line.
 func TestDashboardSourcesIndexProgress(t *testing.T) {
 	f := newIdentityFixture(t)
 	ctx := context.Background()
@@ -550,12 +463,12 @@ func TestDashboardSourcesIndexProgress(t *testing.T) {
 		stmt string
 		args []any
 	}{
-		// Slack: one indexed item, one published item whose embed job failed
-		// (the unbound-identity denial), one still processing.
+		// Slack: one indexed item, one published item whose embed job failed,
+		// one still processing.
 		{`INSERT INTO source_objects (tenant_id, id, connection_id, kind, native_id, authorization_mode, observed_seq)
-		  VALUES ($1, 'prog_obj1', $2, 'message', 'slack:T1', 'source_acl', 1),
-		         ($1, 'prog_obj2', $2, 'message', 'slack:T2', 'source_acl', 1),
-		         ($1, 'prog_obj3', $2, 'message', 'slack:T3', 'source_acl', 1)`, []any{tenant, made["slack"]}},
+		  VALUES ($1, 'prog_obj1', $2, 'message', 'slack:T1', 'collection', 1),
+		         ($1, 'prog_obj2', $2, 'message', 'slack:T2', 'collection', 1),
+		         ($1, 'prog_obj3', $2, 'message', 'slack:T3', 'collection', 1)`, []any{tenant, made["slack"]}},
 		{`INSERT INTO source_object_versions (tenant_id, id, object_id, observed_seq, artifact_ref, content_sha256, byte_size)
 		  VALUES ($1, 'prog_ver1', 'prog_obj1', 1, 'art1', 'sha1', 10),
 		         ($1, 'prog_ver2', 'prog_obj2', 1, 'art2', 'sha2', 10),
@@ -569,10 +482,10 @@ func TestDashboardSourcesIndexProgress(t *testing.T) {
 		{`INSERT INTO jobs (tenant_id, id, operation, status, connection_id, idempotency_key, input_hash, input_ref, principal, submitter_key, policy, error)
 		  VALUES ($1, 'prog_embed_fail', 'rag.embed', 'failed', $2, 'prog-embed-1', 'h', 'prog_ver2',
 		          '{}'::jsonb, 'test-submitter', '{"generation":"1"}'::jsonb,
-		          '{"message":"the indexing user has no access to this item in the source; bind their source identity, then sync again"}'::jsonb)`, []any{tenant, made["slack"]}},
+		          '{"message":"upstream embedding endpoint refused the request"}'::jsonb)`, []any{tenant, made["slack"]}},
 		// GitHub: the only item published with no failed job — fully indexed.
 		{`INSERT INTO source_objects (tenant_id, id, connection_id, kind, native_id, authorization_mode, observed_seq)
-		  VALUES ($1, 'prog_obj9', $2, 'file', 'gh:done/readme.md', 'source_acl', 1)`, []any{tenant, made["clean"]}},
+		  VALUES ($1, 'prog_obj9', $2, 'file', 'gh:done/readme.md', 'collection', 1)`, []any{tenant, made["clean"]}},
 		{`INSERT INTO source_object_versions (tenant_id, id, object_id, observed_seq, artifact_ref, content_sha256, byte_size)
 		  VALUES ($1, 'prog_ver9', 'prog_obj9', 1, 'art9', 'sha9', 10)`, []any{tenant}},
 		{`INSERT INTO collection_items (tenant_id, id, collection_id, object_id)
@@ -614,19 +527,11 @@ func TestDashboardSourcesIndexProgress(t *testing.T) {
 		"Fetching… 3 found · 1 indexed", // live counts while the stream lists
 		`aria-valuenow="66"`,            // (indexed+failed)/items = 2/3
 		"every 3s",                      // in-flight work keeps the poll alive
-		"1 item can't be indexed: your Slack account isn't linked to your Enclava user",
-		"link it in User bindings, then Sync now.",
-		`data-action="sources:bindings"`, // the admin's next step rides the row
+		"1 not indexed: upstream embedding endpoint refused the request",
 	} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("sources page missing %q", want)
 		}
-	}
-	if strings.Contains(page, "not indexed") {
-		t.Fatal("bound-identity failure rendered the generic line instead of the actionable text")
-	}
-	if got := strings.Count(page, "isn't linked to your Enclava user"); got != 1 {
-		t.Fatalf("expected the bindings warning on exactly one row, got %d", got)
 	}
 	// The fully indexed row carries its item count and nothing else.
 	if !strings.Contains(page, `data-label="Items">1`) {

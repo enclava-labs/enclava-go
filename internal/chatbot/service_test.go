@@ -208,7 +208,7 @@ func newChatFixture(t *testing.T, searcher *fakeRAGSearcher, upstream *fakeChatU
 	executor, err := inference.NewService(inference.Deps{
 		Endpoints:     endpoints,
 		Sources:       sourceRepo,
-		Authorizer:    source.NewAuthorizer(sourceRepo, 0),
+		Authorizer:    source.NewAuthorizer(sourceRepo),
 		Billing:       billing.NewService(billingRepo),
 		Artifacts:     postgres.NewArtifactRepo(db),
 		Conversations: postgres.NewChatbotConversationStore(chatRepo),

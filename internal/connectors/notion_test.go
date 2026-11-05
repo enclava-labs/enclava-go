@@ -26,7 +26,7 @@ func notionFixtureAdapter(t *testing.T, handler http.Handler) (*NotionAdapter, s
 	}
 	conn := source.Connection{TenantID: "tenant-test", Kind: source.ConnectionNotion, CredentialRef: "notion-test", Config: map[string]any{
 		"base_url": server.URL + "/v1", "max_depth": float64(8), "max_pages": float64(100),
-		"selected_pages": []any{map[string]any{"page_id": "root", "audiences": []any{map[string]any{"id": "engineering", "members": []any{"identity-1"}}}}},
+		"selected_pages": []any{map[string]any{"page_id": "root"}},
 	}}
 	adapter, err := NewNotionAdapter(conn, resolver)
 	if err != nil {
@@ -98,7 +98,7 @@ func TestNotionRecursivePaginationAndStructuredTables(t *testing.T) {
 	}
 }
 
-func TestNotionOnlyTraversesSelectedRootsAndRequiresAudience(t *testing.T) {
+func TestNotionOnlyTraversesSelectedRoots(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/pages/root", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": "root", "url": "https://www.notion.so/root"})
@@ -116,37 +116,11 @@ func TestNotionOnlyTraversesSelectedRootsAndRequiresAudience(t *testing.T) {
 			t.Fatal("linked unselected page was ingested")
 		}
 	}
-	if _, err := notionSelections([]any{map[string]any{"page_id": "root", "audiences": []any{}}}); err == nil {
-		t.Fatal("selection without publisher-assigned audience was accepted")
+	if _, err := notionSelections([]any{map[string]any{"page_id": ""}}); err == nil {
+		t.Fatal("empty page_id selection was accepted")
 	}
-}
-
-func TestNotionAccessRevokesLostPublisherAndUsesPublishedAudienceGroups(t *testing.T) {
-	mux := http.NewServeMux()
-	rootReads := 0
-	mux.HandleFunc("/v1/pages/root", func(w http.ResponseWriter, r *http.Request) {
-		rootReads++
-		if rootReads == 1 {
-			http.Error(w, "gone", http.StatusNotFound)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": "root", "url": "https://www.notion.so/root"})
-	})
-	adapter, conn := notionFixtureAdapter(t, mux)
-	page, err := adapter.Access(context.Background(), conn, "", 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if page.Completeness != CompletenessComplete || len(page.Grants) != 1 || page.Grants[0].Effect != "deny" || page.Grants[0].Scope != "read" || page.Grants[0].NativeObjectKind != "page" {
-		t.Fatalf("publisher access loss not explicit: %+v", page)
-	}
-	if page.Grants[0].NativeGroupID != "notion:audience:engineering" {
-		t.Fatalf("audience group not source-qualified: %+v", page.Grants[0])
-	}
-	members, err := adapter.Membership(context.Background(), conn, "", 100)
-	if err != nil || members.Completeness != CompletenessComplete || len(members.Memberships) != 1 ||
-		members.Memberships[0].NativeGroupID != page.Grants[0].NativeGroupID || members.Memberships[0].NativePrincipalID != "identity-1" {
-		t.Fatalf("publisher audience membership missing: %+v err=%v", members, err)
+	if _, err := notionSelections([]any{map[string]any{"page_id": "root"}}); err != nil {
+		t.Fatalf("page_id-only selection rejected: %v", err)
 	}
 }
 
@@ -158,29 +132,6 @@ func TestNotionRejectsRedirects(t *testing.T) {
 	adapter, conn := notionFixtureAdapter(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, redirect.URL, http.StatusFound) }))
 	if _, err := adapter.Content(context.Background(), conn, "", 10); err == nil {
 		t.Fatal("followed upstream redirect")
-	}
-}
-func TestNotionAccessGrantsSelectedSubtree(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/pages/root", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": "root", "url": "https://www.notion.so/root"})
-	})
-	mux.HandleFunc("/v1/blocks/root/children", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{"id": "para", "type": "paragraph", "last_edited_time": "r1"}}, "has_more": false})
-	})
-	adapter, conn := notionFixtureAdapter(t, mux)
-	page, err := adapter.Access(context.Background(), conn, "", 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(page.Grants) != 2 {
-		t.Fatalf("expected root and block grants, got %+v", page.Grants)
-	}
-	kinds := map[string]string{"root": "page", "para": "block"}
-	for _, grant := range page.Grants {
-		if grant.Effect != "allow" || grant.Scope != "read" || grant.NativeGroupID != "notion:audience:engineering" || grant.NativeObjectKind != kinds[grant.NativeObjectID] {
-			t.Fatalf("unexpected published-audience grant: %+v", grant)
-		}
 	}
 }
 

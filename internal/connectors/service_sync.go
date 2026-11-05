@@ -36,16 +36,10 @@ func (s *Service) runDurableStream(ctx context.Context, claim *jobs.Claim, princ
 	if err != nil {
 		return err
 	}
-	switch stream {
-	case StreamContent:
-		return s.runContentStream(ctx, claim, principal, conn, adapter, state)
-	case StreamAccess:
-		return s.runAccessStream(ctx, claim, principal, conn, adapter, state)
-	case StreamMembership:
-		return s.runMembershipStream(ctx, claim, principal, conn, adapter, state)
-	default:
+	if stream != StreamContent {
 		return fmt.Errorf("unsupported connector stream %q", stream)
 	}
+	return s.runContentStream(ctx, claim, principal, conn, adapter, state)
 }
 
 func (s *Service) runContentStream(ctx context.Context, claim *jobs.Claim, principal auth.Principal, conn source.Connection, adapter Adapter, state StreamState) error {
@@ -130,14 +124,6 @@ func (s *Service) runContentStream(ctx context.Context, claim *jobs.Claim, princ
 	return errors.New("connector content listing exceeded page limit")
 }
 
-func readCapableScope(scope string) bool {
-	switch scope {
-	case "", "read", "view", "reader", "commenter", "writer", "editor", "owner", "organizer", "fileOrganizer", "member", "post", "reply":
-		return true
-	}
-	return false
-}
-
 func (s *Service) observeContentItem(ctx context.Context, conn source.Connection, item ContentItem) (Observation, error) {
 	if item.NativeID == "" {
 		return Observation{}, errors.New("connector content item native id is required")
@@ -162,7 +148,7 @@ func (s *Service) observeContentItem(ctx context.Context, conn source.Connection
 			}
 			parent, err = s.canonical.UpsertObject(ctx, source.Object{
 				TenantID: conn.TenantID, ConnectionID: conn.ID, ID: id, Kind: parentKind,
-				NativeID: item.ParentNativeID, AuthorizationMode: source.AuthorizationSourceACL, ObservedSeq: 1,
+				NativeID: item.ParentNativeID, AuthorizationMode: source.AuthorizationCollection, ObservedSeq: 1,
 			})
 		}
 		if err != nil {
@@ -177,7 +163,7 @@ func (s *Service) observeContentItem(ctx context.Context, conn source.Connection
 	object, err := s.canonical.UpsertObject(ctx, source.Object{
 		TenantID: conn.TenantID, ConnectionID: conn.ID, ID: objectID, Kind: kind,
 		NativeID: item.NativeID, ParentObjectID: parentID,
-		AuthorizationMode: source.AuthorizationSourceACL, UpstreamRevision: upstream, ObservedSeq: 1,
+		AuthorizationMode: source.AuthorizationCollection, UpstreamRevision: upstream, ObservedSeq: 1,
 	})
 	if err != nil {
 		return Observation{}, err
@@ -326,219 +312,6 @@ func (s *Service) enqueueContent(ctx context.Context, principal auth.Principal, 
 		}
 	}
 	return nil
-}
-
-func (s *Service) runAccessStream(ctx context.Context, claim *jobs.Claim, principal auth.Principal, conn source.Connection, adapter Adapter, state StreamState) error {
-	return s.runGrantStream(ctx, claim, principal, conn, adapter, state, false)
-}
-
-func (s *Service) runMembershipStream(ctx context.Context, claim *jobs.Claim, principal auth.Principal, conn source.Connection, adapter Adapter, state StreamState) error {
-	return s.runGrantStream(ctx, claim, principal, conn, adapter, state, true)
-}
-
-func (s *Service) runGrantStream(ctx context.Context, claim *jobs.Claim, principal auth.Principal, conn source.Connection, adapter Adapter, state StreamState, membership bool) error {
-	kind := source.SnapshotGrants
-	if membership {
-		kind = source.SnapshotMembership
-	}
-	revision := state.Fence
-	if err := s.canonical.BeginSnapshot(ctx, conn.TenantID, conn.ID, kind, revision); err != nil {
-		return err
-	}
-	cursor := Cursor(state.Cursor)
-	for pageNo := 0; pageNo < connectorPageLimit; pageNo++ {
-		if cancelled, err := claim.CancelRequested(ctx); err != nil {
-			return err
-		} else if cancelled {
-			return context.Canceled
-		}
-		var grants []AccessGrant
-		var next Cursor
-		var completeness Completeness
-		var snapshot bool
-		var err error
-		if membership {
-			page, e := adapter.Membership(ctx, conn, cursor, connectorPageSize)
-			err, grants, next, completeness, snapshot = e, page.Memberships, page.NextCursor, page.Completeness, page.Snapshot
-		} else {
-			page, e := adapter.Access(ctx, conn, cursor, connectorPageSize)
-			err, grants, next, completeness, snapshot = e, page.Grants, page.NextCursor, page.Completeness, page.Snapshot
-		}
-		if err != nil {
-			_, _ = s.observations.PersistPage(ctx, state, nil, string(cursor), false, true, err.Error())
-			return fmt.Errorf("connector %s page: %w", state.Stream, err)
-		}
-		if len(grants) > connectorPageSize {
-			_, _ = s.observations.PersistPage(ctx, state, nil, string(cursor), false, true, "adapter exceeded page bound")
-			return errors.New("connector adapter exceeded authorization page bound")
-		}
-		observations := make([]Observation, 0, len(grants))
-		for _, grant := range grants {
-			payload, e := json.Marshal(grant)
-			if e != nil {
-				return e
-			}
-			native := base64.RawURLEncoding.EncodeToString(payload)
-			observations = append(observations, Observation{TenantID: conn.TenantID, ConnectionID: conn.ID, Stream: state.Stream, NativeID: native, Payload: payload})
-		}
-		state, err = s.observations.PersistPage(ctx, state, observations, string(cursor), false, true, "")
-		if err != nil {
-			return err
-		}
-		terminal := next == "" && completeness == CompletenessComplete
-		if !snapshot {
-			terminal = false
-		}
-		state, err = s.observations.PersistPage(ctx, state, nil, string(next), terminal, !terminal, "")
-		if err != nil {
-			return err
-		}
-		if terminal {
-			return s.applyGrantSnapshot(ctx, principal, conn, state, revision, membership)
-		}
-		if next == "" {
-			return errors.New("authorization listing ended incomplete or was not a snapshot")
-		}
-		cursor = next
-	}
-	return errors.New("connector authorization listing exceeded page limit")
-}
-
-func (s *Service) applyGrantSnapshot(ctx context.Context, principal auth.Principal, conn source.Connection, state StreamState, revision int64, membership bool) error {
-	observations, err := s.observations.ListObservations(ctx, state)
-	if err != nil {
-		return err
-	}
-	var grants []source.SourceGrant
-	var memberships []source.SourceGroupMembership
-	unmapped := 0
-	for _, observation := range observations {
-		if observation.ProcessingError != "" {
-			return fmt.Errorf("authorization observation %q failed: %s", observation.NativeID, observation.ProcessingError)
-		}
-		var grant AccessGrant
-		if err := json.Unmarshal(observation.Payload, &grant); err != nil {
-			return fmt.Errorf("decode authorization observation: %w", err)
-		}
-		if membership {
-			if grant.NativePrincipalID == "" || grant.NativeGroupID == "" {
-				return errors.New("membership requires native principal and group")
-			}
-			group, err := s.resolveOrCreateGroup(ctx, conn, grant.NativeGroupID)
-			if err != nil {
-				return err
-			}
-			identity, err := s.observePrincipal(ctx, conn, grant)
-			if err != nil {
-				return err
-			}
-			if identity.MappedUserID == "" {
-				unmapped++
-			}
-			memberships = append(memberships, source.SourceGroupMembership{TenantID: conn.TenantID, ConnectionID: conn.ID, GroupID: group.ID, MemberID: identity.ID, AccessRevision: revision})
-			continue
-		}
-		if grant.Effect == source.GrantEffectAllow && !readCapableScope(grant.Scope) {
-			return fmt.Errorf("unsupported source access scope %q", grant.Scope)
-		}
-		if grant.NativeObjectID == "" {
-			return errors.New("access grant has no native object")
-		}
-		object, err := s.canonical.ObjectForNativeID(ctx, conn.TenantID, conn.ID, firstNonEmpty(grant.NativeObjectKind, conn.Kind), grant.NativeObjectID)
-		if errors.Is(err, source.ErrDenied) {
-			id, idErr := connectorObjectID()
-			if idErr != nil {
-				return idErr
-			}
-			object, err = s.canonical.UpsertObject(ctx, source.Object{
-				TenantID: conn.TenantID, ConnectionID: conn.ID, ID: id,
-				Kind: firstNonEmpty(grant.NativeObjectKind, conn.Kind), NativeID: grant.NativeObjectID,
-				AuthorizationMode: source.AuthorizationSourceACL, ObservedSeq: 1,
-			})
-		}
-		if err != nil {
-			return err
-		}
-		g := source.SourceGrant{TenantID: conn.TenantID, ConnectionID: conn.ID, ObjectID: object.ID, Effect: grant.Effect, AccessRevision: revision}
-		switch grant.Effect {
-		case source.GrantEffectAllow, source.GrantEffectDeny:
-		default:
-			return fmt.Errorf("unsupported source grant effect %q", grant.Effect)
-		}
-		if grant.NativePrincipalID != "" {
-			identity, err := s.observePrincipal(ctx, conn, grant)
-			if err != nil {
-				return err
-			}
-			if identity.MappedUserID == "" {
-				unmapped++
-			}
-			g.SubjectKind, g.SubjectID = source.GrantSubjectUser, identity.ID
-		} else if grant.NativeGroupID != "" {
-			group, err := s.resolveOrCreateGroup(ctx, conn, grant.NativeGroupID)
-			if err != nil {
-				return err
-			}
-			g.SubjectKind, g.SubjectID = source.GrantSubjectGroup, group.ID
-		} else {
-			if grant.Effect != source.GrantEffectDeny {
-				return errors.New("access grant has no native principal or group")
-			}
-			g.SubjectKind = source.GrantSubjectAll
-		}
-		grants = append(grants, g)
-	}
-	kind := source.SnapshotGrants
-	if membership {
-		kind = source.SnapshotMembership
-	}
-	if err := s.observations.WithFence(ctx, state, func(tx source.Tx) error {
-		if membership {
-			return s.canonical.ApplyMembershipSnapshot(ctx, tx, conn.TenantID, conn.ID, revision, memberships, unmapped)
-		}
-		return s.canonical.ApplyAccessSnapshot(ctx, tx, conn.TenantID, conn.ID, revision, grants, unmapped)
-	}); err != nil {
-		return err
-	}
-	key := fmt.Sprintf("%s:connector-v2:%s:%s:%d", OperationAccess, conn.ID, kind, revision)
-	_, _, err = s.jobs.Enqueue(ctx, principal, jobs.EnqueueRequest{TenantID: principal.TenantID, Operation: OperationAccess, IdempotencyKey: key, Subject: jobs.Subject{ConnectionID: conn.ID, ObservedRevision: revision}, InputRef: conn.ID, InputHash: fmt.Sprint(revision), Policy: map[string]any{"connection_id": conn.ID, "snapshot_kind": kind, "revision": revision}, Lane: jobs.LaneBackground})
-	if err != nil {
-		return fmt.Errorf("enqueue rag.access: %w", err)
-	}
-	return nil
-}
-
-func (s *Service) observePrincipal(ctx context.Context, conn source.Connection, grant AccessGrant) (source.SourceIdentity, error) {
-	id, err := connectorObjectID()
-	if err != nil {
-		return source.SourceIdentity{}, err
-	}
-	identity := source.SourceIdentity{TenantID: conn.TenantID, ConnectionID: conn.ID, SourceKind: conn.Kind, ID: id, NativeID: grant.NativePrincipalID, DisplayName: firstNonEmpty(grant.NativePrincipalName, grant.NativePrincipalID)}
-	if err := s.canonical.ObserveSourceIdentity(ctx, identity); err != nil {
-		return source.SourceIdentity{}, err
-	}
-	return s.canonical.ObservedSourceIdentity(ctx, conn.TenantID, conn.ID, grant.NativePrincipalID)
-}
-
-func (s *Service) resolveOrCreateGroup(ctx context.Context, conn source.Connection, nativeID string) (source.SourceGroup, error) {
-	if nativeID == "" {
-		return source.SourceGroup{}, errors.New("native source group id is required")
-	}
-	group, err := s.canonical.SourceGroupForNativeID(ctx, conn.TenantID, conn.ID, nativeID)
-	if err == nil {
-		return group, nil
-	}
-	if !errors.Is(err, source.ErrDenied) {
-		return source.SourceGroup{}, err
-	}
-	id, err := connectorObjectID()
-	if err != nil {
-		return source.SourceGroup{}, err
-	}
-	if err := s.canonical.InsertSourceGroup(ctx, source.SourceGroup{TenantID: conn.TenantID, ConnectionID: conn.ID, SourceKind: conn.Kind, ID: id, NativeID: nativeID, Name: nativeID}); err != nil {
-		return source.SourceGroup{}, err
-	}
-	return s.canonical.SourceGroupForNativeID(ctx, conn.TenantID, conn.ID, nativeID)
 }
 
 func connectorObjectID() (string, error) {

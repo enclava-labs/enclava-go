@@ -243,23 +243,18 @@ func (v *retrievalVectors) Query(_ context.Context, _ string, input QueryInput) 
 // document-enumeration call would hit the nil embedded Repository and fail.
 type searchStubRepo struct {
 	Repository
-	bindings    []IndexBinding
-	connections []string
+	bindings []IndexBinding
 }
 
 func (r *searchStubRepo) DistinctIndexBindings(_ context.Context, _, _ string) ([]IndexBinding, error) {
 	return r.bindings, nil
 }
 
-func (r *searchStubRepo) ListCollectionConnectionIDs(_ context.Context, _, _ string) ([]string, error) {
-	return r.connections, nil
-}
-
 func TestSearchCollectionPrefixesAndMemo(t *testing.T) {
 	exec := &retrievalExecutor{}
 	vectors := &retrievalVectors{}
 	repo := &searchStubRepo{}
-	svc := &Service{repo: repo, executor: exec, vectorStore: vectors, authorizer: source.NewAuthorizer(repo, 0)}
+	svc := &Service{repo: repo, executor: exec, vectorStore: vectors, authorizer: source.NewAuthorizer(repo)}
 	memo := newQueryEmbeddingMemo()
 	for i := range 3 {
 		repo.bindings = []IndexBinding{{QdrantCollection: fmt.Sprint(i), EmbeddingModel: "model", EmbeddingDimensions: 2, QueryPrefix: "query: "}}
@@ -289,7 +284,7 @@ func TestSearchCollectionPrefixesAndMemo(t *testing.T) {
 func TestSearchUtilityModel(t *testing.T) {
 	exec := &retrievalExecutor{}
 	repo := &searchStubRepo{bindings: []IndexBinding{{QdrantCollection: "idx"}}}
-	svc := &Service{repo: repo, executor: exec, vectorStore: &retrievalVectors{}, authorizer: source.NewAuthorizer(repo, 0)}
+	svc := &Service{repo: repo, executor: exec, vectorStore: &retrievalVectors{}, authorizer: source.NewAuthorizer(repo)}
 	input := SearchInput{Query: "hello", Mode: QueryLexical, Rewrite: true}
 	if err := svc.searchModels(context.Background(), "t", &input); !errors.Is(err, ErrUtilityModelNotConfigured) {
 		t.Fatalf("missing model: %v", err)
@@ -319,7 +314,7 @@ func TestSearchCollectionSeparatesQueryPrefixes(t *testing.T) {
 		{QdrantCollection: "index", EmbeddingModel: "model", EmbeddingDimensions: 2, QueryPrefix: "one: "},
 		{QdrantCollection: "index", EmbeddingModel: "model", EmbeddingDimensions: 2, QueryPrefix: "two: "},
 	}}
-	svc := &Service{repo: repo, executor: exec, vectorStore: vectors, authorizer: source.NewAuthorizer(repo, 0)}
+	svc := &Service{repo: repo, executor: exec, vectorStore: vectors, authorizer: source.NewAuthorizer(repo)}
 	_, err := svc.searchCollection(context.Background(), auth.Principal{TenantID: "t"}, Collection{}, SearchInput{Query: "hello", Mode: QueryHybrid}, newQueryEmbeddingMemo())
 	if err != nil || len(exec.requests) != 2 || len(vectors.queries) != 2 {
 		t.Fatalf("requests=%d queries=%d err=%v", len(exec.requests), len(vectors.queries), err)
@@ -362,10 +357,6 @@ func (r *reauthRepo) DistinctIndexBindings(_ context.Context, _, id string) ([]I
 		return nil, nil
 	}
 	return []IndexBinding{{QdrantCollection: r.generation.QdrantCollection, EmbeddingModel: r.generation.EmbeddingModel}}, nil
-}
-
-func (r *reauthRepo) ListCollectionConnectionIDs(_ context.Context, _, _ string) ([]string, error) {
-	return nil, nil
 }
 
 func (r *reauthRepo) PublishedGenerationForVersion(_ context.Context, _, collectionID, versionID string, generation int64) (bool, error) {
@@ -421,7 +412,7 @@ func TestSearchDropsObjectRevokedMidSearch(t *testing.T) {
 	svc := &Service{
 		repo:        repo,
 		vectorStore: &revokingVectors{repo: repo},
-		authorizer:  source.NewAuthorizer(repo, 0),
+		authorizer:  source.NewAuthorizer(repo),
 	}
 	results, err := svc.Search(context.Background(), auth.Principal{TenantID: "t", ActorID: "actor"}, SearchInput{CollectionID: "col-b", Query: "hello", Mode: QueryLexical})
 	if err != nil {
@@ -474,7 +465,7 @@ func TestSearchFinalAuthorizationAfterSelection(t *testing.T) {
 		t.Run(fmt.Sprint(readable), func(t *testing.T) {
 			repo, principal := searchReauthFixture()
 			exec := &retrievalExecutor{onChat: func() { repo.revoked = true }}
-			svc := &Service{repo: repo, vectorStore: &fixedRetrievalVectors{point: *repo.point}, executor: exec, authorizer: source.NewAuthorizer(repo, 0)}
+			svc := &Service{repo: repo, vectorStore: &fixedRetrievalVectors{point: *repo.point}, executor: exec, authorizer: source.NewAuthorizer(repo)}
 			svc.SetUtilityModel("utility")
 			if readable {
 				got, err := svc.SearchReadableWithOptions(context.Background(), principal, "hello", QueryLexical, nil, 5, SearchReadableOptions{SelectSections: true})
@@ -501,7 +492,7 @@ func TestSearchSkipsDeniedEmbeddingBinding(t *testing.T) {
 		{QdrantCollection: "b", EmbeddingModel: "allowed", EmbeddingDimensions: 2},
 	}
 	exec := &retrievalExecutor{denyModel: "denied"}
-	svc := &Service{repo: repo, vectorStore: &fixedRetrievalVectors{point: *repo.point}, executor: exec, authorizer: source.NewAuthorizer(repo, 0)}
+	svc := &Service{repo: repo, vectorStore: &fixedRetrievalVectors{point: *repo.point}, executor: exec, authorizer: source.NewAuthorizer(repo)}
 	results, err := svc.Search(context.Background(), principal, SearchInput{CollectionID: "col", Query: "hello", Mode: QuerySemantic})
 	if err != nil || len(results) != 1 || results[0].DocumentID != "obj" || len(repo.evidence) != 1 {
 		t.Fatalf("results = %#v, evidence = %#v, err=%v", results, repo.evidence, err)

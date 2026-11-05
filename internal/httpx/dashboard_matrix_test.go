@@ -18,7 +18,6 @@ import (
 	"net/url"
 	"strings"
 	"testing"
-	"time"
 
 	"enclava-go/internal/artifacts"
 	"enclava-go/internal/auth"
@@ -134,12 +133,6 @@ func (matrixStubAdapter) Capabilities() connectors.AdapterCapabilities {
 func (matrixStubAdapter) Content(context.Context, source.Connection, connectors.Cursor, int) (connectors.ContentPage, error) {
 	return connectors.ContentPage{Completeness: connectors.CompletenessComplete, Snapshot: true}, nil
 }
-func (matrixStubAdapter) Access(context.Context, source.Connection, connectors.Cursor, int) (connectors.AccessPage, error) {
-	return connectors.AccessPage{Completeness: connectors.CompletenessComplete, Snapshot: true}, nil
-}
-func (matrixStubAdapter) Membership(context.Context, source.Connection, connectors.Cursor, int) (connectors.MembershipPage, error) {
-	return connectors.MembershipPage{Completeness: connectors.CompletenessComplete, Snapshot: true}, nil
-}
 
 func newMatrixFixture(t *testing.T) *matrixFixture {
 	t.Helper()
@@ -178,7 +171,7 @@ func newMatrixFixture(t *testing.T) *matrixFixture {
 	executor, err := inference.NewService(inference.Deps{
 		Endpoints:  f.endpoints,
 		Sources:    f.sourceRepo,
-		Authorizer: source.NewAuthorizer(f.sourceRepo, time.Hour),
+		Authorizer: source.NewAuthorizer(f.sourceRepo),
 		Billing:    billing.NewService(f.billingRepo),
 		Artifacts:  f.artifactRepo,
 	})
@@ -487,13 +480,11 @@ func TestDashboardRouteRoleMatrix(t *testing.T) {
 		{"/dashboard/partials/knowledge/documents", [4]int{nf, nf, nf, deny}}, // missing/unknown collection id answers the uniform 404, not a service error
 		{"/dashboard/partials/knowledge/sources?collection=" + collID, [4]int{ok, ok, deny, deny}},
 		{"/dashboard/partials/knowledge/profiles", [4]int{ok, ok, deny, deny}},
-		// Sources (cap connectors.manage; bindings is access.manage).
+		// Sources (cap connectors.manage).
 		{"/dashboard/sources", [4]int{ok, ok, deny, deny}},
 		{"/dashboard/sources?new=1", [4]int{ok, ok, deny, deny}},
 		{"/dashboard/partials/sources/table", [4]int{ok, ok, deny, deny}},
 		{"/dashboard/partials/sources/drawer", [4]int{ok, ok, deny, deny}},
-		{"/dashboard/partials/sources/bindings?source=" + f.connectorSrc.ID, [4]int{ok, deny, deny, deny}},
-		{"/dashboard/partials/sources/bindings?source=connsrc_bogus", [4]int{nf, deny, deny, deny}},
 		// Assistants (cap chatbot.manage).
 		{"/dashboard/assistants", [4]int{ok, ok, deny, deny}},
 		{"/dashboard/assistants/instructions", [4]int{ok, ok, deny, deny}},

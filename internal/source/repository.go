@@ -13,9 +13,9 @@ import (
 // metadata, links or counts before a successful CanRead.
 var ErrDenied = errors.New("source: access denied")
 
-// Tx is the transaction handle Apply*Snapshot requires — satisfied by
-// *sql.Tx. The database/sql import is types-only and keeps the signature
-// assignable without a wrapper.
+// Tx is the transaction handle connector observation writes run under —
+// satisfied by *sql.Tx. The database/sql import is types-only and keeps the
+// signature assignable without a wrapper.
 type Tx interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
@@ -35,12 +35,6 @@ type ReadOptions struct {
 // and by connector observation flows. Implemented by postgres.SourceRepo.
 // All methods are tenant-scoped; callers pass tenantIDs explicitly except on
 // row-shaped writes that carry TenantID.
-//
-// Snapshot semantics: only a COMPLETE access_snapshot revision is
-// authoritative. ApplyAccessSnapshot/ApplyMembershipSnapshot run inside one
-// transaction each — they write revision-qualified rows, mark the snapshot
-// complete, then delete rows unseen at that revision. An incomplete
-// replacement can never shadow or retire the last complete set.
 type SourceRepository interface {
 	// Connections
 	CreateConnection(ctx context.Context, c Connection) error
@@ -76,43 +70,13 @@ type SourceRepository interface {
 	IngestHandoffExists(ctx context.Context, tenantID, connectionID, collectionID, objectID string, observedSeq int64) (bool, error)
 	// IngestFailed reports whether the newest index generation of the object
 	// version in the collection failed (its state or its embed/ingest job), so
-	// a later sync can observe the unchanged item again and retry indexing —
-	// for example once the source creator's identity has been bound.
+	// a later sync can observe the unchanged item again and retry indexing.
 	IngestFailed(ctx context.Context, tenantID, collectionID, objectID string, observedSeq int64) (bool, error)
 
-	// Source identities, groups and memberships (upsert by unique keys).
-	InsertSourceIdentity(ctx context.Context, id SourceIdentity) error
-	InsertSourceGroup(ctx context.Context, g SourceGroup) error
-	InsertSourceMembership(ctx context.Context, m SourceGroupMembership) error
-	// SourceIdentityForUser returns the connection-scoped source identity
-	// mapped to an Enclava user, or ErrDenied-shaped not-found.
-	SourceIdentityForUser(ctx context.Context, tenantID, connectionID, userID string) (SourceIdentity, error)
-	// GroupIDsForIdentity reads the specified complete membership revision and
-	// fails if it is no longer current.
-	GroupIDsForIdentity(ctx context.Context, tenantID, connectionID, sourceIdentityID string, revision int64) ([]string, error)
-
-	// Grants and snapshots.
-	// AncestorObjectIDs returns the object and its complete, live ancestor chain.
-	// Missing, cross-connection, cyclic or over-depth chains return an error.
-	AncestorObjectIDs(ctx context.Context, tenantID, connectionID, objectID string, maxDepth int) ([]string, error)
-	// AncestorObjectIDsBatch resolves every object's complete, live ancestor
-	// chain in one query under the same rules as AncestorObjectIDs. Each
-	// returned key maps to that object's chain (the object first, parents
-	// last); an object whose chain is missing, cross-connection, cyclic or
-	// over-depth is simply absent from the map — CanRead denies identically.
-	AncestorObjectIDsBatch(ctx context.Context, tenantID, connectionID string, objectIDs []string, maxDepth int) (map[string][]string, error)
-	GrantsForObjects(ctx context.Context, tenantID, connectionID string, objectIDs []string, accessRevision int64) ([]SourceGrant, error)
-	BeginSnapshot(ctx context.Context, tenantID, connectionID, kind string, revision int64) error
-	// LatestCompleteRevision returns the newest COMPLETE snapshot revision
-	// for (connection, kind) with its completion time; not-found when none.
-	LatestCompleteRevision(ctx context.Context, tenantID, connectionID, kind string) (revision int64, completedAt time.Time, err error)
-
-	// Atomic snapshot application. Both take an open transaction so the
-	// row writes, completion marking and unseen-row pruning commit or roll
-	// back as one observation.
-	ApplyAccessSnapshot(ctx context.Context, tx Tx, tenantID, connectionID string, revision int64, grants []SourceGrant, unmappedSubjects int) error
-	ApplyMembershipSnapshot(ctx context.Context, tx Tx, tenantID, connectionID string, revision int64, memberships []SourceGroupMembership, unmappedSubjects int) error
-
+	// CollectionsForObjects returns, per object ID, the live (removed_at IS
+	// NULL) collections containing it — the read set AuthorizationCollection
+	// evaluates. Objects in no collection are absent from the map.
+	CollectionsForObjects(ctx context.Context, tenantID string, objectIDs []string) (map[string][]CollectionAccess, error)
 	// Restrictions (server-owned, can only tighten).
 	SetRestriction(ctx context.Context, r SourceRestriction) error
 	RestrictionsForSubject(ctx context.Context, tenantID, subjectKind, subjectID string) ([]SourceRestriction, error)

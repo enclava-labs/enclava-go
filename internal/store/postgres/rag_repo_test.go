@@ -117,8 +117,7 @@ func TestRAGRepoCollectionChunkReplacementPreservesSharedVersionChunks(t *testin
 	}
 	obj, err := repo.UpsertObject(ctx, source.Object{
 		TenantID: tenant, ID: "obj_1", Kind: "upload", NativeID: "up_1",
-		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: "user_1",
-		Audience: []string{"user_1"},
+		AuthorizationMode: source.AuthorizationCollection, OwnerActorID: "user_1",
 	})
 	if err != nil {
 		t.Fatalf("upsert object: %v", err)
@@ -239,8 +238,7 @@ func seedProjectionFixture(t *testing.T, db *postgres.DB, repo *postgres.RAGRepo
 	}
 	obj, err := repo.UpsertObject(ctx, source.Object{
 		TenantID: tenant, ID: "obj_proj", Kind: "upload", NativeID: "up_proj",
-		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: "user_1",
-		Audience: []string{"user_1"},
+		AuthorizationMode: source.AuthorizationCollection, OwnerActorID: "user_1",
 	})
 	if err != nil {
 		t.Fatalf("upsert object: %v", err)
@@ -598,7 +596,7 @@ func TestRAGRepoAccessProjectionReads(t *testing.T) {
 	}
 	obj, err := repo.UpsertObject(ctx, source.Object{
 		TenantID: tenant, ID: "obj_p", ConnectionID: "", Kind: "upload", NativeID: "up_p",
-		AuthorizationMode: source.AuthorizationAudience, OwnerActorID: "user_1", Audience: []string{"*"},
+		AuthorizationMode: source.AuthorizationCollection, OwnerActorID: "user_1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -666,21 +664,17 @@ func TestRAGRepoAccessProjectionReads(t *testing.T) {
 	if err != nil || len(backlog) != 1 {
 		t.Fatalf("backlog = %#v err=%v", backlog, err)
 	}
-	if err := repo.ProjectGenerationAccess(ctx, tenant, "ragcol_p", obj.ID+"#1", 1, func(current int64) (int64, error) {
-		if current != 0 {
-			t.Fatalf("initial revision = %d", current)
+	projected := 0
+	for range 2 {
+		if err := repo.ProjectGenerationAccess(ctx, tenant, "ragcol_p", obj.ID+"#1", 1, func() error {
+			projected++
+			return nil
+		}); err != nil {
+			t.Fatalf("projection %d: %v", projected, err)
 		}
-		return 5, nil
-	}); err != nil {
-		t.Fatal(err)
 	}
-	if err := repo.ProjectGenerationAccess(ctx, tenant, "ragcol_p", obj.ID+"#1", 1, func(current int64) (int64, error) {
-		if current != 5 {
-			t.Fatalf("stored revision = %d, want 5", current)
-		}
-		return current, nil
-	}); err != nil {
-		t.Fatalf("repeat projection: %v", err)
+	if projected != 2 {
+		t.Fatalf("projection ran %d times, want 2", projected)
 	}
 	backlog, err = repo.ListUnprojectedGenerations(ctx, tenant, 10)
 	if err != nil || len(backlog) != 0 {

@@ -192,7 +192,7 @@ func TestKnowledgeImportHTTPAuthorizationAndDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := source.NewAuthorizer(sources, 0).CanReadVersion(ctx, ownerPrincipal, inputObject, inputVersion, source.ReadOptions{}); err != nil {
+	if err := source.NewAuthorizer(sources).CanReadVersion(ctx, ownerPrincipal, inputObject, inputVersion, source.ReadOptions{}); err != nil {
 		t.Fatalf("input artifact is not readable: %v", err)
 	}
 	if reader, err := store.Read(ctx, artifacts.Ref{TenantID: tenant, ID: resultRef.ID, Kind: artifacts.KindResult}); err != nil {

@@ -109,7 +109,7 @@ func newFixture(t *testing.T) fixture {
 	exec, err := inference.NewService(inference.Deps{
 		Endpoints:  endpoints,
 		Sources:    sources,
-		Authorizer: source.NewAuthorizer(sources, 0),
+		Authorizer: source.NewAuthorizer(sources),
 		Billing:    billing.NewService(billingRepo),
 		Artifacts:  artRepo,
 	}, inference.WithTransportFactory(
@@ -840,7 +840,7 @@ func TestExplicitDeleteFencesAndCleansOnlyUnsharedArtifacts(t *testing.T) {
 	}
 }
 
-func TestExtractionReadsAndDeletionRecheckCurrentSourceAudience(t *testing.T) {
+func TestExtractionReadsAndDeletionRecheckCurrentSourceAccess(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 	f.seedEndpoint(t, "priced-extract")
@@ -865,8 +865,8 @@ func TestExtractionReadsAndDeletionRecheckCurrentSourceAudience(t *testing.T) {
 		t.Fatalf("complete extraction: %v", err)
 	}
 	obj, err := f.sources.UpsertObject(ctx, source.Object{
-		TenantID: f.tenant, ID: "extract-audience-object", Kind: "upload", NativeID: "audience-file",
-		AuthorizationMode: source.AuthorizationAudience, Audience: []string{f.principal.ActorID}, ObservedSeq: 1,
+		TenantID: f.tenant, ID: "extract-owned-object", Kind: "upload", NativeID: "owned-file",
+		AuthorizationMode: source.AuthorizationOwner, OwnerActorID: f.principal.ActorID, ObservedSeq: 1,
 	})
 	if err != nil {
 		t.Fatalf("create source object: %v", err)
@@ -884,8 +884,8 @@ func TestExtractionReadsAndDeletionRecheckCurrentSourceAudience(t *testing.T) {
 	if _, err := f.svc.GetJob(ctx, f.principal, out.JobID); err != nil {
 		t.Fatalf("authorized source result read: %v", err)
 	}
-	if _, err := f.db.SQL.ExecContext(ctx, `UPDATE source_objects SET audience='[]'::jsonb WHERE tenant_id=$1::uuid AND id=$2`, f.tenant, obj.ID); err != nil {
-		t.Fatalf("revoke source audience: %v", err)
+	if _, err := f.db.SQL.ExecContext(ctx, `UPDATE source_objects SET owner_actor_id='someone-else' WHERE tenant_id=$1::uuid AND id=$2`, f.tenant, obj.ID); err != nil {
+		t.Fatalf("revoke source access: %v", err)
 	}
 	if _, err := f.svc.GetJob(ctx, f.principal, out.JobID); !errors.Is(err, extract.ErrNotFound) {
 		t.Fatalf("revoked result read = %v, want not found", err)

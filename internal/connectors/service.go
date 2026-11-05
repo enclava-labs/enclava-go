@@ -54,15 +54,6 @@ type CanonicalSourceRepository interface {
 	WithTx(context.Context, func(source.Tx) error) error
 	ObjectForNativeID(context.Context, string, string, string, string) (source.Object, error)
 	ObjectForNativeIDCrossKind(context.Context, string, string, string) (source.Object, error)
-	SourceIdentityForNativeID(context.Context, string, string, string) (source.SourceIdentity, error)
-	SourceGroupForNativeID(context.Context, string, string, string) (source.SourceGroup, error)
-	InsertSourceIdentity(context.Context, source.SourceIdentity) error
-	ObserveSourceIdentity(context.Context, source.SourceIdentity) error
-	InsertSourceGroup(context.Context, source.SourceGroup) error
-	SourceIdentitiesForConnection(context.Context, string, string) ([]source.SourceIdentity, error)
-	UserExists(context.Context, string, string) (bool, error)
-	SourceIdentityByID(context.Context, string, string) (source.SourceIdentity, error)
-	ObservedSourceIdentity(context.Context, string, string, string) (source.SourceIdentity, error)
 }
 
 type Service struct {
@@ -161,7 +152,7 @@ func (s *Service) GetStreamState(ctx context.Context, p auth.Principal, sourceID
 	if !auth.HasScope(p, "connectors.manage") {
 		return StreamState{}, source.ErrDenied
 	}
-	if stream != string(StreamContent) && stream != string(StreamAccess) && stream != string(StreamMembership) {
+	if stream != string(StreamContent) {
 		return StreamState{}, errors.New("invalid connector stream")
 	}
 	v, err := s.GetSource(ctx, p, sourceID)
@@ -298,14 +289,7 @@ func (s *Service) ListSources(ctx context.Context, p auth.Principal, sourceType 
 		if wanted != "" && c.Kind != wanted {
 			continue
 		}
-		view := connectionView(c)
-		if s.observations != nil {
-			view.UnmappedPrincipals, err = s.observations.UnmappedPrincipals(ctx, p.TenantID, c.ID)
-			if err != nil {
-				return nil, err
-			}
-		}
-		out = append(out, view)
+		out = append(out, connectionView(c))
 	}
 	if offset > 0 {
 		if offset >= len(out) {
@@ -327,14 +311,7 @@ func (s *Service) GetSource(ctx context.Context, p auth.Principal, id string) (S
 	if err != nil {
 		return Source{}, err
 	}
-	view := connectionView(c)
-	if s.observations != nil {
-		view.UnmappedPrincipals, err = s.observations.UnmappedPrincipals(ctx, p.TenantID, c.ID)
-		if err != nil {
-			return Source{}, err
-		}
-	}
-	return view, nil
+	return connectionView(c), nil
 }
 
 func (s *Service) UpdateSource(ctx context.Context, p auth.Principal, id string, input UpdateSourceInput) (Source, error) {
@@ -449,47 +426,29 @@ func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID str
 		// Adapters only fail construction on configuration: credential binding, base URL or required config.
 		return SyncJob{}, fmt.Errorf("%w: %v", ErrInvalidSource, err)
 	}
-	capabilities := adapter.Capabilities()
-	streams := []StreamKind{}
-	if capabilities.Content {
-		streams = append(streams, StreamContent)
-	}
-	if capabilities.Access {
-		streams = append(streams, StreamAccess)
-	}
-	if capabilities.Membership {
-		streams = append(streams, StreamMembership)
-	}
-	if len(streams) == 0 {
-		return SyncJob{}, errors.New("connector adapter exposes no sync streams")
+	if !adapter.Capabilities().Content {
+		return SyncJob{}, errors.New("connector adapter exposes no content stream")
 	}
 	configHash, err := connectorConfigHash(conn)
 	if err != nil {
 		return SyncJob{}, err
 	}
 	key := "connector.sync:" + conn.ID + ":" + configHash + ":" + window
-	var response jobs.Job
-	for _, stream := range streams {
-		job, _, err := s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
-			TenantID:       p.TenantID,
-			Operation:      OperationSync,
-			IdempotencyKey: key + ":" + string(stream),
-			Subject:        jobs.Subject{ConnectionID: conn.ID},
-			InputRef:       conn.ID,
-			InputHash:      configHash,
-			Policy:         map[string]any{"connection_id": conn.ID, "stream": string(stream)},
-			Lane:           jobs.LaneBackground,
-		})
-		if err != nil {
-			return SyncJob{}, err
-		}
-		if stream == StreamContent || response.ID == "" {
-			response = job
-		}
+	job, _, err := s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
+		TenantID:       p.TenantID,
+		Operation:      OperationSync,
+		IdempotencyKey: key + ":" + string(StreamContent),
+		Subject:        jobs.Subject{ConnectionID: conn.ID},
+		InputRef:       conn.ID,
+		InputHash:      configHash,
+		Policy:         map[string]any{"connection_id": conn.ID, "stream": string(StreamContent)},
+		Lane:           jobs.LaneBackground,
+	})
+	if err != nil {
+		return SyncJob{}, err
 	}
-	return jobView(response), nil
+	return jobView(job), nil
 }
-
 func connectorConfigHash(conn source.Connection) (string, error) {
 	cfgBytes, err := json.Marshal(conn.Config)
 	if err != nil {
@@ -634,9 +593,7 @@ func (s *Service) attemptSync(ctx context.Context, claim *jobs.Claim) (string, e
 		return "", errors.New("connectors: durable sync is not configured")
 	}
 	stream := StreamKind(stringFromAny(job.Policy["stream"]))
-	switch stream {
-	case StreamContent, StreamAccess, StreamMembership:
-	default:
+	if stream != StreamContent {
 		return "", errors.New("connector sync job has no valid stream")
 	}
 	factory, ok := s.adapters[SourceKind(conn.Kind)]
@@ -650,11 +607,8 @@ func (s *Service) attemptSync(ctx context.Context, claim *jobs.Claim) (string, e
 	if err := s.validateConnectorSource(ctx, connectionView(conn)); err != nil {
 		return "", err
 	}
-	capabilities := adapter.Capabilities()
-	if stream == StreamContent && !capabilities.Content ||
-		stream == StreamAccess && !capabilities.Access ||
-		stream == StreamMembership && !capabilities.Membership {
-		return "", fmt.Errorf("connector adapter does not support %s observations", stream)
+	if !adapter.Capabilities().Content {
+		return "", errors.New("connector adapter does not support content observations")
 	}
 	if err := claim.MarkDispatched(ctx); err != nil {
 		return "", err
@@ -1321,7 +1275,7 @@ func NewLegacyAdapter(service *Service, kind SourceKind) Adapter {
 }
 
 func (a legacyAdapter) Capabilities() AdapterCapabilities {
-	return AdapterCapabilities{Content: true, UnsupportedScopes: []string{"access", "membership"}}
+	return AdapterCapabilities{Content: true}
 }
 
 func (a legacyAdapter) Content(ctx context.Context, connection source.Connection, cursor Cursor, limit int) (ContentPage, error) {
@@ -1354,12 +1308,4 @@ func (a legacyAdapter) Content(ctx context.Context, connection source.Connection
 		})
 	}
 	return page, nil
-}
-
-func (legacyAdapter) Access(context.Context, source.Connection, Cursor, int) (AccessPage, error) {
-	return AccessPage{Completeness: CompletenessIncomplete}, errors.New("source does not expose access enumeration through the legacy adapter")
-}
-
-func (legacyAdapter) Membership(context.Context, source.Connection, Cursor, int) (MembershipPage, error) {
-	return MembershipPage{Completeness: CompletenessIncomplete}, errors.New("source does not expose membership enumeration through the legacy adapter")
 }

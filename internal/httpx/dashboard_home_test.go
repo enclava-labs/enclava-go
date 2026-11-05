@@ -277,10 +277,10 @@ func TestDashboardHomeAttentionKindsAndFixLinks(t *testing.T) {
 	adminScopes := []string{auth.ScopePlatformAdmin, "pricing.manage", "rag", "connectors.manage", "rag.manage"}
 	admin, adminSess := homeUser(t, f, "home-admin2@example.com", adminScopes, auth.ResourceGrants{}, "admin-pass")
 	adminUpload, err := f.ragSvc.UploadDocument(f.ctx, admin, owner.ID, rag.UploadDocumentInput{
-		FileName: "admin-broken.txt", MimeType: "text/plain", Bytes: []byte("   \n"),
+		FileName: "admin-broken.txt", MimeType: "text/plain", Bytes: []byte("  \t\n"),
 	})
 	if err != nil || adminUpload.Deduplicated || adminUpload.Document.ID == restricted.Document.ID {
-		t.Fatalf("admin upload must create a new document without disclosing the restricted match: %+v err=%v", adminUpload, err)
+		t.Fatalf("admin upload must create a new document: %+v err=%v", adminUpload, err)
 	}
 	f.runNextEmbedFailure(t)
 	f.failSync(t, admin, "sync-home-2", "src-home", "authentication failed")

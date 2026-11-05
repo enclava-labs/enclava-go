@@ -44,7 +44,7 @@ func newModelsFixture(t *testing.T) *modelsFixture {
 	executor, err := inference.NewService(inference.Deps{
 		Endpoints:     endpoints,
 		Sources:       sourceRepo,
-		Authorizer:    source.NewAuthorizer(sourceRepo, time.Hour),
+		Authorizer:    source.NewAuthorizer(sourceRepo),
 		Billing:       billing.NewService(billingRepo),
 		ModelSettings: postgres.NewModelSettingsRepo(db),
 	})

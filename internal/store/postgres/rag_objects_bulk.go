@@ -18,7 +18,7 @@ func (r *RAGRepo) GetObjects(ctx context.Context, tenantID string, ids []string)
 	}
 	rows, err := r.db.SQL.QueryContext(ctx, `
 		SELECT tenant_id::text, id, connection_id, kind, native_id, parent_object_id,
-		       authorization_mode, owner_actor_id, audience, upstream_revision,
+		       authorization_mode, owner_actor_id, upstream_revision,
 		       observed_seq, deleted_at, tombstoned_at
 		FROM source_objects WHERE tenant_id = $1 AND id = ANY($2)`,
 		tenantID, ids)
@@ -35,19 +35,17 @@ func (r *RAGRepo) GetObjects(ctx context.Context, tenantID string, ids []string)
 	for rows.Next() {
 		var o source.Object
 		var connID, parent, owner sql.NullString
-		var audience []byte
 		var upstream sql.NullString
 		var deleted, tombstoned sql.NullTime
 		if err := rows.Scan(
 			&o.TenantID, &o.ID, &connID, &o.Kind, &o.NativeID, &parent,
-			&o.AuthorizationMode, &owner, &audience, &upstream,
+			&o.AuthorizationMode, &owner, &upstream,
 			&o.ObservedSeq, &deleted, &tombstoned); err != nil {
 			return nil, fmt.Errorf("scan object: %w", err)
 		}
 		o.ConnectionID = connID.String
 		o.ParentObjectID = parent.String
 		o.OwnerActorID = owner.String
-		o.Audience = scanJSONList(audience)
 		if upstream.Valid {
 			s := upstream.String
 			o.UpstreamRevision = &s

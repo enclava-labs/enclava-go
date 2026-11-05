@@ -57,11 +57,7 @@ func NewPreviewService(profiles ChunkProfiles, jobRows JobReader, jobSvc *jobs.S
 	if maxUploadMB <= 0 {
 		maxUploadMB = 32
 	}
-	return &PreviewService{profiles: profiles, jobRows: jobRows, maintenance: jobRows.(PreviewMaintenance), jobs: jobSvc, artifacts: store, parser: NewParser(store), source: sourceRepo, authorizer: source.NewAuthorizer(sourceRepo, 0), maxBytes: maxUploadMB * 1024 * 1024}
-}
-
-func (s *PreviewService) SetSourceAccessMaxStale(d time.Duration) {
-	s.authorizer.MaxStale = d
+	return &PreviewService{profiles: profiles, jobRows: jobRows, maintenance: jobRows.(PreviewMaintenance), jobs: jobSvc, artifacts: store, parser: NewParser(store), source: sourceRepo, authorizer: source.NewAuthorizer(sourceRepo), maxBytes: maxUploadMB * 1024 * 1024}
 }
 
 func (s *PreviewService) ListProfiles(ctx context.Context, p auth.Principal) ([]source.ChunkProfile, error) {

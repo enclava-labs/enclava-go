@@ -64,7 +64,7 @@ func NewGitHubAdapter(c source.Connection, secrets CredentialResolver) (Adapter,
 	return &GitHubAdapter{owner: owner, repo: repo, ref: firstNonEmpty(strings.TrimSpace(stringFromAny(c.Config["ref"])), "HEAD"), token: token, base: base, paths: paths, client: newConnectorHTTPClient()}, nil
 }
 func (g *GitHubAdapter) Capabilities() AdapterCapabilities {
-	return AdapterCapabilities{Content: true, Access: true, Membership: true, UnsupportedScopes: []string{"per-file ACL (GitHub permissions apply at repository scope)"}}
+	return AdapterCapabilities{Content: true}
 }
 func (g *GitHubAdapter) request(ctx context.Context, endpoint string, out any) error {
 	for attempt := 0; attempt < 3; attempt++ {
@@ -324,58 +324,6 @@ func (g *GitHubAdapter) allowed(p string) bool {
 		}
 	}
 	return false
-}
-func (g *GitHubAdapter) Access(ctx context.Context, c source.Connection, cursor Cursor, limit int) (AccessPage, error) {
-	x, n, e := g.collaborators(ctx, c, cursor, limit)
-	complete := n == ""
-	cmp := CompletenessIncomplete
-	if complete {
-		cmp = CompletenessComplete
-	}
-	return AccessPage{Grants: x, NextCursor: Cursor(n), Completeness: cmp, Snapshot: complete}, e
-}
-func (g *GitHubAdapter) Membership(ctx context.Context, c source.Connection, cursor Cursor, limit int) (MembershipPage, error) {
-	x, n, e := g.collaborators(ctx, c, cursor, limit)
-	complete := n == ""
-	cmp := CompletenessIncomplete
-	if complete {
-		cmp = CompletenessComplete
-	}
-	return MembershipPage{Memberships: x, NextCursor: Cursor(n), Completeness: cmp, Snapshot: complete}, e
-}
-func (g *GitHubAdapter) collaborators(ctx context.Context, c source.Connection, cursor Cursor, limit int) ([]AccessGrant, string, error) {
-	if limit < 1 || limit > 100 {
-		limit = 100
-	}
-	page := 1
-	if cursor != "" {
-		n, e := strconv.Atoi(string(cursor))
-		if e != nil || n < 1 {
-			return nil, "", errors.New("invalid github cursor")
-		}
-		page = n
-	}
-	var users []struct {
-		Login string `json:"login"`
-		ID    int64  `json:"id"`
-	}
-	endpoint := fmt.Sprintf("%s/repos/%s/%s/collaborators?per_page=%d&page=%d", g.base, url.PathEscape(g.owner), url.PathEscape(g.repo), limit, page)
-	if e := g.request(ctx, endpoint, &users); e != nil {
-		return nil, "", e
-	}
-	out := make([]AccessGrant, 0, len(users))
-	for _, u := range users {
-		id := u.Login
-		if id == "" {
-			id = strconv.FormatInt(u.ID, 10)
-		}
-		out = append(out, AccessGrant{NativeObjectID: "github:" + c.ID + ":" + g.owner + "/" + g.repo, NativeObjectKind: "repository", NativePrincipalID: id, NativePrincipalName: u.Login, NativeGroupID: g.owner + "/" + g.repo, Scope: "read", Effect: "allow"})
-	}
-	next := ""
-	if len(users) == limit {
-		next = strconv.Itoa(page + 1)
-	}
-	return out, next, nil
 }
 
 var _ Adapter = (*GitHubAdapter)(nil)

@@ -31,9 +31,7 @@ const (
 type StreamKind string
 
 const (
-	StreamContent    StreamKind = "content"
-	StreamAccess     StreamKind = "access"
-	StreamMembership StreamKind = "membership"
+	StreamContent StreamKind = "content"
 )
 
 // ContentItem carries provider identity and material, never a local source ref.
@@ -49,16 +47,6 @@ type ContentItem struct {
 	Locator                  source.Locator
 }
 
-// AccessGrant identifies provider-native principals until a binding resolves.
-type AccessGrant struct {
-	NativeObjectID, NativeObjectKind, NativePrincipalID, NativeGroupID string
-	// NativePrincipalName is the provider-visible login/display name for
-	// NativePrincipalID, recorded on the observed identity when known.
-	NativePrincipalName string
-	Scope, Effect       string
-	Inherited           bool
-}
-
 type ContentPage struct {
 	Items        []ContentItem
 	NextCursor   Cursor
@@ -67,31 +55,15 @@ type ContentPage struct {
 	Snapshot     bool
 }
 
-type AccessPage struct {
-	Grants       []AccessGrant
-	NextCursor   Cursor
-	Completeness Completeness
-	Snapshot     bool
-}
-
-type MembershipPage struct {
-	Memberships  []AccessGrant
-	NextCursor   Cursor
-	Completeness Completeness
-	Snapshot     bool
-}
-
 // Adapter pages are bounded; incomplete pages cannot authorize deletion.
 type Adapter interface {
 	Content(context.Context, source.Connection, Cursor, int) (ContentPage, error)
-	Access(context.Context, source.Connection, Cursor, int) (AccessPage, error)
-	Membership(context.Context, source.Connection, Cursor, int) (MembershipPage, error)
 	Capabilities() AdapterCapabilities
 }
 
 type AdapterCapabilities struct {
-	Content, Access, Membership bool
-	UnsupportedScopes           []string
+	Content           bool
+	UnsupportedScopes []string
 }
 
 type AdapterFactories map[SourceKind]func(source.Connection) (Adapter, error)
@@ -104,7 +76,6 @@ type ObservationRepository interface {
 	GetStream(context.Context, string, string, string) (StreamState, error)
 	PersistPage(context.Context, StreamState, []Observation, string, bool, bool, string) (StreamState, error)
 	ListObservations(context.Context, StreamState) ([]Observation, error)
-	UnmappedPrincipals(context.Context, string, string) (int, error)
 	WithFence(context.Context, StreamState, func(source.Tx) error) error
 }
 
@@ -123,7 +94,6 @@ const (
 const (
 	OperationSync   = "connector.sync"
 	OperationIngest = "rag.ingest"
-	OperationAccess = "rag.access"
 )
 
 const (
@@ -149,7 +119,6 @@ type Source struct {
 	CreatedAt          time.Time      `json:"created_at"`
 	UpdatedAt          time.Time      `json:"updated_at"`
 	LastSyncAt         *time.Time     `json:"last_sync_at,omitempty"`
-	UnmappedPrincipals int            `json:"unmapped_principals"`
 }
 
 // SyncJob is the wire-stable view of a durable connector.sync jobs row.

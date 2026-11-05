@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	"enclava-go/internal/source"
@@ -24,234 +23,6 @@ func newRepo(t *testing.T) (*DB, *SourceRepo, context.Context) {
 	return db, NewSourceRepo(db), context.Background()
 }
 
-// TestApplyAccessSnapshot proves a COMPLETE grants snapshot retires unseen
-// grants while an incomplete revision removes nothing.
-func TestApplyAccessSnapshot(t *testing.T) {
-	db, repo, ctx := newRepo(t)
-	seedTenant(t, ctx, db, idTenantA)
-	seedUser(t, ctx, db, idTenantA, "user1")
-	if err := repo.CreateConnection(ctx, source.Connection{
-		TenantID: idTenantA, ID: "conn_a", Kind: "github", Name: "gh", CredentialRef: "ref"}); err != nil {
-		t.Fatalf("create connection: %v", err)
-	}
-	if err := repo.InsertSourceIdentity(ctx, source.SourceIdentity{
-		TenantID: idTenantA, ConnectionID: "conn_a", SourceKind: "github",
-		ID: "sid_u1", NativeID: "u1", MappedUserID: "user1"}); err != nil {
-		t.Fatalf("insert identity: %v", err)
-	}
-	if _, err := repo.UpsertObject(ctx, source.Object{
-		TenantID: idTenantA, ConnectionID: "conn_a", ID: "obj_a", Kind: "repo",
-		NativeID: "acme/widgets", AuthorizationMode: source.AuthorizationSourceACL,
-		ObservedSeq: 1}); err != nil {
-		t.Fatalf("upsert object: %v", err)
-	}
-
-	grant := func(objID, subjectKind, subjectID, effect string, rev int64) source.SourceGrant {
-		return source.SourceGrant{TenantID: idTenantA, ConnectionID: "conn_a",
-			ObjectID: objID, SubjectKind: subjectKind, SubjectID: subjectID,
-			Effect: effect, AccessRevision: rev}
-	}
-	countGrants := func() (allow, deny int) {
-		if err := db.SQL.QueryRowContext(ctx, `
-			SELECT COUNT(*) FILTER (WHERE effect='allow'),
-			       COUNT(*) FILTER (WHERE effect='deny')
-			FROM source_grants WHERE tenant_id = $1`, idTenantA).Scan(&allow, &deny); err != nil {
-			t.Fatalf("count grants: %v", err)
-		}
-		return
-	}
-
-	// Revision 1 completes with two grants.
-	if err := repo.BeginSnapshot(ctx, idTenantA, "conn_a", source.SnapshotGrants, 1); err != nil {
-		t.Fatalf("begin snapshot 1: %v", err)
-	}
-	if err := repo.WithTx(ctx, func(tx source.Tx) error {
-		return repo.ApplyAccessSnapshot(ctx, tx, idTenantA, "conn_a", 1, []source.SourceGrant{
-			grant("obj_a", "user", "sid_u1", "allow", 1),
-			grant("obj_a", "user", "sid_u1", "deny", 1),
-		}, 3)
-	}); err != nil {
-		t.Fatalf("apply snapshot 1: %v", err)
-	}
-	allow, deny := countGrants()
-	if allow != 1 || deny != 1 {
-		t.Fatalf("expected 1 allow + 1 deny at rev1, got %d/%d", allow, deny)
-	}
-
-	// Revision 2 completes without the deny — the unseen deny is retired.
-	if err := repo.BeginSnapshot(ctx, idTenantA, "conn_a", source.SnapshotGrants, 2); err != nil {
-		t.Fatalf("begin snapshot 2: %v", err)
-	}
-	if err := repo.WithTx(ctx, func(tx source.Tx) error {
-		return repo.ApplyAccessSnapshot(ctx, tx, idTenantA, "conn_a", 2, []source.SourceGrant{
-			grant("obj_a", "user", "sid_u1", "allow", 2),
-		}, 1)
-	}); err != nil {
-		t.Fatalf("apply snapshot 2: %v", err)
-	}
-	allow, deny = countGrants()
-	if allow != 2 || deny != 0 {
-		t.Fatalf("expected rev1+rev2 allows and deny pruned, got allow=%d deny=%d", allow, deny)
-	}
-	var unmapped int
-	if err := db.SQL.QueryRowContext(ctx, `SELECT unmapped_subjects FROM access_snapshots
-		WHERE tenant_id = $1 AND connection_id = 'conn_a' AND kind = 'grants' AND revision = 2`, idTenantA).Scan(&unmapped); err != nil || unmapped != 1 {
-		t.Fatalf("grant unmapped count=%d err=%v", unmapped, err)
-	}
-	grants, err := repo.GrantsForObjects(ctx, idTenantA, "conn_a", []string{"obj_a", "missing"}, 2)
-	if err != nil || len(grants) != 1 || grants[0].SubjectID != "sid_u1" || grants[0].Effect != "allow" {
-		t.Fatalf("current grants=%+v err=%v", grants, err)
-	}
-	if _, err := repo.GrantsForObjects(ctx, idTenantA, "conn_a", []string{"obj_a"}, 1); !errors.Is(err, source.ErrDenied) {
-		t.Fatalf("superseded grant revision: %v", err)
-	}
-	grants, err = repo.GrantsForObjects(ctx, idTenantA, "conn_a", []string{"missing"}, 2)
-	if err != nil || len(grants) != 0 {
-		t.Fatalf("empty grants=%+v err=%v", grants, err)
-	}
-
-	// Revision 3 never completes: begin + insert rows via a rolled-back
-	// apply leaves everything intact.
-	if err := repo.BeginSnapshot(ctx, idTenantA, "conn_a", source.SnapshotGrants, 3); err != nil {
-		t.Fatalf("begin snapshot 3: %v", err)
-	}
-	before, _ := countGrants()
-	err = repo.WithTx(ctx, func(tx source.Tx) error {
-		if err := repo.ApplyAccessSnapshot(ctx, tx, idTenantA, "conn_a", 3, nil, 7); err != nil {
-			return err
-		}
-		return errors.New("abort") // caller abandons the observation
-	})
-	if err == nil {
-		t.Fatalf("expected abort error")
-	}
-	after, _ := countGrants()
-	if after != before {
-		t.Fatalf("aborted snapshot changed grants: %d -> %d", before, after)
-	}
-
-	// The incomplete revision is distinguishable and not authoritative.
-	var status string
-	if err := db.SQL.QueryRowContext(ctx, `
-		SELECT status, unmapped_subjects FROM access_snapshots
-		WHERE tenant_id = $1 AND connection_id = 'conn_a' AND kind = 'grants' AND revision = 3`,
-		idTenantA).Scan(&status, &unmapped); err != nil {
-		t.Fatalf("read snapshot 3: %v", err)
-	}
-	if status != "incomplete" || unmapped != 0 {
-		t.Fatalf("snapshot 3 status=%q unmapped=%d, want incomplete and zero", status, unmapped)
-	}
-	if err := repo.BeginSnapshot(ctx, idTenantA, "conn_a", source.SnapshotGrants, 4); err != nil {
-		t.Fatalf("begin all-subject snapshot: %v", err)
-	}
-	if err := repo.WithTx(ctx, func(tx source.Tx) error {
-		return repo.ApplyAccessSnapshot(ctx, tx, idTenantA, "conn_a", 4, []source.SourceGrant{
-			grant("obj_a", source.GrantSubjectAll, "", source.GrantEffectDeny, 4),
-		}, 0)
-	}); err != nil {
-		t.Fatalf("apply all-subject snapshot: %v", err)
-	}
-	grants, err = repo.GrantsForObjects(ctx, idTenantA, "conn_a", []string{"obj_a"}, 4)
-	if err != nil || len(grants) != 1 || grants[0].SubjectKind != source.GrantSubjectAll || grants[0].SubjectID != "" || grants[0].Effect != source.GrantEffectDeny {
-		t.Fatalf("all-subject grant=%+v err=%v", grants, err)
-	}
-}
-
-// TestApplyMembershipSnapshot proves atomic membership replacement at a
-// complete revision and that an incomplete replacement never displaces the
-// last complete set.
-func TestApplyMembershipSnapshot(t *testing.T) {
-	db, repo, ctx := newRepo(t)
-	seedTenant(t, ctx, db, idTenantA)
-	seedUser(t, ctx, db, idTenantA, "user1")
-	seedUser(t, ctx, db, idTenantA, "user2")
-	if err := repo.CreateConnection(ctx, source.Connection{
-		TenantID: idTenantA, ID: "conn_a", Kind: "github", Name: "gh", CredentialRef: "ref"}); err != nil {
-		t.Fatalf("create connection: %v", err)
-	}
-	for _, id := range []struct{ id, native, user string }{
-		{"sid_u1", "u1", "user1"},
-		{"sid_u2", "u2", "user2"},
-	} {
-		if err := repo.InsertSourceIdentity(ctx, source.SourceIdentity{
-			TenantID: idTenantA, ConnectionID: "conn_a", SourceKind: "github",
-			ID: id.id, NativeID: id.native, MappedUserID: id.user}); err != nil {
-			t.Fatalf("insert identity %s: %v", id.id, err)
-		}
-	}
-	if err := repo.InsertSourceGroup(ctx, source.SourceGroup{
-		TenantID: idTenantA, ConnectionID: "conn_a", SourceKind: "github",
-		ID: "grp_1", NativeID: "g1", Name: "devs"}); err != nil {
-		t.Fatalf("insert group: %v", err)
-	}
-
-	member := func(memberID string, rev int64) source.SourceGroupMembership {
-		return source.SourceGroupMembership{TenantID: idTenantA, ConnectionID: "conn_a",
-			GroupID: "grp_1", MemberID: memberID, AccessRevision: rev}
-	}
-
-	// Complete revision 1: sid_u1 in grp_1.
-	if err := repo.BeginSnapshot(ctx, idTenantA, "conn_a", source.SnapshotMembership, 1); err != nil {
-		t.Fatalf("begin: %v", err)
-	}
-	if err := repo.WithTx(ctx, func(tx source.Tx) error {
-		return repo.ApplyMembershipSnapshot(ctx, tx, idTenantA, "conn_a", 1, []source.SourceGroupMembership{member("sid_u1", 1)}, 2)
-	}); err != nil {
-		t.Fatalf("apply rev1: %v", err)
-	}
-
-	// An incomplete revision 2 row must not displace the rev-1 set.
-	if err := repo.BeginSnapshot(ctx, idTenantA, "conn_a", source.SnapshotMembership, 2); err != nil {
-		t.Fatalf("begin rev2: %v", err)
-	}
-	if err := repo.InsertSourceMembership(ctx, member("sid_u2", 2)); err != nil {
-		t.Fatalf("insert incomplete membership: %v", err)
-	}
-	groups, err := repo.GroupIDsForIdentity(ctx, idTenantA, "conn_a", "sid_u1", 1)
-	if err != nil {
-		t.Fatalf("groups for sid_u1: %v", err)
-	}
-	if len(groups) != 1 || groups[0] != "grp_1" {
-		t.Fatalf("expected sid_u1 still in grp_1 at latest complete rev, got %v", groups)
-	}
-	groups, err = repo.GroupIDsForIdentity(ctx, idTenantA, "conn_a", "sid_u2", 1)
-	if err != nil {
-		t.Fatalf("groups for sid_u2: %v", err)
-	}
-	if len(groups) != 0 {
-		t.Fatalf("incomplete rev2 membership must not be authoritative, got %v", groups)
-	}
-
-	// Completing revision 2 replaces the set atomically.
-	if err := repo.WithTx(ctx, func(tx source.Tx) error {
-		return repo.ApplyMembershipSnapshot(ctx, tx, idTenantA, "conn_a", 2, []source.SourceGroupMembership{member("sid_u2", 2)}, 4)
-	}); err != nil {
-		t.Fatalf("apply rev2: %v", err)
-	}
-	groups, err = repo.GroupIDsForIdentity(ctx, idTenantA, "conn_a", "sid_u1", 2)
-	if err != nil {
-		t.Fatalf("groups for sid_u1 post-rev2: %v", err)
-	}
-	if len(groups) != 0 {
-		t.Fatalf("sid_u1 membership should be retired, got %v", groups)
-	}
-	groups, err = repo.GroupIDsForIdentity(ctx, idTenantA, "conn_a", "sid_u2", 2)
-	if err != nil {
-		t.Fatalf("groups for sid_u2 post-rev2: %v", err)
-	}
-	if len(groups) != 1 || groups[0] != "grp_1" {
-		t.Fatalf("sid_u2 should be in grp_1, got %v", groups)
-	}
-	if _, err := repo.GroupIDsForIdentity(ctx, idTenantA, "conn_a", "sid_u2", 1); !errors.Is(err, source.ErrDenied) {
-		t.Fatalf("superseded membership revision: %v", err)
-	}
-	var unmapped int
-	if err := db.SQL.QueryRowContext(ctx, `SELECT unmapped_subjects FROM access_snapshots
-		WHERE tenant_id = $1 AND connection_id = 'conn_a' AND kind = 'membership' AND revision = 2`, idTenantA).Scan(&unmapped); err != nil || unmapped != 4 {
-		t.Fatalf("membership unmapped count=%d err=%v", unmapped, err)
-	}
-}
-
 // TestSourceRepoObjects covers upsert dedupe, tombstone visibility, parent
 // hierarchy and cross-tenant rejection.
 func TestSourceRepoObjects(t *testing.T) {
@@ -265,7 +36,7 @@ func TestSourceRepoObjects(t *testing.T) {
 
 	obj, err := repo.UpsertObject(ctx, source.Object{
 		TenantID: idTenantA, ConnectionID: "conn_a", ID: "obj_parent", Kind: "repo",
-		NativeID: "acme/widgets", AuthorizationMode: source.AuthorizationSourceACL,
+		NativeID: "acme/widgets", AuthorizationMode: source.AuthorizationCollection,
 		ObservedSeq: 1})
 	if err != nil {
 		t.Fatalf("upsert parent: %v", err)
@@ -281,7 +52,7 @@ func TestSourceRepoObjects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upsert duplicate: %v", err)
 	}
-	if again.ID != "obj_parent" || again.AuthorizationMode != source.AuthorizationSourceACL {
+	if again.ID != "obj_parent" || again.AuthorizationMode != source.AuthorizationCollection {
 		t.Fatalf("upsert mutated identity: %+v", again)
 	}
 
@@ -289,34 +60,12 @@ func TestSourceRepoObjects(t *testing.T) {
 	child, err := repo.UpsertObject(ctx, source.Object{
 		TenantID: idTenantA, ConnectionID: "conn_a", ID: "obj_child", Kind: "file",
 		NativeID: "acme/widgets/main.go", ParentObjectID: "obj_parent",
-		AuthorizationMode: source.AuthorizationSourceACL, ObservedSeq: 2})
+		AuthorizationMode: source.AuthorizationCollection, ObservedSeq: 2})
 	if err != nil {
 		t.Fatalf("upsert child: %v", err)
 	}
 	if child.ParentObjectID != "obj_parent" {
 		t.Fatalf("child parent = %q", child.ParentObjectID)
-	}
-	ids, err := repo.AncestorObjectIDs(ctx, idTenantA, "conn_a", "obj_child", 1)
-	if err != nil || len(ids) != 2 || ids[0] != "obj_child" || ids[1] != "obj_parent" {
-		t.Fatalf("ancestor chain=%v err=%v", ids, err)
-	}
-	if _, err := repo.AncestorObjectIDs(ctx, idTenantA, "conn_a", "obj_child", 0); !errors.Is(err, source.ErrDenied) {
-		t.Fatalf("depth limit: %v", err)
-	}
-	if _, err := repo.AncestorObjectIDs(ctx, idTenantB, "conn_a", "obj_child", 8); !errors.Is(err, source.ErrDenied) {
-		t.Fatalf("cross-tenant chain: %v", err)
-	}
-	if _, err := repo.AncestorObjectIDs(ctx, idTenantA, "conn_a", "missing", 8); !errors.Is(err, source.ErrDenied) {
-		t.Fatalf("missing object: %v", err)
-	}
-	if err := repo.ObserveObject(ctx, idTenantA, "obj_parent", "obj_child", nil); err != nil {
-		t.Fatalf("create cycle: %v", err)
-	}
-	if _, err := repo.AncestorObjectIDs(ctx, idTenantA, "conn_a", "obj_child", 8); !errors.Is(err, source.ErrDenied) {
-		t.Fatalf("cyclic chain: %v", err)
-	}
-	if err := repo.ObserveObject(ctx, idTenantA, "obj_parent", "", nil); err != nil {
-		t.Fatalf("restore parent: %v", err)
 	}
 
 	// Cross-tenant parent insert fails on the composite FK.
@@ -357,9 +106,6 @@ func TestSourceRepoObjects(t *testing.T) {
 	}
 	if got.TombstonedAt == nil {
 		t.Fatalf("tombstone flag missing")
-	}
-	if _, err := repo.AncestorObjectIDs(ctx, idTenantA, "conn_a", "obj_child", 8); !errors.Is(err, source.ErrDenied) {
-		t.Fatalf("tombstoned chain: %v", err)
 	}
 	revision := "new-revision"
 	if err := repo.ObserveObject(ctx, idTenantA, "obj_child", "obj_parent", &revision); err != nil {
@@ -402,6 +148,77 @@ func TestSourceRepoRestrictions(t *testing.T) {
 	}
 }
 
+// TestCollectionsForObjects proves the authorizer's containing-collection
+// read: live items map objects to their collection access rows, removed
+// items and foreign tenants are excluded.
+func TestCollectionsForObjects(t *testing.T) {
+	db, repo, ctx := newRepo(t)
+	seedTenant(t, ctx, db, idTenantA)
+	seedTenant(t, ctx, db, idTenantB)
+	seedUser(t, ctx, db, idTenantA, "user1")
+	if err := repo.CreateConnection(ctx, source.Connection{
+		TenantID: idTenantA, ID: "conn_a", Kind: "github", Name: "gh", CredentialRef: "ref"}); err != nil {
+		t.Fatalf("create connection: %v", err)
+	}
+	for _, id := range []string{"obj_a", "obj_b", "obj_c"} {
+		if _, err := repo.UpsertObject(ctx, source.Object{
+			TenantID: idTenantA, ConnectionID: "conn_a", ID: id, Kind: "repo",
+			NativeID: "acme/" + id, ObservedSeq: 1}); err != nil {
+			t.Fatalf("upsert %s: %v", id, err)
+		}
+	}
+	collection := func(id string, active bool, audience string) {
+		if _, err := db.SQL.ExecContext(ctx, `
+			INSERT INTO knowledge_collections
+			    (tenant_id, id, name, embedding_model, qdrant_collection, owner_actor_id, is_active, audience)
+			VALUES ($1, $2, $2, 'model', 'q_'||$2, 'user1', $3, $4::jsonb)`,
+			idTenantA, id, active, audience); err != nil {
+			t.Fatalf("collection %s: %v", id, err)
+		}
+	}
+	item := func(coll, obj string, removed bool) {
+		if _, err := db.SQL.ExecContext(ctx, `
+			INSERT INTO collection_items (tenant_id, id, collection_id, object_id, removed_at)
+			VALUES ($1, $2, $3, $4, CASE WHEN $5 THEN now() ELSE NULL END)`,
+			idTenantA, "it_"+coll+"_"+obj, coll, obj, removed); err != nil {
+			t.Fatalf("item: %v", err)
+		}
+	}
+	collection("coll_a", true, `["u1","*"]`)
+	collection("coll_b", false, `[]`)
+	item("coll_a", "obj_a", false)
+	item("coll_b", "obj_a", false)
+	item("coll_a", "obj_b", true)
+
+	got, err := repo.CollectionsForObjects(ctx, idTenantA, []string{"obj_a", "obj_b", "obj_c"})
+	if err != nil {
+		t.Fatalf("collections for objects: %v", err)
+	}
+	if len(got["obj_a"]) != 2 {
+		t.Fatalf("obj_a collections = %+v", got["obj_a"])
+	}
+	byID := map[string]source.CollectionAccess{}
+	for _, c := range got["obj_a"] {
+		byID[c.ID] = c
+	}
+	if !byID["coll_a"].IsActive || byID["coll_a"].OwnerActorID != "user1" || len(byID["coll_a"].Audience) != 2 {
+		t.Fatalf("coll_a access = %+v", byID["coll_a"])
+	}
+	if byID["coll_b"].IsActive {
+		t.Fatalf("coll_b access = %+v", byID["coll_b"])
+	}
+	if _, ok := got["obj_b"]; ok {
+		t.Fatalf("removed item must not map obj_b: %+v", got["obj_b"])
+	}
+	if _, ok := got["obj_c"]; ok {
+		t.Fatalf("collection-less obj_c must be absent: %+v", got["obj_c"])
+	}
+	other, err := repo.CollectionsForObjects(ctx, idTenantB, []string{"obj_a"})
+	if err != nil || len(other) != 0 {
+		t.Fatalf("cross-tenant = %+v err=%v", other, err)
+	}
+}
+
 // TestIngestHandoffExists proves the crash-window query: a matching jobs row
 // or an index generation for the observed object version both count as
 // durable handoff; unrelated rows do not.
@@ -414,7 +231,7 @@ func TestIngestHandoffExists(t *testing.T) {
 	}
 	if _, err := repo.UpsertObject(ctx, source.Object{
 		TenantID: idTenantA, ConnectionID: "conn_a", ID: "obj_a", Kind: "repo",
-		NativeID: "acme/widgets", AuthorizationMode: source.AuthorizationSourceACL,
+		NativeID: "acme/widgets", AuthorizationMode: source.AuthorizationCollection,
 		ObservedSeq: 1}); err != nil {
 		t.Fatalf("upsert object: %v", err)
 	}
@@ -494,7 +311,7 @@ func TestIngestHandoffExistsGeneration(t *testing.T) {
 	}
 	if _, err := repo.UpsertObject(ctx, source.Object{
 		TenantID: idTenantA, ConnectionID: "conn_a", ID: "obj_a", Kind: "repo",
-		NativeID: "acme/widgets", AuthorizationMode: source.AuthorizationSourceACL,
+		NativeID: "acme/widgets", AuthorizationMode: source.AuthorizationCollection,
 		ObservedSeq: 1}); err != nil {
 		t.Fatalf("upsert object: %v", err)
 	}
@@ -541,7 +358,7 @@ func TestIngestFailed(t *testing.T) {
 	}
 	if _, err := repo.UpsertObject(ctx, source.Object{
 		TenantID: idTenantA, ConnectionID: "conn_a", ID: "obj_a", Kind: "message",
-		NativeID: "slack:C1:1.0", AuthorizationMode: source.AuthorizationSourceACL, ObservedSeq: 1}); err != nil {
+		NativeID: "slack:C1:1.0", AuthorizationMode: source.AuthorizationCollection, ObservedSeq: 1}); err != nil {
 		t.Fatalf("upsert object: %v", err)
 	}
 	if err := repo.InsertObjectVersion(ctx, idTenantA, source.ObjectVersion{

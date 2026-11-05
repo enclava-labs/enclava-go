@@ -67,7 +67,7 @@ func newActivityFixture(t *testing.T) *activityFixture {
 	executor, err := inference.NewService(inference.Deps{
 		Endpoints:  endpoints,
 		Sources:    sourceRepo,
-		Authorizer: source.NewAuthorizer(sourceRepo, time.Hour),
+		Authorizer: source.NewAuthorizer(sourceRepo),
 		Billing:    billing.NewService(billingRepo),
 		Artifacts:  artifactRepo,
 	})
@@ -123,7 +123,7 @@ func containsAttentionKind(items []AttentionItem, kind string) bool {
 
 // uploadFailedDocument seeds one failed document via the real pipeline: a
 // whitespace-only upload fails the embed job with "no extractable text".
-func (f *activityFixture) uploadFailedDocument(t *testing.T, uploader auth.Principal, name, collectionID string, audience []string) string {
+func (f *activityFixture) uploadFailedDocument(t *testing.T, uploader auth.Principal, name, collectionID string) string {
 	t.Helper()
 	var body strings.Builder
 	for _, b := range []byte(name) {
@@ -131,7 +131,7 @@ func (f *activityFixture) uploadFailedDocument(t *testing.T, uploader auth.Princ
 		body.WriteByte('\t')
 	}
 	out, err := f.ragSvc.UploadDocument(f.ctx, uploader, collectionID, rag.UploadDocumentInput{
-		FileName: name, MimeType: "text/plain", Bytes: []byte(body.String()), Audience: audience,
+		FileName: name, MimeType: "text/plain", Bytes: []byte(body.String()),
 	})
 	if err != nil {
 		t.Fatalf("upload %s: %v", name, err)
@@ -448,20 +448,27 @@ func TestDashboardAttentionCapabilityMatrix(t *testing.T) {
 	revoked := activityPrincipal(t, f, "revoked")
 	admin := activityPrincipal(t, f, "admin", auth.ScopePlatformAdmin, "pricing.manage")
 
-	collection, err := f.ragSvc.CreateCollection(f.ctx, uploader, rag.CreateCollectionInput{
-		Name: "Docs", ChunkSize: 100, ChunkOverlap: 10, ACL: map[string]any{"public": true},
+	restricted, err := f.ragSvc.CreateCollection(f.ctx, uploader, rag.CreateCollectionInput{
+		Name: "Docs restricted", ChunkSize: 100, ChunkOverlap: 10,
+		ACL: map[string]any{"audience": []string{uploader.ActorID}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Three restricted failures (uploader-only audience) uploaded BEFORE the
-	// one accessible failure — authorization must happen before the limit.
+	collection, err := f.ragSvc.CreateCollection(f.ctx, uploader, rag.CreateCollectionInput{
+		Name: "Docs", ChunkSize: 100, ChunkOverlap: 10,
+		ACL: map[string]any{"audience": []string{uploader.ActorID, member.ActorID, manager.ActorID}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Three restricted failures (uploader-only collection) uploaded BEFORE the
+	// one shared failure — authorization must happen before the limit.
 	for i := range 3 {
-		f.uploadFailedDocument(t, uploader, fmt.Sprintf("restricted-%d.txt", i), collection.ID, []string{uploader.ActorID})
+		f.uploadFailedDocument(t, uploader, fmt.Sprintf("restricted-%d.txt", i), restricted.ID)
 		f.runNextEmbedFailure(t)
 	}
-	f.uploadFailedDocument(t, uploader, "shared-fail.txt", collection.ID,
-		[]string{uploader.ActorID, member.ActorID, manager.ActorID})
+	f.uploadFailedDocument(t, uploader, "shared-fail.txt", collection.ID)
 	f.runNextEmbedFailure(t)
 
 	f.failExtraction(t, uploader, "failed-extract-1")
@@ -706,7 +713,8 @@ func TestDashboardHomeMetricsRealReads(t *testing.T) {
 	admin := activityPrincipal(t, f, "metrics-admin", auth.ScopePlatformAdmin)
 
 	collection, err := f.ragSvc.CreateCollection(f.ctx, uploader, rag.CreateCollectionInput{
-		Name: "Metrics", ChunkSize: 100, ChunkOverlap: 10, ACL: map[string]any{"public": true},
+		Name: "Metrics", ChunkSize: 100, ChunkOverlap: 10,
+		ACL: map[string]any{"audience": []string{uploader.ActorID, member.ActorID}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -714,7 +722,7 @@ func TestDashboardHomeMetricsRealReads(t *testing.T) {
 	for i := range 3 {
 		if _, err := f.ragSvc.UploadDocument(f.ctx, uploader, collection.ID, rag.UploadDocumentInput{
 			FileName: fmt.Sprintf("doc-%d.txt", i), MimeType: "text/plain",
-			Bytes: []byte(fmt.Sprintf("real document body %d", i)), Audience: []string{uploader.ActorID, member.ActorID},
+			Bytes: []byte(fmt.Sprintf("real document body %d", i)),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -755,10 +763,9 @@ func TestDashboardHomeMetricsRealReads(t *testing.T) {
 		t.Fatalf("OrgBudget = %+v, want the tenant budget progress scalar", metrics.OrgBudget)
 	}
 
-	// The admin's own authorized document count is zero — rag.manage-derived
-	// capabilities never bypass source ACLs, and admin holds no audience.
-	if metrics.DocumentTotal != 0 {
-		t.Fatalf("admin DocumentTotal = %d, want the ACL-authorized count (0)", metrics.DocumentTotal)
+	// Platform admins read every collection, so the admin counts all three.
+	if metrics.DocumentTotal != 3 {
+		t.Fatalf("admin DocumentTotal = %d, want every collection's documents (3)", metrics.DocumentTotal)
 	}
 	if metrics.ConversationTotal != 0 {
 		t.Fatalf("admin ConversationTotal = %d, want own rows only (0)", metrics.ConversationTotal)

@@ -4,11 +4,9 @@
 // handleDashboardConnectors, handleDashboardConnectorAction, routes
 // /dashboard/connectors + /dashboard/partials/connectors,
 // templates/partial_connectors.tmpl, static/connectors.js).
-//
 // D-17: handlers render only — every write goes through Enclava.api against
 // /api/v1/connectors/* from static/pages/sources.js. D-18: one capability
-// per route; the bindings drawer is separately gated on access.manage so it
-// can never render for managers without platform.admin.
+// per route; the credentials tab is separately gated on access.manage.
 package httpx
 
 import (
@@ -26,7 +24,6 @@ import (
 	"enclava-go/internal/connectors"
 	"enclava-go/internal/credentials"
 	"enclava-go/internal/rag"
-	"enclava-go/internal/source"
 )
 
 // dashboardSourcesLimit bounds the table the same way the old page did.
@@ -70,14 +67,19 @@ func safeExternalLink(raw string) string {
 	return ""
 }
 
-// dashboardSourcePermissions is the one-line permission model per provider
-// (§6.8 — static per-family facts, never observed state).
-var dashboardSourcePermissions = map[string]string{
-	"slack":        "Workspace ACLs",
-	"teams":        "Channel membership",
-	"github":       "Repo collaborators",
-	"notion":       "Published audiences",
-	"google_drive": "Drive sharing",
+// dashboardSourceRule is the single read rule every synced object follows:
+// the destination collection's readers, and only they, can read what the
+// source syncs. Rendered verbatim; <collection> interpolates the name.
+const dashboardSourceRuleFmt = "Everyone who can open %s can read everything this source syncs."
+
+// dashboardSourceRule renders the rule for a row: the resolved collection
+// name when present, "the collection" otherwise.
+func dashboardSourceRule(collection string) string {
+	name := strings.TrimSpace(collection)
+	if name == "" {
+		name = "the collection"
+	}
+	return fmt.Sprintf(dashboardSourceRuleFmt, name)
 }
 
 // dashboardSourcesData is the page/table view model.
@@ -102,7 +104,7 @@ type dashboardSourceRow struct {
 	Monogram    string // one-letter badge from the source name
 	Scope       string
 	Collection  string
-	Permissions string // one-line permission model per provider
+	Permissions string // collection read rule with the collection name filled in
 	State       string // statusPill state: healthy|syncing|warning|paused
 	LastError   string
 
@@ -117,7 +119,6 @@ type dashboardSourceRow struct {
 	Fetching      bool   // the content stream is still listing items
 	FailureReason string // most common failed-item message, escaped at render
 	FailureCount  int64
-	NeedsBinding  bool // FailureReason points at an unlinked source identity
 	HasProgress   bool
 	ProgressPct   int
 }
@@ -136,7 +137,6 @@ func (a *App) registerDashboardSourcesRoutes() {
 	a.mux.HandleFunc("/dashboard/partials/sources/table", a.sessionAuth.requireCap(capSourcesManage, a.handleDashboardSourcesTable))
 	a.mux.HandleFunc("/dashboard/partials/sources/credentials", a.sessionAuth.requireCap(capAccessManage, a.handleDashboardSourcesCredentials))
 	a.mux.HandleFunc("/dashboard/partials/sources/drawer", a.sessionAuth.requireCap(capSourcesManage, a.handleDashboardSourcesDrawer))
-	a.mux.HandleFunc("/dashboard/partials/sources/bindings", a.sessionAuth.requireCap(capAccessManage, a.handleDashboardSourcesBindings))
 }
 
 func init() { registerDashboardPage((*App).registerDashboardSourcesRoutes) }
@@ -186,7 +186,7 @@ func (a *App) handleDashboardSourcesTable(w http.ResponseWriter, r *http.Request
 	a.renderDashboardFragment(w, r, "sources", "sources-table", dashboardSourcesData{Rows: rows, Status: status, AnySyncing: anySyncing, Empty: sourcesEmpty(status, caps.SourcesManage)})
 }
 
-// ── Credentials tab (access.manage-gated like the bindings drawer) ────────
+// ── Credentials tab (access.manage-gated) ────────────────────────────────
 
 // dashboardCredentialsData feeds the Credentials tab: the secrets store's
 // own listing plus the one-shot OAuth return notices (?connected/?error).
@@ -392,54 +392,6 @@ func (a *App) handleDashboardSourcesDrawer(w http.ResponseWriter, r *http.Reques
 	a.renderDashboardFragment(w, r, "sources", "sources-drawer", data)
 }
 
-// dashboardSourceBindingsData feeds the access.manage-gated bindings drawer.
-type dashboardSourceBindingsData struct {
-	SourceID   string
-	SourceName string
-	Source     connectors.Source
-	Bindings   []source.SourceIdentity
-	// Users backs the Enclava-user picker; UserLabels shows mapped bindings by email.
-	Users      []auth.User
-	UserLabels map[string]string
-}
-
-func (a *App) handleDashboardSourcesBindings(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		WriteMethodNotAllowed(w)
-		return
-	}
-	if a.connectorSvc == nil {
-		WriteOpenAIError(w, http.StatusNotImplemented, "connectors are not configured", "server_error", "not_configured")
-		return
-	}
-	p, _ := auth.PrincipalFromContext(r.Context())
-	sourceID := strings.TrimSpace(r.URL.Query().Get("source"))
-	data := dashboardSourceBindingsData{SourceID: sourceID}
-	if src, err := a.connectorSvc.GetSource(r.Context(), p, sourceID); err == nil {
-		data.SourceName = src.Name
-		data.Source = src
-	} else {
-		writeConnectorNotFoundOrError(w, err, "connector_source_fetch_failed")
-		return
-	}
-	if rows, err := a.connectorSvc.ListSourceBindings(r.Context(), p, sourceID); err == nil {
-		data.Bindings = rows
-	} else {
-		log.Printf("dashboard sources bindings: %v", err)
-	}
-	if a.identity != nil {
-		if users, err := a.identity.ListUsers(r.Context(), p.TenantID); err == nil {
-			data.Users, data.UserLabels = users, make(map[string]string, len(users))
-			for _, u := range users {
-				data.UserLabels[u.ID] = u.Email
-			}
-		} else {
-			log.Printf("dashboard sources bindings users: %v", err)
-		}
-	}
-	a.renderDashboardFragment(w, r, "sources", "sources-bindings", data)
-}
-
 // dashboardSourceRows projects the caller's sources into table rows: the
 // latest sync job per source (bounded fan-out, same pattern as the attention
 // aggregator — covers scheduled syncs submitted under the scheduler's
@@ -476,18 +428,17 @@ func (a *App) dashboardSourceRows(ctx context.Context, p auth.Principal) ([]dash
 			Monogram:    dashboardSourceMonogram(src.Name, src.Type),
 			Scope:       dashboardSourceScope(src),
 			Collection:  dashboardSourceCollection(src.TargetCollectionID, names),
-			Permissions: dashboardSourcePermissionLabel(src.Type),
+			Permissions: dashboardSourceRule(names[src.TargetCollectionID]),
 			State:       dashboardSourceState(src, latest),
 			LastError:   dashboardSourceError(latest),
 		}
 		if row.LastError == "" && row.State != "syncing" {
-			for _, stream := range []connectors.StreamKind{connectors.StreamContent, connectors.StreamAccess, connectors.StreamMembership} {
-				if state, err := a.connectorSvc.GetStreamState(ctx, p, src.ID, string(stream)); err == nil && state.LastError != "" {
-					row.LastError = state.LastError
-					if src.IsEnabled {
-						row.State = "warning"
-					}
-					break
+			// The content stream's own error covers failures the job row
+			// does not carry.
+			if state, err := a.connectorSvc.GetStreamState(ctx, p, src.ID, string(connectors.StreamContent)); err == nil && state.LastError != "" {
+				row.LastError = state.LastError
+				if src.IsEnabled {
+					row.State = "warning"
 				}
 			}
 		}
@@ -503,7 +454,6 @@ func (a *App) dashboardSourceRows(ctx context.Context, p auth.Principal) ([]dash
 			row.Processing = progress.Processing
 			row.FailureReason = progress.FailureReason
 			row.FailureCount = progress.FailureCount
-			row.NeedsBinding = strings.Contains(progress.FailureReason, "bind their source identity")
 			if progress.Items > 0 {
 				row.HasProgress = true
 				row.ProgressPct = int((progress.Indexed + progress.Failed) * 100 / progress.Items)
@@ -545,15 +495,6 @@ func dashboardSourceError(latest *connectors.SyncJob) string {
 		return latest.ErrorMessage
 	}
 	return ""
-}
-
-// dashboardSourcePermissionLabel is the §6.8 one-line permission model;
-// unknown kinds render "—".
-func dashboardSourcePermissionLabel(kind string) string {
-	if p, ok := dashboardSourcePermissions[kind]; ok {
-		return p
-	}
-	return "—"
 }
 
 // dashboardSourceProviderLabel maps a canonical kind to its tile label.
