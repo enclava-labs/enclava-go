@@ -3,8 +3,10 @@
      settings as live controls — Available to people, the single Default and
      the Fallback alias. Writes go through /api/v1/models/settings/{model}
      from pages/models.js; refresh re-fetches through the section's hx-get so
-     a save (or a refused one) re-renders the controls from stored state. */}}
-<section class="section" id="models-catalog" hx-get="/dashboard/partials/models/catalog" hx-trigger="refresh from:body" hx-swap="outerHTML">
+     a save (or a refused one) re-renders the controls from stored state; a
+     newer refresh replaces one still in flight so quick edits never render
+     a pre-save snapshot. */}}
+<section class="section" id="models-catalog" hx-get="/dashboard/partials/models/catalog" hx-trigger="refresh from:body" hx-swap="outerHTML" hx-sync="this:replace">
   <div class="card">
     <p class="desc">Default is used for new assistants, extraction and search rewrites, and API chat requests that name no model. Available to people — unchecked models are hidden from people and refused for them; administrators can still test them. Fallback answers instead when the model has no working endpoint, is unavailable, or its server refuses or fails before answering.</p>
     {{if .Data.Error}}<div class="attention">{{icon "alert"}}<p>{{.Data.Error}}</p></div>{{end}}
