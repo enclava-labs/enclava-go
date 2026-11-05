@@ -211,8 +211,8 @@ func (s *Service) observeContentItem(ctx context.Context, conn source.Connection
 		}
 		retry := false
 		if !metadataChanged {
-			// Failed indexing (for example before the creator's source identity was
-			// bound) is retried as a new version so the ingest job key changes.
+			// Failed indexing (for example a transient embedding error) is
+			// retried as a new version so the ingest job key changes.
 			failed, failErr := s.canonical.IngestFailed(ctx, conn.TenantID, conn.TargetCollectionID, object.ID, latest.ObservedSeq)
 			if failErr != nil {
 				return Observation{}, failErr

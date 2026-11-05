@@ -1283,7 +1283,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	}
 	if err := s.authorizer.CanReadVersion(ctx, p, obj, ver, source.ReadOptions{}); err != nil {
 		if obj.ConnectionID != "" && errors.Is(err, source.ErrDenied) {
-			return "", fmt.Errorf("%w: the indexing user has no access to this item in the source; bind their source identity, then sync again", err)
+			return "", fmt.Errorf("%w: the source's creator can no longer open its collection; share the collection with them, then sync again", err)
 		}
 		return "", err
 	}
