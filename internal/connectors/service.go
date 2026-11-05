@@ -385,22 +385,24 @@ func (s *Service) SyncSource(ctx context.Context, p auth.Principal, sourceID str
 }
 
 // SyncSourceKeyed uses a caller-provided key to safely retry a manual request.
+// A person is waiting on it, so it runs on the interactive lane instead of
+// queueing behind bulk embedding work.
 func (s *Service) SyncSourceKeyed(ctx context.Context, p auth.Principal, sourceID, key string) (SyncJob, error) {
 	if strings.TrimSpace(key) == "" {
 		key = newID("manual")
 	}
 	sum := sha256.Sum256([]byte(key))
-	return s.syncSource(ctx, p, sourceID, "m"+hex.EncodeToString(sum[:]))
+	return s.syncSource(ctx, p, sourceID, "m"+hex.EncodeToString(sum[:]), jobs.LaneInteractive)
 }
 
 // SyncSourceWindowed enqueues a scheduled sync whose idempotency key carries
 // the schedule window, so each interval produces one job instead of deduping
 // into the previous (already succeeded) manual/scheduled job.
 func (s *Service) SyncSourceWindowed(ctx context.Context, p auth.Principal, sourceID string, window int64) (SyncJob, error) {
-	return s.syncSource(ctx, p, sourceID, "w"+strconv.FormatInt(window, 10))
+	return s.syncSource(ctx, p, sourceID, "w"+strconv.FormatInt(window, 10), jobs.LaneBackground)
 }
 
-func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID string, window string) (SyncJob, error) {
+func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID string, window string, lane jobs.Lane) (SyncJob, error) {
 	if err := requireTenant(p); err != nil {
 		return SyncJob{}, err
 	}
@@ -442,7 +444,7 @@ func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID str
 		InputRef:       conn.ID,
 		InputHash:      configHash,
 		Policy:         map[string]any{"connection_id": conn.ID, "stream": string(StreamContent)},
-		Lane:           jobs.LaneBackground,
+		Lane:           lane,
 	})
 	if err != nil {
 		return SyncJob{}, err

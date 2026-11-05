@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1803,39 +1804,65 @@ func TestReuploadSameSourceIsNewVersionNotDuplicate(t *testing.T) {
 	}
 }
 
-// racingReconcileRepo lets a concurrent embed worker complete each pending
-// reconciliation just before this worker's own completion.
-type racingReconcileRepo struct {
-	*postgres.RAGRepo
-	raced int
+// countingVectorStore serializes point deletions and counts them per
+// (version, generation) so the test can assert each reconciliation item is
+// cleaned exactly once across concurrent workers.
+type countingVectorStore struct {
+	*fakeVectorStore
+	mu        sync.Mutex
+	deletions map[string]int
 }
 
-func (r *racingReconcileRepo) CompleteIndexReconciliation(ctx context.Context, item rag.IndexReconciliation) error {
-	if err := r.RAGRepo.CompleteIndexReconciliation(ctx, item); err != nil {
-		return err
+func (c *countingVectorStore) DeleteGenerationPoints(ctx context.Context, collection, versionID string, generation int64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.deletions == nil {
+		c.deletions = map[string]int{}
 	}
-	r.raced++
-	return r.RAGRepo.CompleteIndexReconciliation(ctx, item)
+	c.deletions[fmt.Sprintf("%s/%d", versionID, generation)]++
+	return c.fakeVectorStore.DeleteGenerationPoints(ctx, collection, versionID, generation)
 }
 
-// TestReconcileIndexPointsToleratesConcurrentCompletion: every embed attempt
-// reconciles the tenant, so parallel workers race on the same items; losing
-// that race must not fail the embed that triggered it.
-func TestReconcileIndexPointsToleratesConcurrentCompletion(t *testing.T) {
+// TestReconcileIndexPointsClaimsEachItemOnce: every embed attempt reconciles
+// the tenant, so parallel workers race on the same rows — SKIP LOCKED must
+// give each row to exactly one worker.
+func TestReconcileIndexPointsClaimsEachItemOnce(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 	c := f.collection(t)
-	f.stageSearchDoc(t, c, "obj_raced", "superseded content", "{}")
-	if _, err := f.db.SQL.ExecContext(ctx, `UPDATE index_generations SET state='superseded' WHERE tenant_id=$1 AND object_version_id='obj_raced#1'`, f.tenant); err != nil {
-		t.Fatal(err)
+	for i := range 6 {
+		objectID := fmt.Sprintf("obj_claim_%d", i)
+		f.stageSearchDoc(t, c, objectID, "superseded content", "{}")
+		if _, err := f.db.SQL.ExecContext(ctx, `UPDATE index_generations SET state='superseded' WHERE tenant_id=$1 AND object_version_id=$2`, f.tenant, objectID+"#1"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.db.SQL.ExecContext(ctx, `INSERT INTO index_reconciliation (tenant_id, collection_id, object_version_id, generation, fence_token, state) VALUES ($1, $2, $3, 1, 1, 'pending')`, f.tenant, c.ID, objectID+"#1"); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if _, err := f.db.SQL.ExecContext(ctx, `INSERT INTO index_reconciliation (tenant_id, collection_id, object_version_id, generation, fence_token, state) VALUES ($1, $2, 'obj_raced#1', 1, 1, 'pending')`, f.tenant, c.ID); err != nil {
-		t.Fatal(err)
+	counting := &countingVectorStore{fakeVectorStore: f.vector}
+	svc := rag.NewService(f.repo, counting, f.executor, "embed-test", f.store, f.jobs)
+	var wg sync.WaitGroup
+	errs := make(chan error, 4)
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- svc.ReconcileIndexPoints(ctx, f.tenant)
+		}()
 	}
-	repo := &racingReconcileRepo{RAGRepo: f.repo}
-	svc := rag.NewService(repo, f.vector, f.executor, "embed-test", f.store, f.jobs)
-	if err := svc.ReconcileIndexPoints(ctx, f.tenant); err != nil || repo.raced != 1 {
-		t.Fatalf("reconcile after a lost race: err=%v raced=%d", err, repo.raced)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	}
+	for i := range 6 {
+		key := fmt.Sprintf("obj_claim_%d#1/1", i)
+		if counting.deletions[key] != 1 {
+			t.Fatalf("deletions[%s] = %d, want 1", key, counting.deletions[key])
+		}
 	}
 	var pending int
 	if err := f.db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM index_reconciliation WHERE tenant_id=$1 AND state='pending'`, f.tenant).Scan(&pending); err != nil || pending != 0 {

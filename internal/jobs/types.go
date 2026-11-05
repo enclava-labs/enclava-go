@@ -41,9 +41,9 @@ type Subject struct {
 	ObservedRevision int64  `json:"observed_revision,omitempty"`
 }
 
-// Lane partitions the queue: bulk background work (connector syncs and their
-// ingest/embed fan-out, access projections, re-embed scans) runs on its own
-// runner capacity so it can never starve interactive jobs.
+// Lane partitions the queue: bulk background work (scheduled connector syncs
+// and their ingest/embed fan-out, access projections, re-embed scans) runs on
+// its own runner capacity so it can never starve interactive jobs.
 type Lane string
 
 const (

@@ -1377,7 +1377,11 @@ func (r *RAGRepo) PublishGenerationFenced(ctx context.Context, tenantID, collect
 			    (tenant_id, collection_id, object_version_id, generation, fence_token, state)
 			SELECT tenant_id, collection_id, object_version_id, generation, lease_fence, 'pending'
 			FROM index_generations
+			-- unbound staging generations never upserted points (the binding is
+			-- written right before the upsert); a published generation with an
+			-- empty binding is a legacy row whose points still exist.
 			WHERE tenant_id=$1 AND collection_id=$2 AND (`+losers+`)
+			  AND (qdrant_collection <> '' OR state = 'published')
 			  AND object_version_id IN (
 			    SELECT id FROM source_object_versions WHERE tenant_id=$1 AND object_id=$3
 			  )
@@ -1569,52 +1573,66 @@ func (r *RAGRepo) RecordKnowledgeImport(ctx context.Context, tenantID, collectio
 	}
 	return nil
 }
-func (r *RAGRepo) ListPendingIndexReconciliations(ctx context.Context, tenantID string, limit int) ([]rag.IndexReconciliation, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-	rows, err := r.db.SQL.QueryContext(ctx, `
-		SELECT ir.tenant_id::text, ir.collection_id, COALESCE(NULLIF(g.qdrant_collection, ''), c.qdrant_collection),
-		       ir.object_version_id, ir.generation, ir.fence_token
-		FROM index_reconciliation ir
-		JOIN index_generations g ON g.tenant_id=ir.tenant_id
-		  AND g.collection_id=ir.collection_id AND g.object_version_id=ir.object_version_id
-		  AND g.generation=ir.generation
-		JOIN knowledge_collections c ON c.tenant_id=ir.tenant_id AND c.id=ir.collection_id
-		WHERE ir.tenant_id=$1 AND ir.state='pending' AND g.state='superseded'
-		ORDER BY ir.created_at LIMIT $2`, tenantID, limit)
-	if err != nil {
-		return nil, fmt.Errorf("list pending index reconciliations: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var pending []rag.IndexReconciliation
-	for rows.Next() {
-		var item rag.IndexReconciliation
-		if err := rows.Scan(&item.TenantID, &item.CollectionID, &item.QdrantCollection,
-			&item.ObjectVersionID, &item.Generation, &item.FenceToken); err != nil {
-			return nil, fmt.Errorf("scan pending index reconciliation: %w", err)
-		}
-		pending = append(pending, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate pending index reconciliations: %w", err)
-	}
-	return pending, nil
-}
 
-func (r *RAGRepo) CompleteIndexReconciliation(ctx context.Context, item rag.IndexReconciliation) error {
-	res, err := r.db.SQL.ExecContext(ctx, `
-		UPDATE index_reconciliation SET state='complete'
-		WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3
-		  AND generation=$4 AND fence_token=$5 AND state='pending'`,
-		item.TenantID, item.CollectionID, item.ObjectVersionID, item.Generation, item.FenceToken)
+// ReconcilePendingIndexes claims up to limit pending reconciliations under
+// FOR UPDATE OF ir SKIP LOCKED — concurrent workers never claim the same
+// row — runs cleanup for each, then marks it complete in one transaction.
+// A cleanup error rolls the whole batch back: every row stays pending.
+func (r *RAGRepo) ReconcilePendingIndexes(ctx context.Context, tenantID string, limit int, cleanup func(rag.IndexReconciliation) error) (int, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+	claimed := 0
+	err := WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT ir.tenant_id::text, ir.collection_id, COALESCE(NULLIF(g.qdrant_collection, ''), c.qdrant_collection),
+			       ir.object_version_id, ir.generation, ir.fence_token
+			FROM index_reconciliation ir
+			JOIN index_generations g ON g.tenant_id=ir.tenant_id
+			  AND g.collection_id=ir.collection_id AND g.object_version_id=ir.object_version_id
+			  AND g.generation=ir.generation
+			JOIN knowledge_collections c ON c.tenant_id=ir.tenant_id AND c.id=ir.collection_id
+			WHERE ir.tenant_id=$1 AND ir.state='pending' AND g.state='superseded'
+			ORDER BY ir.created_at LIMIT $2
+			FOR UPDATE OF ir SKIP LOCKED`, tenantID, limit)
+		if err != nil {
+			return fmt.Errorf("claim pending index reconciliations: %w", err)
+		}
+		var pending []rag.IndexReconciliation
+		for rows.Next() {
+			var item rag.IndexReconciliation
+			if err := rows.Scan(&item.TenantID, &item.CollectionID, &item.QdrantCollection,
+				&item.ObjectVersionID, &item.Generation, &item.FenceToken); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("scan pending index reconciliation: %w", err)
+			}
+			pending = append(pending, item)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("iterate pending index reconciliations: %w", err)
+		}
+		// The tx issues no new statements while its result set is open.
+		_ = rows.Close()
+		for _, item := range pending {
+			if err := cleanup(item); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE index_reconciliation SET state='complete'
+				WHERE tenant_id=$1 AND collection_id=$2 AND object_version_id=$3
+				  AND generation=$4 AND fence_token=$5 AND state='pending'`,
+				item.TenantID, item.CollectionID, item.ObjectVersionID, item.Generation, item.FenceToken); err != nil {
+				return fmt.Errorf("complete index reconciliation: %w", err)
+			}
+			claimed++
+		}
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("complete index reconciliation: %w", err)
+		return 0, err
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return rag.ErrIndexReconciliationChanged
-	}
-	return nil
+	return claimed, nil
 }
 
 func (r *RAGRepo) ListPublishedGenerations(ctx context.Context, tenantID, collectionID string) ([]rag.IndexGeneration, error) {

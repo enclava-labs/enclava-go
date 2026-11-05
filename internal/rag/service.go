@@ -18,6 +18,7 @@ import (
 	"enclava-go/internal/extract"
 	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
+	"enclava-go/internal/llm"
 	"enclava-go/internal/source"
 )
 
@@ -102,8 +103,7 @@ type Repository interface {
 	MarkGenerationState(ctx context.Context, tenantID, collectionID, versionID string, generation int64, state string) error
 	NextGeneration(ctx context.Context, tenantID, collectionID, versionID string) (int64, error)
 	FindArtifactObjectVersion(ctx context.Context, tenantID, artifactID string) (source.Object, source.ObjectVersion, error)
-	ListPendingIndexReconciliations(ctx context.Context, tenantID string, limit int) ([]IndexReconciliation, error)
-	CompleteIndexReconciliation(ctx context.Context, reconciliation IndexReconciliation) error
+	ReconcilePendingIndexes(ctx context.Context, tenantID string, limit int, cleanup func(IndexReconciliation) error) (int, error)
 	ReserveKnowledgeImport(ctx context.Context, tenantID, collectionID, importRef, objectID, kind string) (reservedObjectID string, complete bool, err error)
 	ListGenerationsForConnection(ctx context.Context, tenantID, connectionID string) ([]IndexGeneration, error)
 	// Search reads bindings and connections without enumerating documents,
@@ -1257,9 +1257,6 @@ func (s *Service) JobHandler() jobs.HandlerFunc {
 }
 
 func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, error) {
-	if err := s.ReconcileIndexPoints(ctx, claim.Job().TenantID); err != nil {
-		return "", err
-	}
 	job := claim.Job()
 	var p auth.Principal
 	if err := json.Unmarshal(job.PrincipalSnapshot, &p); err != nil {
@@ -1322,6 +1319,9 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 				return "", jobs.Retryable(fmt.Errorf("requeue %s under current settings: %w", obj.ID, err))
 			}
 			break
+		}
+		if err := s.ReconcileIndexPoints(ctx, job.TenantID); err != nil {
+			return "", err
 		}
 		s.retireIndexes(ctx, job.TenantID, c.ID)
 		return versionRowID(ver), nil
@@ -1452,7 +1452,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		AttemptID: claim.AttemptID(),
 	})
 	if err != nil {
-		return "", err
+		return "", retryEmbedError(err)
 	}
 	if len(vectors) != len(chunkTexts) || len(vectors) == 0 || len(vectors[0]) == 0 {
 		return "", errors.New("provider returned empty embedding")
@@ -1613,6 +1613,25 @@ func (s *Service) requeueForCurrentSettings(ctx context.Context, p auth.Principa
 func retryVectorError(err error) error {
 	var networkError net.Error
 	if errors.Is(err, ErrVectorStoreUnavailable) || errors.As(err, &networkError) {
+		return jobs.Retryable(err)
+	}
+	return err
+}
+
+// retryEmbedError marks transient embedding upstream failures retryable;
+// context cancellation, 4xx answers and config errors stay fatal.
+func retryEmbedError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	var networkError net.Error
+	var upstream *llm.UpstreamError
+	switch {
+	case errors.As(err, &networkError),
+		errors.Is(err, io.EOF),
+		errors.Is(err, io.ErrUnexpectedEOF):
+		return jobs.Retryable(err)
+	case errors.As(err, &upstream) && (upstream.StatusCode == 429 || upstream.StatusCode >= 500):
 		return jobs.Retryable(err)
 	}
 	return err

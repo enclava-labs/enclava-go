@@ -123,46 +123,23 @@ func (s *Service) AccessBackfillJobHandler() jobs.HandlerFunc {
 	}
 }
 
-// ErrIndexReconciliationChanged reports that another worker completed or
-// re-fenced a pending index reconciliation first.
-var ErrIndexReconciliationChanged = errors.New("index reconciliation reservation changed")
-
 func (s *Service) ReconcileIndexPoints(ctx context.Context, tenantID string) error {
 	if s.vectorStore == nil {
 		return errors.New("rag reconciliation: vector store is not configured")
 	}
-	for {
-		pending, err := s.repo.ListPendingIndexReconciliations(ctx, tenantID, 100)
+	cleanup := func(item IndexReconciliation) error {
+		published, err := s.repo.PublishedGenerationForVersion(ctx, item.TenantID, item.CollectionID, item.ObjectVersionID, item.Generation)
 		if err != nil {
 			return err
 		}
-		if len(pending) == 0 {
-			return nil
+		return deleteReconciledGeneration(ctx, s.vectorStore, item, published)
+	}
+	for {
+		claimed, err := s.repo.ReconcilePendingIndexes(ctx, tenantID, 25, cleanup)
+		if err != nil {
+			return err
 		}
-		completed := 0
-		for _, item := range pending {
-			published, err := s.repo.ListPublishedGenerations(ctx, tenantID, item.CollectionID)
-			if err != nil {
-				return err
-			}
-			for _, current := range published {
-				if current.ObjectVersionID == item.ObjectVersionID && current.Generation == item.Generation {
-					return fmt.Errorf("rag reconciliation: refusing to delete published generation %s/%d", item.ObjectVersionID, item.Generation)
-				}
-			}
-			if err := deleteReconciledGeneration(ctx, s.vectorStore, item, false); err != nil {
-				return err
-			}
-			// Every embed attempt reconciles the tenant, so concurrent workers race
-			// on the same items; losing that race leaves nothing for this one to do.
-			if err := s.repo.CompleteIndexReconciliation(ctx, item); errors.Is(err, ErrIndexReconciliationChanged) {
-				continue
-			} else if err != nil {
-				return err
-			}
-			completed++
-		}
-		if completed == 0 {
+		if claimed == 0 {
 			return nil
 		}
 	}
