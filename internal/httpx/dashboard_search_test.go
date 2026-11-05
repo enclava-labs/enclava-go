@@ -44,6 +44,9 @@ func (s *searchStubStore) DeleteDocumentPoints(ctx context.Context, collection, 
 func (s *searchStubStore) DeleteGenerationPoints(ctx context.Context, collection, versionID string, generation int64) error {
 	return nil
 }
+func (s *searchStubStore) DeleteConnectionPoints(ctx context.Context, collection, connectionID string) error {
+	return nil
+}
 func (s *searchStubStore) SetPayload(ctx context.Context, collection string, filter map[string]any, payload map[string]any) error {
 	return nil
 }

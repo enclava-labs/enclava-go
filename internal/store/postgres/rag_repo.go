@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"enclava-go/internal/artifacts"
 	"enclava-go/internal/jobs"
 	"enclava-go/internal/rag"
 	"enclava-go/internal/source"
@@ -73,10 +74,38 @@ func (r *SourceRepo) DeleteConnection(ctx context.Context, tenantID, id string) 
 		return fmt.Errorf("delete connection: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback-after-commit is a no-op
-	// Children first: grants → memberships → restricted refs → snapshots →
-	// objects/groups/identities → the connection itself (003_source FKs have
-	// no cascade).
+	// Tombstone (never delete) the version artifacts so the reconcile pass
+	// removes their files; an existing tombstone keeps its first reason.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE artifacts SET state = 'tombstoned',
+		       tombstone_reason = COALESCE(tombstone_reason, $3),
+		       deleted_at = COALESCE(deleted_at, now())
+		WHERE tenant_id = $1 AND state <> 'tombstoned'
+		  AND id IN (SELECT artifact_ref FROM source_object_versions
+		             WHERE tenant_id = $1 AND object_id IN
+		                 (SELECT id FROM source_objects WHERE tenant_id = $1 AND connection_id = $2))`,
+		tenantID, id, artifacts.ReasonDeleted); err != nil {
+		return fmt.Errorf("delete connection: %w", err)
+	}
+	// Queued work for the dead connection must never run.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET status = 'cancelled', finished_at = now(), updated_at = now()
+		WHERE tenant_id = $1 AND connection_id = $2 AND status = 'queued'`,
+		tenantID, id); err != nil {
+		return fmt.Errorf("delete connection: %w", err)
+	}
+	// Children first, in FK-safe order: index/graph dependents of the
+	// connection's versions (rag_evidence and index_reconciliation cascade),
+	// then versions, then objects; grants → memberships → restricted refs →
+	// snapshots → objects/groups/identities → the connection itself
+	// (003_source FKs have no cascade).
 	steps := []string{
+		`DELETE FROM index_generations WHERE tenant_id = $1 AND object_version_id IN (SELECT v.id FROM source_object_versions v JOIN source_objects o ON o.tenant_id = v.tenant_id AND o.id = v.object_id WHERE v.tenant_id = $1 AND o.connection_id = $2)`,
+		`DELETE FROM chunks WHERE tenant_id = $1 AND object_version_id IN (SELECT v.id FROM source_object_versions v JOIN source_objects o ON o.tenant_id = v.tenant_id AND o.id = v.object_id WHERE v.tenant_id = $1 AND o.connection_id = $2)`,
+		`DELETE FROM blocks WHERE tenant_id = $1 AND parsed_document_id IN (SELECT p.id FROM parsed_documents p JOIN source_object_versions v ON v.tenant_id = p.tenant_id AND v.id = p.object_version_id JOIN source_objects o ON o.tenant_id = v.tenant_id AND o.id = v.object_id WHERE p.tenant_id = $1 AND o.connection_id = $2)`,
+		`DELETE FROM parsed_documents WHERE tenant_id = $1 AND object_version_id IN (SELECT v.id FROM source_object_versions v JOIN source_objects o ON o.tenant_id = v.tenant_id AND o.id = v.object_id WHERE v.tenant_id = $1 AND o.connection_id = $2)`,
+		`DELETE FROM collection_items WHERE tenant_id = $1 AND object_id IN (SELECT id FROM source_objects WHERE tenant_id = $1 AND connection_id = $2)`,
+		`DELETE FROM source_object_versions WHERE tenant_id = $1 AND object_id IN (SELECT id FROM source_objects WHERE tenant_id = $1 AND connection_id = $2)`,
 		`DELETE FROM source_grants WHERE tenant_id = $1 AND object_id IN (SELECT id FROM source_objects WHERE tenant_id = $1 AND connection_id = $2)`,
 		`DELETE FROM source_group_memberships WHERE tenant_id = $1 AND group_id IN (SELECT id FROM source_groups WHERE tenant_id = $1 AND connection_id = $2)`,
 		`DELETE FROM source_restrictions WHERE tenant_id = $1 AND ((subject_type = 'connection' AND subject_id = $2) OR (subject_type = 'object' AND subject_id IN (SELECT id FROM source_objects WHERE tenant_id = $1 AND connection_id = $2)))`,
@@ -688,7 +717,7 @@ const documentColumns = `
 	       j.error_message, COALESCE(lg.warnings, '[]'::jsonb)`
 
 // documentLookups resolves each row's latest version, latest generation and
-// durable failed job through index-keyed LATERAL subqueries.
+// durable failed-or-interrupted job through index-keyed LATERAL subqueries.
 const documentLookups = `
 	LEFT JOIN LATERAL (
 		SELECT v.id, v.observed_seq, v.artifact_ref, v.content_sha256, v.byte_size,
@@ -705,13 +734,13 @@ const documentLookups = `
 		ORDER BY g.generation DESC LIMIT 1
 	) lg ON true
 	LEFT JOIN LATERAL (
-		SELECT j.id, j.error->>'message' AS error_message
+		SELECT j.id, COALESCE(j.error->>'message', 'interrupted before it finished') AS error_message
 		FROM jobs j
 		WHERE j.tenant_id = $1
 		  AND j.operation IN ('` + rag.OperationEmbed + `', '` + rag.OperationIngest + `')
 		  AND j.input_ref = lg.object_version_id
 		  AND j.policy->>'generation' = lg.generation::text
-		  AND j.status = 'failed'
+		  AND (j.status = 'failed' OR (j.status = 'unknown' AND lg.state <> 'published'))
 		LIMIT 1
 	) j ON true`
 

@@ -50,7 +50,7 @@ func (r *ConnectorObservationsRepo) PersistPage(ctx context.Context, state Conne
 	var current int64
 	err = tx.QueryRowContext(ctx, `SELECT observed_seq FROM connector_streams WHERE tenant_id=$1 AND connection_id=$2 AND stream=$3 AND run_id=$4 AND fence=$5 FOR UPDATE`, state.TenantID, state.ConnectionID, state.Stream, state.RunID, state.Fence).Scan(&current)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ConnectorStream{}, errors.New("connector stream fence lost")
+		return ConnectorStream{}, source.ErrStreamSuperseded
 	}
 	if err != nil {
 		return ConnectorStream{}, err
@@ -89,7 +89,7 @@ func (r *ConnectorObservationsRepo) PersistPage(ctx context.Context, state Conne
 		return ConnectorStream{}, err
 	}
 	if n != 1 {
-		return ConnectorStream{}, errors.New("connector stream fence lost")
+		return ConnectorStream{}, source.ErrStreamSuperseded
 	}
 	if err := tx.Commit(); err != nil {
 		return ConnectorStream{}, err
@@ -143,12 +143,12 @@ func (r *ConnectorObservationsRepo) WithFence(ctx context.Context, state Connect
 		err := tx.QueryRowContext(ctx, `SELECT fence FROM connector_streams WHERE tenant_id=$1 AND connection_id=$2 AND stream=$3 AND run_id=$4 FOR UPDATE`, state.TenantID, state.ConnectionID, state.Stream, state.RunID).Scan(&current)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return errors.New("connector stream fence lost")
+				return source.ErrStreamSuperseded
 			}
 			return err
 		}
 		if current != state.Fence {
-			return errors.New("connector stream fence lost")
+			return source.ErrStreamSuperseded
 		}
 		return fn(tx)
 	})

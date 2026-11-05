@@ -253,6 +253,7 @@ func serve() error {
 	connectorSvc := connectors.NewService(sourceRepo, jobsSvc, jobsRepoPG)
 	connectorSvc.SetCredentialResolver(credentialSvc)
 	connectorSvc.SetPrincipalResolver(authSvc.PrincipalForActor)
+	connectorSvc.SetPointPurger(ragSvc.PurgeConnectionPoints)
 	adapterFactories := connectors.AdapterFactories{
 		connectors.SourceKindGitHub: func(c source.Connection) (connectors.Adapter, error) {
 			return connectors.NewGitHubAdapter(c, credentialSvc)
@@ -293,6 +294,8 @@ func serve() error {
 	}
 	runners := []*jobs.Runner{
 		jobs.NewRunner(jobsSvc, artifactStore, jobHandlers, jobs.RunnerConfig{JobTimeout: cfg.JobTimeout, Lane: jobs.LaneInteractive}),
+		// Syncs are few and long: two slots, so one big source never blocks another.
+		jobs.NewRunner(jobsSvc, artifactStore, jobHandlers, jobs.RunnerConfig{JobTimeout: cfg.JobTimeout, Lane: jobs.LaneSync, Concurrency: 2}),
 		jobs.NewRunner(jobsSvc, artifactStore, jobHandlers, jobs.RunnerConfig{JobTimeout: cfg.JobTimeout, Lane: jobs.LaneBackground}),
 	}
 	runnerCtx, stopRunner := context.WithCancel(context.Background())

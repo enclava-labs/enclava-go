@@ -43,13 +43,14 @@ type RunnerConfig struct {
 	HeartbeatEvery  time.Duration // heartbeat cadence; default LeaseTTL/3
 	CancelPollEvery time.Duration // owner-cancel probe cadence; default HeartbeatEvery
 	JobTimeout      time.Duration // per-handler deadline; 0 disables
+	DrainTimeout    time.Duration // shutdown grace for in-flight handlers; default 20s
 }
 
 // Runner leases jobs and executes registered handlers under the fence
 // protocol (JOB-02): heartbeats keep the lease, a lost lease makes every
-// subsequent publish fail with ErrStaleFence, and shutdown releases the
-// leases it still owns so undispatched work is requeued — dispatched work
-// is left to expire into unknown.
+// subsequent publish fail with ErrStaleFence, and shutdown gives in-flight
+// handlers up to DrainTimeout before releasing undispatched claims back to
+// queued and marking dispatched ones unknown.
 type Runner struct {
 	svc      *Service
 	resolver InputResolver
@@ -76,34 +77,46 @@ func NewRunner(svc *Service, resolver InputResolver, handlers map[string]Handler
 	if cfg.WorkerID == "" {
 		cfg.WorkerID = fmt.Sprintf("worker-%d-%s", os.Getpid(), newID("w")[2:])
 	}
+	if cfg.DrainTimeout <= 0 {
+		cfg.DrainTimeout = 20 * time.Second
+	}
 	return &Runner{svc: svc, resolver: resolver, handlers: handlers, cfg: cfg}
 }
 
 // Run polls and executes until ctx is cancelled, then drains: in-flight
-// handlers observe cancellation, undispatched claims are released back to
-// queued, and dispatched ones keep their leases (expiry resolves them to
-// unknown). Returns nil on graceful shutdown.
+// handlers keep running under a detached work context (heartbeats and
+// cancel polls continue) for up to DrainTimeout, then observe cancellation
+// — undispatched claims are released back to queued and dispatched ones
+// are marked unknown. Returns nil on graceful shutdown.
 func (r *Runner) Run(ctx context.Context) error {
 	sem := make(chan struct{}, r.cfg.Concurrency)
 	var wg sync.WaitGroup
+	// Handlers run under workCtx: shutdown detaches them until DrainTimeout.
+	workCtx, workCancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer workCancel()
+	drain := func() {
+		timer := time.AfterFunc(r.cfg.DrainTimeout, workCancel)
+		wg.Wait()
+		timer.Stop()
+	}
 	for {
 		// Take a slot before claiming: a claim never waits unheartbeated
 		// for capacity while its lease runs out.
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
-			wg.Wait()
+			drain()
 			return nil
 		}
 		claim, err := r.svc.LeaseLane(ctx, r.cfg.WorkerID, r.cfg.LeaseTTL, r.cfg.Lane)
 		if err != nil || claim == nil {
 			<-sem
 			if err != nil && ctx.Err() != nil {
-				wg.Wait()
+				drain()
 				return nil
 			}
 			if !sleep(ctx, r.cfg.PollInterval) {
-				wg.Wait()
+				drain()
 				return nil
 			}
 			continue
@@ -112,13 +125,15 @@ func (r *Runner) Run(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			r.execute(ctx, claim)
+			r.execute(workCtx, claim)
 		}()
 	}
 }
 
 // execute runs one claim end-to-end: heartbeat/cancel watcher plus the
 // handler, then translates the handler outcome into the fenced transition.
+// ctx is the work context — it stays live through shutdown until the drain
+// deadline, so heartbeats and terminal writes survive the grace period.
 func (r *Runner) execute(ctx context.Context, claim *Claim) {
 	handler, ok := r.handlers[claim.Job().Operation]
 	if !ok {

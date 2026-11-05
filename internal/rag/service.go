@@ -142,6 +142,7 @@ type VectorStore interface {
 	UpsertPoints(ctx context.Context, collection string, points []QdrantPoint) error
 	DeleteDocumentPoints(ctx context.Context, collection, documentID string) error
 	DeleteGenerationPoints(ctx context.Context, collection, versionID string, generation int64) error
+	DeleteConnectionPoints(ctx context.Context, collection, connectionID string) error
 	SetPayload(ctx context.Context, collection string, filter map[string]any, payload map[string]any) error
 	DeleteCollection(ctx context.Context, collection string) error
 	SearchHybrid(ctx context.Context, collection string, vector []float64, sparse SparseVector, limit int, filter map[string]any) ([]QdrantSearchPoint, error)
@@ -986,6 +987,33 @@ func (s *Service) DeleteDocument(ctx context.Context, p auth.Principal, document
 	}
 	// The last document still on a retired index may just have left it.
 	s.retireIndexes(ctx, p.TenantID, doc.CollectionID)
+	return nil
+}
+
+// PurgeConnectionPoints drops every index point the connection's synced
+// objects left behind, across each generation's bound index. The DB rows go
+// away separately (DeleteConnection); a nil vector store has nothing to purge.
+func (s *Service) PurgeConnectionPoints(ctx context.Context, tenantID, connectionID string) error {
+	if s.vectorStore == nil {
+		return nil
+	}
+	generations, err := s.repo.ListGenerationsForConnection(ctx, tenantID, connectionID)
+	if err != nil {
+		return err
+	}
+	seen := map[string]struct{}{}
+	for _, generation := range generations {
+		if generation.QdrantCollection == "" {
+			continue
+		}
+		if _, dup := seen[generation.QdrantCollection]; dup {
+			continue
+		}
+		seen[generation.QdrantCollection] = struct{}{}
+		if err := s.vectorStore.DeleteConnectionPoints(ctx, generation.QdrantCollection, connectionID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

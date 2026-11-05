@@ -426,7 +426,8 @@ func TestRunnerShutdownReleasesUndispatchedLease(t *testing.T) {
 				return "", ctx.Err() // undispatched → released on drain
 			}
 		},
-	}, jobs.RunnerConfig{PollInterval: 10 * time.Millisecond, LeaseTTL: 2 * time.Second})
+	}, jobs.RunnerConfig{PollInterval: 10 * time.Millisecond, LeaseTTL: 2 * time.Second,
+		DrainTimeout: 50 * time.Millisecond})
 
 	rctx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
@@ -469,7 +470,8 @@ func TestRunnerShutdownInterruptedJobRecordsReasonAndReservation(t *testing.T) {
 			<-ctx.Done() // shutdown cancels the in-flight handler
 			return "", ctx.Err()
 		},
-	}, jobs.RunnerConfig{PollInterval: 10 * time.Millisecond, LeaseTTL: 2 * time.Second})
+	}, jobs.RunnerConfig{PollInterval: 10 * time.Millisecond, LeaseTTL: 2 * time.Second,
+		DrainTimeout: 50 * time.Millisecond})
 
 	rctx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
@@ -514,6 +516,67 @@ func TestRunnerShutdownInterruptedJobRecordsReasonAndReservation(t *testing.T) {
 	}
 	if fin.UpdatedAt.Before(fin.CreatedAt) {
 		t.Fatalf("updated_at %v precedes created_at %v", fin.UpdatedAt, fin.CreatedAt)
+	}
+}
+
+func TestRunnerShutdownDrainsInFlightJobs(t *testing.T) {
+	svc, _, tenant := runnerSetup(t)
+	ctx := context.Background()
+	p := principal(tenant, "a", "c")
+	job := enqueue(t, svc, p, req(tenant, "k", "op.drain", "h", 1))
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+	handlerErr := make(chan error, 1)
+	r := jobs.NewRunner(svc, stubResolver{}, map[string]jobs.HandlerFunc{
+		"op.drain": func(ctx context.Context, lease *jobs.Claim, _ jobs.InputFunc) (string, error) {
+			if err := lease.MarkDispatched(ctx); err != nil {
+				return "", err
+			}
+			close(started)
+			<-release // park until the test releases the drain window
+			handlerErr <- ctx.Err()
+			return "drained-result", nil
+		},
+	}, jobs.RunnerConfig{PollInterval: 10 * time.Millisecond, LeaseTTL: 2 * time.Second,
+		DrainTimeout: 2 * time.Second})
+
+	rctx, stop := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- r.Run(rctx) }()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never dispatched")
+	}
+	stop()
+	select {
+	case err := <-done:
+		t.Fatalf("runner returned before in-flight work finished (err=%v)", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runner: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not drain")
+	}
+	if err := <-handlerErr; err != nil {
+		t.Fatalf("shutdown cancelled the in-flight handler: %v", err)
+	}
+
+	// The dispatched job completed inside the drain window: succeeded, not
+	// unknown (interrupted) or released back to queued.
+	got, err := svc.Get(ctx, p, job.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != jobs.StatusSucceeded {
+		t.Fatalf("drained job status = %q, want %q", got.Status, jobs.StatusSucceeded)
 	}
 }
 

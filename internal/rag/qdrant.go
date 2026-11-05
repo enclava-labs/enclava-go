@@ -10,14 +10,26 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
 var ErrVectorStoreUnavailable = errors.New("vector store unavailable")
 
+// errCollectionMissing marks a 404 collection lookup so UpsertPoints can
+// distinguish "collection deleted" (retryable: re-create) from real schema
+// failures (permanent).
+var errCollectionMissing = errors.New("qdrant collection missing")
+
+type ensuredKey struct {
+	collection string
+	size       int
+}
+
 type QdrantClient struct {
 	baseURL string
 	client  *http.Client
+	ensured sync.Map // ensuredKey → struct{}, set only after a fully successful ensure
 }
 
 type SparseVector struct {
@@ -43,6 +55,29 @@ func NewQdrantClient(baseURL string, timeout time.Duration) *QdrantClient {
 }
 
 func (c *QdrantClient) EnsureCollection(ctx context.Context, collection string, vectorSize int) error {
+	key := ensuredKey{collection: collection, size: vectorSize}
+	if _, ok := c.ensured.Load(key); ok {
+		return nil
+	}
+	if err := c.ensureCollection(ctx, collection, vectorSize); err != nil {
+		return err
+	}
+	c.ensured.Store(key, struct{}{})
+	return nil
+}
+
+// forgetCollection drops every ensured key of a collection: after a delete or
+// a missing-collection error the next ensure must verify the schema again.
+func (c *QdrantClient) forgetCollection(collection string) {
+	c.ensured.Range(func(k, _ any) bool {
+		if k.(ensuredKey).collection == collection {
+			c.ensured.Delete(k)
+		}
+		return true
+	})
+}
+
+func (c *QdrantClient) ensureCollection(ctx context.Context, collection string, vectorSize int) error {
 	if strings.TrimSpace(collection) == "" {
 		return fmt.Errorf("qdrant collection is required")
 	}
@@ -189,6 +224,10 @@ const qdrantUpsertBatch = 128
 func (c *QdrantClient) UpsertPoints(ctx context.Context, collection string, points []QdrantPoint) error {
 	hasSparse, namedDense, err := c.collectionVectors(ctx, collection)
 	if err != nil {
+		if errors.Is(err, errCollectionMissing) {
+			c.forgetCollection(collection)
+			return fmt.Errorf("%w: %w", ErrVectorStoreUnavailable, err)
+		}
 		return err
 	}
 	wirePoints := make([]map[string]any, 0, len(points))
@@ -219,6 +258,10 @@ func (c *QdrantClient) UpsertPoints(ctx context.Context, collection string, poin
 		status, resp, err := c.do(ctx, http.MethodPut, "/collections/"+url.PathEscape(collection)+"/points?wait=true", body)
 		if err != nil {
 			return err
+		}
+		if status == http.StatusNotFound {
+			c.forgetCollection(collection)
+			return fmt.Errorf("%w: qdrant collection %q missing during upsert", ErrVectorStoreUnavailable, collection)
 		}
 		if status >= 300 {
 			return fmt.Errorf("qdrant upsert failed: status=%d body=%s", status, string(resp))
@@ -267,6 +310,27 @@ func (c *QdrantClient) DeleteGenerationPoints(ctx context.Context, collection, v
 	return nil
 }
 
+func (c *QdrantClient) DeleteConnectionPoints(ctx context.Context, collection, connectionID string) error {
+	body, err := json.Marshal(map[string]any{
+		"filter": map[string]any{
+			"must": []map[string]any{
+				{"key": "connection_id", "match": map[string]any{"value": connectionID}},
+			},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	status, resp, err := c.do(ctx, http.MethodPost, "/collections/"+url.PathEscape(collection)+"/points/delete?wait=true", body)
+	if err != nil {
+		return err
+	}
+	if status >= 300 && status != http.StatusNotFound {
+		return fmt.Errorf("qdrant delete connection points failed: status=%d body=%s", status, string(resp))
+	}
+	return nil
+}
+
 func (c *QdrantClient) SetPayload(ctx context.Context, collection string, filter map[string]any, payload map[string]any) error {
 	body, err := json.Marshal(map[string]any{"filter": filter, "payload": payload})
 	if err != nil {
@@ -287,6 +351,7 @@ func (c *QdrantClient) DeleteCollection(ctx context.Context, collection string) 
 	if err != nil {
 		return err
 	}
+	c.forgetCollection(collection)
 	if status >= 300 && status != http.StatusNotFound {
 		return fmt.Errorf("qdrant delete collection failed: status=%d body=%s", status, string(resp))
 	}
@@ -397,6 +462,9 @@ func (c *QdrantClient) collectionVectors(ctx context.Context, collection string)
 	status, resp, err := c.do(ctx, http.MethodGet, "/collections/"+url.PathEscape(collection), nil)
 	if err != nil {
 		return false, false, err
+	}
+	if status == http.StatusNotFound {
+		return false, false, fmt.Errorf("%w: collection %q", errCollectionMissing, collection)
 	}
 	if status >= 300 {
 		return false, false, fmt.Errorf("qdrant collection schema failed: status=%d body=%s", status, string(resp))

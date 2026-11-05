@@ -17,7 +17,8 @@ import (
 // items only (no removed membership, deleted or tombstoned object), the
 // latest version by observed_seq, the latest index generation per
 // (collection, version). Failed = a failed rag.embed/rag.ingest job for the
-// latest generation's version+generation, or generation state 'failed';
+// latest generation's version+generation, an interrupted ('unknown') job
+// whose generation never published, or generation state 'failed';
 // indexed = published and not failed; the rest is processing. The reason
 // block picks the failed jobs' most common error message over failed items
 // and the items carrying it.
@@ -46,13 +47,13 @@ const sourceIndexProgressQuery = `
 			LIMIT 1
 		) lg ON true
 		LEFT JOIN LATERAL (
-			SELECT j.id, j.error->>'message' AS message
+			SELECT j.id, COALESCE(j.error->>'message', 'interrupted before it finished') AS message
 			FROM jobs j
 			WHERE j.tenant_id = o.tenant_id
 			  AND j.operation IN ('` + rag.OperationEmbed + `', '` + rag.OperationIngest + `')
 			  AND j.input_ref = lg.object_version_id
 			  AND j.policy->>'generation' = lg.generation::text
-			  AND j.status = 'failed'
+			  AND (j.status = 'failed' OR (j.status = 'unknown' AND lg.state <> 'published'))
 			ORDER BY j.finished_at DESC NULLS LAST
 			LIMIT 1
 		) fj ON true

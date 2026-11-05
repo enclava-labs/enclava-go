@@ -297,3 +297,166 @@ func TestUpsertSplitsLargeDocumentsUnderQdrantBodyLimit(t *testing.T) {
 		t.Fatalf("delivered %d distinct points, want %d (request sizes %v)", len(ids), len(points), sizes)
 	}
 }
+
+// TestEnsureCollectionRememberedAcrossEmbeds: every embed used to re-check
+// the schema and re-create the 4 payload indexes; after the first successful
+// ensure the client must answer from memory and leave the server alone.
+func TestEnsureCollectionRememberedAcrossEmbeds(t *testing.T) {
+	gets, indexPuts, collectionPuts := 0, 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/collections/docs"):
+			gets++
+			_, _ = w.Write([]byte(`{"result":{"config":{"params":{"vectors":{"dense":{"size":2,"distance":"Cosine"}},"sparse_vectors":{"text":{"modifier":"idf"}}}}}}`))
+		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/index"):
+			indexPuts++
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut:
+			collectionPuts++
+			w.WriteHeader(http.StatusConflict)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := NewQdrantClient(server.URL, time.Second)
+	for i := range 2 {
+		if err := client.EnsureCollection(context.Background(), "docs", 2); err != nil {
+			t.Fatalf("ensure %d: %v", i, err)
+		}
+	}
+	if gets != 1 || indexPuts != 4 || collectionPuts != 0 {
+		t.Fatalf("gets=%d index puts=%d collection puts=%d, want 1/4/0 for two ensures", gets, indexPuts, collectionPuts)
+	}
+}
+
+// TestEnsureCollectionRefreshedAfterDeleteCollection: deleting a collection
+// invalidates the memory — the next ensure verifies the schema again.
+func TestEnsureCollectionRefreshedAfterDeleteCollection(t *testing.T) {
+	gets, indexPuts := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/collections/docs"):
+			gets++
+			_, _ = w.Write([]byte(`{"result":{"config":{"params":{"vectors":{"dense":{"size":2,"distance":"Cosine"}},"sparse_vectors":{"text":{"modifier":"idf"}}}}}}`))
+		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/index"):
+			indexPuts++
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := NewQdrantClient(server.URL, time.Second)
+	if err := client.EnsureCollection(context.Background(), "docs", 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.DeleteCollection(context.Background(), "docs"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.EnsureCollection(context.Background(), "docs", 2); err != nil {
+		t.Fatal(err)
+	}
+	if gets != 2 || indexPuts != 8 {
+		t.Fatalf("gets=%d index puts=%d, want 2/8 after a delete", gets, indexPuts)
+	}
+}
+
+// TestUpsert404ForgetsEnsuredCollection: a collection can vanish between the
+// remembered ensure and the upsert. The upsert must report the store as
+// unavailable so the embed job retries, and the retry's ensure must verify
+// the schema again instead of answering from memory.
+func TestUpsert404ForgetsEnsuredCollection(t *testing.T) {
+	gets, indexPuts, pointPuts := 0, 0, 0
+	gone := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/collections/docs"):
+			gets++
+			if gone {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write([]byte(`{"result":{"config":{"params":{"vectors":{"dense":{"size":2,"distance":"Cosine"}},"sparse_vectors":{"text":{"modifier":"idf"}}}}}}`))
+		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/index"):
+			indexPuts++
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/points"):
+			pointPuts++
+			w.WriteHeader(http.StatusNotFound) // collection dropped after the schema check
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := NewQdrantClient(server.URL, time.Second)
+	if err := client.EnsureCollection(context.Background(), "docs", 2); err != nil {
+		t.Fatal(err)
+	}
+	err := client.UpsertPoints(context.Background(), "docs", []QdrantPoint{{ID: "p-1", Vector: []float64{1, 0}}})
+	if !errors.Is(err, ErrVectorStoreUnavailable) {
+		t.Fatalf("upsert against a deleted collection = %v, want ErrVectorStoreUnavailable", err)
+	}
+	if err := client.EnsureCollection(context.Background(), "docs", 2); err != nil {
+		t.Fatal(err)
+	}
+	// The upsert also forgets on a schema GET 404 (collection deleted before
+	// the schema read could answer).
+	gone = true
+	err = client.UpsertPoints(context.Background(), "docs", []QdrantPoint{{ID: "p-2", Vector: []float64{1, 0}}})
+	if !errors.Is(err, ErrVectorStoreUnavailable) {
+		t.Fatalf("upsert against a missing collection = %v, want ErrVectorStoreUnavailable", err)
+	}
+	gone = false
+	if err := client.EnsureCollection(context.Background(), "docs", 2); err != nil {
+		t.Fatal(err)
+	}
+	if gets != 5 || indexPuts != 12 || pointPuts != 1 {
+		t.Fatalf("gets=%d index puts=%d point puts=%d, want 5/12/1", gets, indexPuts, pointPuts)
+	}
+}
+
+// TestDeleteConnectionPoints: removing a synced source deletes only its own
+// points (connection_id filter) and treats a missing collection as nothing
+// left to delete.
+func TestDeleteConnectionPoints(t *testing.T) {
+	var filter map[string]any
+	var method, path, wait string
+	missing := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, path, wait = r.Method, r.URL.Path, r.URL.Query().Get("wait")
+		if missing {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode delete request: %v", err)
+		}
+		filter, _ = body["filter"].(map[string]any)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	client := NewQdrantClient(server.URL, time.Second)
+	if err := client.DeleteConnectionPoints(context.Background(), "docs", "conn-1"); err != nil {
+		t.Fatal(err)
+	}
+	if method != http.MethodPost || path != "/collections/docs/points/delete" || wait != "true" {
+		t.Fatalf("request %s %s?wait=%s, want POST /collections/docs/points/delete?wait=true", method, path, wait)
+	}
+	must, _ := filter["must"].([]any)
+	if len(must) != 1 {
+		t.Fatalf("filter %#v, want exactly one must clause", filter)
+	}
+	clause, _ := must[0].(map[string]any)
+	match, _ := clause["match"].(map[string]any)
+	if clause["key"] != "connection_id" || match["value"] != "conn-1" {
+		t.Fatalf("filter %#v, want a connection_id match on conn-1", filter)
+	}
+	missing = true
+	if err := client.DeleteConnectionPoints(context.Background(), "docs", "conn-1"); err != nil {
+		t.Fatalf("delete on a missing collection = %v, want success", err)
+	}
+}

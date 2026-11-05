@@ -199,6 +199,18 @@ func (f *fakeVectorStore) DeleteGenerationPoints(ctx context.Context, collection
 	return nil
 }
 
+func (f *fakeVectorStore) DeleteConnectionPoints(ctx context.Context, collection, connectionID string) error {
+	kept := f.points[collection][:0]
+	for _, point := range f.points[collection] {
+		if point.Payload["connection_id"] == connectionID {
+			continue
+		}
+		kept = append(kept, point)
+	}
+	f.points[collection] = kept
+	return nil
+}
+
 func (f *fakeVectorStore) SetPayload(ctx context.Context, collection string, filter map[string]any, payload map[string]any) error {
 	must, _ := filter["must"].([]map[string]any)
 	for i := range f.points[collection] {

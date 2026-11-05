@@ -13,6 +13,11 @@ import (
 // metadata, links or counts before a successful CanRead.
 var ErrDenied = errors.New("source: access denied")
 
+// ErrStreamSuperseded ends a connector sync run whose fenced stream row was
+// taken over by a newer run for the same connection. The superseding run owns
+// the stream's outcome, so the losing run completes instead of failing.
+var ErrStreamSuperseded = errors.New("connector stream superseded by a newer sync run")
+
 // Tx is the transaction handle connector observation writes run under —
 // satisfied by *sql.Tx. The database/sql import is types-only and keeps the
 // signature assignable without a wrapper.

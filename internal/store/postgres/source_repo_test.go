@@ -347,8 +347,10 @@ func TestIngestHandoffExistsGeneration(t *testing.T) {
 }
 
 // TestIngestFailed mirrors the document "failed" status for the newest
-// generation: a failed embed job on a staging generation counts, a newer
-// published generation clears it, and other collections never count.
+// generation: a failed embed job on a staging generation counts, an
+// interrupted ('unknown') job counts only while its generation stays
+// unpublished, a newer published generation clears it, and other
+// collections never count.
 func TestIngestFailed(t *testing.T) {
 	db, repo, ctx := newRepo(t)
 	seedTenant(t, ctx, db, idTenantA)
@@ -403,4 +405,20 @@ func TestIngestFailed(t *testing.T) {
 	exec(`INSERT INTO index_generations (tenant_id, id, collection_id, object_version_id, generation, state)
 		VALUES ($1, 'gen_3', 'col_a', 'obj_a#2', 3, 'failed')`)
 	assert("col_a", true, "newest generation failed")
+
+	exec(`INSERT INTO index_generations (tenant_id, id, collection_id, object_version_id, generation, state)
+		VALUES ($1, 'gen_4', 'col_a', 'obj_a#2', 4, 'staging')`)
+	exec(`INSERT INTO jobs (tenant_id, id, operation, status, connection_id, object_id, observed_revision,
+		                  idempotency_key, input_ref, input_hash, principal, submitter_key, policy)
+		VALUES ($1, 'job_embed_4', 'rag.embed', 'unknown', 'conn_a', 'obj_a', 2,
+		        'key-embed-4', 'obj_a#2', 'h', '{}', 'sub', '{"generation":"4"}'::jsonb)`)
+	assert("col_a", true, "staging generation whose embed job was interrupted")
+
+	exec(`INSERT INTO index_generations (tenant_id, id, collection_id, object_version_id, generation, state)
+		VALUES ($1, 'gen_5', 'col_a', 'obj_a#2', 5, 'published')`)
+	exec(`INSERT INTO jobs (tenant_id, id, operation, status, connection_id, object_id, observed_revision,
+		                  idempotency_key, input_ref, input_hash, principal, submitter_key, policy)
+		VALUES ($1, 'job_embed_5', 'rag.embed', 'unknown', 'conn_a', 'obj_a', 2,
+		        'key-embed-5', 'obj_a#2', 'h', '{}', 'sub', '{"generation":"5"}'::jsonb)`)
+	assert("col_a", false, "published generation clears an interrupted job")
 }

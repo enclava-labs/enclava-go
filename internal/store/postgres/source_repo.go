@@ -542,7 +542,8 @@ func (r *SourceRepo) IngestHandoffExists(ctx context.Context, tenantID, connecti
 }
 
 // IngestFailed mirrors the document "failed" status: the newest generation of
-// the object version in the collection is failed, or its embed/ingest job is.
+// the object version in the collection is failed, or its embed/ingest job is
+// failed or was interrupted ('unknown') before the generation published.
 func (r *SourceRepo) IngestFailed(ctx context.Context, tenantID, collectionID, objectID string, observedSeq int64) (bool, error) {
 	var failed bool
 	err := r.db.SQL.QueryRowContext(ctx, `
@@ -553,7 +554,7 @@ func (r *SourceRepo) IngestFailed(ctx context.Context, tenantID, collectionID, o
 				  AND j.operation IN ('`+rag.OperationEmbed+`', '`+rag.OperationIngest+`')
 				  AND j.input_ref = g.object_version_id
 				  AND j.policy->>'generation' = g.generation::text
-				  AND j.status = 'failed')
+				  AND (j.status = 'failed' OR (j.status = 'unknown' AND g.state <> 'published')))
 			FROM index_generations g
 			JOIN source_object_versions v
 			  ON v.tenant_id = g.tenant_id AND v.id = g.object_version_id

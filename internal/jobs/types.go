@@ -41,13 +41,15 @@ type Subject struct {
 	ObservedRevision int64  `json:"observed_revision,omitempty"`
 }
 
-// Lane partitions the queue: bulk background work (scheduled connector syncs
-// and their ingest/embed fan-out, access projections, re-embed scans) runs on
-// its own runner capacity so it can never starve interactive jobs.
+// Lane partitions the queue so each kind of work has its own runner
+// capacity: interactive jobs people wait on, connector syncs (long, few),
+// and bulk background work (ingest/embed fan-out, access projections,
+// re-embed scans). No lane can starve another.
 type Lane string
 
 const (
 	LaneInteractive Lane = "interactive"
+	LaneSync        Lane = "sync"
 	LaneBackground  Lane = "background"
 )
 

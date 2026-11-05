@@ -166,7 +166,9 @@ source's `target_collection_id` routes synced documents into a knowledge
 collection. Permissions are per collection: everyone who can open the
 collection can read everything the source syncs — the source's own
 permissions do not apply, so sync sensitive scope into restricted
-collections.
+collections. `DELETE` removes the source together with everything it synced:
+its documents leave their collections and the search index, and its queued
+work is cancelled.
 
 Each source names its credential by `credential_ref`: either a
 `CONNECTOR_<PROVIDER>_*` reference bound in `SECRET_BINDINGS` by the operator
@@ -179,7 +181,9 @@ origin.
 Public repository content can sync without a credential.
 `POST /api/v1/connectors/sources/{id}/sync` starts a fresh manual
 sync; send the same `Idempotency-Key` header to retry the same submission.
-Syncing a disabled source returns 409.
+While a sync of the source is already queued or running, the call returns
+that job instead of starting a second one. Syncing a disabled source returns
+409.
 
 Slack sources need a `CONNECTOR_SLACK_*` `credential_ref` holding a token for
 `https://slack.com`. `config.channel_id` limits the source to one channel;

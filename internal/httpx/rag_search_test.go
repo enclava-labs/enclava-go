@@ -376,6 +376,9 @@ func (s *readableSearchStore) DeleteDocumentPoints(ctx context.Context, collecti
 func (s *readableSearchStore) DeleteGenerationPoints(ctx context.Context, collection, versionID string, generation int64) error {
 	return nil
 }
+func (s *readableSearchStore) DeleteConnectionPoints(ctx context.Context, collection, connectionID string) error {
+	return nil
+}
 func (s *readableSearchStore) SetPayload(ctx context.Context, collection string, filter map[string]any, payload map[string]any) error {
 	return nil
 }

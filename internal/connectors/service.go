@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net"
 	"net/http"
@@ -65,6 +66,7 @@ type Service struct {
 	artifacts           *artifacts.Store
 	secrets             CredentialResolver
 	principalForActor   func(context.Context, string, string) (auth.Principal, error)
+	purgePoints         func(ctx context.Context, tenantID, connectionID string) error
 	canonical           CanonicalSourceRepository
 	httpClient          *http.Client
 	allowPrivateBaseURL bool
@@ -117,6 +119,12 @@ func (s *Service) connectorCredential(c source.Connection, endpoint string) (str
 
 func (s *Service) SetPrincipalResolver(resolve func(context.Context, string, string) (auth.Principal, error)) {
 	s.principalForActor = resolve
+}
+
+// SetPointPurger registers the index-side cleanup DeleteSource runs before
+// removing the connection's rows; the source survives a purge failure.
+func (s *Service) SetPointPurger(purge func(ctx context.Context, tenantID, connectionID string) error) {
+	s.purgePoints = purge
 }
 
 func (s *Service) CredentialRefs(p auth.Principal, kind string) []auth.SecretRefMeta {
@@ -369,7 +377,13 @@ func (s *Service) DeleteSource(ctx context.Context, p auth.Principal, id string)
 	if err := requireTenant(p); err != nil {
 		return err
 	}
-	return s.repo.DeleteConnection(ctx, p.TenantID, strings.TrimSpace(id))
+	sourceID := strings.TrimSpace(id)
+	if s.purgePoints != nil {
+		if err := s.purgePoints(ctx, p.TenantID, sourceID); err != nil {
+			return err
+		}
+	}
+	return s.repo.DeleteConnection(ctx, p.TenantID, sourceID)
 }
 
 // ---------------------------------------------------------------------
@@ -384,25 +398,24 @@ func (s *Service) SyncSource(ctx context.Context, p auth.Principal, sourceID str
 	return s.SyncSourceKeyed(ctx, p, sourceID, "")
 }
 
-// SyncSourceKeyed uses a caller-provided key to safely retry a manual request.
-// A person is waiting on it, so it runs on the interactive lane instead of
-// queueing behind bulk embedding work.
+// SyncSourceKeyed uses a caller-provided key to safely retry a manual request
+// without enqueueing a second connector.sync job.
 func (s *Service) SyncSourceKeyed(ctx context.Context, p auth.Principal, sourceID, key string) (SyncJob, error) {
 	if strings.TrimSpace(key) == "" {
 		key = newID("manual")
 	}
 	sum := sha256.Sum256([]byte(key))
-	return s.syncSource(ctx, p, sourceID, "m"+hex.EncodeToString(sum[:]), jobs.LaneInteractive)
+	return s.syncSource(ctx, p, sourceID, "m"+hex.EncodeToString(sum[:]))
 }
 
 // SyncSourceWindowed enqueues a scheduled sync whose idempotency key carries
 // the schedule window, so each interval produces one job instead of deduping
 // into the previous (already succeeded) manual/scheduled job.
 func (s *Service) SyncSourceWindowed(ctx context.Context, p auth.Principal, sourceID string, window int64) (SyncJob, error) {
-	return s.syncSource(ctx, p, sourceID, "w"+strconv.FormatInt(window, 10), jobs.LaneBackground)
+	return s.syncSource(ctx, p, sourceID, "w"+strconv.FormatInt(window, 10))
 }
 
-func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID string, window string, lane jobs.Lane) (SyncJob, error) {
+func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID string, window string) (SyncJob, error) {
 	if err := requireTenant(p); err != nil {
 		return SyncJob{}, err
 	}
@@ -435,6 +448,18 @@ func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID str
 	if err != nil {
 		return SyncJob{}, err
 	}
+	// One sync per connection: a queued or running run already owns the stream.
+	if s.jobRows != nil {
+		for _, status := range []string{jobs.StatusRunning, jobs.StatusQueued} {
+			rows, err := s.jobRows.ListConnectionJobs(ctx, p.TenantID, conn.ID, OperationSync, status, 1)
+			if err != nil {
+				return SyncJob{}, err
+			}
+			if len(rows) > 0 {
+				return jobView(rows[0].Job), nil
+			}
+		}
+	}
 	key := "connector.sync:" + conn.ID + ":" + configHash + ":" + window
 	job, _, err := s.jobs.Enqueue(ctx, p, jobs.EnqueueRequest{
 		TenantID:       p.TenantID,
@@ -444,7 +469,7 @@ func (s *Service) syncSource(ctx context.Context, p auth.Principal, sourceID str
 		InputRef:       conn.ID,
 		InputHash:      configHash,
 		Policy:         map[string]any{"connection_id": conn.ID, "stream": string(StreamContent)},
-		Lane:           lane,
+		Lane:           jobs.LaneSync,
 	})
 	if err != nil {
 		return SyncJob{}, err
@@ -616,6 +641,10 @@ func (s *Service) attemptSync(ctx context.Context, claim *jobs.Claim) (string, e
 		return "", err
 	}
 	if err := s.runDurableStream(ctx, claim, principal, conn, adapter, stream); err != nil {
+		if errors.Is(err, source.ErrStreamSuperseded) {
+			log.Printf("connector source %s sync superseded by a newer run; completing job", strconv.Quote(conn.ID))
+			return "", nil
+		}
 		_ = s.repo.SetSyncState(ctx, conn.TenantID, conn.ID, time.Now().UTC(), JobStatusFailed, err.Error())
 		return "", err
 	}

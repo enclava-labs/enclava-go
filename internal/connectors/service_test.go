@@ -421,6 +421,40 @@ func TestSyncSourceEnqueuesContentStream(t *testing.T) {
 		t.Fatalf("content stream jobs = %d, want 1", syncs)
 	}
 }
+
+func TestSyncSourceReusesActiveSyncJob(t *testing.T) {
+	f := newConnectorFixture(t, &testAdapter{capabilities: AdapterCapabilities{Content: true}})
+	first := f.schedule(t)
+	again, err := f.svc.SyncSource(context.Background(), f.principal, f.connection.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != first.ID {
+		t.Fatalf("second SyncSource returned %s, want queued job %s", again.ID, first.ID)
+	}
+	windowed, err := f.svc.SyncSourceWindowed(context.Background(), f.principal, f.connection.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if windowed.ID != first.ID {
+		t.Fatalf("SyncSourceWindowed returned %s, want queued job %s", windowed.ID, first.ID)
+	}
+	rows, err := f.jobRows.ListConnectionJobs(context.Background(), f.connection.TenantID, f.connection.ID, OperationSync, "", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// jobColumns does not select lane; read it straight from the row.
+	var lane string
+	if err := f.db.SQL.QueryRowContext(context.Background(), `SELECT lane FROM jobs WHERE tenant_id=$1 AND id=$2`, f.tenant, first.ID).Scan(&lane); err != nil {
+		t.Fatal(err)
+	}
+	if lane != string(jobs.LaneSync) {
+		t.Fatalf("sync job lane = %q, want %q", lane, jobs.LaneSync)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("connector.sync jobs = %d, want 1", len(rows))
+	}
+}
 func TestCreateSourceStillRejectsUnsafeCredentialsAndPrivateOrigins(t *testing.T) {
 	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true}}
 	f := newConnectorFixture(t, adapter)
@@ -718,7 +752,11 @@ func TestScheduledThenManualReplaysConnectorIngest(t *testing.T) {
 }
 
 func TestManualSyncWindowsAndRetry(t *testing.T) {
-	f := newConnectorFixture(t)
+	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true}}
+	adapter.content = func(context.Context, source.Connection, Cursor, int) (ContentPage, error) {
+		return ContentPage{Completeness: CompletenessComplete, Snapshot: true}, nil
+	}
+	f := newConnectorFixture(t, adapter)
 	ctx := context.Background()
 	a, err := f.svc.SyncSource(ctx, f.principal, f.connection.ID)
 	if err != nil {
@@ -728,12 +766,21 @@ func TestManualSyncWindowsAndRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.ID == b.ID {
-		t.Fatal("manual syncs reused a job")
+	if a.ID != b.ID {
+		t.Fatal("queued sync ignored")
+	}
+	if _, err := f.runNext(t); err != nil {
+		t.Fatalf("first manual sync: %v", err)
 	}
 	c, err := f.svc.SyncSourceKeyed(ctx, f.principal, f.connection.ID, "request-1")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if c.ID == a.ID {
+		t.Fatal("finished sync was not superseded by a fresh job")
+	}
+	if _, err := f.runNext(t); err != nil {
+		t.Fatalf("keyed manual sync: %v", err)
 	}
 	d, err := f.svc.SyncSourceKeyed(ctx, f.principal, f.connection.ID, "request-1")
 	if err != nil {
@@ -782,5 +829,48 @@ func TestContentSyncCreatesCollectionModeObjectsWithParents(t *testing.T) {
 	reply, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "message", "slack:C123:reply-1")
 	if err != nil || reply.ParentObjectID != child.ID {
 		t.Fatalf("reply parent = %+v, err=%v", reply, err)
+	}
+}
+
+// TestDeleteSourcePurgesIndexPointsFirst: the index purge runs while the
+// source still exists, then the rows go.
+func TestDeleteSourcePurgesIndexPointsFirst(t *testing.T) {
+	f := newConnectorFixture(t)
+	ctx := context.Background()
+
+	var purged bool
+	f.svc.SetPointPurger(func(_ context.Context, tenantID, connectionID string) error {
+		if tenantID != f.tenant || connectionID != f.connection.ID {
+			t.Fatalf("purge args = %s/%s", tenantID, connectionID)
+		}
+		purged = true
+		if _, err := f.sourceRepo.GetConnection(ctx, tenantID, connectionID); err != nil {
+			t.Fatalf("purge ran after the source was deleted: %v", err)
+		}
+		return nil
+	})
+	if err := f.svc.DeleteSource(ctx, f.principal, f.connection.ID); err != nil {
+		t.Fatalf("delete source: %v", err)
+	}
+	if !purged {
+		t.Fatal("point purger was not called")
+	}
+	if _, err := f.sourceRepo.GetConnection(ctx, f.tenant, f.connection.ID); err == nil {
+		t.Fatal("source survived delete")
+	}
+}
+
+// TestDeleteSourceKeepsSourceOnPurgeFailure: a purge failure surfaces and
+// the source's rows stay untouched so it can be retried.
+func TestDeleteSourceKeepsSourceOnPurgeFailure(t *testing.T) {
+	f := newConnectorFixture(t)
+	ctx := context.Background()
+	want := errors.New("index unreachable")
+	f.svc.SetPointPurger(func(context.Context, string, string) error { return want })
+	if err := f.svc.DeleteSource(ctx, f.principal, f.connection.ID); !errors.Is(err, want) {
+		t.Fatalf("delete error = %v", err)
+	}
+	if _, err := f.sourceRepo.GetConnection(ctx, f.tenant, f.connection.ID); err != nil {
+		t.Fatalf("source must survive purge failure: %v", err)
 	}
 }
