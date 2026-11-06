@@ -78,8 +78,13 @@ func (r *SourceRepo) DeleteConnection(ctx context.Context, tenantID, id string) 
 	// generations for this connection. Lock parents before deleting any
 	// child: writers then wait (their FK checks need these rows) and fail
 	// once the rows are gone, instead of leaving a child behind that makes a
-	// later step of this delete violate a foreign key.
+	// later step of this delete violate a foreign key. The stream rows come
+	// first: a sync holds its stream row across a page whose object writes
+	// run on other connections, so taking the connection or object locks
+	// first would leave it waiting on us while we wait on its stream row —
+	// a deadlock Postgres cannot see.
 	for _, lock := range []string{
+		`SELECT 1 FROM connector_streams WHERE tenant_id = $1 AND connection_id = $2 FOR UPDATE`,
 		`SELECT 1 FROM connections WHERE tenant_id = $1 AND id = $2 FOR UPDATE`,
 		`SELECT 1 FROM source_objects WHERE tenant_id = $1 AND connection_id = $2 FOR UPDATE`,
 		`SELECT 1 FROM source_object_versions WHERE tenant_id = $1 AND object_id IN (SELECT id FROM source_objects WHERE tenant_id = $1 AND connection_id = $2) FOR UPDATE`,

@@ -191,3 +191,54 @@ func TestDeleteConnectionWaitsForConcurrentWriters(t *testing.T) {
 		t.Fatalf("generation written during the delete survived: %d, %v", left, err)
 	}
 }
+
+// TestDeleteConnectionDuringSyncPage: a sync holds its stream row for a
+// whole page while that page's object writes run on other connections. A
+// delete arriving mid-page must not block those writes (the page could then
+// never finish and both would wait forever); it waits for the page instead.
+func TestDeleteConnectionDuringSyncPage(t *testing.T) {
+	db := RequireTestDB(t)
+	ctx := context.Background()
+	seedTenant(t, ctx, db, idTenantA)
+	seedConnection(t, ctx, db, idTenantA, "conn_page", "slack")
+	if _, err := NewConnectorObservationsRepo(db).StartRun(ctx, idTenantA, "conn_page", "content", "00000000-0000-4000-8000-0000000000aa", "cfg"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The sync's page transaction: holds the stream row.
+	page, err := db.SQL.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer page.Rollback() //nolint:errcheck // committed below on the happy path
+	if _, err := page.ExecContext(ctx, `SELECT 1 FROM connector_streams WHERE tenant_id = $1 AND connection_id = 'conn_page' FOR UPDATE`, idTenantA); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- NewSourceRepo(db).DeleteConnection(ctx, idTenantA, "conn_page") }()
+	time.Sleep(200 * time.Millisecond)
+
+	// The page's object write on another connection must still go through.
+	writeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if _, err := db.SQL.ExecContext(writeCtx, `INSERT INTO source_objects (tenant_id, id, connection_id, kind, native_id, authorization_mode, observed_seq)
+		VALUES ($1, 'obj_page', 'conn_page', 'message', 'slack:page', 'collection', 1)`, idTenantA); err != nil {
+		t.Fatalf("page write blocked by the delete: %v", err)
+	}
+	if err := page.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("delete after the page: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("delete never finished")
+	}
+	var left int
+	if err := db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM source_objects WHERE tenant_id = $1 AND connection_id = 'conn_page'`, idTenantA).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("objects written by the page survived the delete: %d, %v", left, err)
+	}
+}
