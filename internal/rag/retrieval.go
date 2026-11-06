@@ -266,7 +266,7 @@ func (s *Service) queryIndex(ctx context.Context, p auth.Principal, collection C
 		var points []QdrantSearchPoint
 		var err error
 		if !pages {
-			points, err = s.vectorStore.SearchHybrid(ctx, b.QdrantCollection, vector, SparseVector{}, fetch, filter)
+			points, err = s.vectorStore.SearchHybrid(ctx, b.QdrantCollection, vector, fetch, filter)
 		} else {
 			if qdrant, ok := s.vectorStore.(*QdrantClient); ok && input.Mode == QueryHybrid && round == 0 {
 				hasSparse, _, ferr := qdrant.collectionVectors(ctx, b.QdrantCollection)
@@ -274,7 +274,7 @@ func (s *Service) queryIndex(ctx context.Context, p auth.Principal, collection C
 					return nil, ferr
 				}
 				if !hasSparse {
-					points, err = s.vectorStore.SearchHybrid(ctx, b.QdrantCollection, vector, SparseVector{}, fetch, filter)
+					points, err = s.vectorStore.SearchHybrid(ctx, b.QdrantCollection, vector, fetch, filter)
 					pages = false
 				}
 			}

@@ -32,15 +32,9 @@ type QdrantClient struct {
 	ensured sync.Map // ensuredKey → struct{}, set only after a fully successful ensure
 }
 
-type SparseVector struct {
-	Indices []uint32  `json:"indices"`
-	Values  []float32 `json:"values"`
-}
-
 type QdrantPoint struct {
 	ID      string         `json:"id"`
 	Vector  []float64      `json:"-"`
-	Sparse  SparseVector   `json:"-"`
 	Payload map[string]any `json:"payload"`
 }
 
@@ -242,9 +236,8 @@ func (c *QdrantClient) UpsertPoints(ctx context.Context, collection string, poin
 				}
 				if ok {
 					named["text"] = map[string]any{"text": text, "model": "qdrant/bm25"}
-				} else {
-					named["text"] = point.Sparse
 				}
+				// a point without text carries no sparse vector
 			}
 			vectors = named
 		}
@@ -387,32 +380,24 @@ type QdrantSearchPoint struct {
 }
 
 func (c *QdrantClient) Search(ctx context.Context, collection string, vector []float64, limit int, filter map[string]any) ([]QdrantSearchPoint, error) {
-	return c.SearchHybrid(ctx, collection, vector, SparseVector{}, limit, filter)
+	return c.SearchHybrid(ctx, collection, vector, limit, filter)
 }
 
-func (c *QdrantClient) SearchHybrid(ctx context.Context, collection string, vector []float64, sparse SparseVector, limit int, filter map[string]any) ([]QdrantSearchPoint, error) {
-	hasSparse, namedDense, err := c.collectionVectors(ctx, collection)
+func (c *QdrantClient) SearchHybrid(ctx context.Context, collection string, vector []float64, limit int, filter map[string]any) ([]QdrantSearchPoint, error) {
+	_, namedDense, err := c.collectionVectors(ctx, collection)
 	if err != nil {
 		return nil, err
 	}
-	hasSparse = hasSparse && len(sparse.Indices) > 0
-	return c.search(ctx, collection, vector, sparse, limit, filter, hasSparse, namedDense)
+	return c.search(ctx, collection, vector, limit, filter, namedDense)
 }
 
-func (c *QdrantClient) search(ctx context.Context, collection string, vector []float64, sparse SparseVector, limit int, filter map[string]any, hasSparse, namedDense bool) ([]QdrantSearchPoint, error) {
+func (c *QdrantClient) search(ctx context.Context, collection string, vector []float64, limit int, filter map[string]any, namedDense bool) ([]QdrantSearchPoint, error) {
 	if limit <= 0 {
 		limit = 5
 	}
 	var payload map[string]any
 	path := "/collections/" + url.PathEscape(collection) + "/points/search"
-	if hasSparse {
-		prefetch := []map[string]any{
-			{"query": vector, "using": "dense", "limit": limit, "filter": filter},
-			{"query": sparse, "using": "text", "limit": limit, "filter": filter},
-		}
-		payload = map[string]any{"prefetch": prefetch, "query": map[string]any{"fusion": "rrf"}, "limit": limit, "with_payload": true}
-		path = "/collections/" + url.PathEscape(collection) + "/points/query"
-	} else if namedDense {
+	if namedDense {
 		payload = map[string]any{"query": vector, "using": "dense", "limit": limit, "with_payload": true}
 		if len(filter) > 0 {
 			payload["filter"] = filter

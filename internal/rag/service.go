@@ -145,7 +145,7 @@ type VectorStore interface {
 	DeleteConnectionPoints(ctx context.Context, collection, connectionID string) error
 	SetPayload(ctx context.Context, collection string, filter map[string]any, payload map[string]any) error
 	DeleteCollection(ctx context.Context, collection string) error
-	SearchHybrid(ctx context.Context, collection string, vector []float64, sparse SparseVector, limit int, filter map[string]any) ([]QdrantSearchPoint, error)
+	SearchHybrid(ctx context.Context, collection string, vector []float64, limit int, filter map[string]any) ([]QdrantSearchPoint, error)
 }
 
 // Executor is the shared authorized inference boundary every embedding
@@ -1534,7 +1534,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		payload["block_spans"] = spanPayload
 		chunks = append(chunks, chunk)
 		points = append(points, QdrantPoint{
-			ID: pointID, Vector: vectors[i], Sparse: sparseVector(searchTexts[i]), Payload: payload,
+			ID: pointID, Vector: vectors[i], Payload: payload,
 		})
 	}
 

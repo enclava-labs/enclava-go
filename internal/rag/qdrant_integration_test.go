@@ -6,10 +6,8 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -51,7 +49,6 @@ func TestQdrantClientIntegration(t *testing.T) {
 	if err := client.UpsertPoints(ctx, collection, []rag.QdrantPoint{{
 		ID:     ragPointID(),
 		Vector: []float64{0.1, 0.2, 0.3},
-		Sparse: integrationSparse("qdrant integration content"),
 		Payload: map[string]any{
 			"document_id": "doc_qdrant_integration",
 			"chunk_id":    "chunk_qdrant_integration",
@@ -91,8 +88,8 @@ func TestQdrantHybridAndLegacyIntegration(t *testing.T) {
 	}
 	targetID, otherID := ragPointID(), ragPointID()
 	if err := client.UpsertPoints(ctx, collection, []rag.QdrantPoint{
-		{ID: targetID, Vector: []float64{1, 0}, Sparse: integrationSparse("orchid meadow"), Payload: map[string]any{"document_id": "orchid", "tenant_id": "tenant-a"}},
-		{ID: otherID, Vector: []float64{0, 1}, Sparse: integrationSparse("quartz harbor"), Payload: map[string]any{"document_id": "quartz", "tenant_id": "tenant-b"}},
+		{ID: targetID, Vector: []float64{1, 0}, Payload: map[string]any{"document_id": "orchid", "tenant_id": "tenant-a", "search_text": "orchid meadow"}},
+		{ID: otherID, Vector: []float64{0, 1}, Payload: map[string]any{"document_id": "quartz", "tenant_id": "tenant-b", "search_text": "quartz harbor"}},
 	}); err != nil {
 		t.Fatalf("upsert hybrid points: %v", err)
 	}
@@ -100,14 +97,14 @@ func TestQdrantHybridAndLegacyIntegration(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		vector []float64
-		sparse rag.SparseVector
+		text   string
 	}{
-		{"sparse-only terms", []float64{0, 1}, integrationSparse("orchid meadow")},
-		{"dense-only terms", []float64{1, 0}, integrationSparse("unrelated")},
-		{"both", []float64{1, 0}, integrationSparse("orchid meadow")},
+		{"text-only terms", []float64{0, 1}, "orchid meadow"},
+		{"dense-only terms", []float64{1, 0}, "unrelated"},
+		{"both", []float64{1, 0}, "orchid meadow"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			results, err := client.SearchHybrid(ctx, collection, tc.vector, tc.sparse, 2, filter)
+			results, err := client.Query(ctx, collection, rag.QueryInput{Mode: rag.QueryHybrid, DenseVector: tc.vector, LexicalText: tc.text, Filter: filter, Limit: 2})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -136,28 +133,13 @@ func TestQdrantHybridAndLegacyIntegration(t *testing.T) {
 	if err := client.UpsertPoints(ctx, legacy, []rag.QdrantPoint{{ID: legacyID, Vector: []float64{1, 0}, Payload: map[string]any{"document_id": "legacy"}}}); err != nil {
 		t.Fatalf("upsert legacy point: %v", err)
 	}
-	results, err := client.SearchHybrid(ctx, legacy, []float64{1, 0}, integrationSparse("legacy words"), 1, nil)
+	results, err := client.SearchHybrid(ctx, legacy, []float64{1, 0}, 1, nil)
 	if err != nil {
 		t.Fatalf("search legacy collection: %v", err)
 	}
 	if len(results) != 1 || results[0].ID != legacyID {
 		t.Fatalf("unexpected legacy search results: %#v", results)
 	}
-}
-
-func integrationSparse(text string) rag.SparseVector {
-	indices := make([]uint32, 0, len(strings.Fields(text)))
-	for _, token := range strings.Fields(text) {
-		h := fnv.New32a()
-		_, _ = h.Write([]byte(token))
-		indices = append(indices, h.Sum32())
-	}
-	sort.Slice(indices, func(i, j int) bool { return indices[i] < indices[j] })
-	values := make([]float32, len(indices))
-	for i := range values {
-		values[i] = 1
-	}
-	return rag.SparseVector{Indices: indices, Values: values}
 }
 
 // TestAccessFilterPrefilterIntegration: the acl/published projection
@@ -178,7 +160,7 @@ func TestAccessFilterPrefilterIntegration(t *testing.T) {
 		payload["tenant_id"] = "tenant-a"
 		payload["access_enabled"] = true
 		payload["search_text"] = "sharedterm"
-		return rag.QdrantPoint{ID: ragPointID(), Vector: []float64{1, 0}, Sparse: integrationSparse("sharedterm"), Payload: payload}
+		return rag.QdrantPoint{ID: ragPointID(), Vector: []float64{1, 0}, Payload: payload}
 	}
 	if err := client.UpsertPoints(ctx, collection, []rag.QdrantPoint{
 		point(map[string]any{"document_id": "doc-a", "acl": []string{"sid:a"}, "published": true}),

@@ -38,7 +38,6 @@ func TestLiveQdrantHybridLexicalAndFilters(t *testing.T) {
 	if err := client.UpsertPoints(ctx, collection, []QdrantPoint{{
 		ID:      "0190f1b2-3c4d-7e8f-9012-3456789abcde",
 		Vector:  []float64{0.1, 0.2, 0.3},
-		Sparse:  SparseVector{Indices: []uint32{1}, Values: []float32{1}},
 		Payload: map[string]any{"content": "orchid legal retrieval fixture", "tenant_id": "tenant-live", "object_version_id": "version-live", "generation": 1, "access_enabled": true},
 	}}); err != nil {
 		t.Fatalf("upsert fixture: %v", err)

@@ -53,7 +53,7 @@ func (s *searchStubStore) SetPayload(ctx context.Context, collection string, fil
 func (s *searchStubStore) DeleteCollection(ctx context.Context, collection string) error {
 	return nil
 }
-func (s *searchStubStore) SearchHybrid(ctx context.Context, collection string, vector []float64, sparse rag.SparseVector, limit int, filter map[string]any) ([]rag.QdrantSearchPoint, error) {
+func (s *searchStubStore) SearchHybrid(ctx context.Context, collection string, vector []float64, limit int, filter map[string]any) ([]rag.QdrantSearchPoint, error) {
 	return s.points[collection], nil
 }
 func (s *searchStubStore) Query(ctx context.Context, collection string, in rag.QueryInput) ([]rag.QdrantSearchPoint, error) {

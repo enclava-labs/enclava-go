@@ -249,7 +249,7 @@ func (f *fakeVectorStore) DeleteCollection(_ context.Context, collection string)
 // access_enabled must match, acl must intersect the caller's tokens (or be
 // absent — an unprojected legacy point), and published must be true or
 // absent. Authorization itself is the service's PostgreSQL post-check.
-func (f *fakeVectorStore) SearchHybrid(ctx context.Context, collection string, vector []float64, sparse rag.SparseVector, limit int, filter map[string]any) ([]rag.QdrantSearchPoint, error) {
+func (f *fakeVectorStore) SearchHybrid(ctx context.Context, collection string, vector []float64, limit int, filter map[string]any) ([]rag.QdrantSearchPoint, error) {
 	var tenant string
 	var tokens []string
 	if filter != nil {
@@ -334,7 +334,7 @@ func (f *fakeVectorStore) SearchHybrid(ctx context.Context, collection string, v
 func (f *fakeVectorStore) Query(ctx context.Context, collection string, input rag.QueryInput) ([]rag.QdrantSearchPoint, error) {
 	f.lastQuery = input.DenseVector
 	f.queried = append(f.queried, collection)
-	points, err := f.SearchHybrid(ctx, collection, input.DenseVector, rag.SparseVector{}, input.Limit+input.Offset, input.Filter)
+	points, err := f.SearchHybrid(ctx, collection, input.DenseVector, input.Limit+input.Offset, input.Filter)
 	if err != nil {
 		return nil, err
 	}
