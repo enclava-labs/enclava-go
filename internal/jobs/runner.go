@@ -35,7 +35,6 @@ var _ InputResolver = (*artifacts.Store)(nil)
 // documented per field.
 type RunnerConfig struct {
 	WorkerID        string        // process-unique; "worker-<pid>-<rand>" when empty
-	Operations      []string      // claimable operations; empty = claim everything
 	Lane            Lane          // claimable lane; "" = every lane
 	Concurrency     int           // max simultaneous handlers; default 4
 	PollInterval    time.Duration // idle poll delay; default 500ms
