@@ -4,6 +4,7 @@ import (
 	"context"
 	"enclava-go/internal/auth"
 	"enclava-go/internal/source"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,7 +19,9 @@ import (
 const teamsGraph = "https://graph.microsoft.com/v1.0"
 
 // TeamsAdapter reads only configured Teams and chats using app-only Graph access.
-// shortcut: complete bounded scans replace delta for every scope; use Graph delta only if it gains deletion-aware app-only support.
+// Channel roots sync through messages/delta and chats through a
+// lastModifiedDateTime watermark; a periodic full listing reconciles deletions
+// and older replies.
 type TeamsAdapter struct {
 	connection  source.Connection
 	resolver    CredentialResolver
@@ -54,7 +57,7 @@ func (a *TeamsAdapter) Capabilities() AdapterCapabilities {
 		Content: true,
 		UnsupportedScopes: []string{
 			"app-only access does not impersonate users",
-			"chat messages use bounded complete reconciliation; no deletion-aware app-only delta",
+			"chat messages and deletions plus replies to older channel messages are picked up by the periodic full sync",
 			"meeting chats",
 			"shared-channel guest identity beyond Graph allMembers",
 			"SharePoint attachment contents",
@@ -162,9 +165,52 @@ func (a *TeamsAdapter) get(ctx context.Context, token, endpoint string, target a
 	return a.doJSON(req, target)
 }
 
+// teamsContentCursor pages one run's listing by offset and carries the durable
+// per-run state: the completed full listing's time plus the delta links and chat
+// watermarks a completed run passes to the next.
+type teamsContentCursor struct {
+	Offset     int               `json:"offset,omitempty"`
+	Full       bool              `json:"full,omitempty"`
+	FullAt     string            `json:"full_at,omitempty"`
+	Started    string            `json:"started,omitempty"`
+	DeltaLinks map[string]string `json:"delta_links,omitempty"`
+	ChatMarks  map[string]string `json:"chat_marks,omitempty"`
+}
+
+func encodeTeamsContentCursor(state teamsContentCursor) Cursor {
+	raw, _ := json.Marshal(state)
+	return Cursor("content:" + base64.RawURLEncoding.EncodeToString(raw))
+}
+
+func decodeTeamsContentCursor(cursor Cursor) (teamsContentCursor, error) {
+	var state teamsContentCursor
+	raw := strings.TrimSpace(string(cursor))
+	if raw == "" {
+		return state, nil
+	}
+	if rest, ok := strings.CutPrefix(raw, "content:"); ok {
+		decoded, err := base64.RawURLEncoding.DecodeString(rest)
+		if err != nil || json.Unmarshal(decoded, &state) != nil {
+			return state, errors.New("invalid teams cursor")
+		}
+	} else {
+		// Legacy cursors were integer offsets of full runs.
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return state, errors.New("invalid teams cursor")
+		}
+		state.Offset, state.Full = n, true
+	}
+	if state.Offset < 0 {
+		return state, errors.New("invalid teams cursor")
+	}
+	return state, nil
+}
+
 type teamsPage struct {
 	Value []json.RawMessage `json:"value"`
 	Next  string            `json:"@odata.nextLink"`
+	Delta string            `json:"@odata.deltaLink"`
 }
 
 func (a *TeamsAdapter) list(ctx context.Context, token, endpoint string, max int) ([]json.RawMessage, error) {
@@ -228,6 +274,7 @@ type graphMessage struct {
 	Created  string `json:"createdDateTime"`
 	Modified string `json:"lastModifiedDateTime"`
 	WebURL   string `json:"webUrl"`
+	Deleted  string `json:"deletedDateTime"`
 	From     struct {
 		User struct{ ID, DisplayName string } `json:"user"`
 	} `json:"from"`
@@ -241,14 +288,25 @@ func (a *TeamsAdapter) Content(ctx context.Context, c source.Connection, cursor 
 	if limit < 1 || limit > 100 {
 		return ContentPage{}, errors.New("teams page limit must be between 1 and 100")
 	}
-	offset := 0
-	if cursor != "" {
-		n, err := strconv.Atoi(string(cursor))
-		if err != nil || n < 0 {
-			return ContentPage{}, errors.New("invalid teams cursor")
-		}
-		offset = n
+	state, err := decodeTeamsContentCursor(cursor)
+	if err != nil {
+		return ContentPage{}, err
 	}
+	started := time.Now()
+	if state.Offset == 0 {
+		// Run start: a completed listing is due again after full_sync_interval.
+		var lastFull time.Time
+		if state.FullAt != "" {
+			if parsed, err := time.Parse(time.RFC3339, state.FullAt); err == nil {
+				lastFull = parsed
+			}
+		}
+		state = teamsContentCursor{Full: fullSyncDue(a.connection.Config, lastFull, started), FullAt: state.FullAt, Started: started.Format(time.RFC3339), DeltaLinks: state.DeltaLinks, ChatMarks: state.ChatMarks}
+		if state.Full {
+			state.DeltaLinks, state.ChatMarks = nil, nil
+		}
+	}
+	offset := state.Offset
 	token, err := a.token(ctx)
 	if err != nil {
 		return ContentPage{}, err
@@ -260,6 +318,18 @@ func (a *TeamsAdapter) Content(ctx context.Context, c source.Connection, cursor 
 		}
 		items = append(items, item)
 		return nil
+	}
+	// Starting links and watermarks stay constant for the run's whole listing;
+	// fresh values collected here only enter the final page's checkpoint.
+	nextLinks := map[string]string{}
+	nextMarks := map[string]string{}
+	if !state.Full {
+		for k, v := range state.DeltaLinks {
+			nextLinks[k] = v
+		}
+		for k, v := range state.ChatMarks {
+			nextMarks[k] = v
+		}
 	}
 	for _, team := range a.selectedTeams() {
 		channels, err := a.list(ctx, token, a.baseURL+"/teams/"+teamsID(team)+"/channels?$top=100", teamsMaxItems)
@@ -277,10 +347,33 @@ func (a *TeamsAdapter) Content(ctx context.Context, c source.Connection, cursor 
 			if !allowedTeamChannel(a.connection.Config, team, channel.ID) {
 				continue
 			}
-			messages, err := a.list(ctx, token, a.baseURL+"/teams/"+teamsID(team)+"/channels/"+teamsID(channel.ID)+"/messages?$top=50", teamsMaxItems)
+			key := team + "\x00" + channel.ID
+			var messages []json.RawMessage
+			if state.Full {
+				// Full runs list every root directly: messages/delta only covers
+				// recent history, which would make the snapshot sweep drop older ones.
+				messages, err = a.list(ctx, token, a.baseURL+"/teams/"+teamsID(team)+"/channels/"+teamsID(channel.ID)+"/messages?$top=50", teamsMaxItems)
+				if err == nil {
+					_, link, derr := a.listDelta(ctx, token, a.baseURL+"/teams/"+teamsID(team)+"/channels/"+teamsID(channel.ID)+"/messages/delta", teamsMaxItems)
+					if derr == nil && link != "" {
+						nextLinks[key] = link
+					}
+				}
+			} else {
+				endpoint := state.DeltaLinks[key]
+				if endpoint == "" {
+					endpoint = a.baseURL + "/teams/" + teamsID(team) + "/channels/" + teamsID(channel.ID) + "/messages/delta"
+				}
+				var link string
+				messages, link, err = a.listDelta(ctx, token, endpoint, teamsMaxItems)
+				if link != "" {
+					nextLinks[key] = link
+				}
+			}
 			if err != nil {
 				return ContentPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list %s channel %s messages: %w", channel.MembershipType, channel.ID, err)
 			}
+			messages = filterDeletedTeamsMessages(messages)
 			for _, messageRaw := range messages {
 				var m graphMessage
 				if err := json.Unmarshal(messageRaw, &m); err != nil || m.ID == "" {
@@ -318,7 +411,15 @@ func (a *TeamsAdapter) Content(ctx context.Context, c source.Connection, cursor 
 		}
 	}
 	for _, chat := range a.selectedChats() {
-		messages, err := a.list(ctx, token, a.baseURL+"/chats/"+teamsID(chat)+"/messages?$top=50", teamsMaxItems)
+		endpoint := a.baseURL + "/chats/" + teamsID(chat) + "/messages?$top=50"
+		watermark := nextMarks[chat]
+		if !state.Full && watermark != "" {
+			if mark, err := time.Parse(time.RFC3339, watermark); err == nil {
+				since := mark.Add(-5 * time.Minute).UTC().Format(time.RFC3339)
+				endpoint += "&$orderby=" + url.QueryEscape("lastModifiedDateTime desc") + "&$filter=" + url.QueryEscape("lastModifiedDateTime gt "+since)
+			}
+		}
+		messages, err := a.list(ctx, token, endpoint, teamsMaxItems)
 		if err != nil {
 			return ContentPage{Completeness: CompletenessIncomplete}, fmt.Errorf("list configured chat %s messages (Chat.Read.All/ChatMessage.Read.All required): %w", chat, err)
 		}
@@ -326,6 +427,11 @@ func (a *TeamsAdapter) Content(ctx context.Context, c source.Connection, cursor 
 			var m graphMessage
 			if err := json.Unmarshal(raw, &m); err != nil || m.ID == "" {
 				return ContentPage{}, errors.New("teams chat message payload is malformed")
+			}
+			if parsed := parseTeamsTime(m.Modified); parsed != nil {
+				if current := parseTeamsTime(nextMarks[chat]); current == nil || parsed.After(*current) {
+					nextMarks[chat] = parsed.UTC().Format(time.RFC3339)
+				}
 			}
 			item := teamsMessageItem("", chat, "chat", m, "")
 			item.NativeID = "teams:chat:" + chat + ":" + m.ID
@@ -343,11 +449,61 @@ func (a *TeamsAdapter) Content(ctx context.Context, c source.Connection, cursor 
 	if end > len(items) {
 		end = len(items)
 	}
-	page := ContentPage{Items: items[offset:end], Completeness: CompletenessComplete, Snapshot: end == len(items)}
+	page := ContentPage{Items: items[offset:end], Completeness: CompletenessComplete}
+	state.Offset = end
 	if end < len(items) {
-		page.NextCursor = Cursor(strconv.Itoa(end))
+		page.NextCursor = encodeTeamsContentCursor(state)
+	} else {
+		// Deletions and replies to older roots only surface in a full listing.
+		page.Snapshot = state.Full
+		if state.Full {
+			state.FullAt = state.Started
+		}
+		state.DeltaLinks, state.ChatMarks = nextLinks, nextMarks
+		state.Offset = 0
+		page.Checkpoint = encodeTeamsContentCursor(state)
 	}
 	return page, nil
+}
+
+// listDelta follows a messages/delta chain and returns the final deltaLink.
+func (a *TeamsAdapter) listDelta(ctx context.Context, token, endpoint string, max int) ([]json.RawMessage, string, error) {
+	items := make([]json.RawMessage, 0)
+	delta := ""
+	for pages := 0; endpoint != ""; pages++ {
+		if pages >= 100 {
+			return nil, "", errors.New("teams pagination exceeded 100 pages")
+		}
+		var page teamsPage
+		if err := a.get(ctx, token, endpoint, &page); err != nil {
+			return nil, "", err
+		}
+		items = append(items, page.Value...)
+		if len(items) > max {
+			return nil, "", errors.New("teams listing exceeded configured bound")
+		}
+		if page.Delta != "" {
+			delta = page.Delta
+		}
+		endpoint = page.Next
+	}
+	return items, delta, nil
+}
+
+// filterDeletedTeamsMessages drops tombstones a delta round reports; full runs
+// apply them through the snapshot sweep instead.
+func filterDeletedTeamsMessages(raws []json.RawMessage) []json.RawMessage {
+	kept := raws[:0]
+	for _, raw := range raws {
+		var probe struct {
+			Deleted string `json:"deletedDateTime"`
+		}
+		if json.Unmarshal(raw, &probe) == nil && probe.Deleted != "" {
+			continue
+		}
+		kept = append(kept, raw)
+	}
+	return kept
 }
 func teamsMessageItem(team, channel, membership string, m graphMessage, parent string) ContentItem {
 	id := "teams:" + team + ":" + channel + ":" + m.ID

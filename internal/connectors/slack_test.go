@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/source"
@@ -21,12 +22,15 @@ import (
 // fakeSlack serves conversations.history/replies with Slack's cursor paging
 // over fixed messages, plus the lookups the adapter makes.
 type fakeSlack struct {
-	t        *testing.T
-	history  []map[string]any            // channel messages, any order
-	replies  map[string][]map[string]any // thread ts -> replies, any order
-	mu       sync.Mutex
-	calls    map[string]int
-	override func(w http.ResponseWriter, r *http.Request) bool
+	t         *testing.T
+	history   []map[string]any            // channel messages, any order
+	byChannel map[string][]map[string]any // per-channel history; falls back to history
+	channels  []map[string]any            // member channels for users.conversations
+	replies   map[string][]map[string]any // thread ts -> replies, any order
+	mu        sync.Mutex
+	calls     map[string]int
+	oldest    map[string]string // channel -> oldest param of its last history call
+	override  func(w http.ResponseWriter, r *http.Request) bool
 }
 
 func slackTS(m map[string]any) float64 {
@@ -38,6 +42,13 @@ func (f *fakeSlack) count(path string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls[path]
+}
+
+// lastOldest returns the oldest param of channel's last history call.
+func (f *fakeSlack) lastOldest(channel string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.oldest[channel]
 }
 
 // slackCursorPage pages msgs with opaque "o:<offset>" cursors, as Slack does.
@@ -91,9 +102,21 @@ func (f *fakeSlack) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		write(map[string]any{"ok": true, "user": map[string]any{"id": "U2", "name": "bob", "real_name": "Bob"}})
 	case "/conversations.history":
-		msgs := append([]map[string]any(nil), f.history...)
+		msgs := f.history
+		if f.byChannel != nil {
+			msgs = f.byChannel[q.Get("channel")]
+		}
+		msgs = append([]map[string]any(nil), msgs...)
 		sort.Slice(msgs, func(i, j int) bool { return slackTS(msgs[i]) > slackTS(msgs[j]) })
+		f.mu.Lock()
+		if f.oldest == nil {
+			f.oldest = map[string]string{}
+		}
+		f.oldest[q.Get("channel")] = q.Get("oldest")
+		f.mu.Unlock()
 		write(slackCursorPage(msgs, nil, q.Get("cursor"), limit))
+	case "/users.conversations":
+		write(map[string]any{"ok": true, "channels": f.channels})
 	case "/conversations.replies":
 		parent := q.Get("ts")
 		msgs := append([]map[string]any(nil), f.replies[parent]...)
@@ -378,5 +401,97 @@ func TestSlackPlainText(t *testing.T) {
 		if got := slackPlainText(in, lookup); got != want {
 			t.Errorf("slackPlainText(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestSlackIncrementalSyncs: the first run lists every channel fully and
+// checkpoints per-channel watermarks. A run from that checkpoint reads only
+// the last few hours of known channels (conversations.history oldest) but
+// lists a newly joined channel in full, and a run whose full listing has
+// aged past full_sync_interval lists everything again.
+func TestSlackIncrementalSyncs(t *testing.T) {
+	fake := &fakeSlack{t: t,
+		byChannel: map[string][]map[string]any{
+			"C1": {{"user": "U1", "text": "first", "ts": "1728000000.000000"}},
+		},
+		channels: []map[string]any{{"id": "C1", "name": "general"}},
+	}
+	run := func(conn source.Connection, cursor Cursor, limit int) ContentPage {
+		t.Helper()
+		a, _ := newSlackTestAdapter(t, fake)
+		var page ContentPage
+		for pages := 0; ; pages++ {
+			var err error
+			if page, err = a.Content(context.Background(), conn, cursor, limit); err != nil || pages > 20 {
+				t.Fatalf("page %d = %+v, %v", pages, page, err)
+			}
+			if cursor = page.NextCursor; cursor == "" {
+				return page
+			}
+		}
+	}
+	_, conn := newSlackTestAdapter(t, fake)
+	delete(conn.Config, "channel_id")
+	conn.Config["reconcile"] = "true"
+
+	full := run(conn, "", 100)
+	if !full.Snapshot || full.Checkpoint == "" || full.NextCursor != "" {
+		t.Fatalf("first run must list a full snapshot and checkpoint: %+v", full)
+	}
+	if fake.lastOldest("C1") != "" {
+		t.Fatalf("full run sent oldest = %q", fake.lastOldest("C1"))
+	}
+	cp, err := decodeSlackContentCursor(full.Checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cp.Channel != "" || cp.Full || cp.Oldest["C1"] != "1728000000.000000" || cp.FullAt == "" {
+		t.Fatalf("checkpoint = %+v", cp)
+	}
+
+	// Within the interval the next run is a delta: oldest bounds known
+	// channels and a newly joined channel is still read in full.
+	fake.byChannel["C1"] = append(fake.byChannel["C1"], map[string]any{"user": "U2", "text": "second", "ts": "1728003600.000000"})
+	fake.byChannel["C2"] = []map[string]any{{"user": "U1", "text": "new channel", "ts": "1728005000.000000"}}
+	fake.channels = append(fake.channels, map[string]any{"id": "C2", "name": "random"})
+	// Limit 1 forces C1's two messages over two pages, so lastOldest records
+	// the second (cursor-carrying) history call's bound.
+	delta := run(conn, full.Checkpoint, 1)
+	if delta.Snapshot || delta.Checkpoint == "" {
+		t.Fatalf("delta run must not snapshot: %+v", delta)
+	}
+	if fake.lastOldest("C1") != "1727978400.000000" {
+		t.Fatalf("delta oldest for C1 = %q, want 1727978400.000000 (watermark - 6h)", fake.lastOldest("C1"))
+	}
+	if fake.lastOldest("C2") != "" {
+		t.Fatalf("new channel should list fully, oldest = %q", fake.lastOldest("C2"))
+	}
+	deltaCP, err := decodeSlackContentCursor(delta.Checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deltaCP.Oldest["C1"] != "1728003600.000000" || deltaCP.Oldest["C2"] != "1728005000.000000" || deltaCP.FullAt != cp.FullAt {
+		t.Fatalf("delta checkpoint = %+v", deltaCP)
+	}
+
+	// A checkpoint older than full_sync_interval forces the full listing again.
+	stale := deltaCP
+	stale.FullAt = time.Now().UTC().Add(-25 * time.Hour).Format(time.RFC3339)
+	fullAgain := run(conn, encodeSlackContentCursor(stale), 100)
+	if !fullAgain.Snapshot || fake.lastOldest("C1") != "" || fake.lastOldest("C2") != "" {
+		t.Fatalf("stale FullAt must relist fully: page=%+v oldest C1=%q C2=%q", fullAgain, fake.lastOldest("C1"), fake.lastOldest("C2"))
+	}
+}
+
+// TestSlackLegacyCursorRunsFull: cursors stored by earlier releases (raw
+// Slack cursors without the content: prefix) decode empty and start a full
+// listing rather than failing the sync.
+func TestSlackLegacyCursorRunsFull(t *testing.T) {
+	fake := &fakeSlack{t: t, history: []map[string]any{{"user": "U1", "text": "hello", "ts": "1728000000.000000"}}}
+	a, conn := newSlackTestAdapter(t, fake)
+	conn.Config["reconcile"] = "true"
+	page, err := a.Content(context.Background(), conn, Cursor("raw-legacy-cursor"), 10)
+	if err != nil || !page.Snapshot || len(page.Items) != 1 || page.Checkpoint == "" {
+		t.Fatalf("legacy cursor page = %+v, %v", page, err)
 	}
 }
