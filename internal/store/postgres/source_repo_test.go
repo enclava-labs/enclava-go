@@ -2,7 +2,9 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 
 	"enclava-go/internal/source"
 )
@@ -414,6 +416,20 @@ func TestIngestFailed(t *testing.T) {
 		        'key-embed-4', 'obj_a#2', 'h', '{}', 'sub', '{"generation":"4"}'::jsonb)`)
 	assert("col_a", true, "staging generation whose embed job was interrupted")
 
+	// An interrupted job that may already have been billed is not auto-retried.
+	exec(`INSERT INTO reservations (tenant_id, id, job_id, subject_type, subject_id, price_snapshot,
+	                               reserved_units, limit_amount_micros, currency, state)
+		VALUES ($1, 'res_priced', 'job_embed_4', 'api_key', 'key',
+		        '{"rates":[{"unit":"input","rate_micros":5,"unit_quantity":1}],"currency":"USD","rounding_rule":"ceil"}'::jsonb,
+		        '{"input":1}'::jsonb, 0, 'USD', 'unknown')`)
+	assert("col_a", false, "interrupted job with priced reservation is not retried")
+	exec(`UPDATE reservations SET price_snapshot =
+		'{"rates":[{"unit":"input","rate_micros":0,"unit_quantity":1}],"currency":"USD","rounding_rule":"ceil"}'::jsonb
+		WHERE tenant_id = $1 AND id = 'res_priced'`)
+	assert("col_a", true, "interrupted job with all-zero rates still counts")
+	exec(`DELETE FROM reservations WHERE tenant_id = $1 AND id = 'res_priced'`)
+	assert("col_a", true, "interrupted job with no reservation still counts")
+
 	exec(`INSERT INTO index_generations (tenant_id, id, collection_id, object_version_id, generation, state)
 		VALUES ($1, 'gen_5', 'col_a', 'obj_a#2', 5, 'published')`)
 	exec(`INSERT INTO jobs (tenant_id, id, operation, status, connection_id, object_id, observed_revision,
@@ -421,4 +437,74 @@ func TestIngestFailed(t *testing.T) {
 		VALUES ($1, 'job_embed_5', 'rag.embed', 'unknown', 'conn_a', 'obj_a', 2,
 		        'key-embed-5', 'obj_a#2', 'h', '{}', 'sub', '{"generation":"5"}'::jsonb)`)
 	assert("col_a", false, "published generation clears an interrupted job")
+}
+
+// TestIngestRetryDue backs off automatic retries of unchanged content
+// exponentially (1h, 2h, 4h … capped at one week) from the newest version
+// carrying that content hash; content never seen before is always due.
+func TestIngestRetryDue(t *testing.T) {
+	db, repo, ctx := newRepo(t)
+	seedTenant(t, ctx, db, idTenantA)
+	if err := repo.CreateConnection(ctx, source.Connection{
+		TenantID: idTenantA, ID: "conn_r", Kind: "slack", Name: "slack", CredentialRef: "ref"}); err != nil {
+		t.Fatalf("create connection: %v", err)
+	}
+	if _, err := repo.UpsertObject(ctx, source.Object{
+		TenantID: idTenantA, ConnectionID: "conn_r", ID: "obj_r", Kind: "message",
+		NativeID: "slack:C1:retry", AuthorizationMode: source.AuthorizationCollection, ObservedSeq: 1}); err != nil {
+		t.Fatalf("upsert object: %v", err)
+	}
+
+	now := time.Now().UTC()
+	insertAt := func(seq int, sha string, at time.Time) {
+		t.Helper()
+		if _, err := db.SQL.ExecContext(ctx, `
+			INSERT INTO source_object_versions (tenant_id, id, object_id, observed_seq,
+			                                   artifact_ref, content_sha256, byte_size, created_at)
+			VALUES ($1, $2, 'obj_r', $3, 'art_r', $4, 1, $5)`,
+			idTenantA, fmt.Sprintf("ver_r%d", seq), seq, sha, at); err != nil {
+			t.Fatalf("insert version %d: %v", seq, err)
+		}
+	}
+	due := func(sha string, at time.Time) bool {
+		t.Helper()
+		got, err := repo.IngestRetryDue(ctx, idTenantA, "obj_r", sha, at)
+		if err != nil {
+			t.Fatalf("IngestRetryDue: %v", err)
+		}
+		return got
+	}
+
+	// n=1 → retry allowed after 1h from the newest version.
+	insertAt(1, "sha_a", now)
+	if due("sha_a", now.Add(59*time.Minute)) {
+		t.Fatal("one 59m-old version: must not be due yet")
+	}
+	if !due("sha_a", now.Add(61*time.Minute)) {
+		t.Fatal("one 61m-old version: must be due")
+	}
+
+	// n=3 → 4h; due time tracks the newest matching version.
+	insertAt(2, "sha_a", now.Add(-2*time.Hour))
+	insertAt(3, "sha_a", now.Add(-3*time.Hour))
+	if due("sha_a", now.Add(3*time.Hour+59*time.Minute)) {
+		t.Fatal("three versions 59m short of 4h: must not be due yet")
+	}
+	if !due("sha_a", now.Add(4*time.Hour+time.Minute)) {
+		t.Fatal("three versions past 4h: must be due")
+	}
+	if !due("sha_b", now) {
+		t.Fatal("a hash never versioned must be due immediately")
+	}
+
+	// Deep retry histories cap at one week instead of overflowing.
+	for seq := 4; seq <= 10; seq++ {
+		insertAt(seq, "sha_a", now)
+	}
+	if due("sha_a", now.Add(6*24*time.Hour)) {
+		t.Fatal("ten versions 6d old: weekly cap must hold")
+	}
+	if !due("sha_a", now.Add(7*24*time.Hour+time.Minute)) {
+		t.Fatal("ten versions past a week: capped delay must be due")
+	}
 }

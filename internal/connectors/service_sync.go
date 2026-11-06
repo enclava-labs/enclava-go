@@ -217,7 +217,15 @@ func (s *Service) observeContentItem(ctx context.Context, conn source.Connection
 			if failErr != nil {
 				return Observation{}, failErr
 			}
-			retry = failed
+			if failed {
+				// Back off repeat failures on the same bytes so a permanently
+				// failing item does not re-version (and re-bill) every sync.
+				due, dueErr := s.canonical.IngestRetryDue(ctx, conn.TenantID, object.ID, latest.SHA256, time.Now())
+				if dueErr != nil {
+					return Observation{}, dueErr
+				}
+				retry = due
+			}
 		}
 		if !metadataChanged && !retry {
 			handedOff, handErr := s.canonical.IngestHandoffExists(ctx, conn.TenantID, conn.ID, conn.TargetCollectionID, object.ID, latest.ObservedSeq)

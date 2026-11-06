@@ -538,7 +538,10 @@ func (r *SourceRepo) IngestHandoffExists(ctx context.Context, tenantID, connecti
 
 // IngestFailed mirrors the document "failed" status: the newest generation of
 // the object version in the collection is failed, or its embed/ingest job is
-// failed or was interrupted ('unknown') before the generation published.
+// failed or was interrupted ('unknown') before the generation published. An
+// interrupted job counts only when nothing it held is priced — any of its
+// reservations carrying a rate above zero could already be charged upstream,
+// so a retry is left to manual Reprocess instead of risking a double charge.
 func (r *SourceRepo) IngestFailed(ctx context.Context, tenantID, collectionID, objectID string, observedSeq int64) (bool, error) {
 	var failed bool
 	err := r.db.SQL.QueryRowContext(ctx, `
@@ -549,7 +552,13 @@ func (r *SourceRepo) IngestFailed(ctx context.Context, tenantID, collectionID, o
 				  AND j.operation IN ('`+rag.OperationEmbed+`', '`+rag.OperationIngest+`')
 				  AND j.input_ref = g.object_version_id
 				  AND j.policy->>'generation' = g.generation::text
-				  AND (j.status = 'failed' OR (j.status = 'unknown' AND g.state <> 'published')))
+				  AND (j.status = 'failed' OR (j.status = 'unknown' AND g.state <> 'published'
+				      AND NOT EXISTS (
+				          SELECT 1 FROM reservations rv,
+				               jsonb_array_elements(COALESCE(rv.price_snapshot->'rates','[]'::jsonb)) rate
+				          WHERE rv.tenant_id = j.tenant_id AND rv.job_id = j.id
+				            AND (rate->>'rate_micros')::bigint > 0)))
+			)
 			FROM index_generations g
 			JOIN source_object_versions v
 			  ON v.tenant_id = g.tenant_id AND v.id = g.object_version_id
@@ -563,6 +572,31 @@ func (r *SourceRepo) IngestFailed(ctx context.Context, tenantID, collectionID, o
 		return false, fmt.Errorf("check ingest failure: %w", err)
 	}
 	return failed, nil
+}
+
+// IngestRetryDue backs off automatic retries of unchanged content: with n
+// versions of the object carrying this content hash, the next retry is due
+// after 1h*2^(n-1) from the newest version, capped at one week. A hash never
+// seen before is always due.
+func (r *SourceRepo) IngestRetryDue(ctx context.Context, tenantID, objectID, sha256 string, now time.Time) (bool, error) {
+	var n int
+	var last sql.NullTime
+	err := r.db.SQL.QueryRowContext(ctx, `
+		SELECT COUNT(*), MAX(created_at)
+		FROM source_object_versions
+		WHERE tenant_id = $1 AND object_id = $2 AND content_sha256 = $3`,
+		tenantID, objectID, sha256).Scan(&n, &last)
+	if err != nil {
+		return false, fmt.Errorf("check ingest retry backoff: %w", err)
+	}
+	if n == 0 {
+		return true, nil
+	}
+	delay := 7 * 24 * time.Hour
+	if n <= 8 { // 1h<<(n-1) stays under the week cap; larger n overflows it anyway
+		delay = time.Hour << (n - 1)
+	}
+	return !now.Before(last.Time.Add(delay)), nil
 }
 
 // ---------------------------------------------------------------------

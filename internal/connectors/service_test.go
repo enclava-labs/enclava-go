@@ -633,8 +633,10 @@ func TestContentSyncRewriteAndRetargetHandoff(t *testing.T) {
 
 // TestContentSyncRetriesFailedIndexing: an unchanged item whose indexing
 // failed (for example the embed ran before the creator's source identity was
-// bound) is handed off again on the next sync as a new version reusing the
-// artifact; once indexing succeeded the re-sync is idempotent again.
+// bound) is not re-versioned while the retry backoff holds; once the failed
+// version ages past the backoff the next sync hands it off again as a new
+// version reusing the artifact, and after indexing succeeded the re-sync is
+// idempotent again.
 func TestContentSyncRetriesFailedIndexing(t *testing.T) {
 	ctx := context.Background()
 	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true}}
@@ -693,12 +695,24 @@ func TestContentSyncRetriesFailedIndexing(t *testing.T) {
 		t.Fatalf("initial sync enqueued %d ingests", ingests)
 	}
 	generation(v1, 1, "failed")
-	v2, ingests := syncAndDrain(2)
+	// The failure just happened, so the retry backoff holds: the sync sees the
+	// unchanged item, records nothing new and enqueues no ingest.
+	vHeld, ingests := syncAndDrain(2)
+	if ingests != 0 || vHeld.ObservedSeq != v1.ObservedSeq {
+		t.Fatalf("recently failed indexing retried too soon: ingests=%d vHeld=%+v", ingests, vHeld)
+	}
+	// Age the failed version past the 1h backoff and the retry re-versions.
+	if _, err := f.db.SQL.ExecContext(ctx,
+		`UPDATE source_object_versions SET created_at = created_at - interval '2 hours'
+		 WHERE tenant_id = $1 AND object_id = $2`, f.tenant, v1.ObjectID); err != nil {
+		t.Fatal(err)
+	}
+	v2, ingests := syncAndDrain(3)
 	if ingests != 1 || v2.ObservedSeq != v1.ObservedSeq+1 || v2.ArtifactRef != v1.ArtifactRef {
-		t.Fatalf("failed indexing was not retried: ingests=%d v1=%+v v2=%+v", ingests, v1, v2)
+		t.Fatalf("aged-out failed indexing was not retried: ingests=%d v1=%+v v2=%+v", ingests, v1, v2)
 	}
 	generation(v2, 2, "published")
-	if v3, ingests := syncAndDrain(3); ingests != 0 || v3.ObservedSeq != v2.ObservedSeq {
+	if v3, ingests := syncAndDrain(4); ingests != 0 || v3.ObservedSeq != v2.ObservedSeq {
 		t.Fatalf("indexed item was handed off again: ingests=%d v3=%+v", ingests, v3)
 	}
 }
