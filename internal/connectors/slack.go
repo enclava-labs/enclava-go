@@ -24,12 +24,19 @@ const (
 	// Slack answers bursts with 429 + Retry-After; waiting keeps a large channel import alive.
 	slackRateLimitRetries = 5
 	slackMaxRetryWait     = time.Minute
+	// Delta runs re-read this much history behind each channel's watermark so
+	// late-arriving messages and thread replies near the boundary are not missed.
+	slackDeltaOverlap = 6 * time.Hour
 )
 
 // slackContentCursor follows Slack's own history and replies cursors. Each
 // message is one item and its file attachments queue behind it, so every API
 // page is consumed whole and a page never exceeds the requested item bound.
-// Channel is the channel in progress when the source syncs every channel.
+// Channel is the channel in progress when the source syncs every channel. A
+// cursor with no Channel is a run checkpoint, not a position: Full runs list
+// everything, delta runs read each channel back to Oldest (its watermark)
+// minus slackDeltaOverlap and advance Seen to the newest ts read. FullAt is
+// the RFC3339 time the last full listing started; Started is this run's.
 type slackContentCursor struct {
 	Channel     string   `json:"channel,omitempty"`
 	History     string   `json:"history,omitempty"`
@@ -37,6 +44,12 @@ type slackContentCursor struct {
 	Threads     []string `json:"threads,omitempty"`
 	Replies     string   `json:"replies,omitempty"`
 	Files       []string `json:"files,omitempty"`
+
+	Full    bool              `json:"full,omitempty"`
+	FullAt  string            `json:"full_at,omitempty"`
+	Started string            `json:"started,omitempty"`
+	Oldest  map[string]string `json:"oldest,omitempty"`
+	Seen    map[string]string `json:"seen,omitempty"`
 }
 
 func encodeSlackContentCursor(cursor slackContentCursor) Cursor {
@@ -59,6 +72,47 @@ func decodeSlackContentCursor(cursor Cursor) (slackContentCursor, error) {
 		return state, errors.New("invalid slack content cursor")
 	}
 	return state, nil
+}
+
+// checkpoint returns the stored cursor a completed run starts the next one
+// from: no position, the full-listing time advanced on full runs, and each
+// channel's watermark. Full runs drop channels that were not listed.
+func (c slackContentCursor) checkpoint() slackContentCursor {
+	out := slackContentCursor{FullAt: c.FullAt, Oldest: map[string]string{}}
+	if c.Full {
+		out.FullAt = c.Started
+	}
+	if !c.Full {
+		for channel, ts := range c.Oldest {
+			out.Oldest[channel] = ts
+		}
+	}
+	for channel, ts := range c.Seen {
+		out.Oldest[channel] = maxSlackTimestamp(out.Oldest[channel], ts)
+	}
+	return out
+}
+
+// resetChannel clears the position of a finished channel without losing the
+// run-level fields (Full, FullAt, Started, Oldest, Seen).
+func (c *slackContentCursor) resetChannel() {
+	c.Channel, c.History, c.HistoryDone, c.Threads, c.Replies, c.Files = "", "", false, nil, "", nil
+}
+
+// slackHistoryOldest backs a channel watermark off by the delta overlap for
+// conversations.history's oldest parameter; "" lists the channel in full.
+func slackHistoryOldest(ts string) string {
+	t := slackTimestamp(ts)
+	if t == nil {
+		return ""
+	}
+	oldest := t.Add(-slackDeltaOverlap)
+	return fmt.Sprintf("%d.%06d", oldest.Unix(), oldest.Nanosecond()/1000)
+}
+
+func slackCursorTime(s string) time.Time {
+	t, _ := time.Parse(time.RFC3339, s)
+	return t
 }
 
 type slackAdapter struct {
@@ -119,6 +173,18 @@ func (a *slackAdapter) Content(ctx context.Context, conn source.Connection, curs
 	if err != nil {
 		return ContentPage{}, err
 	}
+	if state.Channel == "" {
+		// No channel in progress: a completed run's checkpoint (or nothing)
+		// starts the next run, full when fullSyncDue says so, else a delta
+		// that re-reads each channel from its Oldest watermark.
+		state.Full = fullSyncDue(conn.Config, slackCursorTime(state.FullAt), time.Now())
+		state.Started = time.Now().UTC().Format(time.RFC3339)
+		state.Seen = nil
+		if state.Full {
+			// A full listing ignores watermarks; the next checkpoint's Oldest is rebuilt from Seen.
+			state.Oldest = nil
+		}
+	}
 	// A source without channel_id syncs every channel the credential is a
 	// member of, one after another in channel-ID order.
 	channel := slackChannel(conn)
@@ -129,8 +195,9 @@ func (a *slackAdapter) Content(ctx context.Context, conn source.Connection, curs
 			}
 		}
 	}
-	// Only explicitly requested whole-channel reconciliations can authorize absence sweeps.
-	page := ContentPage{Completeness: CompletenessComplete, Snapshot: strings.EqualFold(stringFromAny(conn.Config["reconcile"]), "true")}
+	// Absence sweeps run only on explicitly requested reconciliations, and
+	// only a full listing can prove an item is gone.
+	page := ContentPage{Completeness: CompletenessComplete, Snapshot: state.Full && strings.EqualFold(stringFromAny(conn.Config["reconcile"]), "true")}
 	for emptyPages := 0; channel != "" && len(page.Items) < limit; {
 		if len(state.Files) > 0 {
 			file, err := a.fileItem(ctx, state.Files[0])
@@ -148,7 +215,7 @@ func (a *slackAdapter) Content(ctx context.Context, conn source.Connection, curs
 			if channel, err = a.channelAfter(ctx, conn, channel); err != nil {
 				return ContentPage{}, err
 			}
-			state = slackContentCursor{}
+			state.resetChannel()
 			continue
 		}
 		budget := limit - len(page.Items)
@@ -157,12 +224,13 @@ func (a *slackAdapter) Content(ctx context.Context, conn source.Connection, curs
 		if thread {
 			batch, next, err = a.replies(ctx, channel, state.Threads[0], state.Replies, budget)
 		} else {
-			batch, next, err = a.history(ctx, channel, state.History, budget)
+			batch, next, err = a.history(ctx, channel, state.History, slackHistoryOldest(state.Oldest[channel]), budget)
 		}
 		if err != nil {
 			if slackChannel(conn) == "" && slackChannelGone(err) {
 				// Left or deleted since the channel list was taken: move on.
-				state = slackContentCursor{HistoryDone: true}
+				state.resetChannel()
+				state.HistoryDone = true
 				continue
 			}
 			return ContentPage{}, err
@@ -179,6 +247,10 @@ func (a *slackAdapter) Content(ctx context.Context, conn source.Connection, curs
 			if msg.TS == "" {
 				return ContentPage{}, errors.New("slack message omitted ts")
 			}
+			if state.Seen == nil {
+				state.Seen = map[string]string{}
+			}
+			state.Seen[channel] = maxSlackTimestamp(state.Seen[channel], msg.TS)
 			// Thread replies also sent to the channel are listed with their thread.
 			if !thread && msg.ThreadTS != "" && msg.ThreadTS != msg.TS {
 				continue
@@ -214,21 +286,28 @@ func (a *slackAdapter) Content(ctx context.Context, conn source.Connection, curs
 		if channel, err = a.channelAfter(ctx, conn, channel); err != nil {
 			return ContentPage{}, err
 		}
-		state = slackContentCursor{}
+		state.resetChannel()
 	}
 	if channel != "" {
 		state.Channel = channel
 		page.NextCursor = encodeSlackContentCursor(state)
+	} else {
+		page.Checkpoint = encodeSlackContentCursor(state.checkpoint())
 	}
 	return page, nil
 }
 
 // history lists up to limit channel messages, newest first, and the cursor
-// of the next page ("" at the end).
-func (a *slackAdapter) history(ctx context.Context, channel, cursor string, limit int) ([]slackMessage, string, error) {
+// of the next page ("" at the end). oldest bounds how far back the listing
+// goes ("" = the whole channel); it repeats on every page because Slack's
+// cursor does not carry the bounds forward.
+func (a *slackAdapter) history(ctx context.Context, channel, cursor, oldest string, limit int) ([]slackMessage, string, error) {
 	q := url.Values{"channel": {channel}, "limit": {strconv.Itoa(limit)}}
 	if cursor != "" {
 		q.Set("cursor", cursor)
+	}
+	if oldest != "" {
+		q.Set("oldest", oldest)
 	}
 	var data struct {
 		Messages []slackMessage `json:"messages"`
