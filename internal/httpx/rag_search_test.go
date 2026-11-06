@@ -385,7 +385,7 @@ func (s *readableSearchStore) SetPayload(ctx context.Context, collection string,
 func (s *readableSearchStore) DeleteCollection(ctx context.Context, collection string) error {
 	return nil
 }
-func (s *readableSearchStore) SearchHybrid(ctx context.Context, collection string, vector []float64, sparse rag.SparseVector, limit int, filter map[string]any) ([]rag.QdrantSearchPoint, error) {
+func (s *readableSearchStore) SearchHybrid(ctx context.Context, collection string, vector []float64, limit int, filter map[string]any) ([]rag.QdrantSearchPoint, error) {
 	return s.points[collection], nil
 }
 func (s *readableSearchStore) Query(ctx context.Context, collection string, in rag.QueryInput) ([]rag.QdrantSearchPoint, error) {
