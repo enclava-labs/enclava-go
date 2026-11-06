@@ -349,6 +349,29 @@ func serve() error {
 		}
 	}()
 
+	// Bulk job history (syncs and their ingest/embed fan-out) is trimmed after
+	// JOB_RETENTION; user-facing jobs (chat runs, extractions) are kept.
+	retentionDone := make(chan struct{})
+	go func() {
+		defer close(retentionDone)
+		bulkOps := []string{rag.OperationIngest, rag.OperationEmbed, rag.OperationAccessBackfill, rag.OperationReembedScan, connectors.OperationSync, "rag.access"}
+		tick := time.NewTicker(time.Hour)
+		defer tick.Stop()
+		for {
+			purged, err := jobsSvc.PurgeFinished(runnerCtx, cfg.JobRetention, bulkOps)
+			if err != nil && runnerCtx.Err() == nil {
+				log.Printf("job retention sweep failed: %v", err)
+			} else if purged > 0 {
+				log.Printf("job retention sweep: %d finished jobs removed", purged)
+			}
+			select {
+			case <-runnerCtx.Done():
+				return
+			case <-tick.C:
+			}
+		}
+	}()
+
 	promptSvc := prompts.NewService(promptRepo, chatbotSvc)
 
 	// Browser dashboard login runs on the server-session handlers from 01-12;
@@ -421,6 +444,7 @@ func serve() error {
 	<-runnerDone
 	<-schedulerDone
 	<-sweeperDone
+	<-retentionDone
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {

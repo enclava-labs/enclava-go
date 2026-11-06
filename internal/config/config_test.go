@@ -107,10 +107,10 @@ func TestOperationalConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.JobTimeout != 2*time.Hour || cfg.IndexRetirementSoak != 24*time.Hour || cfg.UtilityModel != "" || cfg.MetricsToken != "" || cfg.MetricsAuthDisabled {
+	if cfg.JobTimeout != 2*time.Hour || cfg.JobRetention != 720*time.Hour || cfg.IndexRetirementSoak != 24*time.Hour || cfg.UtilityModel != "" || cfg.MetricsToken != "" || cfg.MetricsAuthDisabled {
 		t.Fatalf("unexpected operational defaults: %+v", cfg)
 	}
-	for _, key := range []string{"JOB_TIMEOUT", "INDEX_RETIREMENT_SOAK"} {
+	for _, key := range []string{"JOB_TIMEOUT", "JOB_RETENTION", "INDEX_RETIREMENT_SOAK"} {
 		t.Run(key, func(t *testing.T) {
 			t.Setenv(key, "-1s")
 			if _, err := Load(); err == nil {
@@ -363,6 +363,7 @@ func clearConfigEnv(t *testing.T) {
 		"ENCLAVA_DATA_DIR",
 		"SESSION_TTL",
 		"JOB_TIMEOUT",
+		"JOB_RETENTION",
 		"INDEX_RETIREMENT_SOAK",
 		"UTILITY_MODEL",
 		"METRICS_TOKEN",

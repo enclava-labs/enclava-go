@@ -821,6 +821,59 @@ func (r *JobsRepo) DeleteJob(ctx context.Context, tenantID, jobID string) error 
 	return nil
 }
 
+// PurgeFinishedJobs hard-deletes up to limit terminal jobs of the listed
+// operations last touched before `before`, together with their attempts —
+// the jobs<->job_attempts FKs are NO ACTION, so one statement clears both.
+// Jobs with a reservations row stay (billing evidence references the job and
+// its attempts), and a failed/unknown job stays while an index generation
+// for its (input_ref, policy generation) is unpublished: that row is what
+// still shows the document as failed.
+func (r *JobsRepo) PurgeFinishedJobs(ctx context.Context, before time.Time, operations []string, limit int) (int64, error) {
+	if limit <= 0 || len(operations) == 0 {
+		return 0, nil
+	}
+	args := []any{before, limit}
+	predicate, args := appendJobPredicate("", args, "j.operation", operations)
+	//nolint:gosec // predicate holds only placeholders
+	res, err := r.db.SQL.ExecContext(ctx, `
+		WITH doomed AS MATERIALIZED (
+			SELECT j.ctid FROM jobs j
+			WHERE j.status IN ('succeeded','failed','cancelled','unknown','deleted')
+			  AND COALESCE(j.finished_at, j.updated_at) < $1`+predicate+`
+			  AND NOT EXISTS (
+			      SELECT 1 FROM reservations r
+			      WHERE r.tenant_id = j.tenant_id AND r.job_id = j.id)
+			  AND NOT EXISTS (
+			      SELECT 1 FROM reservations r
+			      JOIN job_attempts a ON a.tenant_id = r.tenant_id AND a.id = r.attempt_id
+			      WHERE a.tenant_id = j.tenant_id AND a.job_id = j.id)
+			  AND NOT (
+			      j.status IN ('failed','unknown')
+			      AND EXISTS (
+			          SELECT 1 FROM index_generations g
+			          WHERE g.tenant_id = j.tenant_id
+			            AND g.object_version_id = j.input_ref
+			            AND g.generation::text = j.policy->>'generation'
+			            AND g.state <> 'published'))
+			ORDER BY COALESCE(j.finished_at, j.updated_at)
+			LIMIT $2
+			FOR UPDATE OF j SKIP LOCKED
+		), attempts AS (
+			DELETE FROM job_attempts a
+			USING doomed d, jobs j
+			WHERE j.ctid = d.ctid
+			  AND a.tenant_id = j.tenant_id AND a.job_id = j.id
+		)
+		DELETE FROM jobs j
+		USING doomed d
+		WHERE j.ctid = d.ctid`, args...)
+	if err != nil {
+		return 0, fmt.Errorf("purge finished jobs: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 func (r *JobsRepo) CountActivePreviews(ctx context.Context, tenantID string) (int, error) {
 	var count int
 	err := r.db.SQL.QueryRowContext(ctx, `

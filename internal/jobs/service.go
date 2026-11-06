@@ -422,3 +422,28 @@ func (s *Service) Delete(ctx context.Context, p auth.Principal, id string) error
 	}
 	return s.repo.DeleteJob(ctx, p.TenantID, id)
 }
+
+// purgeBatchSize bounds one delete statement; the hourly sweeper calls
+// PurgeFinished, not the repository directly.
+const purgeBatchSize = 5000
+
+// PurgeFinished deletes finished jobs of the listed operations older than
+// `retention`, in bounded batches so one call never holds a giant delete.
+// retention <= 0 disables retention entirely.
+func (s *Service) PurgeFinished(ctx context.Context, retention time.Duration, operations []string) (int64, error) {
+	if retention <= 0 {
+		return 0, nil
+	}
+	before := time.Now().Add(-retention)
+	var total int64
+	for {
+		n, err := s.repo.PurgeFinishedJobs(ctx, before, operations, purgeBatchSize)
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n < purgeBatchSize {
+			return total, nil
+		}
+	}
+}

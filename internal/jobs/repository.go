@@ -113,6 +113,12 @@ type JobsRepository interface {
 	CancelJob(ctx context.Context, tenantID, jobID string) error
 	// DeleteJob tombstones the row (status=deleted, deleted_at).
 	DeleteJob(ctx context.Context, tenantID, jobID string) error
+	// PurgeFinishedJobs hard-deletes up to limit terminal jobs of the listed
+	// operations finished (or last updated) before `before`, together with
+	// their attempts. Jobs with a reservations row, and failed/unknown jobs
+	// backing an unpublished index generation, are kept. Returns the number
+	// of jobs deleted.
+	PurgeFinishedJobs(ctx context.Context, before time.Time, operations []string, limit int) (int64, error)
 }
 
 // IsStaleFence reports whether err is a fencing violation.
