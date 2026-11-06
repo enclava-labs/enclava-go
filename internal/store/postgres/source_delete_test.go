@@ -80,11 +80,16 @@ func TestDeleteConnectionRemovesSyncedRows(t *testing.T) {
 	exec(`INSERT INTO artifacts (tenant_id, id, kind, sha256, byte_size, state, storage_path)
 	      VALUES ($1, 'art_1', 'original', 'sha1', 10, 'final', 'x/y')`)
 
-	// Queued work bound to the connection must not survive it.
+	// Queued work bound to the connection must not survive it — including
+	// embed jobs, which carry only the object.
 	exec(`INSERT INTO jobs (tenant_id, id, operation, status, connection_id,
 	                        idempotency_key, input_ref, input_hash, principal, submitter_key, policy)
 	      VALUES ($1, 'job_sync', 'connector.sync', 'queued', 'conn_del',
 	              'key-sync', 'ver_1', 'h', '{}', 'sub', '{}'::jsonb)`)
+	exec(`INSERT INTO jobs (tenant_id, id, operation, status, object_id,
+	                        idempotency_key, input_ref, input_hash, principal, submitter_key, policy)
+	      VALUES ($1, 'job_embed', 'rag.embed', 'queued', 'obj_1',
+	              'key-embed', 'ver_1', 'h', '{}', 'sub', '{"generation":"1"}'::jsonb)`)
 
 	if err := NewSourceRepo(db).DeleteConnection(ctx, idTenantA, "conn_del"); err != nil {
 		t.Fatalf("delete synced connection: %v", err)
@@ -117,13 +122,15 @@ func TestDeleteConnectionRemovesSyncedRows(t *testing.T) {
 		t.Fatalf("artifact must be tombstoned(deleted), got %s/%s", state, reason)
 	}
 
-	var jobStatus string
-	if err := db.SQL.QueryRowContext(ctx,
-		`SELECT status FROM jobs WHERE tenant_id = $1 AND id = 'job_sync'`,
-		idTenantA).Scan(&jobStatus); err != nil {
-		t.Fatalf("read job row: %v", err)
-	}
-	if jobStatus != "cancelled" {
-		t.Fatalf("queued connection job must be cancelled, got %s", jobStatus)
+	for _, jobID := range []string{"job_sync", "job_embed"} {
+		var jobStatus string
+		if err := db.SQL.QueryRowContext(ctx,
+			`SELECT status FROM jobs WHERE tenant_id = $1 AND id = $2`,
+			idTenantA, jobID).Scan(&jobStatus); err != nil {
+			t.Fatalf("read job row %s: %v", jobID, err)
+		}
+		if jobStatus != "cancelled" {
+			t.Fatalf("queued job %s must be cancelled, got %s", jobID, jobStatus)
+		}
 	}
 }

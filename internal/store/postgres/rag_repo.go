@@ -87,10 +87,13 @@ func (r *SourceRepo) DeleteConnection(ctx context.Context, tenantID, id string) 
 		tenantID, id, artifacts.ReasonDeleted); err != nil {
 		return fmt.Errorf("delete connection: %w", err)
 	}
-	// Queued work for the dead connection must never run.
+	// Queued work for the dead connection must never run. Embed jobs carry
+	// only the object, not the connection.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE jobs SET status = 'cancelled', finished_at = now(), updated_at = now()
-		WHERE tenant_id = $1 AND connection_id = $2 AND status = 'queued'`,
+		WHERE tenant_id = $1 AND status = 'queued'
+		  AND (connection_id = $2 OR object_id IN
+		       (SELECT id FROM source_objects WHERE tenant_id = $1 AND connection_id = $2))`,
 		tenantID, id); err != nil {
 		return fmt.Errorf("delete connection: %w", err)
 	}
