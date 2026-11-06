@@ -48,17 +48,13 @@ func (r *SourceRepo) UpdateConnection(ctx context.Context, c source.Connection) 
 	if err != nil {
 		return fmt.Errorf("marshal connection config: %w", err)
 	}
-	audience, err := jsonList(c.AudienceDefault)
-	if err != nil {
-		return fmt.Errorf("marshal connection audience: %w", err)
-	}
 	res, err := r.db.SQL.ExecContext(ctx, `
 		UPDATE connections SET name = $3, credential_ref = $4, config = $5::jsonb,
-		       target_collection_id = $6, audience_default = $7::jsonb, status = $8,
+		       target_collection_id = $6, status = $7,
 		       updated_at = now()
 		WHERE tenant_id = $1 AND id = $2`,
 		c.TenantID, c.ID, c.Name, c.CredentialRef, config,
-		nullableText(c.TargetCollectionID), audience, c.Status)
+		nullableText(c.TargetCollectionID), c.Status)
 	if err != nil {
 		return fmt.Errorf("update connection: %w", err)
 	}
@@ -118,9 +114,8 @@ func (r *SourceRepo) DeleteConnection(ctx context.Context, tenantID, id string) 
 	}
 	// Children first, in FK-safe order: index/graph dependents of the
 	// connection's versions (rag_evidence and index_reconciliation cascade),
-	// then versions, then objects; grants → memberships → restricted refs →
-	// snapshots → objects/groups/identities → the connection itself
-	// (003_source FKs have no cascade).
+	// then versions, then restricted refs and objects, then the connection
+	// itself (003_source FKs have no cascade).
 	steps := []string{
 		`DELETE FROM index_generations WHERE tenant_id = $1 AND object_version_id IN (SELECT v.id FROM source_object_versions v JOIN source_objects o ON o.tenant_id = v.tenant_id AND o.id = v.object_id WHERE v.tenant_id = $1 AND o.connection_id = $2)`,
 		`DELETE FROM chunks WHERE tenant_id = $1 AND object_version_id IN (SELECT v.id FROM source_object_versions v JOIN source_objects o ON o.tenant_id = v.tenant_id AND o.id = v.object_id WHERE v.tenant_id = $1 AND o.connection_id = $2)`,
@@ -128,13 +123,8 @@ func (r *SourceRepo) DeleteConnection(ctx context.Context, tenantID, id string) 
 		`DELETE FROM parsed_documents WHERE tenant_id = $1 AND object_version_id IN (SELECT v.id FROM source_object_versions v JOIN source_objects o ON o.tenant_id = v.tenant_id AND o.id = v.object_id WHERE v.tenant_id = $1 AND o.connection_id = $2)`,
 		`DELETE FROM collection_items WHERE tenant_id = $1 AND object_id IN (SELECT id FROM source_objects WHERE tenant_id = $1 AND connection_id = $2)`,
 		`DELETE FROM source_object_versions WHERE tenant_id = $1 AND object_id IN (SELECT id FROM source_objects WHERE tenant_id = $1 AND connection_id = $2)`,
-		`DELETE FROM source_grants WHERE tenant_id = $1 AND object_id IN (SELECT id FROM source_objects WHERE tenant_id = $1 AND connection_id = $2)`,
-		`DELETE FROM source_group_memberships WHERE tenant_id = $1 AND group_id IN (SELECT id FROM source_groups WHERE tenant_id = $1 AND connection_id = $2)`,
 		`DELETE FROM source_restrictions WHERE tenant_id = $1 AND ((subject_type = 'connection' AND subject_id = $2) OR (subject_type = 'object' AND subject_id IN (SELECT id FROM source_objects WHERE tenant_id = $1 AND connection_id = $2)))`,
-		`DELETE FROM access_snapshots WHERE tenant_id = $1 AND connection_id = $2`,
 		`DELETE FROM source_objects WHERE tenant_id = $1 AND connection_id = $2`,
-		`DELETE FROM source_groups WHERE tenant_id = $1 AND connection_id = $2`,
-		`DELETE FROM source_identities WHERE tenant_id = $1 AND connection_id = $2`,
 	}
 	for _, q := range steps {
 		if _, err := tx.ExecContext(ctx, q, tenantID, id); err != nil {

@@ -64,20 +64,16 @@ func (r *SourceRepo) CreateConnection(ctx context.Context, c source.Connection) 
 	if err != nil {
 		return fmt.Errorf("marshal connection config: %w", err)
 	}
-	audience, err := jsonList(c.AudienceDefault)
-	if err != nil {
-		return fmt.Errorf("marshal connection audience: %w", err)
-	}
 	status := c.Status
 	if status == "" {
 		status = "active"
 	}
 	_, err = r.db.SQL.ExecContext(ctx, `
 		INSERT INTO connections (tenant_id, id, kind, name, credential_ref, config,
-		                         target_collection_id, audience_default, status, created_by)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		                         target_collection_id, status, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		c.TenantID, c.ID, c.Kind, c.Name, c.CredentialRef, config,
-		nullableText(c.TargetCollectionID), audience, status, nullableText(c.CreatedBy))
+		nullableText(c.TargetCollectionID), status, nullableText(c.CreatedBy))
 	if err != nil {
 		return fmt.Errorf("insert connection: %w", err)
 	}
@@ -89,22 +85,21 @@ type connectionScanner interface {
 }
 
 const connectionColumns = `tenant_id::text, id, kind, name, credential_ref, config,
-	target_collection_id, audience_default, status, created_by,
+	target_collection_id, status, created_by,
 	synced_at, sync_status, sync_error, created_at, updated_at`
 
 func scanConnection(row connectionScanner, c *source.Connection) error {
-	var config, audience []byte
+	var config []byte
 	var target, createdBy, syncStatus, syncError sql.NullString
 	var syncedAt sql.NullTime
 	err := row.Scan(&c.TenantID, &c.ID, &c.Kind, &c.Name, &c.CredentialRef,
-		&config, &target, &audience, &c.Status, &createdBy,
+		&config, &target, &c.Status, &createdBy,
 		&syncedAt, &syncStatus, &syncError, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return err
 	}
 	_ = json.Unmarshal(config, &c.Config)
 	c.TargetCollectionID = target.String
-	c.AudienceDefault = scanJSONList(audience)
 	c.CreatedBy = createdBy.String
 	if syncedAt.Valid {
 		t := syncedAt.Time

@@ -41,7 +41,6 @@ type Connection struct {
 	CredentialRef      string // server-approved ref bound to tenant+kind+origin
 	Config             map[string]any
 	TargetCollectionID string
-	AudienceDefault    []string
 	Status             string
 	CreatedBy          string
 	SyncedAt           *time.Time
