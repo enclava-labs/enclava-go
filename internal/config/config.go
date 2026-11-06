@@ -42,6 +42,7 @@ type Config struct {
 	DefaultEmbeddingDimensions int
 	ConnectorSyncInterval      time.Duration
 	JobTimeout                 time.Duration
+	JobRetention               time.Duration
 	UtilityModel               string
 	IndexRetirementSoak        time.Duration
 	MetricsToken               string
@@ -135,6 +136,7 @@ func Load() (Config, error) {
 		DefaultEmbeddingModel:   strings.TrimSpace(getEnv("DEFAULT_EMBEDDING_MODEL", "qwen3-embedding-4b")),
 		ConnectorSyncInterval:   getEnvDuration("CONNECTOR_SYNC_INTERVAL", 0),
 		JobTimeout:              2 * time.Hour,
+		JobRetention:            30 * 24 * time.Hour,
 		UtilityModel:            strings.TrimSpace(getEnv("UTILITY_MODEL", "")),
 		IndexRetirementSoak:     24 * time.Hour,
 		MetricsToken:            getEnv("METRICS_TOKEN", ""),
@@ -167,6 +169,7 @@ func Load() (Config, error) {
 	}
 	for name, target := range map[string]*time.Duration{
 		"JOB_TIMEOUT":           &cfg.JobTimeout,
+		"JOB_RETENTION":         &cfg.JobRetention,
 		"INDEX_RETIREMENT_SOAK": &cfg.IndexRetirementSoak,
 	} {
 		if raw := os.Getenv(name); raw != "" {
