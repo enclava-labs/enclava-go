@@ -200,10 +200,23 @@ with channel, author and UTC time, with mentions resolved and a permalink back
 to Slack; join/leave notices are skipped. Slack rate limits are waited out
 using `Retry-After` (up to five times per call).
 
+Slack and Teams syncs are incremental between full listings: a sync reads only
+recent Slack messages (from six hours before the newest message the previous
+sync saw, per channel) and only new or changed Teams channel messages and chat
+messages. A full listing runs when the last one is older than
+`config.full_sync_interval` (Go duration string or seconds; default 24h); only
+full listings pick up deletions, edits of older messages and replies to
+threads started earlier.
+
 Connector sync workers resolve the source creator's current user grants and
 billing identity for ingest and embedding. A missing or disabled creator
 fails the job; model and endpoint access must be granted to that creator.
-Every sync retries items whose indexing failed.
+Syncs retry items whose indexing failed, backing off while the content stays
+unchanged: after 1h, 2h, 4h and so on, at most weekly. An item whose embedding
+was interrupted after the request was sent is retried automatically only when
+that request could not have been billed (its price was zero); otherwise use
+Retry on the document. Finished sync, ingest and embedding jobs are removed
+after `JOB_RETENTION` (default 30 days).
 
 Drive files flagged copy/download-restricted for readers are skipped by the
 content stream and never synced.
