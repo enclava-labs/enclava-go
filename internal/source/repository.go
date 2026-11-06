@@ -77,6 +77,12 @@ type SourceRepository interface {
 	// version in the collection failed (its state or its embed/ingest job), so
 	// a later sync can observe the unchanged item again and retry indexing.
 	IngestFailed(ctx context.Context, tenantID, collectionID, objectID string, observedSeq int64) (bool, error)
+	// IngestRetryDue reports whether an automatic re-version of unchanged
+	// content is due yet: after n versions carrying this content hash the
+	// next one waits 1h*2^(n-1) from the newest version (capped at one week),
+	// so a persistently failing item stops churning hourly retries. Manual
+	// reprocess bypasses this.
+	IngestRetryDue(ctx context.Context, tenantID, objectID, sha256 string, now time.Time) (bool, error)
 
 	// CollectionsForObjects returns, per object ID, the live (removed_at IS
 	// NULL) collections containing it — the read set AuthorizationCollection
