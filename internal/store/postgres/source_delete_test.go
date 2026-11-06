@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 // TestDeleteConnectionRemovesSyncedRows proves deleting a synced source is
@@ -132,5 +133,61 @@ func TestDeleteConnectionRemovesSyncedRows(t *testing.T) {
 		if jobStatus != "cancelled" {
 			t.Fatalf("queued job %s must be cancelled, got %s", jobID, jobStatus)
 		}
+	}
+}
+
+// TestDeleteConnectionWaitsForConcurrentWriters: a sync or embed still
+// writing (here an uncommitted generation for one of the source's versions)
+// must not make the delete fail on a foreign key — the delete waits for the
+// writer and removes what it wrote.
+func TestDeleteConnectionWaitsForConcurrentWriters(t *testing.T) {
+	db := RequireTestDB(t)
+	ctx := context.Background()
+	seedTenant(t, ctx, db, idTenantA)
+	seedConnection(t, ctx, db, idTenantA, "conn_race", "slack")
+	for _, q := range []string{
+		`INSERT INTO source_objects (tenant_id, id, connection_id, kind, native_id, authorization_mode, observed_seq)
+		 VALUES ($1, 'obj_race', 'conn_race', 'message', 'slack:race', 'collection', 1)`,
+		`INSERT INTO source_object_versions (tenant_id, id, object_id, observed_seq, artifact_ref, content_sha256, byte_size)
+		 VALUES ($1, 'ver_race', 'obj_race', 1, 'art_race', 'sha', 10)`,
+		`INSERT INTO knowledge_collections (tenant_id, id, name, qdrant_collection)
+		 VALUES ($1, 'col_race', 'race', 'qdrant_race')`,
+	} {
+		if _, err := db.SQL.ExecContext(ctx, q, idTenantA); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writer, err := db.SQL.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Rollback() //nolint:errcheck // committed below on the happy path
+	if _, err := writer.ExecContext(ctx, `INSERT INTO index_generations (tenant_id, id, collection_id, object_version_id, generation, state)
+		VALUES ($1, 'gen_race', 'col_race', 'ver_race', 1, 'staging')`, idTenantA); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- NewSourceRepo(db).DeleteConnection(ctx, idTenantA, "conn_race") }()
+	select {
+	case err := <-done:
+		t.Fatalf("delete finished while a writer still held its rows: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := writer.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("delete after the concurrent write: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("delete never finished")
+	}
+	var left int
+	if err := db.SQL.QueryRowContext(ctx, `SELECT count(*) FROM index_generations WHERE tenant_id = $1 AND id = 'gen_race'`, idTenantA).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("generation written during the delete survived: %d, %v", left, err)
 	}
 }
