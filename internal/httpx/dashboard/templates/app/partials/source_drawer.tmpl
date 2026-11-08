@@ -34,6 +34,9 @@
     <button type="button" class="tile" data-action="sources:provider" data-provider="slack" aria-pressed="false">{{icon "chat"}}<b>Slack</b><span class="subline">Channel messages</span></button>
     <button type="button" class="tile" data-action="sources:provider" data-provider="teams" aria-pressed="false">{{icon "users"}}<b>Microsoft Teams</b><span class="subline">Channels and chats</span></button>
     <button type="button" class="tile" data-action="sources:provider" data-provider="github" aria-pressed="false">{{icon "command"}}<b>GitHub</b><span class="subline">Repository files</span></button>
+    <button type="button" class="tile" data-action="sources:provider" data-provider="gitlab" aria-pressed="false">{{icon "command"}}<b>GitLab</b><span class="subline">Repository, issues and merge requests</span></button>
+    <button type="button" class="tile" data-action="sources:provider" data-provider="jira" aria-pressed="false">{{icon "audit"}}<b>Jira</b><span class="subline">Project issues</span></button>
+    <button type="button" class="tile" data-action="sources:provider" data-provider="linear" aria-pressed="false">{{icon "activity"}}<b>Linear</b><span class="subline">Team issues</span></button>
     <button type="button" class="tile" data-action="sources:provider" data-provider="notion" aria-pressed="false">{{icon "file"}}<b>Notion</b><span class="subline">Pages and subpages</span></button>
     <button type="button" class="tile" data-action="sources:provider" data-provider="google_drive" aria-pressed="false">{{icon "upload"}}<b>Google Drive</b><span class="subline">Shared folders</span></button>
   </div>
@@ -99,6 +102,43 @@
     <span class="help">Public repository content can sync without a credential. Manage stored credentials in <a href="/dashboard/sources/credentials">Credentials</a>.</span>
   </div>
 
+  <div data-provider-fields="gitlab" hidden>
+    <label class="label" for="gitlab-project">Project</label>
+    <input class="field" id="gitlab-project" data-config="project" placeholder="group/project" required>
+    <label class="label" for="gitlab-ref">Branch</label>
+    <input class="field" id="gitlab-ref" data-config="ref" placeholder="Default branch">
+    <label class="label" for="gitlab-paths">Paths</label>
+    <textarea class="field" id="gitlab-paths" data-config="paths" data-type="list" rows="2" placeholder="docs/ per line"></textarea>
+    <span class="help">Optional — restrict file sync to these repository paths. Issues and merge requests always sync.</span>
+    <label class="label" for="gitlab-base">GitLab URL</label>
+    <input class="field" id="gitlab-base" data-config="base_url" autocomplete="off" placeholder="https://gitlab.com">
+    <label class="label" for="gitlab-credential">Credential reference</label>
+    <input class="field" id="gitlab-credential" data-credential list="cred-gitlab" autocomplete="off">
+    <datalist id="cred-gitlab">{{range index .Data.CredentialRefs "gitlab"}}<option value="{{.RefID}}">{{.Name}}</option>{{end}}</datalist>
+    <span class="help">Public projects can sync without a credential. Manage stored credentials in <a href="/dashboard/sources/credentials">Credentials</a>.</span>
+  </div>
+
+  <div data-provider-fields="jira" hidden>
+    <label class="label" for="jira-site">Site URL</label>
+    <input class="field" id="jira-site" data-config="base_url" autocomplete="off" placeholder="https://acme.atlassian.net" required>
+    <label class="label" for="jira-project">Project key</label>
+    <input class="field" id="jira-project" data-config="project" placeholder="ENG" required>
+    <label class="label" for="jira-credential">Credential reference</label>
+    <input class="field" id="jira-credential" data-credential list="cred-jira" autocomplete="off" required>
+    <datalist id="cred-jira">{{range index .Data.CredentialRefs "jira"}}<option value="{{.RefID}}">{{.Name}}</option>{{end}}</datalist>
+    {{if not (index .Data.CredentialRefs "jira")}}<span class="help">No Jira credentials configured — <a href="/dashboard/sources/credentials">add one in Credentials</a> or bind a CONNECTOR_JIRA_* secret in server configuration.</span>{{end}}
+  </div>
+
+  <div data-provider-fields="linear" hidden>
+    <label class="label" for="linear-teams">Team keys</label>
+    <input class="field" id="linear-teams" data-config="team_keys" data-type="list" autocomplete="off" placeholder="ENG, OPS">
+    <span class="help">Optional — empty syncs every team the key can see.</span>
+    <label class="label" for="linear-credential">Credential reference</label>
+    <input class="field" id="linear-credential" data-credential list="cred-linear" autocomplete="off" required>
+    <datalist id="cred-linear">{{range index .Data.CredentialRefs "linear"}}<option value="{{.RefID}}">{{.Name}}</option>{{end}}</datalist>
+    {{if not (index .Data.CredentialRefs "linear")}}<span class="help">No Linear credentials configured — <a href="/dashboard/sources/credentials">add one in Credentials</a> or bind a CONNECTOR_LINEAR_* secret in server configuration.</span>{{end}}
+  </div>
+
   <div data-provider-fields="notion" hidden>
     <label class="label" for="notion-pages">Page IDs</label>
     <textarea class="field" id="notion-pages" data-notion-pages rows="2" placeholder="page id per line" required></textarea>
@@ -146,6 +186,15 @@
     <p class="muted">Everyone who can open the target collection can read everything this source syncs.</p>
   </div>
   <div data-provider-access="github" hidden>
+    <p class="muted">Everyone who can open the target collection can read everything this source syncs.</p>
+  </div>
+  <div data-provider-access="gitlab" hidden>
+    <p class="muted">Everyone who can open the target collection can read everything this source syncs.</p>
+  </div>
+  <div data-provider-access="jira" hidden>
+    <p class="muted">Everyone who can open the target collection can read everything this source syncs.</p>
+  </div>
+  <div data-provider-access="linear" hidden>
     <p class="muted">Everyone who can open the target collection can read everything this source syncs.</p>
   </div>
   <div data-provider-access="notion" hidden>

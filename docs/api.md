@@ -200,13 +200,33 @@ with channel, author and UTC time, with mentions resolved and a permalink back
 to Slack; join/leave notices are skipped. Slack rate limits are waited out
 using `Retry-After` (up to five times per call).
 
-Slack and Teams syncs are incremental between full listings: a sync reads only
-recent Slack messages (from six hours before the newest message the previous
-sync saw, per channel) and only new or changed Teams channel messages and chat
-messages. A full listing runs when the last one is older than
+GitLab sources require `config.project` (`group/project` path or numeric ID)
+and sync the repository files at `config.ref` (default branch; optional
+`config.paths`), issues and merge requests, each issue or merge request as one
+document with its comments (system notes skipped). `config.base_url` points
+at a self-managed instance (default `https://gitlab.com`); public projects
+sync without a credential (GitLab only returns comments to signed-in
+callers, so their documents carry none), otherwise use a `CONNECTOR_GITLAB_*`
+token with `read_api` and `read_repository`.
+
+Jira sources require `config.base_url` (the Jira Cloud site, e.g.
+`https://acme.atlassian.net`), `config.project` (project key) and a
+`CONNECTOR_JIRA_*` credential holding `email:api-token` for that site. Each
+issue becomes one document with its fields, description and comments.
+
+Linear sources need a `CONNECTOR_LINEAR_*` personal API key and sync every
+team the key can see, or only `config.team_keys` (e.g. `["ENG", "OPS"]`).
+Each issue becomes one document with its fields, description and comments.
+
+Slack, Teams, GitLab, Jira and Linear syncs are incremental between full
+listings: a sync reads only recent Slack messages (from six hours before the
+newest message the previous sync saw, per channel), new or changed Teams
+channel and chat messages, and GitLab, Jira and Linear items updated since the
+previous sync started (GitLab files only when the branch moved, by comparing
+commits). A full listing runs when the last one is older than
 `config.full_sync_interval` (Go duration string or seconds; default 24h); only
-full listings pick up deletions, edits of older messages and replies to
-threads started earlier.
+full listings pick up deletions, edits of older Slack and Teams messages and
+replies to threads started earlier.
 
 Connector sync workers resolve the source creator's current user grants and
 billing identity for ingest and embedding. A missing or disabled creator
@@ -228,7 +248,8 @@ listing checkpoint so the next sync re-lists from the start.
 
 Every synced item keeps a link to its original: Slack message (and thread
 reply) permalinks, GitHub issue/PR/comment URLs and file links pinned to the
-synced commit, Notion page links and `#<block>` anchors for blocks, Teams
+synced commit, GitLab issue, merge request and file links, Jira and Linear
+issue links, Notion page links and `#<block>` anchors for blocks, Teams
 message links and Drive file links. `GET /api/v1/rag/evidence/{id}` returns
 it as `native_link` (plus `source_kind` and `title`); a GitHub file citation
 carries a `#L<start>-L<end>` anchor when the cited passage occurs exactly once
@@ -244,16 +265,18 @@ write-only: they are sealed with AES-256-GCM under `ENCLAVA_SECRETS_KEY`
 (32 bytes, base64 — `openssl rand -base64 32`; without it the store is off and
 only `SECRET_BINDINGS` work) and never returned. A stored credential is sent
 only to its provider's API origin (or the custom HTTPS origin it was added
-with, e.g. GitHub Enterprise); its ID is the `credential_ref` sources use,
-derived from the name (`Enclava Labs` → `CONNECTOR_SLACK_ENCLAVA_LABS`).
+with, e.g. GitHub Enterprise or self-managed GitLab; Jira credentials must name
+their site); its ID is the `credential_ref` sources use, derived from the name
+(`Enclava Labs` → `CONNECTOR_SLACK_ENCLAVA_LABS`).
 
 - `GET /api/v1/connectors/credentials` — stored credentials (with `used_by`
   source IDs), refs bound in server configuration and per-provider OAuth state.
 - `POST /api/v1/connectors/credentials` `{provider, name, secret, origin?}` —
-  add a token or key; GitHub, Slack, Notion and Google Drive tokens are checked
-  against the provider first (`400 credential_invalid` when refused). Teams
-  takes the app registration's client secret; tenant and client IDs stay on
-  the source.
+  add a token or key; GitHub, Slack, Notion, Google Drive, GitLab, Jira
+  (`email:api-token`, `origin` = the site URL) and Linear credentials are
+  checked against the provider first (`400 credential_invalid` when refused).
+  Teams takes the app registration's client secret; tenant and client IDs stay
+  on the source.
 - `PUT /api/v1/connectors/credentials/{id}` `{secret}` rotates a token;
   `DELETE` removes it (`409 credential_in_use` while sources use it).
 - `PUT /api/v1/connectors/oauth-apps/{provider}` `{client_id, client_secret}` /

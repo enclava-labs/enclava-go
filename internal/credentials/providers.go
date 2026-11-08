@@ -3,6 +3,7 @@ package credentials
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,13 +43,17 @@ func defaultProviders() map[string]*provider {
 			oauth: &oauthSpec{authEndpoint: "https://accounts.google.com/o/oauth2/v2/auth", exchangeEndpoint: "https://oauth2.googleapis.com/token",
 				scopes: []string{"https://www.googleapis.com/auth/drive.readonly"}, scopeSep: " ",
 				extra: url.Values{"response_type": {"code"}, "access_type": {"offline"}, "prompt": {"consent"}, "include_granted_scopes": {"true"}}}},
+		{id: "gitlab", label: "GitLab", refPrefix: "GITLAB", defaultOrigin: "https://gitlab.com", probe: probeGitLab},
+		// Jira sites have no shared API origin: credentials name their site.
+		{id: "jira", label: "Jira", refPrefix: "JIRA", probe: probeJira},
+		{id: "linear", label: "Linear", refPrefix: "LINEAR", defaultOrigin: "https://api.linear.app", probe: probeLinear},
 	} {
 		out[pv.id] = pv
 	}
 	return out
 }
 
-var providerOrder = []string{"github", "slack", "notion", "teams", "google_drive"}
+var providerOrder = []string{"github", "slack", "notion", "teams", "google_drive", "gitlab", "jira", "linear"}
 
 func orderedProviders(m map[string]*provider) []*provider {
 	out := make([]*provider, 0, len(providerOrder))
@@ -97,6 +102,10 @@ func getJSON(ctx context.Context, client *http.Client, endpoint string, header h
 		return err
 	}
 	req.Header = header
+	return doJSON(client, req, out)
+}
+
+func doJSON(client *http.Client, req *http.Request, out any) error {
 	req.Header.Set("Accept", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
@@ -173,6 +182,57 @@ func probeGoogleDrive(ctx context.Context, client *http.Client, origin, token st
 		return "", err
 	}
 	return about.User.EmailAddress, nil
+}
+
+func probeGitLab(ctx context.Context, client *http.Client, origin, token string) (string, error) {
+	var user struct {
+		Username string `json:"username"`
+	}
+	if err := getJSON(ctx, client, origin+"/api/v4/user", bearer(token), &user); err != nil {
+		return "", err
+	}
+	return user.Username, nil
+}
+
+// probeJira checks an Atlassian account email and API token pasted as
+// email:token against the credential's site.
+func probeJira(ctx context.Context, client *http.Client, origin, token string) (string, error) {
+	if !strings.Contains(token, ":") {
+		return "", errors.New("paste the account email and API token as email:token")
+	}
+	header := http.Header{"Authorization": {"Basic " + base64.StdEncoding.EncodeToString([]byte(token))}}
+	var me struct {
+		EmailAddress string `json:"emailAddress"`
+		DisplayName  string `json:"displayName"`
+	}
+	if err := getJSON(ctx, client, origin+"/rest/api/2/myself", header, &me); err != nil {
+		return "", err
+	}
+	return firstNonEmpty(me.EmailAddress, me.DisplayName), nil
+}
+
+// probeLinear checks a personal API key; Linear takes it without "Bearer".
+func probeLinear(ctx context.Context, client *http.Client, origin, token string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, origin+"/graphql", strings.NewReader(`{"query":"{ viewer { email } organization { name } }"}`))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", token)
+	req.Header.Set("Content-Type", "application/json")
+	var out struct {
+		Data struct {
+			Viewer       struct{ Email string }
+			Organization struct{ Name string }
+		}
+		Errors []json.RawMessage
+	}
+	if err := doJSON(client, req, &out); err != nil {
+		return "", err
+	}
+	if len(out.Errors) > 0 {
+		return "", errors.New("linear rejected the key")
+	}
+	return firstNonEmpty(out.Data.Organization.Name, out.Data.Viewer.Email), nil
 }
 
 // oauthSpec is one provider's OAuth 2.0 authorization-code flow.

@@ -16,6 +16,9 @@ const (
 	SourceKindTeams       SourceKind = SourceKind(source.ConnectionTeams)
 	SourceKindNotion      SourceKind = SourceKind(source.ConnectionNotion)
 	SourceKindGoogleDrive SourceKind = SourceKind(source.ConnectionGoogleDrive)
+	SourceKindGitLab      SourceKind = SourceKind(source.ConnectionGitLab)
+	SourceKindJira        SourceKind = SourceKind(source.ConnectionJira)
+	SourceKindLinear      SourceKind = SourceKind(source.ConnectionLinear)
 )
 
 // Cursor is opaque provider state scoped to one connection and stream.
@@ -79,14 +82,16 @@ type ObservationRepository interface {
 	WithFence(context.Context, StreamState, func(source.Tx) error) error
 }
 
-// Canonical source kinds (schema CHECK constraint); linear was a legacy
-// alias and is rejected — there is no linear adapter in the canonical set.
+// Canonical source kinds (schema CHECK constraint).
 const (
 	SourceTypeGitHub      = "github"
 	SourceTypeSlack       = "slack"
 	SourceTypeTeams       = "teams"
 	SourceTypeNotion      = "notion"
 	SourceTypeGoogleDrive = "google_drive"
+	SourceTypeGitLab      = "gitlab"
+	SourceTypeJira        = "jira"
+	SourceTypeLinear      = "linear"
 )
 
 // Durable job operation enqueued by SyncSource. The job persists queued

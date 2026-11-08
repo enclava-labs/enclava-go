@@ -12,6 +12,9 @@ const (
 	ConnectionTeams       = "teams"
 	ConnectionNotion      = "notion"
 	ConnectionGoogleDrive = "google_drive"
+	ConnectionGitLab      = "gitlab"
+	ConnectionJira        = "jira"
+	ConnectionLinear      = "linear"
 )
 
 // Object authorization modes.
