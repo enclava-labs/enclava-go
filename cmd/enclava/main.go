@@ -270,6 +270,15 @@ func serve() error {
 		connectors.SourceKindGoogleDrive: func(source.Connection) (connectors.Adapter, error) {
 			return connectors.NewGDriveAdapter(connectorSvc), nil
 		},
+		connectors.SourceKindGitLab: func(c source.Connection) (connectors.Adapter, error) {
+			return connectors.NewGitLabAdapter(c, credentialSvc)
+		},
+		connectors.SourceKindJira: func(c source.Connection) (connectors.Adapter, error) {
+			return connectors.NewJiraAdapter(c, credentialSvc)
+		},
+		connectors.SourceKindLinear: func(c source.Connection) (connectors.Adapter, error) {
+			return connectors.NewLinearAdapter(c, credentialSvc)
+		},
 	}
 	connectorSvc.SetSyncDependencies(adapterFactories, postgres.NewConnectorObservationsRepo(pgDB), artifactStore, sourceRepo)
 

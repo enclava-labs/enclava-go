@@ -3,6 +3,7 @@ package credentials
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -383,5 +384,53 @@ func TestTokenRequestWireFormats(t *testing.T) {
 	}
 	if !strings.Contains(providers["slack"].oauth.authorizeURL("cid", "https://enclava.test/cb", "st"), "scope="+url.QueryEscape("channels:history,channels:read")) {
 		t.Fatal("slack scopes must be comma separated")
+	}
+}
+
+func TestJiraAndLinearTokensAreProbedAndSiteBound(t *testing.T) {
+	api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/rest/api/2/myself":
+			if r.Header.Get("Authorization") != "Basic "+base64.StdEncoding.EncodeToString([]byte("ann@acme.test:tok")) {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			_, _ = io.WriteString(w, `{"emailAddress":"ann@acme.test"}`)
+		case "/graphql":
+			if r.Method != http.MethodPost || r.Header.Get("Authorization") != "lin_api_good" {
+				_, _ = io.WriteString(w, `{"errors":[{"message":"Authentication required"}]}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"data":{"viewer":{"email":"v@acme.test"},"organization":{"name":"Acme"}}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	svc := newTestService(t, newMemRepo(), nil, api.Client())
+	ctx := context.Background()
+
+	if _, err := svc.CreateToken(ctx, admin("u1"), "jira", "Acme", "ann@acme.test:tok", ""); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "site URL") {
+		t.Fatalf("jira credential without a site: %v", err)
+	}
+	if _, err := svc.CreateToken(ctx, admin("u1"), "jira", "Acme", "tok", api.URL); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "email:token") {
+		t.Fatalf("jira token without email: %v", err)
+	}
+	view, err := svc.CreateToken(ctx, admin("u1"), "jira", "Acme", "ann@acme.test:tok", api.URL)
+	if err != nil || view.ID != "CONNECTOR_JIRA_ACME" || view.Details["account"] != "ann@acme.test" {
+		t.Fatalf("jira credential = %+v, %v", view, err)
+	}
+	if got, err := svc.Resolve(tenant, auth.SecretPurposeConnector, api.URL, view.ID); err != nil || got != "ann@acme.test:tok" {
+		t.Fatalf("jira release to its site = %q, %v", got, err)
+	}
+	if _, err := svc.Resolve(tenant, auth.SecretPurposeConnector, "https://other.atlassian.net", view.ID); err == nil {
+		t.Fatal("jira credential released to another site")
+	}
+
+	if _, err := svc.CreateToken(ctx, admin("u1"), "linear", "Bad", "lin_api_bad", api.URL); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("rejected linear key: %v", err)
+	}
+	if view, err := svc.CreateToken(ctx, admin("u1"), "linear", "Acme", "lin_api_good", api.URL); err != nil || view.Details["account"] != "Acme" {
+		t.Fatalf("linear credential = %+v, %v", view, err)
 	}
 }

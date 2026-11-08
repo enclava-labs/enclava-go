@@ -47,7 +47,7 @@ async function openWizard(page: Page, query = '?new=1') {
   await page.goto(`${BASE}/dashboard/sources${query}`);
   const drawer = page.locator('#drawer');
   await expect(drawer).toHaveClass(/open/);
-  await expect(drawer.locator('.tile')).toHaveCount(5);
+  await expect(drawer.locator('.tile')).toHaveCount(8);
   return drawer;
 }
 async function pickProvider(drawer: Locator, provider: string) {

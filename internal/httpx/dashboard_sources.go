@@ -29,7 +29,7 @@ import (
 // dashboardSourcesLimit bounds the table the same way the old page did.
 const dashboardSourcesLimit = 100
 
-// dashboardSourceProviders is the wizard's five families in tile order
+// dashboardSourceProviders is the wizard's provider families in tile order
 // (D-13: every canonical connector kind, none silently dropped).
 var dashboardSourceProviders = []struct {
 	ID, Label, Icon, Subtitle string
@@ -38,6 +38,9 @@ var dashboardSourceProviders = []struct {
 	{"slack", "Slack", "chat", "Channel messages", true},
 	{"teams", "Microsoft Teams", "users", "Channels and chats", true},
 	{"github", "GitHub", "command", "Repository files", false},
+	{"gitlab", "GitLab", "command", "Repository, issues and merge requests", false},
+	{"jira", "Jira", "audit", "Project issues", true},
+	{"linear", "Linear", "activity", "Team issues", true},
 	{"notion", "Notion", "file", "Pages and subpages", true},
 	{"google_drive", "Google Drive", "upload", "Shared folders", true},
 }
@@ -227,6 +230,9 @@ var dashboardCredentialHints = map[string]string{
 	"notion":       "An internal integration secret from the Notion integration's settings.",
 	"teams":        "The app registration's client secret — tenant and client IDs stay on each source.",
 	"google_drive": "OAuth is recommended — access tokens expire after about an hour.",
+	"gitlab":       "A personal, group or project access token with read_api and read_repository; set the API origin for self-managed GitLab.",
+	"jira":         "Your Atlassian account email and an API token, pasted as email:token, with the site URL (https://acme.atlassian.net) as API origin.",
+	"linear":       "A personal API key from Linear's Settings → Security & access.",
 }
 
 // handleDashboardPageCredentials renders the Credentials tab page; the
@@ -669,6 +675,29 @@ func dashboardSourceScope(src connectors.Source) string {
 			scope += fmt.Sprintf(" · %d paths", len(paths))
 		}
 		return scope
+	case connectors.SourceTypeGitLab:
+		if project := str("project"); project != "" {
+			scope := project
+			if ref := str("ref"); ref != "" {
+				scope += "@" + ref
+			}
+			if paths := list("paths"); len(paths) > 0 {
+				scope += fmt.Sprintf(" · %d paths", len(paths))
+			}
+			return scope
+		}
+	case connectors.SourceTypeJira:
+		if project := str("project"); project != "" {
+			return "Project " + project
+		}
+	case connectors.SourceTypeLinear:
+		if teams := list("team_keys"); len(teams) > 0 {
+			return "Teams " + strings.Join(teams, ", ")
+		}
+		if teams := str("team_keys"); teams != "" {
+			return "Teams " + teams
+		}
+		return "All teams"
 	case connectors.SourceTypeNotion:
 		pages, _ := cfg["selected_pages"].([]any)
 		if len(pages) == 0 {

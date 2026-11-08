@@ -950,8 +950,14 @@ func normalizeSourceType(raw string) (string, error) {
 		return SourceTypeNotion, nil
 	case SourceTypeGoogleDrive:
 		return SourceTypeGoogleDrive, nil
+	case SourceTypeGitLab:
+		return SourceTypeGitLab, nil
+	case SourceTypeJira:
+		return SourceTypeJira, nil
+	case SourceTypeLinear:
+		return SourceTypeLinear, nil
 	default:
-		return "", errors.New("type must be one of: github, slack, teams, notion, google_drive")
+		return "", errors.New("type must be one of: github, slack, teams, notion, google_drive, gitlab, jira, linear")
 	}
 }
 
@@ -1081,7 +1087,7 @@ func connectorRequiresCredential(source Source) bool {
 		return false
 	}
 	switch source.Type {
-	case SourceTypeSlack, SourceTypeNotion, SourceTypeTeams, SourceTypeGoogleDrive:
+	case SourceTypeSlack, SourceTypeNotion, SourceTypeTeams, SourceTypeGoogleDrive, SourceTypeJira, SourceTypeLinear:
 		return true
 	default:
 		return false
@@ -1089,7 +1095,7 @@ func connectorRequiresCredential(source Source) bool {
 
 }
 
-var connectorCredentialRefPattern = regexp.MustCompile(`^CONNECTOR_(GITHUB|SLACK|TEAMS|NOTION|GOOGLE_DRIVE)_[A-Z0-9_]+$`)
+var connectorCredentialRefPattern = regexp.MustCompile(`^CONNECTOR_(GITHUB|SLACK|TEAMS|NOTION|GOOGLE_DRIVE|GITLAB|JIRA|LINEAR)_[A-Z0-9_]+$`)
 
 func refuseConnectorRedirect(*http.Request, []*http.Request) error {
 	return errors.New("connector redirects are not followed")
@@ -1116,12 +1122,24 @@ func requireAPIOrigin(raw string) (*url.URL, error) {
 }
 
 func (s *Service) validateConnectorSource(ctx context.Context, source Source) error {
-	if source.Type == SourceTypeGitHub {
+	switch source.Type {
+	case SourceTypeGitHub:
 		if strings.TrimSpace(stringFromAny(source.Config["owner"])) == "" {
 			return errors.New("config.owner is required for a GitHub source")
 		}
 		if strings.TrimSpace(stringFromAny(source.Config["repo"])) == "" {
 			return errors.New("config.repo is required for a GitHub source")
+		}
+	case SourceTypeGitLab:
+		if strings.TrimSpace(stringFromAny(source.Config["project"])) == "" {
+			return errors.New("config.project is required for a GitLab source")
+		}
+	case SourceTypeJira:
+		if strings.TrimSpace(stringFromAny(source.Config["base_url"])) == "" {
+			return errors.New("config.base_url (the Jira site, e.g. https://acme.atlassian.net) is required for a Jira source")
+		}
+		if strings.TrimSpace(stringFromAny(source.Config["project"])) == "" {
+			return errors.New("config.project is required for a Jira source")
 		}
 	}
 	if err := validateCredentialRef(source); err != nil {
@@ -1157,6 +1175,12 @@ func credentialProviderForType(sourceType string) string {
 		return "NOTION"
 	case SourceTypeGoogleDrive:
 		return "GOOGLE_DRIVE"
+	case SourceTypeGitLab:
+		return "GITLAB"
+	case SourceTypeJira:
+		return "JIRA"
+	case SourceTypeLinear:
+		return "LINEAR"
 	default:
 		return ""
 	}

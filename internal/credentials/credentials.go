@@ -185,7 +185,7 @@ func (s *Service) provider(id string) (*provider, error) {
 	if pv := s.providers[id]; pv != nil {
 		return pv, nil
 	}
-	return nil, fmt.Errorf("%w: provider must be one of github, slack, notion, teams, google_drive", ErrInvalid)
+	return nil, fmt.Errorf("%w: provider must be one of github, slack, notion, teams, google_drive, gitlab, jira, linear", ErrInvalid)
 }
 
 var slugPattern = regexp.MustCompile(`[^A-Z0-9]+`)
@@ -329,6 +329,9 @@ func (s *Service) CreateToken(ctx context.Context, p auth.Principal, providerID,
 			return CredentialView{}, fmt.Errorf("%w: API origin must look like https://api.example.com", ErrInvalid)
 		}
 		details["origin"] = canonical
+	}
+	if apiOrigin(pv, details) == "" {
+		return CredentialView{}, fmt.Errorf("%w: %s credentials need their site URL as the API origin, e.g. https://acme.atlassian.net", ErrInvalid, pv.label)
 	}
 	if account, err := pv.probeToken(ctx, s.client, apiOrigin(pv, details), token); err != nil {
 		return CredentialView{}, fmt.Errorf("%w: %s rejected the token: %v", ErrInvalid, pv.label, err)

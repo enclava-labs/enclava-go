@@ -22,6 +22,9 @@
     slack: { label: 'Slack' },
     teams: { label: 'Microsoft Teams' },
     github: { label: 'GitHub' },
+    gitlab: { label: 'GitLab' },
+    jira: { label: 'Jira' },
+    linear: { label: 'Linear' },
     notion: { label: 'Notion' },
     google_drive: { label: 'Google Drive' },
   };

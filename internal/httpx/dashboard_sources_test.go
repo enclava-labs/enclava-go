@@ -342,7 +342,7 @@ func TestDashboardSourcesDrawerProviders(t *testing.T) {
 		t.Fatalf("drawer: expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	drawer := rec.Body.String()
-	for _, provider := range []string{"slack", "teams", "github", "notion", "google_drive"} {
+	for _, provider := range []string{"slack", "teams", "github", "gitlab", "jira", "linear", "notion", "google_drive"} {
 		if !strings.Contains(drawer, `data-provider="`+provider+`"`) ||
 			!strings.Contains(drawer, `data-provider-fields="`+provider+`"`) {
 			t.Fatalf("drawer missing provider %q tile and field group", provider)
@@ -363,21 +363,21 @@ func TestDashboardSourcesDrawerProviders(t *testing.T) {
 	if strings.Contains(drawer, `data-config="channel_ids"`) {
 		t.Fatal("a raw channel_ids input came back — use the pair textarea")
 	}
-	for _, want := range []string{`data-config="folder_id"`, "data-notion-pages", `data-config="owner"`, `data-config="repo"`} {
+	for _, want := range []string{`data-config="folder_id"`, "data-notion-pages", `data-config="owner"`, `data-config="repo"`, `data-config="project"`, `data-config="team_keys"`} {
 		if !strings.Contains(drawer, want) {
 			t.Fatalf("drawer missing %s", want)
 		}
 	}
 	// No credential refs configured on this fixture: every provider renders
 	// the truthful empty state and a suggestion input (never secret values).
-	for _, provider := range []string{"Slack", "Teams", "Notion", "Google Drive"} {
+	for _, provider := range []string{"Slack", "Teams", "Jira", "Linear", "Notion", "Google Drive"} {
 		if !strings.Contains(drawer, "No "+provider+" credentials configured") {
 			t.Fatalf("drawer missing the %s credential empty state", provider)
 		}
 	}
 	// The Access step states the single collection rule per provider and the
 	// Notion published-audiences editor is gone.
-	for _, provider := range []string{"slack", "teams", "github", "notion", "google_drive"} {
+	for _, provider := range []string{"slack", "teams", "github", "gitlab", "jira", "linear", "notion", "google_drive"} {
 		if !strings.Contains(drawer, `data-provider-access="`+provider+`"`) {
 			t.Fatalf("drawer missing the %s access pane", provider)
 		}
@@ -564,7 +564,7 @@ func TestDashboardSourcesCredentialsTab(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(page, "ENCLAVA_SECRETS_KEY") || strings.Contains(page, `data-action="creds:add"`) {
 		t.Fatalf("disabled store: expected the notice without forms, got %d body=%s", rec.Code, page)
 	}
-	for _, provider := range []string{"Slack", "Microsoft Teams", "GitHub", "Notion", "Google Drive"} {
+	for _, provider := range []string{"Slack", "Microsoft Teams", "GitHub", "GitLab", "Jira", "Linear", "Notion", "Google Drive"} {
 		if !strings.Contains(page, "<h2>"+provider+"</h2>") {
 			t.Fatalf("credentials page missing the %s card", provider)
 		}
