@@ -13,6 +13,28 @@ import (
 	"enclava-go/internal/source"
 )
 
+// Files extraction already reads keep their derived type (no re-versioning);
+// readable files it would reject become plain text; binaries stay untyped.
+func TestRepositoryFileMIME(t *testing.T) {
+	for name, tc := range map[string]struct {
+		data string
+		want string
+	}{
+		"README.md":      {"# Title", ""},
+		"notes.txt":      {"plain", ""},
+		"data.json":      {`{"a":1}`, ""},
+		"cmd/main.go":    {"package main", "text/plain; charset=utf-8"},
+		"Makefile":       {"build:\n\tgo build", "text/plain; charset=utf-8"},
+		".gitlab-ci.yml": {"stages: [test]", "text/plain; charset=utf-8"},
+		"logo.bin":       {"\x89PNG\x00\x01", ""},
+		"latin1.go":      {"caf\xe9", ""},
+	} {
+		if got := repositoryFileMIME(name, []byte(tc.data)); got != tc.want {
+			t.Errorf("%s: %q, want %q", name, got, tc.want)
+		}
+	}
+}
+
 func TestGitLabFullAndIncrementalSync(t *testing.T) {
 	head := "sha1"
 	phase := "full"
@@ -49,7 +71,7 @@ func TestGitLabFullAndIncrementalSync(t *testing.T) {
 			if r.URL.Query().Get("ref") != head || r.URL.Query().Get("recursive") != "true" {
 				t.Error("invalid tree query")
 			}
-			write([]any{map[string]string{"type": "blob", "path": "dir/a.txt"}, map[string]string{"type": "blob", "path": "b.txt"}, map[string]string{"type": "tree", "path": "dir"}})
+			write([]any{map[string]string{"type": "blob", "path": "dir/a.txt"}, map[string]string{"type": "blob", "path": "main.go"}, map[string]string{"type": "blob", "path": "logo.bin"}, map[string]string{"type": "tree", "path": "dir"}})
 		case path == "/repository/compare":
 			compareCalls++
 			if r.URL.Query().Get("from") != "sha1" || r.URL.Query().Get("to") != "sha2" {
@@ -59,6 +81,10 @@ func TestGitLabFullAndIncrementalSync(t *testing.T) {
 		case strings.HasPrefix(path, "/repository/files/"):
 			if strings.Contains(path, "dir/a.txt") && !strings.Contains(r.URL.EscapedPath(), "dir%2Fa.txt") {
 				t.Errorf("file path not encoded: %s", r.URL.EscapedPath())
+			}
+			if strings.Contains(path, "logo.bin") {
+				_, _ = w.Write([]byte{'b', 0, 'i', 'n'})
+				return
 			}
 			_, _ = fmt.Fprint(w, "file content")
 		case path == "/issues" || path == "/merge_requests":
@@ -126,14 +152,17 @@ func TestGitLabFullAndIncrementalSync(t *testing.T) {
 		return nil, ""
 	}
 	items, checkpoint := run("", true)
-	if len(items) != 4 || items[0].NativeID != "gitlab:conn:group/sub/project:dir/a.txt" {
+	if len(items) != 5 || items[0].NativeID != "gitlab:conn:group/sub/project:dir/a.txt" {
 		t.Fatalf("full items: %+v", items)
 	}
-	if items[2].Kind != "issue" || items[2].Filename != "issue-1.md" || !strings.Contains(items[2].Text, "**Bob** — 2025-01-01 00:00 UTC") || strings.Contains(items[2].Text, "hidden") || items[2].CreatedAt == nil || items[2].MIMEType != "text/markdown" {
-		t.Fatalf("issue: %+v", items[2])
+	if items[1].MIMEType != "text/plain; charset=utf-8" || items[2].MIMEType != "" || string(items[2].Content) != "b\x00in" {
+		t.Fatalf("file mime types: %+v", items)
 	}
-	if items[3].Kind != "merge_request" || !strings.Contains(items[3].Text, "feature → main") {
-		t.Fatalf("merge request: %+v", items[3])
+	if items[3].Kind != "issue" || items[3].Filename != "issue-1.md" || !strings.Contains(items[3].Text, "**Bob** — 2025-01-01 00:00 UTC") || strings.Contains(items[3].Text, "hidden") || items[3].CreatedAt == nil || items[3].MIMEType != "text/markdown" {
+		t.Fatalf("issue: %+v", items[3])
+	}
+	if items[4].Kind != "merge_request" || !strings.Contains(items[4].Text, "feature → main") {
+		t.Fatalf("merge request: %+v", items[4])
 	}
 	phase = "unchanged"
 	items, checkpoint = run(checkpoint, false)

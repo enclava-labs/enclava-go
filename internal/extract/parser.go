@@ -133,6 +133,10 @@ type parseBlock struct {
 	locator              source.Locator
 }
 
+// Supported reports whether Parse accepts a document with this name and
+// content type.
+func Supported(name, contentType string) bool { return formatFor(name, contentType) != "" }
+
 func formatFor(name, contentType string) string {
 	ext := strings.ToLower(filepath.Ext(name))
 	media, _, _ := mime.ParseMediaType(strings.ToLower(strings.TrimSpace(contentType)))

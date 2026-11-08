@@ -6,10 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"net/url"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -242,8 +240,7 @@ func (g *GitLabAdapter) files(ctx context.Context, c source.Connection, s gitLab
 		if len(data) > 8<<20 {
 			continue
 		}
-		contentType := firstNonEmpty(mime.TypeByExtension(path.Ext(e.Path)), "application/octet-stream")
-		items = append(items, ContentItem{NativeID: parent + ":" + e.Path, ParentNativeID: parent, ParentKind: "repository", Kind: "file", NativeRevision: s.Head, Title: e.Path, Filename: e.Path, MIMEType: contentType, Content: data, URL: s.WebURL + "/-/blob/" + url.PathEscape(s.Head) + "/" + escapePathSegments(e.Path)})
+		items = append(items, ContentItem{NativeID: parent + ":" + e.Path, ParentNativeID: parent, ParentKind: "repository", Kind: "file", NativeRevision: s.Head, Title: e.Path, Filename: e.Path, MIMEType: repositoryFileMIME(e.Path, data), Content: data, URL: s.WebURL + "/-/blob/" + url.PathEscape(s.Head) + "/" + escapePathSegments(e.Path)})
 	}
 	if s.Index < len(entries) {
 		return gitLabPage(items, s), nil

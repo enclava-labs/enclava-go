@@ -1,6 +1,7 @@
 package connectors
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -21,9 +22,11 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"enclava-go/internal/artifacts"
 	"enclava-go/internal/auth"
+	"enclava-go/internal/extract"
 	"enclava-go/internal/jobs"
 	"enclava-go/internal/source"
 )
@@ -1057,6 +1060,18 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// repositoryFileMIME types readable source and config files (.go, .yaml,
+// Makefile …) as plain text when the type the sync would derive from the
+// name is one extraction rejects. Supported and binary files keep that type,
+// so files that already index are not re-versioned.
+func repositoryFileMIME(name string, data []byte) string {
+	derived := firstNonEmpty(mime.TypeByExtension(filepath.Ext(name)), "application/octet-stream")
+	if extract.Supported(name, derived) || !utf8.Valid(data) || bytes.Contains(data, []byte{0}) {
+		return ""
+	}
+	return "text/plain; charset=utf-8"
 }
 
 func connectorBaseURL(source Source, fallback string) string {
