@@ -220,7 +220,7 @@ func (g *GitHubAdapter) treePage(ctx context.Context, c source.Connection, s ghC
 				return ContentPage{}, e
 			}
 		}
-		items = append(items, ContentItem{NativeID: "github:" + c.ID + ":" + g.owner + "/" + g.repo + ":" + entry.Path, ParentNativeID: "github:" + c.ID + ":" + g.owner + "/" + g.repo, ParentKind: "repository", Kind: "file", NativeRevision: s.SHA + ":" + firstNonEmpty(blob.SHA, entry.SHA), Title: entry.Path, Filename: entry.Path, Content: data, URL: "https://github.com/" + g.owner + "/" + g.repo + "/blob/" + s.SHA + "/" + entry.Path})
+		items = append(items, ContentItem{NativeID: "github:" + c.ID + ":" + g.owner + "/" + g.repo + ":" + entry.Path, ParentNativeID: "github:" + c.ID + ":" + g.owner + "/" + g.repo, ParentKind: "repository", Kind: "file", NativeRevision: s.SHA + ":" + firstNonEmpty(blob.SHA, entry.SHA), Title: entry.Path, Filename: entry.Path, MIMEType: repositoryFileMIME(entry.Path, data), Content: data, URL: "https://github.com/" + g.owner + "/" + g.repo + "/blob/" + s.SHA + "/" + entry.Path})
 	}
 	if s.Index < len(tree) {
 		return ghPage(items, s), nil
