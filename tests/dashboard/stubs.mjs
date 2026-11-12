@@ -66,7 +66,6 @@ function deterministicVector(input) {
   }
   return v;
 }
-
 function chatReply(model, content, extra = {}) {
   return {
     id: 'chatcmpl-e2e-' + crypto.randomBytes(6).toString('hex'),
@@ -76,6 +75,31 @@ function chatReply(model, content, extra = {}) {
     choices: [{ index: 0, message: { role: 'assistant', content, ...extra }, finish_reason: 'stop' }],
     usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 },
   };
+}
+
+// sendChatStream replays a non-stream reply as SSE: content (or tool_calls)
+// split across a few delta chunks, a final usage chunk, then [DONE].
+function sendChatStream(res, reply) {
+  res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+  const msg = reply.choices[0].message;
+  const chunk = (delta, finish = null) =>
+    res.write('data: ' + JSON.stringify({ id: reply.id, object: 'chat.completion.chunk', created: reply.created, model: reply.model, choices: [{ index: 0, delta, finish_reason: finish }] }) + '\n\n');
+  if (Array.isArray(msg.tool_calls)) {
+    const call = msg.tool_calls[0];
+    const args = call.function.arguments;
+    chunk({ role: 'assistant', tool_calls: [{ index: 0, id: call.id, type: 'function', function: { name: call.function.name, arguments: args.slice(0, 5) } }] });
+    chunk({ tool_calls: [{ index: 0, function: { arguments: args.slice(5) } }] }, 'tool_calls');
+  } else {
+    const content = String(msg.content ?? '');
+    const third = Math.max(1, Math.ceil(content.length / 3));
+    chunk({ role: 'assistant', content: content.slice(0, third) });
+    chunk({ content: content.slice(third, third * 2) });
+    chunk({ content: content.slice(third * 2) }, 'stop');
+  }
+  if (reply.usage) {
+    res.write('data: ' + JSON.stringify({ id: reply.id, object: 'chat.completion.chunk', model: reply.model, choices: [], usage: reply.usage }) + '\n\n');
+  }
+  res.end('data: [DONE]\n\n');
 }
 
 async function inference(req, res) {
@@ -101,6 +125,7 @@ async function inference(req, res) {
     if (messages.some((m) => m?.role === 'user' && m.content === 'E2E reservation without usage')) {
       const reply = chatReply(model, 'Usage unavailable.');
       delete reply.usage;
+      if (body.stream) return sendChatStream(res, reply);
       return send(res, 200, reply);
     }
     // Grounding oracle: if the prompt carries a GROUNDING-MARKER sentence
@@ -110,22 +135,27 @@ async function inference(req, res) {
       : Array.isArray(m?.content) ? m.content.map((p) => p?.text || '').join(' ') : '';
     const marker = messages.map(text).join('\n').match(/GROUNDING-MARKER-[a-z0-9]+/);
     if (marker) {
-      return send(res, 200, chatReply(model, `The handbook's secret marker is ${marker[0]} [1].`));
+      const reply = chatReply(model, `The handbook's secret marker is ${marker[0]} [1].`);
+      if (body.stream) return sendChatStream(res, reply);
+      return send(res, 200, reply);
     }
     const hasToolResult = messages.some((m) => m && m.role === 'tool');
     const tools = Array.isArray(body.tools) ? body.tools : [];
     const echo = tools.find((t) => t && t.function && t.function.name === 'e2e_echo');
     if (echo && !hasToolResult) {
-      return send(res, 200, chatReply(model, '', {
+      const reply = chatReply(model, '', {
         tool_calls: [{
           id: 'call_e2e_echo_1',
           type: 'function',
           function: { name: 'e2e_echo', arguments: JSON.stringify({ text: 'e2e echo call' }) },
         }],
-      }));
+      });
+      if (body.stream) return sendChatStream(res, reply);
+      return send(res, 200, reply);
     }
-    return send(res, 200, chatReply(model,
-      'The enclave renewal window is the first Monday of each quarter [1].'));
+    const reply = chatReply(model, 'The enclave renewal window is the first Monday of each quarter [1].');
+    if (body.stream) return sendChatStream(res, reply);
+    return send(res, 200, reply);
   }
   if (req.method === 'POST' && u.pathname === '/v1/embeddings') {
     const body = JSON.parse(await readBody(req) || '{}');

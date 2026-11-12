@@ -174,6 +174,23 @@ test.describe('Chat run flow (member)', () => {
     expect(page.url()).not.toContain(convID);
     await awaitTerminal(page);
   });
+
+  test('live run streams through the events endpoint and the final answer renders', async ({ page }) => {
+    const seed = seedData();
+    await page.goto(`${BASE}/dashboard/chat?assistant=${encodeURIComponent(seed.assistantID)}`);
+    // Register before send: polling (and with it the events stream) starts
+    // as soon as the 202 returns.
+    const events = page.waitForRequest(
+      (r) => /\/api\/v1\/agent-runs\/.+\/events$/.test(r.url()),
+      { timeout: 30_000 },
+    );
+    await page.fill('#composer', 'Stream the renewal window answer.');
+    await page.click('[data-action="chat:send"]');
+    await events; // the Chat page opened the run's SSE stream
+    await awaitTerminal(page);
+    // The server-rendered thread stays the source of truth for the answer.
+    await expect(page.locator('#chatThread article.message .bubble').last()).toContainText('renewal window');
+  });
 });
 
 test.describe('Chat surfaces and grants (member)', () => {

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strings"
 	"time"
@@ -362,6 +361,10 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 	}
 	ctx, cancel := context.WithTimeout(parent, maxRunWallTime)
 	defer cancel()
+	// The run's stream entry exists only while this worker owns the run;
+	// finish (deferred) turns every subscriber's stream into done.
+	s.broker.entry(run.ID)
+	defer s.broker.finish(run.ID)
 	if len(run.Input) > maxRunInputBytes {
 		return "", invalidInput(errors.New("stored run input exceeds limit"))
 	}
@@ -627,8 +630,10 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 			}
 			dispatched = true
 		}
+		s.broker.publish(run.ID, "reset", "")
 		result, err := s.executor.Execute(ctx, p, inference.Request{
 			Capability: inference.CapabilityChat, Model: bot.Model, EndpointID: strings.TrimSpace(bot.ProviderID),
+			Stream:  true,
 			Payload: body, Inputs: inputRefs, Estimate: completionEstimate(body),
 			JobID: run.JobID, AttemptID: claim.AttemptID(),
 		})
@@ -656,7 +661,12 @@ func (s *Service) executeRun(parent context.Context, p auth.Principal, claim *jo
 		if result.Model != "" {
 			run.Model = result.Model
 		}
-		response, readErr := io.ReadAll(io.LimitReader(result.Body, maxRunOutputBytes+1))
+		// Streamed dispatch: assemble the SSE body back into the exact
+		// non-stream chat.completion shape the run loop already parses,
+		// fanning each content fragment out to Chat-page subscribers. The
+		// body is always drained to EOF so stream settlement observes the
+		// terminal usage event.
+		response, readErr := assembleChatStream(result.Body, func(text string) { s.broker.publish(run.ID, "delta", text) })
 		closeErr := result.Body.Close()
 		if readErr != nil {
 			err = readErr

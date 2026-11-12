@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -475,8 +476,20 @@ func (a *App) handleAgentRuns(w http.ResponseWriter, r *http.Request, p auth.Pri
 
 func (a *App) handleAgentRunByID(w http.ResponseWriter, r *http.Request, p auth.Principal) {
 	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/agent-runs/"), "/")
+	stream := strings.HasSuffix(id, "/events")
+	if stream {
+		id = strings.TrimSuffix(id, "/events")
+	}
 	if id == "" || a.chatbotSvc == nil {
 		http.NotFound(w, r)
+		return
+	}
+	if stream {
+		if r.Method != http.MethodGet {
+			WriteMethodNotAllowed(w)
+			return
+		}
+		a.handleAgentRunEvents(w, r, p, id)
 		return
 	}
 	switch r.Method {
@@ -495,6 +508,47 @@ func (a *App) handleAgentRunByID(w http.ResponseWriter, r *http.Request, p auth.
 		WriteJSON(w, http.StatusOK, map[string]any{"cancelled": true, "id": id})
 	default:
 		WriteMethodNotAllowed(w)
+	}
+}
+
+// handleAgentRunEvents streams a live run's content deltas as SSE. The
+// authorizer is the ordinary GET of the same run; a terminal run or one with
+// no live worker entry (other process, already finished) answers done
+// immediately so the client's polling stays the fallback.
+func (a *App) handleAgentRunEvents(w http.ResponseWriter, r *http.Request, p auth.Principal, id string) {
+	if _, err := a.chatbotSvc.GetRun(r.Context(), p, id); err != nil {
+		writeChatbotNotFoundOrError(w, err, "agent_run_fetch_failed")
+		return
+	}
+	events, cancel := a.chatbotSvc.SubscribeRunEvents(id)
+	defer cancel()
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	writeEvent := func(kind, text string) bool {
+		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", kind, strconv.Quote(text)); err != nil {
+			return false
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return true
+	}
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-events:
+			if !ok {
+				return
+			}
+			if !writeEvent(event.Kind, event.Text) {
+				return
+			}
+		}
 	}
 }
 
