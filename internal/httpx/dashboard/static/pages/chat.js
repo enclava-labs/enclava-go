@@ -35,7 +35,7 @@
   window.__enclavaChat = true;
 
   const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'unknown']);
-  const state = { conversation: null, run: null, timer: null, busy: false, sending: false };
+  const state = { conversation: null, run: null, timer: null, busy: false, sending: false, stream: null };
 
   const el = (id) => document.getElementById(id);
 
@@ -75,6 +75,91 @@
     clearTimeout(state.timer);
     state.timer = null;
     state.run = null;
+    closeStream();
+  }
+
+  // ── Live run stream (best-effort) ───────────────────────────────────────
+  // While polling runs, /events may stream deltas into ONE transient
+  // assistant bubble. Every failure path is silent: polling + the
+  // server-rendered thread remain the source of truth.
+  function streamBubble() {
+    const s = state.stream;
+    if (s && document.contains(s.bubble)) return s.bubble;
+    const thread = el('chatThread');
+    if (!thread) return null;
+    const article = document.createElement('article');
+    article.className = 'message assistant';
+    const author = document.createElement('div');
+    author.className = 'author';
+    author.textContent = 'Assistant';
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    // bindBubble must never re-process our own markdown output.
+    bubble.dataset.citationsBound = '1';
+    article.appendChild(author);
+    article.appendChild(bubble);
+    thread.appendChild(article);
+    if (s) s.bubble = bubble;
+    return bubble;
+  }
+
+  function renderStreamText() {
+    const s = state.stream;
+    if (!s || !s.bubble || !document.contains(s.bubble)) return;
+    s.bubble.textContent = '';
+    s.bubble.appendChild(renderMarkdown(s.text));
+  }
+
+  function closeStream() {
+    const s = state.stream;
+    state.stream = null;
+    if (!s) return;
+    if (s.ctrl) s.ctrl.abort();
+    if (s.bubble && s.bubble.parentNode) s.bubble.parentNode.remove();
+  }
+
+  function openStream(runID) {
+    closeStream();
+    if (!window.fetch || typeof window.ReadableStream !== 'function') return;
+    const ctrl = new AbortController();
+    const s = { ctrl, bubble: null, text: '' };
+    state.stream = s;
+    streamBubble();
+    fetch('/api/v1/agent-runs/' + encodeURIComponent(runID) + '/events', {
+      signal: ctrl.signal, headers: { accept: 'text/event-stream' },
+    }).then((res) => {
+      if (!res.ok || !res.body) throw new Error('stream unavailable');
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      const pump = () => reader.read().then((r) => {
+        if (r.done || state.stream !== s) return;
+        buf += dec.decode(r.value, { stream: true });
+        let cut;
+        while ((cut = buf.indexOf('\n\n')) >= 0) {
+          const frame = buf.slice(0, cut);
+          buf = buf.slice(cut + 2);
+          let kind = '', data = '';
+          for (const line of frame.split('\n')) {
+            if (line.startsWith('event:')) kind = line.slice(6).trim();
+            else if (line.startsWith('data:')) data += line.slice(5).trim();
+          }
+          if (state.stream !== s) return;
+          if (kind === 'delta' && data) {
+            s.text += JSON.parse(data);
+            streamBubble();
+            renderStreamText();
+          } else if (kind === 'reset') {
+            s.text = '';
+            renderStreamText();
+          } else if (kind === 'done') {
+            return;
+          }
+        }
+        return pump();
+      });
+      return pump();
+    }).catch(() => {});
   }
 
   const pollMs = () => (window.Enclava && window.Enclava.POLL_MS) || 3000;
@@ -105,8 +190,8 @@
   // other terminal state.
   function startPolling(runID) {
     stopPolling();
-    if (!runID) return;
     state.run = runID;
+    openStream(runID);
     const tick = async () => {
       if (state.run !== runID) return;
       let run;

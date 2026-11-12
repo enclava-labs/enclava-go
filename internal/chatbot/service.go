@@ -125,6 +125,7 @@ type Service struct {
 	jobSvc            *jobs.Service
 	extractor         Extractor
 	principalResolver RunPrincipalResolver
+	broker            runBroker
 }
 
 func (s *Service) ConfigureMCP(dispatcher MCPToolDispatcher) { s.mcpTools = dispatcher }

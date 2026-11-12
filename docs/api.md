@@ -368,6 +368,10 @@ times; model-step input summaries include the durable `job_id` and
 `attempt_id` associated with their billing reservation. A wall-clock timeout
 is reported explicitly even while the detached upstream call settles.
 Configured tools that cannot be used report the reason on the run and step.
+While a run executes in this process, `GET /api/v1/agent-runs/{id}/events`
+(same authorization as the run read) streams the live answer as SSE
+(`event: delta|reset|done`); runs in another process or already terminal
+answer `done` immediately, so polling the run remains the fallback.
 
 `DELETE /api/v1/prompt-templates/{id}` returns `409 template_in_use` when an
 assistant still references the instructions; its message names assistants
