@@ -12,6 +12,7 @@ import (
 
 	"enclava-go/internal/inference"
 	"enclava-go/internal/jobs"
+	"enclava-go/internal/telemetry"
 )
 
 var processStartTime = time.Now()
@@ -25,6 +26,31 @@ func (a *App) ConfigureMetrics(token string, disabled bool, counts jobCounter, a
 	a.metricsAuthDisabled = disabled
 	a.metricsJobs = counts
 	a.metricsAdmission = admission
+}
+
+// ConfigureTelemetryMetrics attaches the telemetry registry's collectors; they
+// are exported through the same authenticated /metrics endpoint.
+func (a *App) ConfigureTelemetryMetrics(m *telemetry.Metrics) {
+	a.telemetryMetrics = m
+}
+
+// metricsMiddleware wraps the mux (innermost) recording request metrics under
+// the matched route pattern. It reuses statusRecorder, which forwards Flush so
+// streaming responses keep working.
+func (a *App) metricsMiddleware(next http.Handler) http.Handler {
+	if a.telemetryMetrics == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		route := r.Pattern
+		if route == "" {
+			route = "unmatched"
+		}
+		a.telemetryMetrics.Observe(r.Method, route, rec.status, time.Since(start))
+	})
 }
 
 func (a *App) handleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -86,5 +112,8 @@ func (a *App) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	if _, err := w.Write([]byte(strings.Join(lines, "\n") + "\n")); err != nil {
 		return
+	}
+	if a.telemetryMetrics != nil {
+		_ = a.telemetryMetrics.WriteText(w)
 	}
 }

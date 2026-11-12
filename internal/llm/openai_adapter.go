@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"enclava-go/internal/telemetry"
 )
 
 type OpenAICompatibleAdapter struct {
@@ -65,8 +67,8 @@ func (a *OpenAICompatibleAdapter) rebuildClients(timeout time.Duration) {
 	if timeout > headerTimeout {
 		headerTimeout = timeout
 	}
-	jsonTransport := endpointTransport(origin, a.allowPrivate, headerTimeout)
-	streamTransport := endpointTransport(origin, a.allowPrivate, defaultStreamHeader)
+	jsonTransport := telemetry.WrapTransport(endpointTransport(origin, a.allowPrivate, headerTimeout))
+	streamTransport := telemetry.WrapTransport(endpointTransport(origin, a.allowPrivate, defaultStreamHeader))
 	// Streaming client has no overall Timeout: long-running SSE streams are
 	// bounded by response-header, idle and wall limits on the body instead.
 	a.client = &http.Client{

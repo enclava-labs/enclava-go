@@ -47,3 +47,11 @@ Native dependencies for extraction: poppler, tesseract, and bubblewrap
 (used to sandbox parsing and OCR subprocesses).
 
 API reference: docs/api.md
+
+## Observability
+
+Prometheus metrics are served at `GET /metrics` on the main port, protected
+by `METRICS_TOKEN` (or `METRICS_AUTH_DISABLED=true`); it includes HTTP
+request totals and latency histograms by route plus runtime/process metrics.
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` (optionally `OTEL_SERVICE_NAME`) to enable
+OTLP/HTTP trace export; outbound inference client calls are traced too.
