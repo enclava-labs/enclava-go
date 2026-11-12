@@ -33,6 +33,7 @@ import (
 	"enclava-go/internal/rag"
 	"enclava-go/internal/source"
 	"enclava-go/internal/store/postgres"
+	"enclava-go/internal/telemetry"
 )
 
 func main() {
@@ -83,6 +84,12 @@ func serve() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	shutdownTracing, err := telemetry.InitTracing(ctx)
+	if err != nil {
+		return fmt.Errorf("tracing init error: %w", err)
+	}
+	metrics := telemetry.NewMetrics()
 
 	// CORE-02/CORE-05: the ONLY database open is PostgreSQL — there is no
 	// SQLite path anywhere in the composition root.
@@ -426,14 +433,16 @@ func serve() error {
 	app.SetSecurityAudit(auditRepo)
 	app.ConfigureVectorStoreProbe(httpx.ProbeHTTP(cfg.QdrantURL + "/collections"))
 	app.ConfigureMetrics(cfg.MetricsToken, cfg.MetricsAuthDisabled, jobsRepoPG, admission)
+	app.ConfigureTelemetryMetrics(metrics)
 
 	// The extract module mounts its API routes on the app's mux — every
 	// processing call it makes funnels through the shared executor.
 	extractmodule.New(extractSvc, previewSvc, cfg.MaxUploadSizeMB).Register(app.Mux(), app)
 
+	mainHandler := telemetry.WrapHandler(app.Handler())
 	srv := &http.Server{
 		Addr:              cfg.Addr(),
-		Handler:           app.Handler(),
+		Handler:           mainHandler,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
@@ -461,6 +470,9 @@ func serve() error {
 		if closeErr := srv.Close(); closeErr != nil {
 			log.Printf("forced server close failed: %v", closeErr)
 		}
+	}
+	if err := shutdownTracing(shutdownCtx); err != nil {
+		log.Printf("trace flush failed: %v", err)
 	}
 	log.Printf("shutdown complete")
 	return nil

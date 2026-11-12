@@ -27,6 +27,7 @@ import (
 	"enclava-go/internal/prompts"
 	"enclava-go/internal/rag"
 	"enclava-go/internal/store/postgres"
+	"enclava-go/internal/telemetry"
 )
 
 type App struct {
@@ -64,6 +65,7 @@ type App struct {
 	metricsAuthDisabled bool
 	metricsJobs         jobCounter
 	metricsAdmission    *inference.Admission
+	telemetryMetrics    *telemetry.Metrics
 	rl                  *RateLimiter
 	gate                *inferenceGate
 	mux                 *http.ServeMux
@@ -227,7 +229,11 @@ func NewApp(
 }
 
 func (a *App) Handler() http.Handler {
+	// Innermost wrapper: requestIDMiddleware clones the request via
+	// r.WithContext, so only a middleware around the mux sees the mux-set
+	// r.Pattern used as the route label.
 	var h http.Handler = a.mux
+	h = a.metricsMiddleware(h)
 	h = a.inferenceAdmissionMiddleware(h)
 	h = http.MaxBytesHandler(h, a.maxRequestBodyBytes())
 	h = recoverMiddleware(h)
