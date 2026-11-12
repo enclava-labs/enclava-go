@@ -4,13 +4,6 @@ FROM golang:1.27.3-alpine AS build
 
 WORKDIR /src
 
-# go.mod replaces the SDK binding with a dev-machine checkout at
-# ../enclava-proxy-sdk/...; provide the pinned upstream at that path so
-# container builds resolve the same module revision.
-RUN apk add --no-cache git ca-certificates \
-	&& git clone --quiet https://github.com/enclava-labs/confidential-inference-sdk /enclava-proxy-sdk/confidential-inference-sdk \
-	&& git -C /enclava-proxy-sdk/confidential-inference-sdk checkout --quiet adcb08cee700fe9f18ac1954cc146b98295e2008
-
 COPY go.mod go.sum ./
 RUN go mod download
 
@@ -19,7 +12,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o
 
 FROM alpine:3.22
 
-RUN apk add --no-cache ca-certificates \
+RUN apk add --no-cache ca-certificates poppler-utils tesseract-ocr tesseract-ocr-data-eng bubblewrap \
 	&& addgroup -g 10001 app \
 	&& adduser -D -u 10001 -G app app
 

@@ -4,17 +4,16 @@ go 1.27.3
 
 require (
 	github.com/coreos/go-oidc/v3 v3.21.0
-	github.com/enclava-labs/confidential-inference-sdk/bindings/go v0.0.0
+	github.com/enclava-labs/confidential-inference-sdk/bindings/go v0.0.0-20261101205306-adcb08cee700
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/openai/openai-go/v3 v3.85.0
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/tinfoilsh/tinfoil-go v0.16.3
 	golang.org/x/crypto v0.58.0
 	golang.org/x/net v0.61.0
 	golang.org/x/oauth2 v0.37.0
 	golang.org/x/sync v0.24.0
 )
-
-replace github.com/enclava-labs/confidential-inference-sdk/bindings/go => ../enclava-proxy-sdk/confidential-inference-sdk/bindings/go
 
 require (
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
@@ -63,7 +62,6 @@ require (
 	github.com/oklog/ulid/v2 v2.1.2 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 // indirect
 	github.com/secure-systems-lab/go-securesystemslib v0.11.1 // indirect
 	github.com/shibumi/go-pathspec v1.3.0 // indirect
 	github.com/sigstore/protobuf-specs v0.5.2 // indirect
