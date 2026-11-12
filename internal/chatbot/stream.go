@@ -44,6 +44,7 @@ func assembleChatStream(body io.Reader, onDelta func(string)) ([]byte, error) {
 	// scripted fixtures in CI) pass through unchanged.
 	var plain []byte
 	sawData := false
+	sawDone := false
 	handle := func(data []byte) error {
 		var chunk struct {
 			Choices []struct {
@@ -112,6 +113,7 @@ func assembleChatStream(body io.Reader, onDelta func(string)) ([]byte, error) {
 			sawData = true
 			data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
 			if data == "[DONE]" {
+				sawDone = true
 				eventData = eventData[:0]
 				continue
 			}
@@ -151,6 +153,11 @@ func assembleChatStream(body io.Reader, onDelta func(string)) ([]byte, error) {
 			return nil, errors.New("chat stream carried no events")
 		}
 		return bytes.TrimRight(plain, "\n"), nil
+	}
+	// A stream that ends with neither a finish_reason nor [DONE] was cut
+	// off: failing the attempt beats persisting a truncated answer as final.
+	if finish == "" && !sawDone {
+		return nil, errors.New("chat stream ended before completion")
 	}
 	return marshalAssembledCompletion(content.String(), calls, finish, usage)
 }

@@ -131,3 +131,10 @@ func (t *trackingReader) Read(p []byte) (int, error) {
 	*t.n += n
 	return n, err
 }
+
+func TestAssembleChatStreamRejectsTruncatedStream(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
+	if _, err := assembleChatStream(strings.NewReader(body), nil); err == nil {
+		t.Fatal("truncated stream (no finish_reason, no [DONE]) must fail")
+	}
+}
