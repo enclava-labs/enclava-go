@@ -123,8 +123,7 @@
     if (!window.fetch || typeof window.ReadableStream !== 'function') return;
     const ctrl = new AbortController();
     const s = { ctrl, bubble: null, text: '' };
-    state.stream = s;
-    streamBubble();
+    state.stream = s; // the bubble is created lazily on the first delta
     fetch('/api/v1/agent-runs/' + encodeURIComponent(runID) + '/events', {
       signal: ctrl.signal, headers: { accept: 'text/event-stream' },
     }).then((res) => {
@@ -190,6 +189,7 @@
   // other terminal state.
   function startPolling(runID) {
     stopPolling();
+    if (!runID) return;
     state.run = runID;
     openStream(runID);
     const tick = async () => {
