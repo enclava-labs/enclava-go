@@ -2,17 +2,20 @@
  *
  * One delegated module on window.Enclava contracts (D-20): no inline
  * handlers, no hx-on, no page-local evidence fetching. Behaviors:
- *   chat:send   POST /api/v1/agent-runs — a 202's conversation_id is
- *               adopted into state + URL (history.replaceState) so later
- *               turns, reloads and deep links address the same conversation;
- *               inside an open conversation the thread always posts ITS OWN
- *               assistant (composer data-assistant), switching the picker
- *               starts a new conversation (AST-I02)
+ *   chat:send   POST /dashboard/chat/stream — a plain turn (no evidence
+ *               handoff) streams assistant text token-by-token over SSE;
+ *               tool-configured assistants stream-fallback answers the
+ *               same 202 run envelope (or the browser lacks ReadableStream
+ *               → direct POST /api/v1/agent-runs). A 202's
+ *               conversation_id is adopted into state + URL
+ *               (history.replaceState) so later turns, reloads and deep
+ *               links address the same conversation; inside an open
+ *               conversation the thread always posts ITS OWN assistant
+ *               (composer data-assistant), switching the picker starts a
+ *               new conversation (AST-I02)
+ *   stop        aborts the SSE fetch (the server persists the interrupted
+ *               turn); a polled run DELETEs as before
  *   polling     GET /api/v1/agent-runs/{id} every Enclava.POLL_MS while
- *               queued|running — NO time cutoff; a 200 payload carrying
- *               status failed feeds run.error through Enclava.errorAction
- *   chat:stop   the trigger's shared data-confirm arms; chat.js consumes the
- *               enclava:confirm event and DELETEs the run
  *   markdown    assistant .bubble text renders a SAFE subset (paragraphs,
  *               headings, bold/italic, inline + fenced code, lists, http(s)
  *               links) built from DOM nodes ONLY — createElement/textContent,
@@ -35,7 +38,7 @@
   window.__enclavaChat = true;
 
   const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'unknown']);
-  const state = { conversation: null, run: null, timer: null, busy: false, sending: false };
+  const state = { conversation: null, run: null, timer: null, busy: false, sending: false, abort: null };
 
   const el = (id) => document.getElementById(id);
 
@@ -137,6 +140,146 @@
     state.timer = setTimeout(tick, pollMs());
   }
 
+  // assistantHasTools reads the server-rendered tool marker: picker
+  // options for a fresh chat, the composer for an open conversation.
+  function assistantHasTools() {
+    if (state.conversation) {
+      const box = el('chatComposer');
+      return !!(box && box.dataset.tools);
+    }
+    const select = el('assistantSelect');
+    const opt = select && select.selectedOptions && select.selectedOptions[0];
+    return !!(opt && opt.dataset.tools);
+  }
+
+  function clearComposer() {
+    const ta = el('composer');
+    if (ta) ta.value = '';
+  }
+
+  // Adopt the authoritative conversation_id: state, URL and thread.
+  function adoptConversation(convID, assistantID) {
+    if (convID && convID !== state.conversation) {
+      state.conversation = convID;
+      history.replaceState(null, '', '/dashboard/chat/' + encodeURIComponent(convID));
+      const box = el('chatComposer');
+      if (box) box.dataset.assistant = assistantID;
+      loadThread();
+    }
+  }
+
+  // sendRun is the original polled path: POST a run, adopt its
+  // conversation, poll to terminal.
+  async function sendRun(body, assistantID) {
+    const run = await window.Enclava.api('POST', '/api/v1/agent-runs', body);
+    clearComposer();
+    adoptConversation(run && run.conversation_id, assistantID);
+    if (run && run.id) startPolling(run.id);
+    window.Enclava.refresh(); // history gains the conversation
+  }
+
+  // liveTurn appends the transient in-flight markup (user bubble, growing
+  // assistant bubble, stop row) to the thread; the server re-render after
+  // the stream replaces all of it with the persisted truth.
+  function liveTurn(input) {
+    const thread = el('chatThread');
+    if (!thread) return null;
+    const art = (cls, text) => {
+      const a = document.createElement('article');
+      a.className = 'message ' + cls;
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.textContent = text;
+      a.appendChild(bubble);
+      thread.appendChild(a);
+      return bubble;
+    };
+    art('user', input);
+    const bubble = art('assistant', '');
+    const row = document.createElement('div');
+    row.className = 'runline';
+    const stop = document.createElement('button');
+    stop.type = 'button';
+    stop.className = 'btn danger';
+    stop.dataset.action = 'confirm';
+    stop.dataset.confirm = 'Stop run?';
+    stop.textContent = 'Stop';
+    row.appendChild(stop);
+    thread.appendChild(row);
+    return bubble;
+  }
+
+  // streamTurn posts one turn to the dashboard streaming endpoint. An SSE
+  // content-type streams assistant text token-by-token into a live bubble
+  // (final rendering — citations, sources, runlines — comes from the
+  // server re-render afterwards); a JSON body is the tool/evidence
+  // fallback: the same 202 run envelope a direct POST returns. Stop
+  // aborts the fetch; the server persists the interrupted turn.
+  async function streamTurn(body, assistantID) {
+    state.abort = new AbortController();
+    const res = await fetch('/dashboard/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': window.Enclava.csrfToken() },
+      body: JSON.stringify(body),
+      signal: state.abort.signal,
+    });
+    if ((res.headers.get('content-type') || '').indexOf('text/event-stream') < 0) {
+      const data = await res.clone().json().catch(() => null);
+      if (res.ok && data && data.id) {
+        clearComposer();
+        adoptConversation(data.conversation_id, assistantID);
+        startPolling(data.id);
+        window.Enclava.refresh();
+        return;
+      }
+      if (res.status === 401 && window.Enclava.toLogin) {
+        window.Enclava.toLogin(); // same return-path redirect api() performs
+        throw { message: 'Sign in required', code: 'unauthorized', status: 401 };
+      }
+      // Same {message, code, status} shape api() rejects with, so
+      // Enclava.errorAction maps price_missing/budget_exceeded identically.
+      const e = (data && (data.error || data)) || {};
+      throw {
+        message: (typeof e.message === 'string' && e.message) || 'Request failed',
+        code: e.code || 'error',
+        status: res.status,
+      };
+    }
+    clearComposer();
+    adoptConversation(res.headers.get('X-Enclava-Conversation-ID'), assistantID);
+    const bubble = liveTurn(body.input);
+    let text = '';
+    let buf = '';
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buf += decoder.decode(chunk.value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        const t = line.trim();
+        if (t.indexOf('data:') !== 0) continue;
+        const data = t.slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+        try {
+          const choice = JSON.parse(data).choices[0];
+          const delta = choice && ((choice.delta && choice.delta.content)
+            || (choice.message && choice.message.content));
+          if (typeof delta === 'string') text += delta;
+        } catch (err) { /* non-JSON keep-alive frames pass through */ }
+      }
+      if (bubble) {
+        bubble.textContent = '';
+        bubble.appendChild(renderMarkdown(text));
+      }
+    }
+    setBusy(false);
+    loadThread();  // server re-render carries citations + sources
+    window.Enclava.refresh();
+  }
+
   async function send() {
     if (state.sending) return;
     const input = composerText();
@@ -155,24 +298,25 @@
     state.sending = true;
     setBusy(true);
     try {
-      const run = await window.Enclava.api('POST', '/api/v1/agent-runs', body);
-      const ta = el('composer');
-      if (ta) ta.value = '';
-      // Adopt the authoritative conversation_id: state, URL and thread.
-      const convID = run && run.conversation_id;
-      if (convID && convID !== state.conversation) {
-        state.conversation = convID;
-        history.replaceState(null, '', '/dashboard/chat/' + encodeURIComponent(convID));
-        if (box) box.dataset.assistant = assistantID;
-        loadThread();
+      if (window.fetch && typeof ReadableStream !== 'undefined' && !evIDs.length && !assistantHasTools()) {
+        await streamTurn(body, assistantID); // falls back to a run server-side
+      } else {
+        await sendRun(body, assistantID);
       }
-      if (run && run.id) startPolling(run.id);
-      window.Enclava.refresh(); // history gains the conversation
     } catch (err) {
-      setBusy(false);
-      failAction(err, send); // shared map: Set price / budgets / Try again
+      if (err && err.name === 'AbortError') {
+        setBusy(false);
+        loadThread(); // server persisted the interrupted turn
+        window.Enclava.refresh();
+      } else if (err && err.status === 401) {
+        return; // streamTurn already ran Enclava.toLogin()
+      } else {
+        setBusy(false);
+        failAction(err, send); // shared map: Set price / budgets / Try again
+      }
     } finally {
       state.sending = false;
+      state.abort = null;
     }
   }
 
@@ -412,6 +556,10 @@
       document.querySelectorAll('.h-item[data-conv-id="' + CSS.escape(id) + '"]').forEach((row) => row.remove());
       if (state.conversation === id) newChat();
       else window.Enclava.refresh();
+      return;
+    }
+    if (!e.target.closest('[data-run-id]') && state.abort) {
+      state.abort.abort(); // streaming turn: aborting the fetch persists the interrupted turn server-side
       return;
     }
     const trigger = e.target.closest('[data-run-id]');

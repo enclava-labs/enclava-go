@@ -179,11 +179,15 @@ test.describe('admin error surfaces', () => {
     await page.fill('#composer', 'admin unpriced run');
     await page.click('[data-action="chat:send"]');
     await awaitTerminal(page, 120_000);
-    const line = page.locator('.thread-body .runline').last();
-    await expect(line).toBeVisible();
-    const fix = line.locator('a[href]');
+    // The tool-less assistant streams: the unpriced denial surfaces as the
+    // sticky error toast with the SAME capability-resolved fix link the
+    // runline carried, and the thread keeps the interrupted-turn message.
+    const toast = page.locator('#toast.show.error');
+    await expect(toast).toBeVisible();
+    const fix = toast.locator('a[href]');
     await expect(fix.first()).toBeVisible();
     expect(await fix.first().getAttribute('href')).toContain('/dashboard/models');
+    await expect(page.locator('.thread-body')).toContainText('interrupted before completion');
   });
 });
 

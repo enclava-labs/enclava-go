@@ -9,6 +9,7 @@ package httpx
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -38,6 +39,7 @@ func (a *App) registerDashboardChatRoutes() {
 	a.mux.HandleFunc("GET /dashboard/partials/evidence/{evidenceID}",
 		a.sessionAuth.requireCap(capSearch, a.handleDashboardEvidencePartial))
 	a.mux.HandleFunc("GET /dashboard/partials/evidence/", a.sessionAuth.renderDashboardNotFound)
+	a.mux.HandleFunc("POST /dashboard/chat/stream", a.sessionAuth.requireCap(capChat, a.handleDashboardChatStream))
 	a.mux.HandleFunc("GET /dashboard/partials/chat/sources", a.sessionAuth.requireCap(capSearch, a.handleDashboardChatSources))
 }
 
@@ -50,6 +52,9 @@ type chatViewData struct {
 	// SelectedDisabled marks the open conversation's assistant as present
 	// but not runnable (disabled): the notice replaces the composer.
 	SelectedDisabled bool
+	// AssistantTools marks picker assistants with configured tools — the
+	// Chat page streams only tool-less turns (handleDashboardChatStream).
+	AssistantTools map[string]bool
 	// NoAssistants renders ONE empty state over the thread and hides the
 	// picker/composer (UX-M04).
 	NoAssistants    bool
@@ -197,6 +202,7 @@ func (a *App) handleDashboardChatPage(w http.ResponseWriter, r *http.Request) {
 		History:           a.buildChatHistory(r.Context(), p, "", ""),
 	}
 	data.fillEmptyStates(caps)
+	data.AssistantTools = assistantToolFlags(data.Assistants)
 	if data.NoAssistants = len(data.Assistants) == 0; data.NoAssistants {
 		data.ThreadEmpty = data.AssistantsEmpty
 	}
@@ -221,6 +227,16 @@ func (a *App) handleDashboardChatConversation(w http.ResponseWriter, r *http.Req
 		return // the 404/500 response is already committed
 	}
 	a.renderDashboard(w, r, "chat", data)
+}
+
+// assistantToolFlags marks which assistants carry configured tools — the
+// Chat page streams only tool-less turns (handleDashboardChatStream).
+func assistantToolFlags(bots []chatbot.Instance) map[string]bool {
+	flags := make(map[string]bool, len(bots))
+	for _, bot := range bots {
+		flags[bot.ID] = assistantHasTools(bot)
+	}
+	return flags
 }
 
 // handleDashboardChatHistory re-renders the history fragment (?cursor= for
@@ -257,6 +273,60 @@ func (a *App) handleDashboardChatThread(w http.ResponseWriter, r *http.Request) 
 	a.renderDashboardFragment(w, r, "chat", "chat-thread", data)
 }
 
+// handleDashboardChatStream serves POST /dashboard/chat/stream — the Chat
+// page's streaming turn. It is a thin session-authenticated wrapper over
+// the same PrepareChatCompletion/ExecutePrepared/PersistAssistantMessage
+// path behind the external SSE endpoint, so the persisted turn (user +
+// assistant message, RAG evidence ids, interrupted-on-disconnect) is the
+// conversation model the thread already renders. Tool-configured
+// assistants and evidence-handoff sends cannot stream truthfully (no tool
+// loop, no evidence attach in the completion path): those start a normal
+// agent run and answer the same 202 run envelope a direct POST would, so
+// chat.js polls exactly like before.
+func (a *App) handleDashboardChatStream(w http.ResponseWriter, r *http.Request) {
+	p, _ := auth.PrincipalFromContext(r.Context())
+	var input struct {
+		AssistantID string `json:"assistant_id"`
+		chatbot.AssistantRunInput
+	}
+	if a.chatbotSvc == nil || DecodeJSON(r, &input) != nil || strings.TrimSpace(input.AssistantID) == "" {
+		WriteJSON(w, http.StatusBadRequest, map[string]string{"message": "invalid chat request"})
+		return
+	}
+	bot, err := a.chatbotSvc.Get(r.Context(), p, input.AssistantID)
+	if err != nil {
+		writeChatbotNotFoundOrError(w, err, "chat_stream_start_failed")
+		return
+	}
+	if !assistantHasTools(bot) && len(input.EvidenceIDs) == 0 {
+		payload, err := json.Marshal(map[string]any{
+			"messages":        []map[string]any{{"role": "user", "content": input.Input}},
+			"conversation_id": input.ConversationID,
+			"stream":          true,
+		})
+		if err != nil {
+			WriteJSON(w, http.StatusBadRequest, map[string]string{"message": "invalid chat request"})
+			return
+		}
+		a.handleExternalChatbotCompletionStream(w, r, p, input.AssistantID, payload)
+		return
+	}
+	run, err := a.chatbotSvc.StartRun(r.Context(), p, input.AssistantID, input.AssistantRunInput)
+	if err != nil {
+		writeChatbotNotFoundOrError(w, err, "chat_stream_start_failed")
+		return
+	}
+	WriteJSON(w, http.StatusAccepted, run)
+}
+
+// assistantHasTools mirrors the service's settings["tools"] read: a
+// tool-configured assistant must take the agent-run path (tool loop),
+// never the single-call streaming completion.
+func assistantHasTools(bot chatbot.Instance) bool {
+	tools, _ := bot.Settings["tools"].([]any)
+	return len(tools) > 0
+}
+
 // appendChatThread loads + projects the conversation into the view data.
 // not-found/forbidden → uniform 404 page (false, response committed);
 // other service errors → logged 500.
@@ -284,6 +354,7 @@ func (a *App) appendChatThread(w http.ResponseWriter, r *http.Request, data *cha
 	for _, bot := range a.listAssistants(r.Context(), p) {
 		if bot.ID == view.Conversation.ChatbotID {
 			data.SelectedDisabled = !bot.IsEnabled
+			data.AssistantTools = map[string]bool{bot.ID: assistantHasTools(bot)}
 			break
 		}
 	}

@@ -422,8 +422,9 @@ test.describe('member home and error-toast cases', () => {
     await expect(toast).toBeVisible();
     await expect(toast).toContainText('administrator');
     await expect(toast.locator('a[href]')).toHaveCount(0);
-    const line = page.locator('.thread-body .runline').last();
-    await expect(line).toContainText('administrator');
-    await expect(line.locator('a[href]')).toHaveCount(0);
+    // No run row on a streamed turn: the server persisted the interrupted
+    // assistant message; the toast carries the administrator fallback copy.
+    await expect(page.locator('.thread-body')).toContainText('interrupted before completion');
+    await expect(page.locator('.thread-body .runline a[href]')).toHaveCount(0);
   });
 });

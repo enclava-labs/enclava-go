@@ -805,6 +805,8 @@
     caps: caps,
     errorAction: errorAction,
     POLL_MS: POLL_MS,
+    csrfToken: csrfToken,
+    toLogin: loginRedirect,
   };
   window.Enclava.version = 'oa';
 })();

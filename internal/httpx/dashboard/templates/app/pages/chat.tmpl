@@ -28,7 +28,7 @@
       <div class="stack">
         <label class="label" for="assistantSelect">Assistant</label>
         <select class="field" id="assistantSelect" aria-label="Assistant"{{if not .Data.Assistants}} disabled{{end}}>
-          {{$sel := .Data.SelectedAssistant}}{{range .Data.Assistants}}<option value="{{.ID}}"{{if eq .ID $sel}} selected{{end}}>{{.Name}}</option>{{end}}
+          {{$sel := .Data.SelectedAssistant}}{{$tools := .Data.AssistantToolFlags}}{{range .Data.Assistants}}<option value="{{.ID}}"{{if eq .ID $sel}} selected{{end}}{{if index $tools .ID}} data-tools="1"{{end}}>{{.Name}}</option>{{end}}
         </select>
         <span class="help">Don't see an assistant you expected? Ask an administrator to grant your role access.</span>
         {{if not .Data.Assistants}}<span class="help">{{.Data.AssistantsEmpty.Text}}</span>{{end}}
@@ -49,7 +49,7 @@
         {{if .Data.NoAssistants}}{{.Data.AssistantsEmpty.Text}}{{else}}This assistant is no longer available. Pick another assistant to start a new conversation.{{end}}
       </div>
     {{else}}
-    <div class="composer" id="chatComposer"{{if .Data.EvidenceIDsAttr}} data-evidence="{{.Data.EvidenceIDsAttr}}"{{end}}{{if and .Data.ConversationID .Data.SelectedAssistant}} data-assistant="{{.Data.SelectedAssistant}}"{{end}}>
+    <div class="composer" id="chatComposer"{{if .Data.EvidenceIDsAttr}} data-evidence="{{.Data.EvidenceIDsAttr}}"{{end}}{{if and .Data.ConversationID .Data.SelectedAssistant}} data-assistant="{{.Data.SelectedAssistant}}"{{if index .Data.AssistantToolFlags .Data.SelectedAssistant}} data-tools="1"{{end}}{{end}}>
       <textarea class="field" id="composer" rows="2" placeholder="Ask a follow-up…" aria-label="Message"></textarea>
       <div class="compose-foot">
         <span class="muted" id="evidenceChip"{{if not .Data.EvidenceIDsAttr}} hidden{{end}}>Answering from the saved passages you attached.</span>
