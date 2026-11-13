@@ -452,14 +452,16 @@ func tokenAttr(token htmltoken.Token, key string) string {
 }
 
 func parseOCRTSV(raw []byte) ([]parseBlock, error) {
-	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	// Trim line ends only: a row without text ends in a tab that is part of
+	// its twelve columns, and a blank page's output ends with such a row.
+	lines := strings.Split(strings.Trim(string(raw), "\r\n"), "\n")
 	if len(lines) < 2 {
 		return nil, errors.New("extract: malformed OCR output")
 	}
 	var blocks []parseBlock
 	offset := 0
 	for _, line := range lines[1:] {
-		cols := strings.Split(line, "\t")
+		cols := strings.Split(strings.TrimRight(line, "\r"), "\t")
 		if len(cols) < 12 {
 			return nil, errors.New("extract: malformed OCR output")
 		}

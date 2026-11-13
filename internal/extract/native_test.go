@@ -193,3 +193,14 @@ func mustLookPath(t *testing.T, name string) string {
 func artifactsRef() artifacts.Ref {
 	return artifacts.Ref{TenantID: "tenant", ID: "artifact", Kind: artifacts.KindOriginal}
 }
+
+// A blank page yields only structural rows whose text column is empty; that
+// is an empty page, not malformed output that fails the whole document.
+func TestParseOCRTSVBlankPage(t *testing.T) {
+	raw := []byte("level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n" +
+		"1\t1\t0\t0\t0\t0\t0\t0\t828\t1198\t-1\t\n")
+	blocks, err := parseOCRTSV(raw)
+	if err != nil || len(blocks) != 0 {
+		t.Fatalf("blank page: blocks=%v err=%v", blocks, err)
+	}
+}
