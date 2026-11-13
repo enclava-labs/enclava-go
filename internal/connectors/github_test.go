@@ -75,6 +75,13 @@ func TestGitHubContentPinsIdentityToConnectionAndRevision(t *testing.T) {
 		page.Items[1].Title != "Bug" || page.Items[1].ParentKind != "issues" || page.Items[1].NativeID != "github:conn1:acme/docs:comment:100" {
 		t.Fatalf("issue/comment title or parent missing: %#v", page.Items)
 	}
+	// Without a markdown type the ingest pipeline rejects issue text as an
+	// unsupported document.
+	for _, item := range page.Items {
+		if item.MIMEType != "text/markdown" || item.Filename != "Bug.md" {
+			t.Fatalf("issue/comment not typed as markdown: %#v", item)
+		}
+	}
 	page, err = g.Content(context.Background(), conn, page.NextCursor, 100)
 	if err != nil {
 		t.Fatal(err)

@@ -250,7 +250,7 @@ func (g *GitHubAdapter) discussionPage(ctx context.Context, c source.Connection,
 			continue
 		}
 		id := fmt.Sprintf("github:%s:%s:%s:%d", c.ID, g.owner+"/"+g.repo, kind, r.ID)
-		parent := []ContentItem{{NativeID: id, ParentNativeID: "github:" + c.ID + ":" + g.owner + "/" + g.repo, ParentKind: "repository", Kind: kind, NativeRevision: r.UpdatedAt, Title: r.Title, Filename: r.Title, Text: r.Body, URL: r.HTMLURL}}
+		parent := []ContentItem{{NativeID: id, ParentNativeID: "github:" + c.ID + ":" + g.owner + "/" + g.repo, ParentKind: "repository", Kind: kind, NativeRevision: r.UpdatedAt, Title: r.Title, Filename: r.Title + ".md", MIMEType: "text/markdown", Text: r.Body, URL: r.HTMLURL}}
 		comments, e := g.comments(ctx, c, fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments", g.base, url.PathEscape(g.owner), url.PathEscape(g.repo), r.Number), id, kind, r.Title, "comment")
 		if e != nil {
 			return ContentPage{}, e
@@ -301,7 +301,7 @@ func (g *GitHubAdapter) comments(ctx context.Context, c source.Connection, endpo
 			return nil, e
 		}
 		for _, r := range rows {
-			out = append(out, ContentItem{NativeID: fmt.Sprintf("github:%s:%s:%s:%d", c.ID, g.owner+"/"+g.repo, kind, r.ID), ParentNativeID: parent, ParentKind: parentKind, Kind: kind, NativeRevision: r.UpdatedAt, Title: title, Text: r.Body, URL: r.HTMLURL})
+			out = append(out, ContentItem{NativeID: fmt.Sprintf("github:%s:%s:%s:%d", c.ID, g.owner+"/"+g.repo, kind, r.ID), ParentNativeID: parent, ParentKind: parentKind, Kind: kind, NativeRevision: r.UpdatedAt, Title: title, Filename: title + ".md", MIMEType: "text/markdown", Text: r.Body, URL: r.HTMLURL})
 		}
 		if len(rows) < 100 {
 			return out, nil

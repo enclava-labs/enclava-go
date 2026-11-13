@@ -130,10 +130,24 @@ func runBootstrap(ctx context.Context, args []string) error {
 		var tenantID string
 		err := tx.QueryRowContext(ctx,
 			`INSERT INTO tenants (id, slug, display_name)
-			 VALUES (gen_random_uuid(), $1, $2) RETURNING id::text`,
+			 VALUES (gen_random_uuid(), $1, $2)
+			 ON CONFLICT (slug) DO NOTHING RETURNING id::text`,
 			*tenantSlug, *tenantSlug).Scan(&tenantID)
+		if errors.Is(err, sql.ErrNoRows) {
+			// A server started before bootstrap has already seeded the bare
+			// tenant row; adopt it as long as nobody has been set up in it.
+			err = tx.QueryRowContext(ctx,
+				`SELECT t.id::text FROM tenants t
+				 WHERE t.slug = $1
+				   AND NOT EXISTS (SELECT 1 FROM users u WHERE u.tenant_id = t.id)
+				   AND NOT EXISTS (SELECT 1 FROM roles r WHERE r.tenant_id = t.id)`,
+				*tenantSlug).Scan(&tenantID)
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("tenant %q already has users or roles (refuses an existing slug)", *tenantSlug)
+			}
+		}
 		if err != nil {
-			return fmt.Errorf("create tenant %q (refuses an existing slug): %w", *tenantSlug, err)
+			return fmt.Errorf("create tenant %q: %w", *tenantSlug, err)
 		}
 		for _, role := range bootstrapRoles {
 			if _, err := tx.ExecContext(ctx,

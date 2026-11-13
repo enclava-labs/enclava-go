@@ -21,6 +21,11 @@ pipeline parses and OCRs documents for retrieval-augmented chat and search.
     cp .env.example .env
     docker compose up --build
 
+Set `PRIVATEMODE_API_KEY` in `.env` first; compose routes inference through
+a bundled `privatemode-proxy`, which the provider requires. Set
+`ENCLAVA_SECRETS_KEY` (`openssl rand -base64 32`) to store connector
+credentials from the dashboard.
+
 The dashboard is at http://localhost:8080/dashboard. Create the first
 tenant and admin user from inside the running container:
 
