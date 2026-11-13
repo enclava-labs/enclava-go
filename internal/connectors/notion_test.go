@@ -161,3 +161,18 @@ func TestNotionBlockURLsAnchorToEnclosingPage(t *testing.T) {
 		t.Fatalf("block url = %q, want page url + dashless anchor", byID["a1b2-c3d4"].URL)
 	}
 }
+
+func TestValidNotionPageURLHosts(t *testing.T) {
+	for raw, want := range map[string]bool{
+		"https://www.notion.so/Page-abc":       true,
+		"https://app.notion.com/Page-abc":      true,
+		"https://acme.notion.site/Page-abc":    true,
+		"http://app.notion.com/Page-abc":       false,
+		"https://notion.com.evil.example/Page": false,
+		"https://evilnotion.com/Page":          false,
+	} {
+		if got := validNotionPageURL(raw); got != want {
+			t.Errorf("validNotionPageURL(%q) = %v, want %v", raw, got, want)
+		}
+	}
+}

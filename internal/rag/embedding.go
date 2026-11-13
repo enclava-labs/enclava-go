@@ -6,14 +6,61 @@ import (
 	"enclava-go/internal/auth"
 	"enclava-go/internal/billing"
 	"enclava-go/internal/inference"
+	"enclava-go/internal/llm"
 	"enclava-go/internal/source"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 	"strings"
+	"sync"
+	"time"
 	"unicode/utf8"
 )
+
+// A bulk sync fans out one embedding request per document and easily exceeds
+// a provider's per-minute request limit. Embedding jobs therefore share a
+// cooldown: a 429 pauses every job-scoped embedding call in the process and
+// the rejected batch is sent again, instead of burning the job's attempts
+// within milliseconds. Interactive calls (search, probes) never wait.
+var (
+	embedRateLimitPause = 15 * time.Second
+	embedRateLimitWaits = 16
+	embedCooldown       struct {
+		sync.Mutex
+		until time.Time
+	}
+)
+
+func embedRateLimited(err error) bool {
+	var upstream *llm.UpstreamError
+	return errors.As(err, &upstream) && upstream.StatusCode == 429
+}
+
+// waitEmbedCooldown blocks until the shared cooldown has passed; extend
+// starts a fresh pause first. Jitter keeps waiting jobs from resuming at once.
+func waitEmbedCooldown(ctx context.Context, extend bool) error {
+	embedCooldown.Lock()
+	if extend {
+		embedCooldown.until = time.Now().Add(embedRateLimitPause)
+	}
+	wait := time.Until(embedCooldown.until)
+	embedCooldown.Unlock()
+	if wait <= 0 {
+		return ctx.Err()
+	}
+	wait += time.Duration(rand.Int64N(int64(embedRateLimitPause)/4 + 1)) //nolint:gosec // jitter, not security
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
 
 func defaultEmbeddingPrefixes(model string) (query, passage string) {
 	model = strings.ToLower(model)
@@ -96,7 +143,18 @@ func createEmbeddings(ctx context.Context, executor Executor, p auth.Principal, 
 			units += u
 			end++
 		}
+		if scope.JobID != "" {
+			if err := waitEmbedCooldown(ctx, false); err != nil {
+				return nil, err
+			}
+		}
 		batchVectors, err := createEmbeddingBatch(ctx, executor, p, model, inputs[offset:end], units, scope)
+		for waits := 0; scope.JobID != "" && waits < embedRateLimitWaits && embedRateLimited(err); waits++ {
+			if waitEmbedCooldown(ctx, true) != nil {
+				break // cancelled: report the rate-limit error
+			}
+			batchVectors, err = createEmbeddingBatch(ctx, executor, p, model, inputs[offset:end], units, scope)
+		}
 		if err != nil {
 			return nil, err
 		}
