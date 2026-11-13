@@ -396,7 +396,7 @@ func parsePDFBBox(raw []byte) ([]parseBlock, error) {
 		switch kind {
 		case htmltoken.ErrorToken:
 			if z.Err() == io.EOF && !inWord && page > 0 {
-				return blocks, nil
+				return mergeLineWords(blocks, false), nil
 			}
 			return nil, errors.New("extract: malformed Poppler bbox output")
 		case htmltoken.StartTagToken:
@@ -486,7 +486,64 @@ func parseOCRTSV(raw []byte) ([]parseBlock, error) {
 		blocks = append(blocks, parseBlock{kind: "paragraph", text: text, start: offset, end: offset + len(text), locator: source.Locator{Page: &page, Box: fmt.Sprintf("%d,%d,%d,%d", left, top, width, height)}})
 		offset += len(text)
 	}
-	return blocks, nil
+	return mergeLineWords(blocks, true), nil
+}
+
+// mergeLineWords joins consecutive word blocks that sit on one text line into
+// a single block: its text is the words separated by spaces and its box their
+// union. Poppler and Tesseract report every word separately; kept that way,
+// document text reads one word per line and a chunk carries a span per word.
+// sized marks Tesseract boxes (left,top,width,height); Poppler's are edges
+// (xMin,yMin,xMax,yMax). Offsets are renumbered for the merged blocks.
+func mergeLineWords(words []parseBlock, sized bool) []parseBlock {
+	type edges struct{ x0, y0, x1, y1 float64 }
+	parse := func(box string) (edges, bool) {
+		parts := strings.Split(box, ",")
+		if len(parts) != 4 {
+			return edges{}, false
+		}
+		var v [4]float64
+		for i, part := range parts {
+			f, err := strconv.ParseFloat(part, 64)
+			if err != nil {
+				return edges{}, false
+			}
+			v[i] = f
+		}
+		if sized {
+			return edges{v[0], v[1], v[0] + v[2], v[1] + v[3]}, true
+		}
+		return edges{v[0], v[1], v[2], v[3]}, true
+	}
+	out := make([]parseBlock, 0, len(words)/6+1)
+	var line edges
+	open := false // out's last block is a line that can take more words
+	for _, word := range words {
+		box, ok := parse(word.locator.Box)
+		if open && ok {
+			last := &out[len(out)-1]
+			middle, height := (box.y0+box.y1)/2, box.y1-box.y0
+			samePage := last.locator.Page != nil && word.locator.Page != nil && *last.locator.Page == *word.locator.Page
+			if samePage && middle > line.y0 && middle < line.y1 && box.x0 >= line.x1-height/2 {
+				last.text += " " + word.text
+				line = edges{min(line.x0, box.x0), min(line.y0, box.y0), max(line.x1, box.x1), max(line.y1, box.y1)}
+				if sized {
+					last.locator.Box = fmt.Sprintf("%.0f,%.0f,%.0f,%.0f", line.x0, line.y0, line.x1-line.x0, line.y1-line.y0)
+				} else {
+					last.locator.Box = fmt.Sprintf("%f,%f,%f,%f", line.x0, line.y0, line.x1, line.y1)
+				}
+				continue
+			}
+		}
+		out = append(out, word)
+		line, open = box, ok
+	}
+	offset := 0
+	for i := range out {
+		out[i].start, out[i].end = offset, offset+len(out[i].text)
+		offset = out[i].end + 1
+	}
+	return out
 }
 
 func imageDimensions(data []byte) (int, error) {
