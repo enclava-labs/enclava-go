@@ -417,7 +417,7 @@ func parsePDFBBox(raw []byte, firstPage int) ([]parseBlock, error) {
 		switch kind {
 		case htmltoken.ErrorToken:
 			if z.Err() == io.EOF && !inWord && page >= firstPage {
-				return mergeLineWords(blocks, false), nil
+				return mergeParagraphLines(mergeLineWords(blocks, false), false), nil
 			}
 			return nil, errors.New("extract: malformed Poppler bbox output")
 		case htmltoken.StartTagToken:
@@ -507,7 +507,7 @@ func parseOCRTSV(raw []byte) ([]parseBlock, error) {
 		blocks = append(blocks, parseBlock{kind: "paragraph", text: text, start: offset, end: offset + len(text), locator: source.Locator{Page: &page, Box: fmt.Sprintf("%d,%d,%d,%d", left, top, width, height)}})
 		offset += len(text)
 	}
-	return mergeLineWords(blocks, true), nil
+	return mergeParagraphLines(mergeLineWords(blocks, true), true), nil
 }
 
 // mergeLineWords joins consecutive word blocks that sit on one text line into
