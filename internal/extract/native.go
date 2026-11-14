@@ -135,9 +135,13 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 func (b *limitedBuffer) String() string { return b.b.String() }
 
 func runNativeInContainer(ctx context.Context, prlimit, binary string, args []string, dir string, maxOutput int64) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, prlimit, append([]string{"--cpu=30", "--as=536870912", "--nproc=16", "--fsize=16777216", "--", binary}, args...)...) //nolint:gosec // prlimit, binary and args are server-resolved PATH lookups of fixed tool names; args are process-confined
+	// No --nproc here: without a user namespace that limit counts every
+	// process of the uid on the host (the app container shares it), so
+	// Tesseract's worker threads failed to start. The container's pids limit
+	// bounds processes instead, and Tesseract is held to one thread.
+	cmd := exec.CommandContext(ctx, prlimit, append([]string{"--cpu=30", "--as=536870912", "--fsize=16777216", "--", binary}, args...)...) //nolint:gosec // prlimit, binary and args are server-resolved PATH lookups of fixed tool names; args are process-confined
 	cmd.Dir = dir
-	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=/work", "TMPDIR=/tmp", "LANG=C.UTF-8", "LC_ALL=C.UTF-8", "LD_LIBRARY_PATH=/usr/lib:/usr/lib64"}
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + dir, "TMPDIR=/tmp", "LANG=C.UTF-8", "LC_ALL=C.UTF-8", "LD_LIBRARY_PATH=/usr/lib:/usr/lib64", "OMP_THREAD_LIMIT=1"}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stderr limitedBuffer
 	stderr.limit = 64 << 10

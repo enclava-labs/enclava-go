@@ -586,6 +586,19 @@ func TestRAGRepoEmbeddingRecipeAndProgress(t *testing.T) {
 	if err != nil || len(pending) != 0 || len(total) != 1 {
 		t.Fatalf("query-only progress = %v / %v, %v", pending, total, err)
 	}
+	// A changed chunk profile makes the published generation stale too.
+	// (only a newer version of the same profile; other profiles are a
+	// per-document choice and stay untouched).
+	rechunked := c
+	if rechunked.ChunkProfileVersionID, err = repo.EnsureChunkProfile(ctx, tenant, "rag-"+c.ID+"-structured", 200, 10, rag.ChunkStrategyAuto); err != nil {
+		t.Fatal(err)
+	}
+	if docs, err := repo.DocumentsToReembed(ctx, tenant, rechunked); err != nil || len(docs) != 1 {
+		t.Fatalf("chunk profile change pending = %v, %v", docs, err)
+	}
+	if pendingDocs, err := repo.PendingReembed(ctx, tenant, rechunked); err != nil || !pendingDocs {
+		t.Fatalf("chunk profile change pending flag = %v, %v", pendingDocs, err)
+	}
 	c.PassagePrefix = "passage two "
 	if err := repo.UpdateCollection(ctx, c); err != nil {
 		t.Fatal(err)
