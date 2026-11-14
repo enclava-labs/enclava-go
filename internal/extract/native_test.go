@@ -88,7 +88,7 @@ func TestNativeMalformedOversizedAndCancelledInputs(t *testing.T) {
 	if _, err := imageDimensions(oversized); !errors.Is(err, ErrDocumentTooLarge) {
 		t.Fatalf("oversized image error=%v", err)
 	}
-	if _, err := parsePDFBBox([]byte("<html><word>broken")); err == nil {
+	if _, err := parsePDFBBox([]byte("<html><word>broken"), 1); err == nil {
 		t.Fatal("malformed bbox output was accepted")
 	}
 	if _, err := parseOCRTSV([]byte("not TSV")); err == nil {
@@ -215,7 +215,7 @@ func TestPDFWordsMergeIntoLines(t *testing.T) {
 </page><page width="612" height="792">
 <word xMin="72.000000" yMin="116.000000" xMax="95.000000" yMax="128.000000">next</word>
 </page></doc></body></html>`)
-	blocks, err := parsePDFBBox(raw)
+	blocks, err := parsePDFBBox(raw, 1)
 	if err != nil || len(blocks) != 3 {
 		t.Fatalf("blocks=%#v err=%v", blocks, err)
 	}
@@ -227,6 +227,12 @@ func TestPDFWordsMergeIntoLines(t *testing.T) {
 	}
 	if blocks[2].text != "next" || *blocks[2].locator.Page != 2 {
 		t.Fatalf("next page: %#v", blocks[2])
+	}
+
+	// A later batch of a large PDF numbers its pages from the batch start.
+	blocks, err = parsePDFBBox(raw, 51)
+	if err != nil || len(blocks) != 3 || *blocks[0].locator.Page != 51 || *blocks[2].locator.Page != 52 {
+		t.Fatalf("batch page numbers: %#v err=%v", blocks, err)
 	}
 
 	ocr := []byte("level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n" +

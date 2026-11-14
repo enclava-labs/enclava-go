@@ -23,10 +23,16 @@ import (
 )
 
 const (
-	maxNativeInput  = 32 << 20
+	maxNativeInput  = 256 << 20
 	maxNativeOutput = 16 << 20
-	maxPDFPages     = 100
+	maxPDFPages     = 5000
 	maxImagePixels  = 40_000_000
+	// maxOCRPixels bounds the total raster area OCR'd for one PDF (about 57
+	// letter pages at 150 dpi); pages with a text layer do not count.
+	maxOCRPixels = 120_000_000
+	// pdfTextBatchPages is how many pages one pdftotext run extracts, so the
+	// per-process CPU and output limits bound a batch rather than the document.
+	pdfTextBatchPages = 50
 )
 
 type NativeCapabilities struct {
@@ -176,7 +182,7 @@ func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data
 		return source.Document{}, err
 	}
 	if len(data) > maxNativeInput {
-		return source.Document{}, ErrDocumentTooLarge
+		return source.Document{}, fmt.Errorf("%w: file is %d MB, the limit is %d MB", ErrDocumentTooLarge, len(data)>>20, maxNativeInput>>20)
 	}
 	if format == "image" {
 		if len(data) < 8 || string(data[:8]) != "\x89PNG\r\n\x1a\n" {
@@ -226,19 +232,29 @@ func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data
 			return source.Document{}, err
 		}
 		if pages > maxPDFPages {
-			return source.Document{}, ErrDocumentTooLarge
+			return source.Document{}, fmt.Errorf("%w: PDF has %d pages, the limit is %d", ErrDocumentTooLarge, pages, maxPDFPages)
 		}
 		pdftotext, _ := exec.LookPath("pdftotext")
-		bbox, err := runNative(ctx, sandbox, prlimit, pdftotext, []string{"-bbox", "-f", "1", "-l", strconv.Itoa(pages), "/work/input", "-"}, dir, maxNativeOutput)
-		if err != nil {
-			if encryptedPDF(info, err) {
-				return source.Document{}, ErrEncryptedDocument
+		for first := 1; first <= pages; first += pdfTextBatchPages {
+			last := min(first+pdfTextBatchPages-1, pages)
+			bbox, err := runNative(ctx, sandbox, prlimit, pdftotext, []string{"-bbox", "-f", strconv.Itoa(first), "-l", strconv.Itoa(last), "/work/input", "-"}, dir, maxNativeOutput)
+			if err != nil {
+				if encryptedPDF(info, err) {
+					return source.Document{}, ErrEncryptedDocument
+				}
+				if errors.Is(err, ErrDocumentTooLarge) {
+					return source.Document{}, fmt.Errorf("%w: text of PDF pages %d-%d exceeds %d MB", ErrDocumentTooLarge, first, last, maxNativeOutput>>20)
+				}
+				if ctx.Err() != nil {
+					return source.Document{}, ctx.Err()
+				}
+				return source.Document{}, fmt.Errorf("%w: PDF text: %v", ErrMalformedDocument, err)
 			}
-			return source.Document{}, fmt.Errorf("%w: PDF text: %v", ErrMalformedDocument, err)
-		}
-		blocks, err = parsePDFBBox(bbox)
-		if err != nil {
-			return source.Document{}, err
+			batch, err := parsePDFBBox(bbox, first)
+			if err != nil {
+				return source.Document{}, err
+			}
+			blocks = append(blocks, batch...)
 		}
 		hasText := make(map[int]bool)
 		for _, block := range blocks {
@@ -366,8 +382,11 @@ func ocrPDFPage(ctx context.Context, sandbox, prlimit, dir string, page int, lan
 		return nil, err
 	}
 	*totalPixels += pixels
-	if pixels > maxImagePixels || *totalPixels > 120_000_000 {
-		return nil, ErrDocumentTooLarge
+	if pixels > maxImagePixels {
+		return nil, fmt.Errorf("%w: PDF page %d is %d megapixels at 150 dpi, the OCR limit is %d", ErrDocumentTooLarge, page, pixels/1_000_000, maxImagePixels/1_000_000)
+	}
+	if *totalPixels > maxOCRPixels {
+		return nil, fmt.Errorf("%w: PDF has too many scanned pages to OCR (limit reached at page %d, about %d letter-size pages)", ErrDocumentTooLarge, page, maxOCRPixels/(1275*1650))
 	}
 	tesseract, _ := exec.LookPath("tesseract")
 	raw, err := runNative(ctx, sandbox, prlimit, tesseract, []string{"/work/page.png", "stdout", "-l", language, "tsv"}, dir, maxNativeOutput)
@@ -384,10 +403,12 @@ func ocrPDFPage(ctx context.Context, sandbox, prlimit, dir string, page int, lan
 	return blocks, nil
 }
 
-func parsePDFBBox(raw []byte) ([]parseBlock, error) {
+// parsePDFBBox reads pdftotext -bbox output for a page range starting at
+// firstPage.
+func parsePDFBBox(raw []byte, firstPage int) ([]parseBlock, error) {
 	z := htmltoken.NewTokenizer(bytes.NewReader(raw))
 	var blocks []parseBlock
-	page, textOffset := 0, 0
+	page, textOffset := firstPage-1, 0
 	box := ""
 	inWord := false
 	for {
@@ -395,7 +416,7 @@ func parsePDFBBox(raw []byte) ([]parseBlock, error) {
 		token := z.Token()
 		switch kind {
 		case htmltoken.ErrorToken:
-			if z.Err() == io.EOF && !inWord && page > 0 {
+			if z.Err() == io.EOF && !inWord && page >= firstPage {
 				return mergeLineWords(blocks, false), nil
 			}
 			return nil, errors.New("extract: malformed Poppler bbox output")
@@ -419,7 +440,7 @@ func parsePDFBBox(raw []byte) ([]parseBlock, error) {
 						return nil, errors.New("extract: malformed Poppler word box")
 					}
 				}
-				if page < 1 {
+				if page < firstPage {
 					return nil, errors.New("extract: Poppler word without page")
 				}
 				box = strings.Join(boxes, ",")
