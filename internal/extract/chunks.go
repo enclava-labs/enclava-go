@@ -34,6 +34,9 @@ func Chunk(document source.Document, profile source.ChunkProfile) ([]source.Chun
 			}
 		}
 	}
+	if profile.BoundaryStrategy == "auto" {
+		return chunkAuto(document, blocks, profile)
+	}
 	var chunks []source.Chunk
 	totalChunks := 0
 	var current source.Chunk
