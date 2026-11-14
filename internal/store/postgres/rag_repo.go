@@ -164,8 +164,8 @@ func (r *RAGRepo) InsertCollection(ctx context.Context, c rag.Collection) error 
 	profileVersionID := c.ChunkProfileVersionID
 	if profileVersionID == "" {
 		// No validated selection supplied: keep the legacy default of one
-		// owned fixed/row-wise profile version for the collection.
-		if profileVersionID, err = r.EnsureChunkProfile(ctx, c.TenantID, "rag-"+c.ID, c.ChunkSize, c.ChunkOverlap); err != nil {
+		// owned row-wise profile version for the collection.
+		if profileVersionID, err = r.EnsureChunkProfile(ctx, c.TenantID, "rag-"+c.ID, c.ChunkSize, c.ChunkOverlap, c.ChunkStrategy); err != nil {
 			return err
 		}
 	}
@@ -192,7 +192,7 @@ func scanCollection(scanner interface {
 	var createdAt time.Time
 	err := scanner.Scan(&c.TenantID, &c.ID, &c.Name, &desc, &c.EmbeddingModel, &c.EmbeddingDimensions,
 		&qdrant, &audience, &meta, &owner, &c.IsActive, &createdAt, &profile, &retired, &c.EmbedTitles,
-		&c.QueryPrefix, &c.PassagePrefix, &retiredSince)
+		&c.QueryPrefix, &c.PassagePrefix, &retiredSince, &c.ChunkStrategy)
 	if err != nil {
 		return rag.Collection{}, err
 	}
@@ -236,7 +236,10 @@ const collectionSelect = `
 	SELECT tenant_id::text, id, name, description, embedding_model, embedding_dimensions,
 	       qdrant_collection, audience, metadata, owner_actor_id, is_active, created_at,
 	       COALESCE(chunk_profile_version_id, ''), retired_qdrant_collections, embed_titles,
-	       query_prefix, passage_prefix, retired_index_since
+	       query_prefix, passage_prefix, retired_index_since,
+	       COALESCE((SELECT cp.boundary_strategy FROM chunk_profiles cp
+	                 WHERE cp.tenant_id = knowledge_collections.tenant_id
+	                   AND cp.id = knowledge_collections.chunk_profile_version_id), 'fixed')
 	FROM knowledge_collections`
 
 func (r *RAGRepo) GetCollection(ctx context.Context, tenantID, id string) (rag.Collection, error) {
@@ -363,7 +366,8 @@ func (r *RAGRepo) LiveIndexNames(ctx context.Context, tenantID, collectionID str
 
 // DocumentsToReembed snapshots the live documents whose latest version is
 // published under another index or document-name choice than the
-// collection's current ones and has no newer embed job queued or running.
+// collection's current ones, or under an older version of its chunk profile,
+// and has no newer embed job queued or running.
 func (r *RAGRepo) DocumentsToReembed(ctx context.Context, tenantID string, c rag.Collection) ([]rag.Document, error) {
 	//nolint:gosec // embedded operation is a package constant; values are bound
 	rows, err := r.db.SQL.QueryContext(ctx, `
@@ -375,7 +379,11 @@ func (r *RAGRepo) DocumentsToReembed(ctx context.Context, tenantID string, c rag
 		  AND g.object_version_id=v.id AND g.state='published'
 		WHERE ci.tenant_id=$1 AND ci.collection_id=$2 AND ci.removed_at IS NULL
 		  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL
-		  AND g.qdrant_collection <> '' AND (g.qdrant_collection <> $3 OR g.embed_titles <> $4 OR g.passage_prefix <> $5)
+		  AND g.qdrant_collection <> '' AND (g.qdrant_collection <> $3 OR g.embed_titles <> $4 OR g.passage_prefix <> $5
+			    OR EXISTS (
+			      SELECT 1 FROM chunk_profiles cur
+			      JOIN chunk_profiles old ON old.tenant_id=cur.tenant_id AND old.profile_id=cur.profile_id AND old.id<>cur.id
+			      WHERE cur.tenant_id=g.tenant_id AND cur.id=$6 AND old.id=g.chunk_profile_version_id))
 		  AND NOT EXISTS (
 		    SELECT 1 FROM index_generations n
 		    JOIN jobs j ON j.tenant_id=n.tenant_id AND j.input_ref=n.object_version_id
@@ -384,7 +392,7 @@ func (r *RAGRepo) DocumentsToReembed(ctx context.Context, tenantID string, c rag
 		    WHERE n.tenant_id=g.tenant_id AND n.collection_id=g.collection_id
 		      AND n.object_version_id=g.object_version_id AND n.generation > g.generation
 		      AND n.state='staging')
-		ORDER BY o.id`, tenantID, c.ID, c.QdrantCollection, c.EmbedTitles, c.PassagePrefix)
+		ORDER BY o.id`, tenantID, c.ID, c.QdrantCollection, c.EmbedTitles, c.PassagePrefix, c.ChunkProfileVersionID)
 	if err != nil {
 		return nil, fmt.Errorf("list documents to re-embed: %w", err)
 	}
@@ -413,7 +421,11 @@ func (r *RAGRepo) PendingReembed(ctx context.Context, tenantID string, c rag.Col
 			  AND g.object_version_id=v.id AND g.state='published'
 			WHERE ci.tenant_id=$1 AND ci.collection_id=$2 AND ci.removed_at IS NULL
 			  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL
-			  AND g.qdrant_collection <> '' AND (g.qdrant_collection <> $3 OR g.embed_titles <> $4 OR g.passage_prefix <> $5)
+			  AND g.qdrant_collection <> '' AND (g.qdrant_collection <> $3 OR g.embed_titles <> $4 OR g.passage_prefix <> $5
+			    OR EXISTS (
+			      SELECT 1 FROM chunk_profiles cur
+			      JOIN chunk_profiles old ON old.tenant_id=cur.tenant_id AND old.profile_id=cur.profile_id AND old.id<>cur.id
+			      WHERE cur.tenant_id=g.tenant_id AND cur.id=$6 AND old.id=g.chunk_profile_version_id))
 			  AND NOT EXISTS (
 			    SELECT 1 FROM index_generations n
 			    JOIN jobs j ON j.tenant_id=n.tenant_id AND j.input_ref=n.object_version_id
@@ -422,7 +434,7 @@ func (r *RAGRepo) PendingReembed(ctx context.Context, tenantID string, c rag.Col
 			    WHERE n.tenant_id=g.tenant_id AND n.collection_id=g.collection_id
 			      AND n.object_version_id=g.object_version_id AND n.generation > g.generation
 			      AND n.state='staging'))`,
-		tenantID, c.ID, c.QdrantCollection, c.EmbedTitles, c.PassagePrefix).Scan(&pending); err != nil {
+		tenantID, c.ID, c.QdrantCollection, c.EmbedTitles, c.PassagePrefix, c.ChunkProfileVersionID).Scan(&pending); err != nil {
 		return false, fmt.Errorf("check pending re-embedding: %w", err)
 	}
 	return pending, nil
@@ -435,13 +447,17 @@ func (r *RAGRepo) ReembedProgressDocuments(ctx context.Context, tenantID string,
 			SELECT 1 FROM index_generations g
 			WHERE g.tenant_id=ci.tenant_id AND g.collection_id=ci.collection_id
 			  AND g.object_version_id=v.id AND g.state='published' AND g.qdrant_collection <> ''
-			  AND (g.qdrant_collection <> $3 OR g.embed_titles <> $4 OR g.passage_prefix <> $5))
+			  AND (g.qdrant_collection <> $3 OR g.embed_titles <> $4 OR g.passage_prefix <> $5
+			    OR EXISTS (
+			      SELECT 1 FROM chunk_profiles cur
+			      JOIN chunk_profiles old ON old.tenant_id=cur.tenant_id AND old.profile_id=cur.profile_id AND old.id<>cur.id
+			      WHERE cur.tenant_id=g.tenant_id AND cur.id=$6 AND old.id=g.chunk_profile_version_id)))
 		FROM collection_items ci
 		JOIN source_objects o ON o.tenant_id=ci.tenant_id AND o.id=ci.object_id
 		LEFT JOIN source_object_versions v ON v.tenant_id=o.tenant_id AND v.object_id=o.id AND v.observed_seq=o.observed_seq
 		WHERE ci.tenant_id=$1 AND ci.collection_id=$2 AND ci.removed_at IS NULL
 		  AND o.deleted_at IS NULL AND o.tombstoned_at IS NULL
-		ORDER BY o.id`, tenantID, c.ID, c.QdrantCollection, c.EmbedTitles, c.PassagePrefix)
+		ORDER BY o.id`, tenantID, c.ID, c.QdrantCollection, c.EmbedTitles, c.PassagePrefix, c.ChunkProfileVersionID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list re-embedding progress: %w", err)
 	}
@@ -476,10 +492,10 @@ func (r *RAGRepo) DeleteCollection(ctx context.Context, tenantID, id string) err
 }
 
 // EnsureChunkProfile returns the immutable chunk_profiles row id for the
-// (profileID, size, overlap) triple, inserting a new version when the
-// parameters changed. Changing a profile creates a new processing version —
-// published evidence is never silently mutated.
-func (r *RAGRepo) EnsureChunkProfile(ctx context.Context, tenantID, profileID string, size, overlap int) (string, error) {
+// (profileID, size, overlap, strategy) tuple, inserting a new version when
+// any parameter changed. Changing a profile creates a new processing
+// version — published evidence is never silently mutated.
+func (r *RAGRepo) EnsureChunkProfile(ctx context.Context, tenantID, profileID string, size, overlap int, strategy string) (string, error) {
 	var id string
 	var version int
 	err := r.db.SQL.QueryRowContext(ctx, `
@@ -493,8 +509,8 @@ func (r *RAGRepo) EnsureChunkProfile(ctx context.Context, tenantID, profileID st
 			INSERT INTO chunk_profiles
 			    (tenant_id, id, profile_id, version, name, boundary_strategy,
 			     max_size_codepoints, overlap_codepoints, table_handling)
-			VALUES ($1, $2, $3, 1, $4, 'fixed', $5, $6, 'row-wise')`,
-			tenantID, id, profileID, profileID, size, overlap); err != nil {
+			VALUES ($1, $2, $3, 1, $4, $5, $6, $7, 'row-wise')`,
+			tenantID, id, profileID, profileID, strategy, size, overlap); err != nil {
 			return "", fmt.Errorf("insert chunk profile: %w", err)
 		}
 		return id, nil
@@ -502,12 +518,13 @@ func (r *RAGRepo) EnsureChunkProfile(ctx context.Context, tenantID, profileID st
 		return "", fmt.Errorf("read chunk profile: %w", err)
 	}
 	var haveSize, haveOverlap int64
+	var haveStrategy string
 	if err := r.db.SQL.QueryRowContext(ctx, `
-		SELECT max_size_codepoints, overlap_codepoints FROM chunk_profiles
-		WHERE tenant_id = $1 AND id = $2`, tenantID, id).Scan(&haveSize, &haveOverlap); err != nil {
+		SELECT max_size_codepoints, overlap_codepoints, boundary_strategy FROM chunk_profiles
+		WHERE tenant_id = $1 AND id = $2`, tenantID, id).Scan(&haveSize, &haveOverlap, &haveStrategy); err != nil {
 		return "", err
 	}
-	if int(haveSize) == size && int(haveOverlap) == overlap {
+	if int(haveSize) == size && int(haveOverlap) == overlap && haveStrategy == strategy {
 		return id, nil
 	}
 	id = newPGID("cpv")
@@ -515,8 +532,8 @@ func (r *RAGRepo) EnsureChunkProfile(ctx context.Context, tenantID, profileID st
 		INSERT INTO chunk_profiles
 		    (tenant_id, id, profile_id, version, name, boundary_strategy,
 		     max_size_codepoints, overlap_codepoints, table_handling)
-		VALUES ($1, $2, $3, $4, $5, 'fixed', $6, $7, 'row-wise')`,
-		tenantID, id, profileID, version+1, profileID, size, overlap); err != nil {
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'row-wise')`,
+		tenantID, id, profileID, version+1, profileID, strategy, size, overlap); err != nil {
 		return "", fmt.Errorf("insert chunk profile version: %w", err)
 	}
 	return id, nil

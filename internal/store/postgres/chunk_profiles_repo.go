@@ -117,7 +117,7 @@ func validatePersistedProfile(p source.ChunkProfile) error {
 		return fmt.Errorf("invalid chunk profile size or overlap")
 	}
 	switch p.BoundaryStrategy {
-	case "fixed", "heading", "clause", "paragraph", "message", "thread", "code_lines":
+	case "auto", "fixed", "heading", "clause", "paragraph", "message", "thread", "code_lines":
 	default:
 		return fmt.Errorf("invalid chunk profile boundary strategy")
 	}

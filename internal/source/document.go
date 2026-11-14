@@ -46,7 +46,7 @@ type ChunkProfile struct {
 	Version            int    // monotonic within ProfileID
 	SizeCodePoints     int
 	OverlapCodePoints  int
-	BoundaryStrategy   string // fixed|heading|clause|paragraph|message|thread|code_lines
+	BoundaryStrategy   string // auto|fixed|heading|clause|paragraph|message|thread|code_lines
 	IncludeParents     bool
 	TableHandling      string // e.g. atomic|row-wise|skip
 	PreserveClauses    bool   // legal profiles keep clause/subsection context

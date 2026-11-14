@@ -30,6 +30,7 @@ func TestRAGRepoCollectionsTenantScoped(t *testing.T) {
 		EmbeddingModel:   "embed-test",
 		ChunkSize:        500,
 		ChunkOverlap:     50,
+		ChunkStrategy:    rag.ChunkStrategyFixed,
 		ACL:              map[string]any{"public": true},
 		Audience:         []string{"*"},
 		Metadata:         map[string]any{"team": "search"},
@@ -77,15 +78,15 @@ func TestRAGRepoChunkProfileVersions(t *testing.T) {
 	tenant := testdb.SeedTenant(t, db, "cp")
 	repo := postgres.NewRAGRepo(db)
 
-	id1, err := repo.EnsureChunkProfile(ctx, tenant, "rag-col", 100, 10)
+	id1, err := repo.EnsureChunkProfile(ctx, tenant, "rag-col", 100, 10, rag.ChunkStrategyFixed)
 	if err != nil {
 		t.Fatalf("ensure profile: %v", err)
 	}
-	again, err := repo.EnsureChunkProfile(ctx, tenant, "rag-col", 100, 10)
+	again, err := repo.EnsureChunkProfile(ctx, tenant, "rag-col", 100, 10, rag.ChunkStrategyFixed)
 	if err != nil || again != id1 {
 		t.Fatalf("same params must return same immutable row: %s vs %s", again, id1)
 	}
-	id2, err := repo.EnsureChunkProfile(ctx, tenant, "rag-col", 200, 10)
+	id2, err := repo.EnsureChunkProfile(ctx, tenant, "rag-col", 200, 10, rag.ChunkStrategyFixed)
 	if err != nil {
 		t.Fatalf("ensure profile v2: %v", err)
 	}
@@ -101,6 +102,69 @@ func TestRAGRepoChunkProfileVersions(t *testing.T) {
 	if version != 2 {
 		t.Fatalf("expected version 2, got %d", version)
 	}
+	id3, err := repo.EnsureChunkProfile(ctx, tenant, "rag-col", 200, 10, rag.ChunkStrategyAuto)
+	if err != nil {
+		t.Fatalf("ensure profile v3: %v", err)
+	}
+	if id3 == id2 {
+		t.Fatal("a strategy-only change must create a new version row")
+	}
+	idAgain, err := repo.EnsureChunkProfile(ctx, tenant, "rag-col", 200, 10, rag.ChunkStrategyAuto)
+	if err != nil || idAgain != id3 {
+		t.Fatalf("same strategy must return same immutable row: %s vs %s", idAgain, id3)
+	}
+	var strategy string
+	if err := db.SQL.QueryRowContext(ctx,
+		`SELECT boundary_strategy, version FROM chunk_profiles WHERE tenant_id = $1 AND id = $2`,
+		tenant, id3).Scan(&strategy, &version); err != nil {
+		t.Fatalf("read v3: %v", err)
+	}
+	if strategy != rag.ChunkStrategyAuto || version != 3 {
+		t.Fatalf("v3 = %s v%d, want auto v3", strategy, version)
+	}
+}
+
+// TestRAGRepoCollectionChunkStrategyLoad: the collection's chunk_strategy is
+// derived from the attached chunk profile version's boundary_strategy —
+// including a document-profile version pinned through chunk_profile_version_id.
+func TestRAGRepoCollectionChunkStrategyLoad(t *testing.T) {
+	db := testdb.New(t)
+	ctx := context.Background()
+	tenant := testdb.SeedTenant(t, db, "cs")
+	repo := postgres.NewRAGRepo(db)
+
+	if err := repo.InsertCollection(ctx, rag.Collection{
+		TenantID: tenant, ID: "ragcol_auto", Name: "Auto", QdrantCollection: "rag_auto",
+		EmbeddingModel: "m", ChunkSize: 100, ChunkOverlap: 10, ChunkStrategy: rag.ChunkStrategyAuto, IsActive: true,
+	}); err != nil {
+		t.Fatalf("insert auto collection: %v", err)
+	}
+	auto, err := repo.GetCollection(ctx, tenant, "ragcol_auto")
+	if err != nil {
+		t.Fatalf("get auto collection: %v", err)
+	}
+	if auto.ChunkStrategy != rag.ChunkStrategyAuto {
+		t.Fatalf("auto collection strategy = %q, want auto", auto.ChunkStrategy)
+	}
+
+	heading, err := repo.EnsureChunkProfile(ctx, tenant, "fam-head", 400, 40, "heading")
+	if err != nil {
+		t.Fatalf("ensure heading profile: %v", err)
+	}
+	if err := repo.InsertCollection(ctx, rag.Collection{
+		TenantID: tenant, ID: "ragcol_profiled", Name: "Profiled", QdrantCollection: "rag_profiled",
+		EmbeddingModel: "m", ChunkSize: 100, ChunkOverlap: 10, ChunkStrategy: rag.ChunkStrategyAuto,
+		ChunkProfileVersionID: heading, IsActive: true,
+	}); err != nil {
+		t.Fatalf("insert profiled collection: %v", err)
+	}
+	profiled, err := repo.GetCollection(ctx, tenant, "ragcol_profiled")
+	if err != nil {
+		t.Fatalf("get profiled collection: %v", err)
+	}
+	if profiled.ChunkStrategy != "heading" {
+		t.Fatalf("profiled collection strategy = %q, want heading (read-only from the pinned version)", profiled.ChunkStrategy)
+	}
 }
 
 func TestRAGRepoCollectionChunkReplacementPreservesSharedVersionChunks(t *testing.T) {
@@ -111,7 +175,7 @@ func TestRAGRepoCollectionChunkReplacementPreservesSharedVersionChunks(t *testin
 
 	if err := repo.InsertCollection(ctx, rag.Collection{
 		TenantID: tenant, ID: "ragcol_1", Name: "C", QdrantCollection: "rag_1",
-		EmbeddingModel: "m", ChunkSize: 100, ChunkOverlap: 10, IsActive: true,
+		EmbeddingModel: "m", ChunkSize: 100, ChunkOverlap: 10, ChunkStrategy: rag.ChunkStrategyFixed, IsActive: true,
 	}); err != nil {
 		t.Fatalf("insert collection: %v", err)
 	}
@@ -166,7 +230,7 @@ func TestRAGRepoCollectionChunkReplacementPreservesSharedVersionChunks(t *testin
 	if err := repo.ReplaceVersionChunksAndStage(ctx, tenant, "ragcol_1", obj.ID, doc.ObjectVersionID, 1, gen, "", chunks); err == nil {
 		t.Fatal("expected chunk insert to fail without a bound profile")
 	}
-	profileID, err := repo.EnsureChunkProfile(ctx, tenant, "rag-ragcol_1-structured", 100, 10)
+	profileID, err := repo.EnsureChunkProfile(ctx, tenant, "rag-ragcol_1-structured", 100, 10, rag.ChunkStrategyFixed)
 	if err != nil {
 		t.Fatalf("ensure profile: %v", err)
 	}
@@ -197,11 +261,11 @@ func TestRAGRepoCollectionChunkReplacementPreservesSharedVersionChunks(t *testin
 	}
 	if err := repo.InsertCollection(ctx, rag.Collection{
 		TenantID: tenant, ID: "ragcol_2", Name: "Other", QdrantCollection: "rag_2",
-		EmbeddingModel: "m", ChunkSize: 100, ChunkOverlap: 10, IsActive: true,
+		EmbeddingModel: "m", ChunkSize: 100, ChunkOverlap: 10, ChunkStrategy: rag.ChunkStrategyFixed, IsActive: true,
 	}); err != nil {
 		t.Fatalf("insert second collection: %v", err)
 	}
-	profileB, err := repo.EnsureChunkProfile(ctx, tenant, "rag-ragcol_2-structured", 100, 10)
+	profileB, err := repo.EnsureChunkProfile(ctx, tenant, "rag-ragcol_2-structured", 100, 10, rag.ChunkStrategyFixed)
 	if err != nil {
 		t.Fatalf("ensure second collection profile: %v", err)
 	}
@@ -232,7 +296,7 @@ func seedProjectionFixture(t *testing.T, db *postgres.DB, repo *postgres.RAGRepo
 	if err := repo.InsertCollection(ctx, rag.Collection{
 		TenantID: tenant, ID: collectionID, Name: "C", OwnerActorID: "user_1",
 		QdrantCollection: "rag_" + collectionID, EmbeddingModel: "m",
-		ChunkSize: 100, ChunkOverlap: 10, IsActive: true,
+		ChunkSize: 100, ChunkOverlap: 10, ChunkStrategy: rag.ChunkStrategyFixed, IsActive: true,
 	}); err != nil {
 		t.Fatalf("insert collection: %v", err)
 	}
@@ -268,7 +332,7 @@ func seedProjectionFixture(t *testing.T, db *postgres.DB, repo *postgres.RAGRepo
 
 func stageChunks(t *testing.T, repo *postgres.RAGRepo, tenant, collectionID, objectID, versionID string, generation int64, chunkIDs ...string) {
 	t.Helper()
-	profileID, err := repo.EnsureChunkProfile(context.Background(), tenant, "rag-"+collectionID+"-structured", 100, 10)
+	profileID, err := repo.EnsureChunkProfile(context.Background(), tenant, "rag-"+collectionID+"-structured", 100, 10, rag.ChunkStrategyFixed)
 	if err != nil {
 		t.Fatalf("ensure profile: %v", err)
 	}
@@ -445,7 +509,7 @@ func TestRAGRepoDocumentProjectionTruthAndIdentity(t *testing.T) {
 	if err := repo.InsertCollection(ctx, rag.Collection{
 		TenantID: tenant, ID: "ragcol_other", Name: "D", OwnerActorID: "user_1",
 		QdrantCollection: "rag_ragcol_other", EmbeddingModel: "m",
-		ChunkSize: 100, ChunkOverlap: 10, IsActive: true,
+		ChunkSize: 100, ChunkOverlap: 10, ChunkStrategy: rag.ChunkStrategyFixed, IsActive: true,
 	}); err != nil {
 		t.Fatalf("insert second collection: %v", err)
 	}
@@ -495,7 +559,7 @@ func TestRAGRepoEmbeddingRecipeAndProgress(t *testing.T) {
 	if err := repo.MarkGenerationState(ctx, tenant, c.ID, versionID, 1, "published"); err != nil {
 		t.Fatal(err)
 	}
-	profile, err := repo.EnsureChunkProfile(ctx, tenant, "rag-"+c.ID+"-structured", 100, 10)
+	profile, err := repo.EnsureChunkProfile(ctx, tenant, "rag-"+c.ID+"-structured", 100, 10, rag.ChunkStrategyFixed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,6 +585,19 @@ func TestRAGRepoEmbeddingRecipeAndProgress(t *testing.T) {
 	pending, total, err := repo.ReembedProgressDocuments(ctx, tenant, c)
 	if err != nil || len(pending) != 0 || len(total) != 1 {
 		t.Fatalf("query-only progress = %v / %v, %v", pending, total, err)
+	}
+	// A changed chunk profile makes the published generation stale too.
+	// (only a newer version of the same profile; other profiles are a
+	// per-document choice and stay untouched).
+	rechunked := c
+	if rechunked.ChunkProfileVersionID, err = repo.EnsureChunkProfile(ctx, tenant, "rag-"+c.ID+"-structured", 200, 10, rag.ChunkStrategyAuto); err != nil {
+		t.Fatal(err)
+	}
+	if docs, err := repo.DocumentsToReembed(ctx, tenant, rechunked); err != nil || len(docs) != 1 {
+		t.Fatalf("chunk profile change pending = %v, %v", docs, err)
+	}
+	if pendingDocs, err := repo.PendingReembed(ctx, tenant, rechunked); err != nil || !pendingDocs {
+		t.Fatalf("chunk profile change pending flag = %v, %v", pendingDocs, err)
 	}
 	c.PassagePrefix = "passage two "
 	if err := repo.UpdateCollection(ctx, c); err != nil {
@@ -590,7 +667,7 @@ func TestRAGRepoAccessProjectionReads(t *testing.T) {
 	repo := postgres.NewRAGRepo(db)
 	if err := repo.InsertCollection(ctx, rag.Collection{
 		TenantID: tenant, ID: "ragcol_p", Name: "C", QdrantCollection: "rag_p",
-		EmbeddingModel: "m", ChunkSize: 100, ChunkOverlap: 10, IsActive: true,
+		EmbeddingModel: "m", ChunkSize: 100, ChunkOverlap: 10, ChunkStrategy: rag.ChunkStrategyFixed, IsActive: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -624,7 +701,7 @@ func TestRAGRepoAccessProjectionReads(t *testing.T) {
 	if _, err := db.SQL.ExecContext(ctx, `UPDATE collection_items SET removed_at=NULL WHERE tenant_id=$1 AND collection_id=$2 AND object_id=$3`, tenant, "ragcol_p", obj.ID); err != nil {
 		t.Fatal(err)
 	}
-	profileID, err := repo.EnsureChunkProfile(ctx, tenant, "rag-ragcol_p-structured", 100, 10)
+	profileID, err := repo.EnsureChunkProfile(ctx, tenant, "rag-ragcol_p-structured", 100, 10, rag.ChunkStrategyFixed)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -65,6 +65,9 @@ type Config struct {
 	// against (SESSION_TENANT_SLUG); the serve path seeds the "bootstrap"
 	// slug and `enclava bootstrap --tenant <slug>` targets it.
 	SessionTenantSlug string
+	// ExtractWorkerSocket points at the extract-worker sidecar unix socket;
+	// empty keeps local bubblewrap-isolated native processing.
+	ExtractWorkerSocket string
 	// SecretBindings are the operator-approved tenant-bound credential
 	// references (SECRET_BINDINGS). Auth owns resolution; config only parses
 	// and validates this trusted runtime configuration — a stored
@@ -110,12 +113,13 @@ func Load() (Config, error) {
 	privatemodeBaseURL := getEnv("PRIVATEMODE_BASE_URL", "")
 
 	cfg := Config{
-		Host:        getEnv("APP_HOST", "0.0.0.0"),
-		Port:        getEnvInt("APP_PORT", 8080),
-		DatabaseURL: getEnv("DATABASE_URL", ""),
-		DataDir:     getEnv("ENCLAVA_DATA_DIR", "./data"),
-		SessionTTL:  getEnvDuration("SESSION_TTL", 12*time.Hour),
-		ReadTimeout: getEnvDuration("HTTP_READ_TIMEOUT", 30*time.Second),
+		Host:                getEnv("APP_HOST", "0.0.0.0"),
+		Port:                getEnvInt("APP_PORT", 8080),
+		DatabaseURL:         getEnv("DATABASE_URL", ""),
+		ExtractWorkerSocket: strings.TrimSpace(getEnv("ENCLAVA_EXTRACT_WORKER_SOCKET", "")),
+		DataDir:             getEnv("ENCLAVA_DATA_DIR", "./data"),
+		SessionTTL:          getEnvDuration("SESSION_TTL", 12*time.Hour),
+		ReadTimeout:         getEnvDuration("HTTP_READ_TIMEOUT", 30*time.Second),
 		// Streaming (SSE) can exceed fixed write timeouts; prefer disabling unless you know you don't need streaming.
 		WriteTimeout:            getEnvDuration("HTTP_WRITE_TIMEOUT", 0),
 		IdleTimeout:             getEnvDuration("HTTP_IDLE_TIMEOUT", 60*time.Second),

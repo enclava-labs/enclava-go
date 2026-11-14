@@ -417,3 +417,81 @@ func TestCollectionProfileVersionHTTP(t *testing.T) {
 		t.Fatalf("updated collection profile = %q, want %q", updatedCollection.ChunkProfileVersionID, profileB.ID)
 	}
 }
+
+// TestCollectionChunkStrategyHTTP: chunk_strategy round-trips through the
+// collection API — default auto on create, explicit fixed, PUT switches it,
+// and invalid values are 400s; a pinned profile version reports read-only.
+func TestCollectionChunkStrategyHTTP(t *testing.T) {
+	db := testdb.New(t)
+	ctx := context.Background()
+	identityRepo := postgres.NewIdentityRepo(db)
+	tenant := testdb.SeedTenant(t, db, "rag-chunk-strategy")
+	manager := testdb.SeedUser(t, db, tenant, "chunk-manager@example.test", nil)
+	managerKey, _ := testdb.SeedAPIKey(t, db, tenant, testdb.SeedKeySpec{Name: "chunk-manager", OwnerUserID: manager.ID, Scopes: []string{"rag", "rag.manage"}})
+	ragSvc := rag.NewService(postgres.NewRAGRepo(db), nil, nil, "", nil, nil)
+	authService := auth.NewService(identityRepo, "")
+	app := NewApp(authService, nil, "", nil, identityRepo, nil, nil, nil, nil, nil, nil, nil, nil, "sha256", "", "enc_", nil, nil, 1, false, nil, nil, GateConfig{}, postgres.NewSourceRepo(db), postgres.NewArtifactRepo(db))
+	app.ragSvc = ragSvc
+	request := func(method, path, payload string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+managerKey)
+		rec := httptest.NewRecorder()
+		app.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+	readStrategy := func(rec *httptest.ResponseRecorder) string {
+		t.Helper()
+		var collection rag.Collection
+		if err := json.Unmarshal(rec.Body.Bytes(), &collection); err != nil {
+			t.Fatalf("decode %s: %v", rec.Body.String(), err)
+		}
+		return collection.ChunkStrategy
+	}
+
+	created := request(http.MethodPost, "/api/v1/rag/collections", `{"name":"default auto"}`)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create = %d body=%s", created.Code, created.Body.String())
+	}
+	if got := readStrategy(created); got != rag.ChunkStrategyAuto {
+		t.Fatalf("default create strategy = %q, want auto", got)
+	}
+	var collection rag.Collection
+	if err := json.Unmarshal(created.Body.Bytes(), &collection); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := request(http.MethodPost, "/api/v1/rag/collections", `{"name":"bad","chunk_strategy":"heading"}`); got.Code != http.StatusBadRequest {
+		t.Fatalf("invalid create strategy = %d body=%s", got.Code, got.Body.String())
+	}
+	if got := request(http.MethodPut, "/api/v1/rag/collections/"+collection.ID, `{"chunk_strategy":"clause"}`); got.Code != http.StatusBadRequest {
+		t.Fatalf("invalid update strategy = %d body=%s", got.Code, got.Body.String())
+	}
+
+	updated := request(http.MethodPut, "/api/v1/rag/collections/"+collection.ID, `{"chunk_strategy":"fixed"}`)
+	if updated.Code != http.StatusOK {
+		t.Fatalf("update to fixed = %d body=%s", updated.Code, updated.Body.String())
+	}
+	if got := readStrategy(updated); got != rag.ChunkStrategyFixed {
+		t.Fatalf("updated strategy = %q, want fixed", got)
+	}
+	fetched := request(http.MethodGet, "/api/v1/rag/collections/"+collection.ID, "")
+	if got := readStrategy(fetched); got != rag.ChunkStrategyFixed {
+		t.Fatalf("get strategy = %q, want fixed", got)
+	}
+
+	// A pinned document-profile version reports its own strategy read-only.
+	profile, err := postgres.NewChunkProfilesRepo(db).Create(ctx, tenant, source.ChunkProfile{
+		ProfileID: "strategy-heading", SizeCodePoints: 500, OverlapCodePoints: 50,
+		BoundaryStrategy: "heading", TableHandling: "atomic",
+	}, manager.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := request(http.MethodPost, "/api/v1/rag/collections", `{"name":"pinned","chunk_profile_version_id":"`+profile.ID+`"}`)
+	if pinned.Code != http.StatusCreated {
+		t.Fatalf("create pinned = %d body=%s", pinned.Code, pinned.Body.String())
+	}
+	if got := readStrategy(pinned); got != "heading" {
+		t.Fatalf("pinned strategy = %q, want heading", got)
+	}
+}

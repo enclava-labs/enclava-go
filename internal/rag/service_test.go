@@ -2216,7 +2216,7 @@ func (f *fixture) stageSearchDoc(t *testing.T, collection rag.Collection, object
 	if err := f.repo.SaveParsedDocument(ctx, "rag-structured-v1", parsed); err != nil {
 		t.Fatal(err)
 	}
-	profileID, err := f.repo.EnsureChunkProfile(ctx, f.tenant, "rag-"+collection.ID+"-structured", 200, 20)
+	profileID, err := f.repo.EnsureChunkProfile(ctx, f.tenant, "rag-"+collection.ID+"-structured", 200, 20, rag.ChunkStrategyFixed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3048,7 +3048,7 @@ func (f *fixture) stageGitHubFileDoc(t *testing.T, collection rag.Collection, ob
 	if err := f.repo.SaveParsedDocument(ctx, "rag-structured-v1", parsed); err != nil {
 		t.Fatal(err)
 	}
-	profileID, err := f.repo.EnsureChunkProfile(ctx, f.tenant, "rag-"+collection.ID+"-structured", 200, 20)
+	profileID, err := f.repo.EnsureChunkProfile(ctx, f.tenant, "rag-"+collection.ID+"-structured", 200, 20, rag.ChunkStrategyFixed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3120,5 +3120,124 @@ func TestResolveEvidenceNonGitHubLinkUnchanged(t *testing.T) {
 	}
 	if resolved[0].SourceKind != "upload" {
 		t.Fatalf("source kind = %q", resolved[0].SourceKind)
+	}
+}
+
+// TestServiceChunkStrategyDefaultAndSwitch: create defaults to auto, invalid
+// values are caller errors, a strategy switch mints and binds a new immutable
+// profile version, and a size-only update keeps the current strategy.
+func TestServiceChunkStrategyDefaultAndSwitch(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	created, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{
+		Name: "Auto default", ACL: map[string]any{"public": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.ChunkStrategy != rag.ChunkStrategyAuto {
+		t.Fatalf("default strategy = %q, want auto", created.ChunkStrategy)
+	}
+
+	fixed, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{
+		Name: "Fixed", ChunkStrategy: rag.ChunkStrategyFixed, ACL: map[string]any{"public": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixed.ChunkStrategy != rag.ChunkStrategyFixed {
+		t.Fatalf("explicit fixed create = %q, want fixed", fixed.ChunkStrategy)
+	}
+
+	if _, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{
+		Name: "Bad", ChunkStrategy: "heading", ACL: map[string]any{"public": true},
+	}); !errors.Is(err, rag.ErrInvalidInput) {
+		t.Fatalf("invalid create strategy = %v, want ErrInvalidInput", err)
+	}
+	if _, err := f.svc.UpdateCollection(ctx, f.principal, fixed.ID, rag.UpdateCollectionInput{
+		ChunkStrategy: &[]string{"clause"}[0],
+	}); !errors.Is(err, rag.ErrInvalidInput) {
+		t.Fatalf("invalid update strategy = %v, want ErrInvalidInput", err)
+	}
+
+	// fixed → auto: a new immutable version is minted and bound to the
+	// collection, exactly like a chunk-size change.
+	switched, err := f.svc.UpdateCollection(ctx, f.principal, fixed.ID, rag.UpdateCollectionInput{
+		ChunkStrategy: &[]string{rag.ChunkStrategyAuto}[0],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if switched.ChunkStrategy != rag.ChunkStrategyAuto {
+		t.Fatalf("switched strategy = %q, want auto", switched.ChunkStrategy)
+	}
+	if switched.ChunkProfileVersionID == fixed.ChunkProfileVersionID {
+		t.Fatal("strategy switch must bind a new profile version")
+	}
+	var versions int
+	if err := f.db.SQL.QueryRowContext(ctx,
+		`SELECT count(*) FROM chunk_profiles WHERE tenant_id = $1 AND profile_id = $2`,
+		f.tenant, "rag-"+fixed.ID).Scan(&versions); err != nil {
+		t.Fatal(err)
+	}
+	if versions != 2 {
+		t.Fatalf("profile family has %d versions, want 2", versions)
+	}
+
+	// A size-only update keeps the current strategy.
+	resized, err := f.svc.UpdateCollection(ctx, f.principal, fixed.ID, rag.UpdateCollectionInput{ChunkSize: &[]int{200}[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resized.ChunkStrategy != rag.ChunkStrategyAuto || resized.ChunkSize != 200 {
+		t.Fatalf("size-only update = %d/%q, want 200/auto", resized.ChunkSize, resized.ChunkStrategy)
+	}
+}
+
+// TestServiceChunkStrategyPinnedProfileReadOnly: re-posting the read-only
+// strategy of a pinned document-profile version (as the dashboard settings
+// form does on every save) must not mint or rebind anything.
+func TestServiceChunkStrategyPinnedProfileReadOnly(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	pinned, err := postgres.NewChunkProfilesRepo(f.db).Create(ctx, f.tenant, source.ChunkProfile{
+		ProfileID: "strategy-clause", SizeCodePoints: 500, OverlapCodePoints: 50,
+		BoundaryStrategy: "clause", TableHandling: "atomic",
+	}, f.principal.ActorID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := f.svc.CreateCollection(ctx, f.principal, rag.CreateCollectionInput{
+		Name: "Pinned", ChunkProfileVersionID: &pinned.ID, ACL: map[string]any{"public": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ChunkStrategy != "clause" {
+		t.Fatalf("pinned strategy = %q, want clause", c.ChunkStrategy)
+	}
+	// The settings form posts the current strategy back unchanged alongside
+	// an unrelated rename.
+	same := c.ChunkStrategy
+	updated, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{
+		Name: &[]string{"Pinned renamed"}[0], ChunkStrategy: &same,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.ChunkProfileVersionID != c.ChunkProfileVersionID || updated.ChunkStrategy != "clause" {
+		t.Fatalf("unchanged strategy re-anchored the profile: %q → %q (%s)", c.ChunkProfileVersionID, updated.ChunkProfileVersionID, updated.ChunkStrategy)
+	}
+	// An explicit switch to auto rebinds the collection to a minted
+	// default-family version — the operator asked for collection chunking.
+	switched, err := f.svc.UpdateCollection(ctx, f.principal, c.ID, rag.UpdateCollectionInput{
+		ChunkStrategy: &[]string{rag.ChunkStrategyAuto}[0],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if switched.ChunkStrategy != rag.ChunkStrategyAuto || switched.ChunkProfileVersionID == c.ChunkProfileVersionID {
+		t.Fatalf("explicit switch = %q on %q, want auto on a new version", switched.ChunkStrategy, switched.ChunkProfileVersionID)
 	}
 }

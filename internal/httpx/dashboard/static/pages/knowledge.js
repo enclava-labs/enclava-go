@@ -74,6 +74,7 @@
     var dims = form.elements.embedding_dimensions.value;
     if (dims !== '') payload.embedding_dimensions = Number(dims);
     payload.embed_titles = form.elements.embed_titles.checked;
+    payload.chunk_strategy = form.elements.chunk_strategy.value;
     var profile = form.elements.chunk_profile_version_id.value;
     if (profile) payload.chunk_profile_version_id = profile;
     payload.acl = form.elements.access.value === 'org' ? { audience: ['*'] } : {};
@@ -173,6 +174,7 @@
       embedding_dimensions: Number(form.elements.embedding_dimensions.value),
       embed_titles: form.elements.embed_titles.checked,
     };
+    payload.chunk_strategy = form.elements.chunk_strategy.value;
     var profile = form.elements.chunk_profile_version_id.value;
     if (profile) payload.chunk_profile_version_id = profile;
     payload.acl = form.elements.access.value === 'org' ? { audience: ['*'] } : { audience: [] };
