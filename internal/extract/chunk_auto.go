@@ -131,12 +131,30 @@ func (b *autoBuilder) addBlock(block source.Block) {
 	}
 	if len(b.spans) > 0 && b.runes()+b.sepCost(block)+n > b.profile.SizeCodePoints {
 		if len(b.spans) > b.carryLen {
+			tail := b.cleanBreakTail(n)
 			b.flushCurrent()
 			b.seedCarry()
+			if len(tail) > 0 {
+				if isHeadingBlock(b.blocks[tail[0].BlockID]) {
+					// a chunk starting at a heading repeats no overlap
+					b.spans, b.carryLen, b.pending = nil, 0, nil
+				} else if len(b.spans) == 0 {
+					b.addContext(b.blocks[tail[0].BlockID])
+				}
+				b.spans = append(b.spans, tail...)
+			}
 		}
-		// the seeded overlap alone may already overflow with this block
+		// the seeded overlap may not fit next to this block: drop it, keeping
+		// any body moved over by the clean break
 		if len(b.spans) > 0 && b.runes()+b.sepCost(block)+n > b.profile.SizeCodePoints {
-			b.spans, b.carryLen, b.pending = nil, 0, nil
+			b.spans = append(b.spans[:b.ctxLen:b.ctxLen], b.spans[b.ctxLen+b.carryLen:]...)
+			b.carryLen, b.pending = 0, nil
+			if len(b.spans) == 0 {
+				b.spans, b.ctxLen = nil, 0
+			}
+		}
+		if b.ctxLen > 0 && b.runes()+b.sepCost(block)+n > b.profile.SizeCodePoints {
+			b.spans, b.ctxLen = b.spans[b.ctxLen:], 0
 		}
 	}
 	if block.Kind == "heading" && len(b.spans) == b.carryLen {
@@ -152,6 +170,44 @@ func (b *autoBuilder) addBlock(block source.Block) {
 		// the context prefix does not fit next to this block: drop it
 		b.spans, b.ctxLen = b.spans[b.ctxLen:], 0
 	}
+}
+
+// cleanBreakTail is called when the chunk is full and the next block (next
+// code points) does not fit. Blocks are often single lines (PDF text, e-books
+// converted from PDF), so the last packed block may stop mid-sentence, or be
+// a heading whose text follows in the next chunk. When an earlier block in
+// the last 40% of the chunk ends a sentence, the blocks after it are removed
+// from the chunk and returned so they open the next one.
+func (b *autoBuilder) cleanBreakTail(next int) []source.Span {
+	first, last := b.ctxLen+b.carryLen, len(b.spans)-1
+	if last <= first || b.endsSentence(b.spans[last]) {
+		return nil
+	}
+	size := b.profile.SizeCodePoints
+	for j := last - 1; j >= first; j-- {
+		tailRunes := spanRunes(b.spans[j+1:], b.blocks)
+		if tailRunes*5 > size*2 || tailRunes+1+next > size {
+			return nil
+		}
+		if b.endsSentence(b.spans[j]) {
+			tail := append([]source.Span{}, b.spans[j+1:]...)
+			b.spans = b.spans[:j+1]
+			return tail
+		}
+	}
+	return nil
+}
+
+// endsSentence reports whether the span's text ends with sentence-final
+// punctuation, ignoring closing quotes and brackets. Headings never do.
+func (b *autoBuilder) endsSentence(span source.Span) bool {
+	block := b.blocks[span.BlockID]
+	if isHeadingBlock(block) {
+		return false
+	}
+	text := strings.TrimRight(block.Text[span.ByteStart:span.ByteEnd], " \t\r\n\"'”’»)]")
+	r, _ := utf8.DecodeLastRuneInString(text)
+	return strings.ContainsRune(".!?…。！？", r)
 }
 
 // addSectionBlock packs section-aware: a new chunk always starts at a heading

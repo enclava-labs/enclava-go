@@ -547,3 +547,41 @@ func chunksTexts(chunks []source.Chunk) []string {
 	}
 	return texts
 }
+
+// Documents whose blocks are single lines (PDF text, e-books converted from
+// PDF) must still end chunks at a sentence end, and a heading line must not
+// be left dangling at the end of a chunk.
+func TestAutoLineBlocksBreakAfterSentenceEnd(t *testing.T) {
+	lines := []string{"A heading line"}
+	for i := range 60 {
+		lines = append(lines,
+			fmt.Sprintf("Sentence %d starts on this line and keeps going past", i),
+			"the line end before it finally stops here.",
+			"A short one follows. And another begins and",
+			"wraps onto the next line.")
+		if i%7 == 6 {
+			lines = append(lines, fmt.Sprintf("%d. Dangling Heading", i))
+		}
+	}
+	var blocks []source.Block
+	for i, line := range lines {
+		blocks = append(blocks, source.Block{ID: fmt.Sprintf("b%d", i), Ordinal: i, Kind: "paragraph", Text: line})
+	}
+	doc, _ := autoDoc(t, blocks)
+	for _, overlap := range []int{0, 80} {
+		profile := autoProfile(400, overlap)
+		checkAutoInvariants(t, doc, profile)
+		chunks, err := Chunk(doc, profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(chunks) < 10 {
+			t.Fatalf("expected many chunks, got %d", len(chunks))
+		}
+		for i, chunk := range chunks[:len(chunks)-1] {
+			if !strings.HasSuffix(chunk.Text, ".") || strings.HasSuffix(chunk.Text, "Heading") {
+				t.Fatalf("overlap %d: chunk %d does not end at a sentence end: %q", overlap, i, chunk.Text[max(0, len(chunk.Text)-80):])
+			}
+		}
+	}
+}
