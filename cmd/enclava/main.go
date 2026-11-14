@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -55,6 +56,8 @@ func run(args []string) int {
 				return 1
 			}
 			return 0
+		case "extract-worker":
+			return runExtractWorker(args[1:])
 		}
 	}
 	if err := serve(); err != nil {
@@ -64,15 +67,70 @@ func run(args []string) int {
 	return 0
 }
 
+// runExtractWorker serves native PDF/OCR parsing on a unix socket for the
+// app container, which cannot run bubblewrap itself. --check probes the
+// socket's capabilities and exits for container healthchecks.
+func runExtractWorker(args []string) int {
+	socketPath := strings.TrimSpace(os.Getenv("ENCLAVA_EXTRACT_WORKER_SOCKET"))
+	if socketPath == "" {
+		socketPath = "/run/enclava-extract/worker.sock"
+	}
+	concurrency := 2
+	check := false
+	fs := flag.NewFlagSet("extract-worker", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.StringVar(&socketPath, "socket", socketPath, "unix socket path")
+	fs.IntVar(&concurrency, "concurrency", concurrency, "max concurrent parses")
+	fs.BoolVar(&check, "check", false, "probe the socket capabilities and exit")
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, "Usage: enclava extract-worker [--socket PATH] [--concurrency N] [--check]\n")
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		log.Printf("extract-worker: unexpected argument %q", fs.Arg(0))
+		return 2
+	}
+	if concurrency < 1 {
+		log.Print("extract-worker: --concurrency must be a positive integer")
+		return 2
+	}
+	if check {
+		return checkExtractWorker(socketPath)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := extract.ServeExtractWorker(ctx, socketPath, concurrency); err != nil {
+		log.Printf("extract-worker error: %v", err)
+		return 1
+	}
+	return 0
+}
+
+func checkExtractWorker(socketPath string) int {
+	extract.SetNativeWorker(socketPath)
+	caps := extract.ProbeNative()
+	fmt.Printf("PDF=%t OCR=%t languages=%v reason=%s\n", caps.PDF, caps.OCR, caps.Languages, caps.Reason)
+	if !caps.PDF && !caps.OCR && caps.Reason != "" {
+		return 1
+	}
+	return 0
+}
+
 func printUsage() {
 	fmt.Fprint(os.Stderr, `Usage: enclava [command]
 
 Commands:
-  (none)      start the server
-  bootstrap   create the first tenant and admin user
+  (none)          start the server
+  bootstrap       create the first tenant and admin user
+  extract-worker  serve native PDF/OCR parsing on a unix socket
 
 Options:
-  -h, --help  show this help
+  -h, --help      show this help
 `)
 }
 
@@ -80,6 +138,11 @@ func serve() error {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("config error: %w", err)
+	}
+	// Route native PDF/OCR to the extract-worker sidecar when configured; this
+	// must precede any ProbeNative call in serve.
+	if cfg.ExtractWorkerSocket != "" {
+		extract.SetNativeWorker(cfg.ExtractWorkerSocket)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

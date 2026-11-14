@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"unicode/utf8"
 
@@ -44,43 +45,69 @@ type NativeCapabilities struct {
 
 // ProbeNative reports only capabilities available inside the required filesystem and network sandbox.
 func ProbeNative() NativeCapabilities {
-	nativeProbe.Do(func() {
-		sandbox, e1 := exec.LookPath("bwrap")
-		prlimit, e2 := exec.LookPath("prlimit")
-		if e1 != nil || e2 != nil {
-			nativeCaps.Reason = "prlimit and bubblewrap are required for native processing"
-			return
-		}
-		if _, err := runNative(context.Background(), sandbox, prlimit, "/usr/bin/true", nil, "", 1); err != nil {
-			nativeCaps.Reason = "native processor sandbox unavailable: " + err.Error()
-			return
-		}
-		_, textErr := exec.LookPath("pdftotext")
-		_, rasterErr := exec.LookPath("pdftoppm")
-		_, infoErr := exec.LookPath("pdfinfo")
-		if textErr == nil && rasterErr == nil && infoErr == nil {
-			nativeCaps.PDF = true
-		} else {
-			nativeCaps.Reason = "Poppler pdfinfo, pdftotext and pdftoppm are required"
-		}
-		if tesseract, err := exec.LookPath("tesseract"); err == nil {
-			nativeCaps.Languages = availableLanguages(tesseract, sandbox, prlimit)
-			nativeCaps.OCR = len(nativeCaps.Languages) > 0
-		}
-		if !nativeCaps.OCR {
-			if nativeCaps.Reason != "" {
-				nativeCaps.Reason += "; "
-			}
-			nativeCaps.Reason += "Tesseract or OCR language assets are unavailable"
-		}
-	})
+	if nativeWorkerPath() != "" {
+		return probeNativeWorker()
+	}
+	nativeProbe.Do(func() { nativeCaps = probeNativeLocally() })
 	caps := nativeCaps
 	caps.Languages = append([]string(nil), nativeCaps.Languages...)
 	return caps
 }
 
+func probeNativeLocally() NativeCapabilities {
+	var caps NativeCapabilities
+	sandbox, e1 := exec.LookPath("bwrap")
+	prlimit, e2 := exec.LookPath("prlimit")
+	if e1 != nil || e2 != nil {
+		if nativeSandboxMode() != nativeSandboxContainer {
+			caps.Reason = "prlimit and bubblewrap are required for native processing"
+			return caps
+		}
+	} else if nativeSandboxMode() == nativeSandboxContainer {
+		sandbox = ""
+	}
+	if _, err := runNative(context.Background(), sandbox, prlimit, "/usr/bin/true", nil, "", 1); err != nil {
+		caps.Reason = "native processor sandbox unavailable: " + err.Error()
+		return caps
+	}
+	_, textErr := exec.LookPath("pdftotext")
+	_, rasterErr := exec.LookPath("pdftoppm")
+	_, infoErr := exec.LookPath("pdfinfo")
+	if textErr == nil && rasterErr == nil && infoErr == nil {
+		caps.PDF = true
+	} else {
+		caps.Reason = "Poppler pdfinfo, pdftotext and pdftoppm are required"
+	}
+	if tesseract, err := exec.LookPath("tesseract"); err == nil {
+		caps.Languages = availableLanguages(tesseract, sandbox, prlimit)
+		caps.OCR = len(caps.Languages) > 0
+	}
+	if !caps.OCR {
+		if caps.Reason != "" {
+			caps.Reason += "; "
+		}
+		caps.Reason += "Tesseract or OCR language assets are unavailable"
+	}
+	return caps
+}
+
 var nativeProbe sync.Once
 var nativeCaps NativeCapabilities
+
+// nativeSandbox selects how runNative isolates tools: "bwrap" wraps them in
+// bubblewrap + prlimit (the default), "container" runs prlimit directly —
+// only the extract-worker subcommand may select it, since there the process
+// itself runs inside the sandboxed sidecar container.
+var nativeSandbox atomic.Int32
+
+const (
+	nativeSandboxBwrap     int32 = 0
+	nativeSandboxContainer int32 = 1
+)
+
+func nativeSandboxMode() int32 { return nativeSandbox.Load() }
+
+func enableContainerSandbox() { nativeSandbox.Store(nativeSandboxContainer) }
 
 type limitedBuffer struct {
 	b     bytes.Buffer
@@ -104,6 +131,43 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 }
 
 func (b *limitedBuffer) String() string { return b.b.String() }
+
+func runNativeInContainer(ctx context.Context, prlimit, binary string, args []string, dir string, maxOutput int64) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, prlimit, append([]string{"--cpu=30", "--as=536870912", "--nproc=16", "--fsize=16777216", "--", binary}, args...)...) //nolint:gosec // prlimit, binary and args are server-resolved PATH lookups of fixed tool names; args are process-confined
+	cmd.Dir = dir
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=/work", "TMPDIR=/tmp", "LANG=C.UTF-8", "LC_ALL=C.UTF-8", "LD_LIBRARY_PATH=/usr/lib:/usr/lib64"}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var stderr limitedBuffer
+	stderr.limit = 64 << 10
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err = cmd.Start(); err != nil {
+		return nil, err
+	}
+	stopKill := context.AfterFunc(ctx, func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) })
+	out, readErr := io.ReadAll(io.LimitReader(stdout, maxOutput+1))
+	if readErr != nil || len(out) > int(maxOutput) {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	waitErr := cmd.Wait()
+	stopKill()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if len(out) > int(maxOutput) {
+		return nil, ErrDocumentTooLarge
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if waitErr != nil {
+		return nil, fmt.Errorf("native processor failed: %s", strings.TrimSpace(stderr.String()))
+	}
+	return out, nil
+}
 
 func availableLanguages(bin, sandbox, prlimit string) []string {
 	out, err := runNative(context.Background(), sandbox, prlimit, bin, []string{"--list-langs"}, "", 2<<20)
@@ -138,6 +202,19 @@ func runNative(ctx context.Context, sandbox, prlimit, binary string, args []stri
 		}
 	}
 	defer cleanup()
+	if nativeSandboxMode() == nativeSandboxContainer {
+		if prlimit == "" {
+			return nil, errors.New("prlimit is required for native processing")
+		}
+		rewritten := make([]string, len(args))
+		for i, arg := range args {
+			if strings.HasPrefix(arg, "/work") {
+				arg = dir + strings.TrimPrefix(arg, "/work")
+			}
+			rewritten[i] = arg
+		}
+		return runNativeInContainer(ctx, prlimit, binary, rewritten, dir, maxOutput)
+	}
 	cmdArgs := make([]string, 0, 31+len(args)) // 31 fixed sandbox/prlimit arguments below
 	cmdArgs = append(cmdArgs, "--die-with-parent", "--new-session", "--unshare-all", "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--bind", dir, "/work", "--chdir", "/work", "--", prlimit, "--cpu=30", "--as=536870912", "--nproc=16", "--fsize=16777216", "--", binary)
 	cmdArgs = append(cmdArgs, args...)
@@ -178,43 +255,59 @@ func runNative(ctx context.Context, sandbox, prlimit, binary string, args []stri
 }
 
 func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data []byte, format string) (source.Document, error) {
-	if err := ctx.Err(); err != nil {
+	if nativeWorkerPath() != "" {
+		return parseNativeViaWorker(ctx, ref, opts, data, format)
+	}
+	blocks, warnings, err := parseNativeBlocks(ctx, data, format)
+	if err != nil {
 		return source.Document{}, err
 	}
+	document := makeDocument(opts.ObjectRef, ref, blocks)
+	document.ParseWarnings = warnings
+	return document, nil
+}
+
+// parseNativeBlocks runs the local native pipeline and returns raw blocks and
+// warnings; parseNative wraps them into a source.Document. The extract-worker
+// HTTP handler serves exactly this result set.
+func parseNativeBlocks(ctx context.Context, data []byte, format string) ([]parseBlock, []string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if len(data) > maxNativeInput {
-		return source.Document{}, fmt.Errorf("%w: file is %d MB, the limit is %d MB", ErrDocumentTooLarge, len(data)>>20, maxNativeInput>>20)
+		return nil, nil, fmt.Errorf("%w: file is %d MB, the limit is %d MB", ErrDocumentTooLarge, len(data)>>20, maxNativeInput>>20)
 	}
 	if format == "image" {
 		if len(data) < 8 || string(data[:8]) != "\x89PNG\r\n\x1a\n" {
-			return source.Document{}, fmt.Errorf("%w: %s is unsupported; only PNG image OCR is supported", ErrUnsupportedFormat, http.DetectContentType(data))
+			return nil, nil, fmt.Errorf("%w: %s is unsupported; only PNG image OCR is supported", ErrUnsupportedFormat, http.DetectContentType(data))
 		}
 		pixels, err := imageDimensions(data)
 		if err != nil {
-			return source.Document{}, err
+			return nil, nil, err
 		}
 		if pixels > maxImagePixels {
-			return source.Document{}, ErrDocumentTooLarge
+			return nil, nil, ErrDocumentTooLarge
 		}
 	}
 	caps := ProbeNative()
 	if format == "pdf" && !caps.PDF {
-		return source.Document{}, fmt.Errorf("extract: PDF unavailable: %s", caps.Reason)
+		return nil, nil, fmt.Errorf("extract: PDF unavailable: %s", caps.Reason)
 	}
 	if format == "image" && !caps.OCR {
-		return source.Document{}, fmt.Errorf("extract: OCR unavailable: %s", caps.Reason)
+		return nil, nil, fmt.Errorf("extract: OCR unavailable: %s", caps.Reason)
 	}
 	sandbox, _ := exec.LookPath("bwrap")
 	prlimit, _ := exec.LookPath("prlimit")
 	dir, err := os.MkdirTemp("", "enclava-native-")
 	if err != nil {
-		return source.Document{}, err
+		return nil, nil, err
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 	if err = os.Chmod(dir, 0700); err != nil { //nolint:gosec // fresh MkdirTemp dir: 0700 is minimal for a private directory (needs the execute bit)
-		return source.Document{}, err
+		return nil, nil, err
 	}
-	if err = os.WriteFile(filepath.Join(dir, "input"), data, 0600); err != nil {
-		return source.Document{}, err
+	if err = os.WriteFile(filepath.Join(dir, "input"), data, 0600); err != nil { //nolint:gosec // G703: dir is a fresh private MkdirTemp dir; the path is not attacker-controlled
+		return nil, nil, err
 	}
 	var blocks []parseBlock
 	var parseWarnings []string
@@ -223,16 +316,16 @@ func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data
 		info, err := runNative(ctx, sandbox, prlimit, pdfinfo, []string{"/work/input"}, dir, 1<<20)
 		if err != nil {
 			if encryptedPDF(info, err) {
-				return source.Document{}, ErrEncryptedDocument
+				return nil, nil, ErrEncryptedDocument
 			}
-			return source.Document{}, fmt.Errorf("%w: PDF metadata: %v", ErrMalformedDocument, err)
+			return nil, nil, fmt.Errorf("%w: PDF metadata: %v", ErrMalformedDocument, err)
 		}
 		pages, err := pdfPageCount(info)
 		if err != nil {
-			return source.Document{}, err
+			return nil, nil, err
 		}
 		if pages > maxPDFPages {
-			return source.Document{}, fmt.Errorf("%w: PDF has %d pages, the limit is %d", ErrDocumentTooLarge, pages, maxPDFPages)
+			return nil, nil, fmt.Errorf("%w: PDF has %d pages, the limit is %d", ErrDocumentTooLarge, pages, maxPDFPages)
 		}
 		pdftotext, _ := exec.LookPath("pdftotext")
 		for first := 1; first <= pages; first += pdfTextBatchPages {
@@ -240,19 +333,19 @@ func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data
 			bbox, err := runNative(ctx, sandbox, prlimit, pdftotext, []string{"-bbox", "-f", strconv.Itoa(first), "-l", strconv.Itoa(last), "/work/input", "-"}, dir, maxNativeOutput)
 			if err != nil {
 				if encryptedPDF(info, err) {
-					return source.Document{}, ErrEncryptedDocument
+					return nil, nil, ErrEncryptedDocument
 				}
 				if errors.Is(err, ErrDocumentTooLarge) {
-					return source.Document{}, fmt.Errorf("%w: text of PDF pages %d-%d exceeds %d MB", ErrDocumentTooLarge, first, last, maxNativeOutput>>20)
+					return nil, nil, fmt.Errorf("%w: text of PDF pages %d-%d exceeds %d MB", ErrDocumentTooLarge, first, last, maxNativeOutput>>20)
 				}
 				if ctx.Err() != nil {
-					return source.Document{}, ctx.Err()
+					return nil, nil, ctx.Err()
 				}
-				return source.Document{}, fmt.Errorf("%w: PDF text: %v", ErrMalformedDocument, err)
+				return nil, nil, fmt.Errorf("%w: PDF text: %v", ErrMalformedDocument, err)
 			}
 			batch, err := parsePDFBBox(bbox, first)
 			if err != nil {
-				return source.Document{}, err
+				return nil, nil, err
 			}
 			blocks = append(blocks, batch...)
 		}
@@ -264,7 +357,7 @@ func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data
 		}
 		var rasterPixels int
 		if !caps.OCR && len(hasText) < pages {
-			return source.Document{}, fmt.Errorf("extract: PDF OCR unavailable: %s", caps.Reason)
+			return nil, nil, fmt.Errorf("extract: PDF OCR unavailable: %s", caps.Reason)
 		}
 		for page := 1; page <= pages; page++ {
 			if hasText[page] {
@@ -278,7 +371,7 @@ func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data
 				}
 				pageBlocks, err := ocrPDFPage(ctx, sandbox, prlimit, dir, page, ocrLanguage(caps.Languages), &rasterPixels)
 				if err != nil {
-					return source.Document{}, err
+					return nil, nil, err
 				}
 				blocks = append(blocks, pageBlocks...)
 			}
@@ -299,22 +392,20 @@ func parseNative(ctx context.Context, ref artifacts.Ref, opts ParseOptions, data
 			offset = blocks[i].end + 1
 		}
 		if len(blocks) == 0 {
-			return source.Document{}, fmt.Errorf("%w: PDF contains no extractable text", ErrMalformedDocument)
+			return nil, nil, fmt.Errorf("%w: PDF contains no extractable text", ErrMalformedDocument)
 		}
 	} else {
 		tesseract, _ := exec.LookPath("tesseract")
 		raw, err := runNative(ctx, sandbox, prlimit, tesseract, []string{"/work/input", "stdout", "-l", ocrLanguage(caps.Languages), "tsv"}, dir, maxNativeOutput)
 		if err != nil {
-			return source.Document{}, err
+			return nil, nil, err
 		}
 		blocks, err = parseOCRTSV(raw)
 		if err != nil {
-			return source.Document{}, err
+			return nil, nil, err
 		}
 	}
-	document := makeDocument(opts.ObjectRef, ref, blocks)
-	document.ParseWarnings = parseWarnings
-	return document, nil
+	return blocks, parseWarnings, nil
 }
 
 func encryptedPDF(info []byte, err error) bool {
