@@ -191,7 +191,7 @@ func (f *searchFixture) stageSearchDoc(t *testing.T, collection rag.Collection, 
 	if err := repo.SaveParsedDocument(ctx, "rag-structured-v1", parsed); err != nil {
 		t.Fatal(err)
 	}
-	profileID, err := repo.EnsureChunkProfile(ctx, f.tenant, "rag-"+collection.ID+"-structured", 200, 20)
+	profileID, err := repo.EnsureChunkProfile(ctx, f.tenant, "rag-"+collection.ID+"-structured", 200, 20, "fixed")
 	if err != nil {
 		t.Fatal(err)
 	}

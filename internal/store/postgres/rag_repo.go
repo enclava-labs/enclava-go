@@ -164,8 +164,8 @@ func (r *RAGRepo) InsertCollection(ctx context.Context, c rag.Collection) error 
 	profileVersionID := c.ChunkProfileVersionID
 	if profileVersionID == "" {
 		// No validated selection supplied: keep the legacy default of one
-		// owned fixed/row-wise profile version for the collection.
-		if profileVersionID, err = r.EnsureChunkProfile(ctx, c.TenantID, "rag-"+c.ID, c.ChunkSize, c.ChunkOverlap); err != nil {
+		// owned row-wise profile version for the collection.
+		if profileVersionID, err = r.EnsureChunkProfile(ctx, c.TenantID, "rag-"+c.ID, c.ChunkSize, c.ChunkOverlap, c.ChunkStrategy); err != nil {
 			return err
 		}
 	}
@@ -192,7 +192,7 @@ func scanCollection(scanner interface {
 	var createdAt time.Time
 	err := scanner.Scan(&c.TenantID, &c.ID, &c.Name, &desc, &c.EmbeddingModel, &c.EmbeddingDimensions,
 		&qdrant, &audience, &meta, &owner, &c.IsActive, &createdAt, &profile, &retired, &c.EmbedTitles,
-		&c.QueryPrefix, &c.PassagePrefix, &retiredSince)
+		&c.QueryPrefix, &c.PassagePrefix, &retiredSince, &c.ChunkStrategy)
 	if err != nil {
 		return rag.Collection{}, err
 	}
@@ -236,7 +236,10 @@ const collectionSelect = `
 	SELECT tenant_id::text, id, name, description, embedding_model, embedding_dimensions,
 	       qdrant_collection, audience, metadata, owner_actor_id, is_active, created_at,
 	       COALESCE(chunk_profile_version_id, ''), retired_qdrant_collections, embed_titles,
-	       query_prefix, passage_prefix, retired_index_since
+	       query_prefix, passage_prefix, retired_index_since,
+	       COALESCE((SELECT cp.boundary_strategy FROM chunk_profiles cp
+	                 WHERE cp.tenant_id = knowledge_collections.tenant_id
+	                   AND cp.id = knowledge_collections.chunk_profile_version_id), 'fixed')
 	FROM knowledge_collections`
 
 func (r *RAGRepo) GetCollection(ctx context.Context, tenantID, id string) (rag.Collection, error) {
@@ -476,10 +479,10 @@ func (r *RAGRepo) DeleteCollection(ctx context.Context, tenantID, id string) err
 }
 
 // EnsureChunkProfile returns the immutable chunk_profiles row id for the
-// (profileID, size, overlap) triple, inserting a new version when the
-// parameters changed. Changing a profile creates a new processing version —
-// published evidence is never silently mutated.
-func (r *RAGRepo) EnsureChunkProfile(ctx context.Context, tenantID, profileID string, size, overlap int) (string, error) {
+// (profileID, size, overlap, strategy) tuple, inserting a new version when
+// any parameter changed. Changing a profile creates a new processing
+// version — published evidence is never silently mutated.
+func (r *RAGRepo) EnsureChunkProfile(ctx context.Context, tenantID, profileID string, size, overlap int, strategy string) (string, error) {
 	var id string
 	var version int
 	err := r.db.SQL.QueryRowContext(ctx, `
@@ -493,8 +496,8 @@ func (r *RAGRepo) EnsureChunkProfile(ctx context.Context, tenantID, profileID st
 			INSERT INTO chunk_profiles
 			    (tenant_id, id, profile_id, version, name, boundary_strategy,
 			     max_size_codepoints, overlap_codepoints, table_handling)
-			VALUES ($1, $2, $3, 1, $4, 'fixed', $5, $6, 'row-wise')`,
-			tenantID, id, profileID, profileID, size, overlap); err != nil {
+			VALUES ($1, $2, $3, 1, $4, $5, $6, $7, 'row-wise')`,
+			tenantID, id, profileID, profileID, strategy, size, overlap); err != nil {
 			return "", fmt.Errorf("insert chunk profile: %w", err)
 		}
 		return id, nil
@@ -502,12 +505,13 @@ func (r *RAGRepo) EnsureChunkProfile(ctx context.Context, tenantID, profileID st
 		return "", fmt.Errorf("read chunk profile: %w", err)
 	}
 	var haveSize, haveOverlap int64
+	var haveStrategy string
 	if err := r.db.SQL.QueryRowContext(ctx, `
-		SELECT max_size_codepoints, overlap_codepoints FROM chunk_profiles
-		WHERE tenant_id = $1 AND id = $2`, tenantID, id).Scan(&haveSize, &haveOverlap); err != nil {
+		SELECT max_size_codepoints, overlap_codepoints, boundary_strategy FROM chunk_profiles
+		WHERE tenant_id = $1 AND id = $2`, tenantID, id).Scan(&haveSize, &haveOverlap, &haveStrategy); err != nil {
 		return "", err
 	}
-	if int(haveSize) == size && int(haveOverlap) == overlap {
+	if int(haveSize) == size && int(haveOverlap) == overlap && haveStrategy == strategy {
 		return id, nil
 	}
 	id = newPGID("cpv")
@@ -515,8 +519,8 @@ func (r *RAGRepo) EnsureChunkProfile(ctx context.Context, tenantID, profileID st
 		INSERT INTO chunk_profiles
 		    (tenant_id, id, profile_id, version, name, boundary_strategy,
 		     max_size_codepoints, overlap_codepoints, table_handling)
-		VALUES ($1, $2, $3, $4, $5, 'fixed', $6, $7, 'row-wise')`,
-		tenantID, id, profileID, version+1, profileID, size, overlap); err != nil {
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'row-wise')`,
+		tenantID, id, profileID, version+1, profileID, strategy, size, overlap); err != nil {
 		return "", fmt.Errorf("insert chunk profile version: %w", err)
 	}
 	return id, nil

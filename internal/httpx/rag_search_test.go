@@ -185,7 +185,7 @@ func (f ragDocsFixture) stageEvidenceObject(t *testing.T, objectID, audienceOwne
 	if err := f.repo.SaveParsedDocument(ctx, "rag-structured-v1", parsed); err != nil {
 		t.Fatal(err)
 	}
-	profileID, err := f.repo.EnsureChunkProfile(ctx, f.tenant, "rag-"+f.collectionID+"-structured", 200, 20)
+	profileID, err := f.repo.EnsureChunkProfile(ctx, f.tenant, "rag-"+f.collectionID+"-structured", 200, 20, "fixed")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,7 +497,7 @@ func stageReadableDoc(t *testing.T, db *postgres.DB, vector *readableSearchStore
 	if err := repo.SaveParsedDocument(ctx, "rag-structured-v1", parsed); err != nil {
 		t.Fatal(err)
 	}
-	profileID, err := repo.EnsureChunkProfile(ctx, tenant, "rag-"+collection.ID+"-structured", 200, 20)
+	profileID, err := repo.EnsureChunkProfile(ctx, tenant, "rag-"+collection.ID+"-structured", 200, 20, "fixed")
 	if err != nil {
 		t.Fatal(err)
 	}

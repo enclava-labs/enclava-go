@@ -154,6 +154,15 @@ while it stays under ~25% of the chunk size. BM25 indexes a `search_text`
 payload of title + chunk + keyword metadata regardless of `embed_titles`.
 Changing `embed_titles` with `PUT` re-embeds in the background.
 
+`chunk_strategy` selects how documents are split: `"auto"` (the default for
+new collections) adapts boundaries per document — headings, paragraphs and
+sentences — while `"fixed"` cuts at an exact `chunk_size` with
+`chunk_overlap`. It is accepted on create and `PUT`, returned on every
+collection read, and changing it creates a new immutable chunk-profile
+version. A collection pinned to a processing-profile version
+(`chunk_profile_version_id`) reports that profile's strategy (heading,
+clause, …) read-only.
+
 Every `PUT` also queues any document still embedded under older settings, so
 repeating a `PUT` that failed midway finishes the re-embedding it started.
 

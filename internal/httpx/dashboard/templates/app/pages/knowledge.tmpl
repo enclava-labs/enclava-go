@@ -44,6 +44,14 @@
       <span class="help">Helps tell many documents apart; turn it off for a collection that holds one long document, such as a book.</span>
     </div>
     <div>
+      <label class="label" for="knc-chunking">Chunking</label>
+      <select class="field" id="knc-chunking" name="chunk_strategy">
+        <option value="auto" selected>Adaptive (recommended)</option>
+        <option value="fixed">Fixed size</option>
+      </select>
+      <span class="help">Adaptive splits by headings, paragraphs and sentences. Fixed cuts at an exact length.</span>
+    </div>
+    <div>
       <label class="label" for="knc-profile">Processing profile</label>
       <select class="field" id="knc-profile" name="chunk_profile_version_id" data-knowledge-profile-select>
         <option value="">Default chunking</option>
