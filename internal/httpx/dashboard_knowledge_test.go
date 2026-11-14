@@ -249,6 +249,39 @@ func TestDashboardKnowledgeMemberDenials(t *testing.T) {
 	}
 }
 
+// TestDashboardKnowledgeChunkingControls: the New-collection drawer and the
+// settings form carry the chunking select (chunk_strategy) that knowledge.js
+// posts — Adaptive by default on create, the current value on edit.
+func TestDashboardKnowledgeChunkingControls(t *testing.T) {
+	f := newKnowledgeFixture(t)
+	mgr, mgrCSRF := f.manager(t, "know-chunking@example.test")
+
+	list := f.get(t, mgr, mgrCSRF, "/dashboard/knowledge")
+	if list.Code != http.StatusOK {
+		t.Fatalf("manager list = %d body=%s", list.Code, list.Body.String())
+	}
+	for _, want := range []string{
+		`name="chunk_strategy"`,
+		`<option value="auto" selected>Adaptive (recommended)</option>`,
+		`<option value="fixed">Fixed size</option>`,
+		"Adaptive splits by headings, paragraphs and sentences. Fixed cuts at an exact length.",
+	} {
+		if !strings.Contains(list.Body.String(), want) {
+			t.Fatalf("create drawer missing %q", want)
+		}
+	}
+
+	col := f.collection(t, "Chunked", []string{"*"})
+	page := f.get(t, mgr, mgrCSRF, "/dashboard/knowledge/"+col.ID+"/settings")
+	if page.Code != http.StatusOK {
+		t.Fatalf("settings = %d body=%s", page.Code, page.Body.String())
+	}
+	sbody := page.Body.String()
+	if !strings.Contains(sbody, `name="chunk_strategy"`) || !strings.Contains(sbody, `<option value="auto" selected>Adaptive (recommended)</option>`) {
+		t.Fatalf("settings form missing the chunking select with the current value:\n%s", sbody)
+	}
+}
+
 // TestDashboardKnowledgeMemberDocumentRows covers collection-level row
 // privacy: the member lists every document of a collection shared with
 // them, and a collection they cannot open never leaks its titles.

@@ -16,6 +16,12 @@ const (
 
 	DefaultChunkSize    = 1000
 	DefaultChunkOverlap = 150
+
+	// ChunkStrategyAuto picks boundary rules per document; ChunkStrategyFixed
+	// cuts at an exact length. A collection attached to a document-profile
+	// version may report another strategy (heading, clause, …) read-only.
+	ChunkStrategyAuto  = "auto"
+	ChunkStrategyFixed = "fixed"
 )
 
 // Collection is a tenant-scoped knowledge collection. It persists over
@@ -40,15 +46,20 @@ type Collection struct {
 	EmbeddingDimensions      int                  `json:"embedding_dimensions"` // 0 = the model's full output
 	// EmbedTitles prefixes each chunk with its document's name before
 	// embedding: better across many documents, worse inside a single one.
-	EmbedTitles  bool           `json:"embed_titles"`
-	ChunkSize    int            `json:"chunk_size"`
-	ChunkOverlap int            `json:"chunk_overlap"`
-	ACL          map[string]any `json:"acl,omitempty"`
-	Audience     []string       `json:"audience,omitempty"`
-	Metadata     map[string]any `json:"metadata,omitempty"`
-	IsActive     bool           `json:"is_active"`
-	CreatedAt    time.Time      `json:"created_at"`
-	UpdatedAt    time.Time      `json:"updated_at"`
+	EmbedTitles  bool `json:"embed_titles"`
+	ChunkSize    int  `json:"chunk_size"`
+	ChunkOverlap int  `json:"chunk_overlap"`
+	// ChunkStrategy mirrors the attached chunk profile version's
+	// boundary_strategy: "auto"/"fixed" for collection-level chunking, or
+	// another strategy (heading, clause, …) read-only when a document-profile
+	// version is attached.
+	ChunkStrategy string         `json:"chunk_strategy"`
+	ACL           map[string]any `json:"acl,omitempty"`
+	Audience      []string       `json:"audience,omitempty"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
+	IsActive      bool           `json:"is_active"`
+	CreatedAt     time.Time      `json:"created_at"`
+	UpdatedAt     time.Time      `json:"updated_at"`
 }
 
 // Document is the legacy-stable JSON view over a source.Object row joined to
@@ -150,18 +161,21 @@ type ImportResultInput struct {
 }
 
 type CreateCollectionInput struct {
-	Name                  string         `json:"name"`
-	Description           string         `json:"description,omitempty"`
-	EmbeddingModel        string         `json:"embedding_model,omitempty"`
-	EmbeddingDimensions   *int           `json:"embedding_dimensions,omitempty"`
-	QueryPrefix           *string        `json:"query_prefix,omitempty"`
-	PassagePrefix         *string        `json:"passage_prefix,omitempty"`
-	EmbedTitles           *bool          `json:"embed_titles,omitempty"` // default true
-	ChunkProfileVersionID *string        `json:"chunk_profile_version_id,omitempty"`
-	ChunkSize             int            `json:"chunk_size,omitempty"`
-	ChunkOverlap          int            `json:"chunk_overlap,omitempty"`
-	ACL                   map[string]any `json:"acl,omitempty"`
-	Metadata              map[string]any `json:"metadata,omitempty"`
+	Name                  string  `json:"name"`
+	Description           string  `json:"description,omitempty"`
+	EmbeddingModel        string  `json:"embedding_model,omitempty"`
+	EmbeddingDimensions   *int    `json:"embedding_dimensions,omitempty"`
+	QueryPrefix           *string `json:"query_prefix,omitempty"`
+	PassagePrefix         *string `json:"passage_prefix,omitempty"`
+	EmbedTitles           *bool   `json:"embed_titles,omitempty"` // default true
+	ChunkProfileVersionID *string `json:"chunk_profile_version_id,omitempty"`
+	ChunkSize             int     `json:"chunk_size,omitempty"`
+	ChunkOverlap          int     `json:"chunk_overlap,omitempty"`
+	// ChunkStrategy is "auto" (default) or "fixed"; ignored when
+	// ChunkProfileVersionID pins a document-profile version.
+	ChunkStrategy string         `json:"chunk_strategy,omitempty"`
+	ACL           map[string]any `json:"acl,omitempty"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
 }
 
 type UpdateCollectionInput struct {
@@ -175,6 +189,7 @@ type UpdateCollectionInput struct {
 	ChunkProfileVersionID *string        `json:"chunk_profile_version_id,omitempty"`
 	ChunkSize             *int           `json:"chunk_size,omitempty"`
 	ChunkOverlap          *int           `json:"chunk_overlap,omitempty"`
+	ChunkStrategy         *string        `json:"chunk_strategy,omitempty"`
 	ACL                   map[string]any `json:"acl,omitempty"`
 	Metadata              map[string]any `json:"metadata,omitempty"`
 	IsActive              *bool          `json:"is_active,omitempty"`

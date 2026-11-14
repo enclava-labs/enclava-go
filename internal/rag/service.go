@@ -53,9 +53,9 @@ type Repository interface {
 	UpdateCollection(ctx context.Context, c Collection) error
 	DeleteCollection(ctx context.Context, tenantID, id string) error
 	// EnsureChunkProfile returns the immutable chunk_profiles row for
-	// (tenant, profileID, size, overlap), inserting version N+1 when the
-	// (size, overlap) pair changed.
-	EnsureChunkProfile(ctx context.Context, tenantID, profileID string, size, overlap int) (chunkProfileVersionID string, err error)
+	// (tenant, profileID, size, overlap, strategy), inserting version N+1
+	// when any of the parameters changed.
+	EnsureChunkProfile(ctx context.Context, tenantID, profileID string, size, overlap int, strategy string) (chunkProfileVersionID string, err error)
 	SaveParsedDocument(ctx context.Context, parserVersion string, document source.Document) error
 	// Collection items and document projection (latest version + latest
 	// index generation state). ListDocuments filters by validated status
@@ -445,6 +445,10 @@ func (s *Service) CreateCollection(ctx context.Context, p auth.Principal, input 
 	if err != nil {
 		return Collection{}, err
 	}
+	chunkStrategy, err := normalizeChunkStrategy(input.ChunkStrategy)
+	if err != nil {
+		return Collection{}, err
+	}
 	embeddingModel := strings.TrimSpace(input.EmbeddingModel)
 	if embeddingModel == "" {
 		embeddingModel = s.defaultEmbeddingModel
@@ -485,6 +489,7 @@ func (s *Service) CreateCollection(ctx context.Context, p auth.Principal, input 
 		EmbedTitles:           input.EmbedTitles == nil || *input.EmbedTitles,
 		ChunkSize:             chunkSize,
 		ChunkOverlap:          chunkOverlap,
+		ChunkStrategy:         chunkStrategy,
 		ChunkProfileVersionID: profileVersionID,
 		ACL:                   normalizeACL(input.ACL),
 		Audience:              collectionAudience(input.ACL),
@@ -599,26 +604,37 @@ func (s *Service) UpdateCollection(ctx context.Context, p auth.Principal, id str
 		// Only passages change: documents re-embed in place.
 		c.EmbedTitles = *input.EmbedTitles
 	}
-	if input.ChunkSize != nil || input.ChunkOverlap != nil {
-		chunkSize := c.ChunkSize
-		chunkOverlap := c.ChunkOverlap
+	if input.ChunkSize != nil || input.ChunkOverlap != nil || input.ChunkStrategy != nil {
+		chunkSize, chunkOverlap, chunkStrategy := c.ChunkSize, c.ChunkOverlap, c.ChunkStrategy
 		if input.ChunkSize != nil {
 			chunkSize = *input.ChunkSize
 		}
 		if input.ChunkOverlap != nil {
 			chunkOverlap = *input.ChunkOverlap
 		}
+		if input.ChunkStrategy != nil {
+			chunkStrategy = strings.TrimSpace(*input.ChunkStrategy)
+			if chunkStrategy != ChunkStrategyAuto && chunkStrategy != ChunkStrategyFixed && chunkStrategy != c.ChunkStrategy {
+				return Collection{}, fmt.Errorf("%w: chunk_strategy must be %q or %q", ErrInvalidInput, ChunkStrategyAuto, ChunkStrategyFixed)
+			}
+		}
 		chunkSize, chunkOverlap, err = normalizeChunkSettings(chunkSize, chunkOverlap)
 		if err != nil {
 			return Collection{}, err
 		}
-		// A profile change creates a new immutable version row; published
-		// evidence is never silently re-chunked under a mutated profile.
-		if _, err := s.repo.EnsureChunkProfile(ctx, p.TenantID, "rag-"+c.ID, chunkSize, chunkOverlap); err != nil {
-			return Collection{}, err
+		if chunkSize != c.ChunkSize || chunkOverlap != c.ChunkOverlap || chunkStrategy != c.ChunkStrategy {
+			// A profile change creates a new immutable version row and
+			// re-points the collection at it; published evidence is never
+			// silently re-chunked under a mutated profile.
+			versionID, err := s.repo.EnsureChunkProfile(ctx, p.TenantID, "rag-"+c.ID, chunkSize, chunkOverlap, chunkStrategy)
+			if err != nil {
+				return Collection{}, err
+			}
+			c.ChunkSize = chunkSize
+			c.ChunkOverlap = chunkOverlap
+			c.ChunkStrategy = chunkStrategy
+			c.ChunkProfileVersionID = versionID
 		}
-		c.ChunkSize = chunkSize
-		c.ChunkOverlap = chunkOverlap
 	}
 	if input.ACL != nil {
 		c.ACL = normalizeACL(input.ACL)
@@ -1739,6 +1755,19 @@ func normalizeChunkSettings(chunkSize, chunkOverlap int) (int, int, error) {
 		return 0, 0, errors.New("chunk_overlap must be smaller than chunk_size")
 	}
 	return chunkSize, chunkOverlap, nil
+}
+
+// normalizeChunkStrategy defaults create input to auto and rejects anything a
+// collection may not be set to directly.
+func normalizeChunkStrategy(strategy string) (string, error) {
+	strategy = strings.TrimSpace(strategy)
+	if strategy == "" {
+		return ChunkStrategyAuto, nil
+	}
+	if strategy != ChunkStrategyAuto && strategy != ChunkStrategyFixed {
+		return "", fmt.Errorf("%w: chunk_strategy must be %q or %q", ErrInvalidInput, ChunkStrategyAuto, ChunkStrategyFixed)
+	}
+	return strategy, nil
 }
 
 func safeCollectionName(id string) string {
