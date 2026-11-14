@@ -66,7 +66,9 @@ func probeNativeLocally() NativeCapabilities {
 	} else if nativeSandboxMode() == nativeSandboxContainer {
 		sandbox = ""
 	}
-	if _, err := runNative(context.Background(), sandbox, prlimit, "/usr/bin/true", nil, "", 1); err != nil {
+	// Probe with prlimit itself: it is always present, and unlike `true` it
+	// lives under /usr on every distribution (Alpine has only /bin/true).
+	if _, err := runNative(context.Background(), sandbox, prlimit, prlimit, []string{"--version"}, "", 4096); err != nil {
 		caps.Reason = "native processor sandbox unavailable: " + err.Error()
 		return caps
 	}
