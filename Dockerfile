@@ -15,7 +15,7 @@ FROM alpine:3.22
 RUN apk add --no-cache ca-certificates util-linux-misc poppler-utils tesseract-ocr tesseract-ocr-data-eng bubblewrap \
 	&& addgroup -g 10001 app \
 	&& adduser -D -u 10001 -G app app \
-	&& install -d -o app -g app /data
+	&& install -d -o app -g app /data /run/enclava-extract
 
 COPY --from=build /out/app /usr/local/bin/app
 COPY docker/enclava-go-cap-entrypoint /usr/local/bin/enclava-go-cap-entrypoint

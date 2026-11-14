@@ -11,12 +11,14 @@ services:
       # Privatemode only accepts requests through its local proxy.
       PRIVATEMODE_BASE_URL: http://privatemode-proxy:8080/v1
       INFERENCE_PROVIDER: ${INFERENCE_PROVIDER:-privatemode}
+      ENCLAVA_EXTRACT_WORKER_SOCKET: /run/enclava-extract/worker.sock
       QDRANT_URL: http://qdrant:6333
       DEFAULT_EMBEDDING_MODEL: ${DEFAULT_EMBEDDING_MODEL:-qwen3-embedding-4b}
     ports:
       - "${APP_PORT_HOST:-8080}:8080"
     volumes:
       - enclava-data:/data
+      - extract-worker-socket:/run/enclava-extract
     depends_on:
       postgres:
         condition: service_healthy
@@ -24,8 +26,34 @@ services:
         condition: service_started
       privatemode-proxy:
         condition: service_started
+      extract-worker:
+        condition: service_started
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/livez"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # Sandboxed native PDF/OCR sidecar: same image, no network, read-only root.
+  # The container itself is the sandbox (bubblewrap cannot nest inside Docker),
+  # so it serves the unix socket both containers share.
+  extract-worker:
+    build:
+      context: .
+    entrypoint: ["/usr/local/bin/app", "extract-worker"]
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp:size=2g,mode=1777"]
+    pids_limit: 256
+    mem_limit: 2g
+    restart: unless-stopped
+    volumes:
+      - extract-worker-socket:/run/enclava-extract
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/app", "extract-worker", "--check"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -62,3 +90,4 @@ volumes:
   enclava-data:
   postgres-data:
   qdrant-data:
+  extract-worker-socket:

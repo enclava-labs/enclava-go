@@ -36,6 +36,15 @@ Without `--password`, a generated admin password is printed exactly once
 along with the bootstrap API key. There is no HTTP signup; database
 access authorizes bootstrap.
 
+PDF and image OCR parsing runs in a companion `extract-worker` container
+(same image, `enclava extract-worker`). bubblewrap cannot create namespaces
+inside Docker, so the app talks to the worker over a unix socket on the
+shared `extract-worker-socket` volume; the worker has no network, a
+read-only root filesystem and all capabilities dropped — the container
+itself is the sandbox. Non-compose deployments either run the worker the
+same way or leave `ENCLAVA_EXTRACT_WORKER_SOCKET` unset and rely on
+bubblewrap on a host that permits it.
+
 ## Local development
 
     make build   # CGO_ENABLED=0 go build -> ./enclava
