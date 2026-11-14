@@ -29,7 +29,7 @@ import (
 	htmltoken "golang.org/x/net/html"
 )
 
-const maxParseBytes = 32 << 20
+const maxParseBytes = 256 << 20
 const maxExpandedBytes = 64 << 20
 
 var (
@@ -73,7 +73,7 @@ func (p *Parser) Parse(ctx context.Context, ref artifacts.Ref, opts ParseOptions
 		return source.Document{}, err
 	}
 	if len(data) > maxParseBytes {
-		return source.Document{}, ErrDocumentTooLarge
+		return source.Document{}, fmt.Errorf("%w: file is larger than %d MB", ErrDocumentTooLarge, maxParseBytes>>20)
 	}
 	if ref.SHA256 == "" {
 		digest := sha256.Sum256(data)

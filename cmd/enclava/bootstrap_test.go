@@ -50,6 +50,13 @@ func TestBootstrap(t *testing.T) {
 	slug := fmt.Sprintf("bootstrap-%d", time.Now().UnixNano())
 	bin, env := bootstrapBinary(t, dsn)
 
+	// A server started before bootstrap seeds the bare tenant row; bootstrap
+	// must adopt it rather than refuse.
+	if _, err := db.SQL.ExecContext(context.Background(),
+		`INSERT INTO tenants (id, slug, display_name) VALUES (gen_random_uuid(), $1, $1)`, slug); err != nil {
+		t.Fatalf("seed tenant: %v", err)
+	}
+
 	output, err := runBootstrapCmd(t, bin, env, slug)
 	if err != nil {
 		t.Fatalf("first bootstrap: %v\n%s", err, output)

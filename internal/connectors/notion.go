@@ -360,6 +360,8 @@ func validNotionPageURL(raw string) bool {
 		return false
 	}
 	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	// The API now returns app.notion.com links; older pages still use notion.so.
 	return host == "notion.so" || strings.HasSuffix(host, ".notion.so") ||
+		host == "notion.com" || strings.HasSuffix(host, ".notion.com") ||
 		host == "notion.site" || strings.HasSuffix(host, ".notion.site")
 }

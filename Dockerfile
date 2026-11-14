@@ -12,9 +12,10 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o
 
 FROM alpine:3.22
 
-RUN apk add --no-cache ca-certificates poppler-utils tesseract-ocr tesseract-ocr-data-eng bubblewrap \
+RUN apk add --no-cache ca-certificates util-linux-misc poppler-utils tesseract-ocr tesseract-ocr-data-eng bubblewrap \
 	&& addgroup -g 10001 app \
-	&& adduser -D -u 10001 -G app app
+	&& adduser -D -u 10001 -G app app \
+	&& install -d -o app -g app /data
 
 COPY --from=build /out/app /usr/local/bin/app
 COPY docker/enclava-go-cap-entrypoint /usr/local/bin/enclava-go-cap-entrypoint

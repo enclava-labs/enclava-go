@@ -88,7 +88,7 @@ func TestNativeMalformedOversizedAndCancelledInputs(t *testing.T) {
 	if _, err := imageDimensions(oversized); !errors.Is(err, ErrDocumentTooLarge) {
 		t.Fatalf("oversized image error=%v", err)
 	}
-	if _, err := parsePDFBBox([]byte("<html><word>broken")); err == nil {
+	if _, err := parsePDFBBox([]byte("<html><word>broken"), 1); err == nil {
 		t.Fatal("malformed bbox output was accepted")
 	}
 	if _, err := parseOCRTSV([]byte("not TSV")); err == nil {
@@ -192,4 +192,53 @@ func mustLookPath(t *testing.T, name string) string {
 
 func artifactsRef() artifacts.Ref {
 	return artifacts.Ref{TenantID: "tenant", ID: "artifact", Kind: artifacts.KindOriginal}
+}
+
+// A blank page yields only structural rows whose text column is empty; that
+// is an empty page, not malformed output that fails the whole document.
+func TestParseOCRTSVBlankPage(t *testing.T) {
+	raw := []byte("level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n" +
+		"1\t1\t0\t0\t0\t0\t0\t0\t828\t1198\t-1\t\n")
+	blocks, err := parseOCRTSV(raw)
+	if err != nil || len(blocks) != 0 {
+		t.Fatalf("blank page: blocks=%v err=%v", blocks, err)
+	}
+}
+
+// Words on one line become one block; a new line, column or page starts
+// another. Single words keep their original box.
+func TestPDFWordsMergeIntoLines(t *testing.T) {
+	raw := []byte(`<html><body><doc><page width="612" height="792">
+<word xMin="72.000000" yMin="100.000000" xMax="100.000000" yMax="112.000000">Maneuver</word>
+<word xMin="104.000000" yMin="100.000000" xMax="140.000000" yMax="112.000000">warfare</word>
+<word xMin="72.000000" yMin="116.000000" xMax="90.000000" yMax="128.000000">is</word>
+</page><page width="612" height="792">
+<word xMin="72.000000" yMin="116.000000" xMax="95.000000" yMax="128.000000">next</word>
+</page></doc></body></html>`)
+	blocks, err := parsePDFBBox(raw, 1)
+	if err != nil || len(blocks) != 3 {
+		t.Fatalf("blocks=%#v err=%v", blocks, err)
+	}
+	if blocks[0].text != "Maneuver warfare" || blocks[0].locator.Box != "72.000000,100.000000,140.000000,112.000000" || *blocks[0].locator.Page != 1 {
+		t.Fatalf("merged line: %#v", blocks[0])
+	}
+	if blocks[1].text != "is" || blocks[1].locator.Box != "72.000000,116.000000,90.000000,128.000000" || blocks[1].start != 17 || blocks[1].end != 19 {
+		t.Fatalf("second line: %#v", blocks[1])
+	}
+	if blocks[2].text != "next" || *blocks[2].locator.Page != 2 {
+		t.Fatalf("next page: %#v", blocks[2])
+	}
+
+	// A later batch of a large PDF numbers its pages from the batch start.
+	blocks, err = parsePDFBBox(raw, 51)
+	if err != nil || len(blocks) != 3 || *blocks[0].locator.Page != 51 || *blocks[2].locator.Page != 52 {
+		t.Fatalf("batch page numbers: %#v err=%v", blocks, err)
+	}
+
+	ocr := []byte("level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n" +
+		"5\t1\t1\t1\t1\t1\t25\t40\t100\t20\t95\tScanned\n5\t1\t1\t1\t1\t2\t130\t41\t60\t20\t95\tline\n5\t1\t1\t1\t2\t1\t25\t70\t50\t20\t95\tbelow")
+	blocks, err = parseOCRTSV(ocr)
+	if err != nil || len(blocks) != 2 || blocks[0].text != "Scanned line" || blocks[0].locator.Box != "25,40,165,21" || blocks[1].text != "below" {
+		t.Fatalf("OCR lines: %#v err=%v", blocks, err)
+	}
 }
