@@ -11,7 +11,7 @@ import (
 var ErrInvalidChunkProfile = errors.New("extract: invalid chunk profile")
 
 var boundaryStrategies = map[string]bool{
-	"fixed": true, "heading": true, "clause": true, "paragraph": true,
+	"auto": true, "fixed": true, "heading": true, "clause": true, "paragraph": true,
 	"message": true, "thread": true, "code_lines": true,
 }
 
