@@ -563,7 +563,7 @@ func TestAutoLineBlocksBreakAfterSentenceEnd(t *testing.T) {
 			lines = append(lines, fmt.Sprintf("%d. Dangling Heading", i))
 		}
 	}
-	var blocks []source.Block
+	blocks := make([]source.Block, 0, len(lines))
 	for i, line := range lines {
 		blocks = append(blocks, source.Block{ID: fmt.Sprintf("b%d", i), Ordinal: i, Kind: "paragraph", Text: line})
 	}
