@@ -29,27 +29,49 @@ const (
 	slackDeltaOverlap = 6 * time.Hour
 )
 
-// slackContentCursor follows Slack's own history and replies cursors. Each
-// message is one item and its file attachments queue behind it, so every API
-// page is consumed whole and a page never exceeds the requested item bound.
-// Channel is the channel in progress when the source syncs every channel. A
-// cursor with no Channel is a run checkpoint, not a position: Full runs list
-// everything, delta runs read each channel back to Oldest (its watermark)
-// minus slackDeltaOverlap and advance Seen to the newest ts read. FullAt is
-// the RFC3339 time the last full listing started; Started is this run's.
+// slackContentCursor follows Slack's own history cursor. Each thread is one
+// item — its replies are fetched while its root is processed — and file
+// attachments queue behind it, so every API page is consumed whole and a
+// page never exceeds the requested item bound. Channel is the channel in
+// progress when the source syncs every channel. A cursor with no Channel is
+// a run checkpoint, not a position: Full runs list everything, delta runs
+// read each channel back to Oldest (its watermark) minus slackDeltaOverlap
+// and advance Seen to the newest ts read. FullAt is the RFC3339 time the
+// last full listing started; Started is this run's.
 type slackContentCursor struct {
-	Channel     string   `json:"channel,omitempty"`
-	History     string   `json:"history,omitempty"`
-	HistoryDone bool     `json:"history_done,omitempty"`
-	Threads     []string `json:"threads,omitempty"`
-	Replies     string   `json:"replies,omitempty"`
-	Files       []string `json:"files,omitempty"`
+	Channel     string            `json:"channel,omitempty"`
+	History     string            `json:"history,omitempty"`
+	HistoryDone bool              `json:"history_done,omitempty"`
+	Files       []slackQueuedFile `json:"files,omitempty"`
 
 	Full    bool              `json:"full,omitempty"`
 	FullAt  string            `json:"full_at,omitempty"`
 	Started string            `json:"started,omitempty"`
 	Oldest  map[string]string `json:"oldest,omitempty"`
 	Seen    map[string]string `json:"seen,omitempty"`
+}
+
+// slackQueuedFile is a file attachment waiting for its own item; ParentID is
+// the thread document it was shared in. Cursors written before threads
+// became documents stored bare file IDs; they still decode, parentless.
+type slackQueuedFile struct {
+	ID       string `json:"id"`
+	ParentID string `json:"parent_id,omitempty"`
+}
+
+func (f *slackQueuedFile) UnmarshalJSON(raw []byte) error {
+	var id string
+	if err := json.Unmarshal(raw, &id); err == nil {
+		f.ID = id
+		return nil
+	}
+	type plain slackQueuedFile
+	var decoded plain
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return err
+	}
+	*f = slackQueuedFile(decoded)
+	return nil
 }
 
 func encodeSlackContentCursor(cursor slackContentCursor) Cursor {
@@ -96,7 +118,7 @@ func (c slackContentCursor) checkpoint() slackContentCursor {
 // resetChannel clears the position of a finished channel without losing the
 // run-level fields (Full, FullAt, Started, Oldest, Seen).
 func (c *slackContentCursor) resetChannel() {
-	c.Channel, c.History, c.HistoryDone, c.Threads, c.Replies, c.Files = "", "", false, nil, "", nil
+	c.Channel, c.History, c.HistoryDone, c.Files = "", "", false, nil
 }
 
 // slackHistoryOldest backs a channel watermark off by the delta overlap for
@@ -200,7 +222,8 @@ func (a *slackAdapter) Content(ctx context.Context, conn source.Connection, curs
 	page := ContentPage{Completeness: CompletenessComplete, Snapshot: state.Full && strings.EqualFold(stringFromAny(conn.Config["reconcile"]), "true")}
 	for emptyPages := 0; channel != "" && len(page.Items) < limit; {
 		if len(state.Files) > 0 {
-			file, err := a.fileItem(ctx, state.Files[0])
+			queued := state.Files[0]
+			file, err := a.fileItem(ctx, queued.ID, queued.ParentID)
 			if err != nil {
 				return ContentPage{}, err
 			}
@@ -210,8 +233,7 @@ func (a *slackAdapter) Content(ctx context.Context, conn source.Connection, curs
 			state.Files = state.Files[1:]
 			continue
 		}
-		thread := len(state.Threads) > 0
-		if !thread && state.HistoryDone {
+		if state.HistoryDone {
 			if channel, err = a.channelAfter(ctx, conn, channel); err != nil {
 				return ContentPage{}, err
 			}
@@ -219,13 +241,7 @@ func (a *slackAdapter) Content(ctx context.Context, conn source.Connection, curs
 			continue
 		}
 		budget := limit - len(page.Items)
-		var batch []slackMessage
-		var next string
-		if thread {
-			batch, next, err = a.replies(ctx, channel, state.Threads[0], state.Replies, budget)
-		} else {
-			batch, next, err = a.history(ctx, channel, state.History, slackHistoryOldest(state.Oldest[channel]), budget)
-		}
+		batch, next, err := a.history(ctx, channel, state.History, slackHistoryOldest(state.Oldest[channel]), budget)
 		if err != nil {
 			if slackChannel(conn) == "" && slackChannelGone(err) {
 				// Left or deleted since the channel list was taken: move on.
@@ -251,37 +267,29 @@ func (a *slackAdapter) Content(ctx context.Context, conn source.Connection, curs
 				state.Seen = map[string]string{}
 			}
 			state.Seen[channel] = maxSlackTimestamp(state.Seen[channel], msg.TS)
-			// Thread replies also sent to the channel are listed with their thread.
-			if !thread && msg.ThreadTS != "" && msg.ThreadTS != msg.TS {
+			// Replies also sent to the channel are listed beside their
+			// thread; conversations.replies returns them inside the thread
+			// document, so the channel copy is skipped here.
+			if msg.ThreadTS != "" && msg.ThreadTS != msg.TS {
 				continue
 			}
-			if !thread && msg.ReplyCount > 0 {
-				state.Threads = append(state.Threads, msg.TS)
-			}
-			if slackNoticeSubtypes[msg.Subtype] {
+			if slackSkippableMessage(msg) {
 				continue
 			}
-			item, err := a.messageItem(ctx, channel, msg)
+			item, files, err := a.threadItem(ctx, channel, msg)
 			if err != nil {
 				return ContentPage{}, err
 			}
 			page.Items = append(page.Items, item)
-			for _, file := range msg.Files {
-				state.Files = append(state.Files, file.ID)
-			}
+			state.Files = append(state.Files, files...)
 		}
-		switch {
-		case thread && next == "":
-			state.Threads, state.Replies = state.Threads[1:], ""
-		case thread:
-			state.Replies = next
-		case next == "":
+		if next == "" {
 			state.HistoryDone = true
-		default:
+		} else {
 			state.History = next
 		}
 	}
-	if channel != "" && state.HistoryDone && len(state.Threads) == 0 && len(state.Files) == 0 {
+	if channel != "" && state.HistoryDone && len(state.Files) == 0 {
 		// The page filled exactly as this channel finished.
 		if channel, err = a.channelAfter(ctx, conn, channel); err != nil {
 			return ContentPage{}, err
@@ -371,6 +379,10 @@ type slackMessage struct {
 	TS         string `json:"ts"`
 	ThreadTS   string `json:"thread_ts"`
 	ReplyCount int    `json:"reply_count"`
+	Edited     struct {
+		User string `json:"user"`
+		TS   string `json:"ts"`
+	} `json:"edited"`
 	BotProfile struct {
 		Name string `json:"name"`
 	} `json:"bot_profile"`
@@ -387,40 +399,169 @@ var slackNoticeSubtypes = map[string]bool{
 	"group_name": true, "group_archive": true, "group_unarchive": true, "tombstone": true,
 }
 
-func (a *slackAdapter) messageItem(ctx context.Context, channel string, msg slackMessage) (ContentItem, error) {
-	link, err := a.permalink(ctx, channel, msg)
-	if err != nil {
-		return ContentItem{}, err
-	}
-	title := a.channelTitle(ctx, channel)
-	parent, parentKind := "slack:"+channel, "channel"
-	if msg.ThreadTS != "" && msg.ThreadTS != msg.TS {
-		parent, parentKind = "slack:"+channel+":"+msg.ThreadTS, "message"
-	}
-	return ContentItem{NativeID: "slack:" + channel + ":" + msg.TS, ParentNativeID: parent, ParentKind: parentKind,
-		Kind: "message", NativeRevision: msg.TS, Title: title, Filename: "slack-" + channel + "-" + msg.TS + ".txt", MIMEType: "text/plain",
-		Text: a.messageText(ctx, title, msg), URL: link, CreatedAt: slackTimestamp(msg.TS)}, nil
+// slackSkippableMessage reports channel notices and deletion tombstones that
+// carry no conversation content.
+func slackSkippableMessage(msg slackMessage) bool {
+	return slackNoticeSubtypes[msg.Subtype] || msg.Subtype == "message_deleted"
 }
 
-// messageText renders a message as a header line (channel, author, time)
-// followed by its text with Slack markup resolved to readable names.
-func (a *slackAdapter) messageText(ctx context.Context, title string, msg slackMessage) string {
-	var header []string
-	if title != "" {
-		header = append(header, "#"+title)
+// threadItem assembles the one document a Slack thread produces: a message
+// block per message in time order, each with its own author, timestamp and
+// permalink, and the document itself linking to the root message. A message
+// with no replies is a thread of one under the same id scheme. File
+// attachments on any message queue as their own items parented to the thread.
+func (a *slackAdapter) threadItem(ctx context.Context, channel string, root slackMessage) (ContentItem, []slackQueuedFile, error) {
+	messages := []slackMessage{root}
+	if root.ReplyCount > 0 {
+		replies, err := a.threadReplies(ctx, channel, root.TS)
+		if err != nil {
+			return ContentItem{}, nil, err
+		}
+		messages = append(messages, replies...)
 	}
-	if msg.ThreadTS != "" && msg.ThreadTS != msg.TS {
-		header = append(header, "thread reply")
+	sort.SliceStable(messages, func(i, j int) bool { return slackTimeBefore(messages[i].TS, messages[j].TS) })
+	channelName := firstNonEmpty(a.channelTitle(ctx, channel), channel)
+	container := "#" + channelName
+	nativeID := "slack:" + channel + ":thread:" + root.TS
+	rootLink, err := a.permalink(ctx, channel, root)
+	if err != nil {
+		return ContentItem{}, nil, err
 	}
-	author := firstNonEmpty(msg.Username, msg.BotProfile.Name, "unknown")
+	rootAuthor := a.messageAuthor(ctx, root)
+	rootText := slackPlainText(root.Text, func(id string) string { return a.userName(ctx, id) })
+
+	blocks := make([]source.StructuredBlock, 0, len(messages))
+	authors := []string{}
+	seenAuthors := map[string]bool{}
+	var files []slackQueuedFile
+	var created, updated *time.Time
+	latestTS := root.TS
+	var latest time.Time
+	for _, msg := range messages {
+		if slackSkippableMessage(msg) {
+			continue
+		}
+		author := a.messageAuthor(ctx, msg)
+		link, err := a.permalink(ctx, channel, msg)
+		if err != nil {
+			return ContentItem{}, nil, err
+		}
+		block := source.StructuredBlock{
+			Kind:     source.StructuredMessage,
+			Text:     slackPlainText(msg.Text, func(id string) string { return a.userName(ctx, id) }),
+			Author:   author,
+			NativeID: msg.TS,
+			URL:      link,
+		}
+		if ts := slackTimestamp(msg.TS); ts != nil {
+			block.CreatedAt = ts.UTC().Format(time.RFC3339Nano)
+			if created == nil {
+				created = ts
+			}
+		}
+		// An edit is the message's latest activity: edited.ts supersedes ts
+		// for the block's updated_at and for the document revision.
+		edited := slackTimestamp(msg.Edited.TS)
+		if edited != nil {
+			block.UpdatedAt = edited.UTC().Format(time.RFC3339Nano)
+		}
+		if msg.TS != root.TS {
+			block.ParentNativeID = root.TS
+		}
+		blocks = append(blocks, block)
+		if author != "" && !seenAuthors[author] {
+			seenAuthors[author] = true
+			authors = append(authors, author)
+		}
+		activity, activityTS := msg.TS, slackTimestamp(msg.TS)
+		if edited != nil && (activityTS == nil || edited.After(*activityTS)) {
+			activity, activityTS = msg.Edited.TS, edited
+		}
+		if activityTS != nil && (latest.IsZero() || activityTS.After(latest)) {
+			latest, latestTS = *activityTS, activity
+		}
+		for _, f := range msg.Files {
+			if f.ID != "" {
+				files = append(files, slackQueuedFile{ID: f.ID, ParentID: nativeID})
+			}
+		}
+	}
+	if !latest.IsZero() {
+		updated = &latest
+	}
+	return ContentItem{
+		NativeID:       nativeID,
+		ParentNativeID: "slack:" + channel,
+		ParentKind:     "channel",
+		Kind:           "thread",
+		// The revision moves on a new reply (count) or an edit/newest
+		// message (ts), so an unchanged thread re-ingests nothing.
+		NativeRevision: latestTS + ":" + strconv.Itoa(len(messages)-1),
+		Title:          rootAuthor + " in " + container + ": " + strings.TrimSpace(slackTitleSnippet(rootText)),
+		Filename:       "slack-" + channel + "-thread-" + root.TS + ".blocks.json",
+		URL:            rootLink,
+		CreatedAt:      created,
+		UpdatedAt:      updated,
+		Blocks:         blocks,
+		Container:      container,
+		Authors:        authors,
+	}, files, nil
+}
+
+// threadReplies pages through conversations.replies until the whole thread
+// is collected, oldest first. The root repeats on every page and is dropped
+// by replies; a ts repeated across pages is dropped here.
+func (a *slackAdapter) threadReplies(ctx context.Context, channel, parent string) ([]slackMessage, error) {
+	var out []slackMessage
+	seen := map[string]bool{parent: true}
+	cursor := ""
+	for pages := 0; pages < 100; pages++ {
+		batch, next, err := a.replies(ctx, channel, parent, cursor, slackPageLimit)
+		if err != nil {
+			return nil, err
+		}
+		for _, msg := range batch {
+			if msg.TS == "" || seen[msg.TS] {
+				continue
+			}
+			seen[msg.TS] = true
+			out = append(out, msg)
+		}
+		if next == "" {
+			return out, nil
+		}
+		cursor = next
+	}
+	return nil, errors.New("slack thread replies exceeded 100 pages")
+}
+
+// messageAuthor resolves the display name credited on a message: the
+// workspace directory for members, the posted username or bot name otherwise.
+func (a *slackAdapter) messageAuthor(ctx context.Context, msg slackMessage) string {
 	if msg.User != "" {
-		author = a.userName(ctx, msg.User)
+		return a.userName(ctx, msg.User)
 	}
-	header = append(header, author)
-	if created := slackTimestamp(msg.TS); created != nil {
-		header = append(header, created.Format("2006-01-02 15:04 UTC"))
+	return firstNonEmpty(msg.Username, msg.BotProfile.Name, "unknown")
+}
+
+// slackTitleSnippet is the root text a thread title shows: its first 50
+// characters, cut on a rune boundary.
+func slackTitleSnippet(text string) string {
+	if runes := []rune(text); len(runes) > 50 {
+		return string(runes[:50])
 	}
-	return strings.Join(header, " · ") + "\n" + slackPlainText(msg.Text, func(id string) string { return a.userName(ctx, id) })
+	return text
+}
+
+func slackTimeBefore(a, b string) bool {
+	at, bt := time.Time{}, time.Time{}
+	if t := slackTimestamp(a); t != nil {
+		at = *t
+	}
+	if t := slackTimestamp(b); t != nil {
+		bt = *t
+	}
+	return at.Before(bt)
 }
 
 var slackMarkupPattern = regexp.MustCompile(`<([^<>]*)>`)
@@ -696,7 +837,7 @@ func slackTimestamp(ts string) *time.Time {
 	return &value
 }
 
-func (a *slackAdapter) fileItem(ctx context.Context, id string) (*ContentItem, error) {
+func (a *slackAdapter) fileItem(ctx context.Context, id, parentID string) (*ContentItem, error) {
 	if id == "" {
 		return nil, errors.New("slack message file omitted id")
 	}
@@ -725,7 +866,11 @@ func (a *slackAdapter) fileItem(ctx context.Context, id string) (*ContentItem, e
 		return nil, errors.New("slack files.info omitted file id")
 	}
 	name := firstNonEmpty(f.Name, f.Title, f.ID)
-	return &ContentItem{NativeID: "slack:file:" + f.ID, Kind: "file", NativeRevision: f.ID, Title: f.Name, Filename: name, MIMEType: f.Mimetype, URL: f.Permalink}, nil
+	item := &ContentItem{NativeID: "slack:file:" + f.ID, Kind: "file", NativeRevision: f.ID, Title: f.Name, Filename: name, MIMEType: f.Mimetype, URL: f.Permalink}
+	if parentID != "" {
+		item.ParentNativeID, item.ParentKind = parentID, "thread"
+	}
+	return item, nil
 }
 
 // call performs one Slack Web API GET, waiting out rate limits a bounded
