@@ -73,7 +73,7 @@ func safeExternalLink(raw string) string {
 // safeSourceLink admits the deep links v1.2 emits: http(s) targets plus
 // same-origin absolute-path URLs such as the retained-copy
 // "/api/v1/rag/evidence/<id>/copy" link. Protocol-relative ("//host") and
-// scheme-relative tricks stay rejected — defence in depth on top of the
+// scheme-relative tricks stay rejected — defense in depth on top of the
 // rag service's own scheme gate.
 func safeSourceLink(raw string) string {
 	trimmed := strings.TrimSpace(raw)

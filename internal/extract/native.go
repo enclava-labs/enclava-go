@@ -682,7 +682,7 @@ const smallCapsGapRatio = 0.25
 // the similar-height bound in joinable), and their gap is under
 // smallCapsGapRatio of the line height ("L" + "EVELS" → "LEVELS",
 // "W" + "AR" → "WAR"). A real one-letter word ("A", "I") is set at the same
-// height as its neighbour and keeps its space; lowercase tails never qualify.
+// height as its neighbor and keeps its space; lowercase tails never qualify.
 func smallCapsJoin(lineText, word string, prev, box pdfBox, lineHeight float64) bool {
 	tail := lineText[strings.LastIndexAny(lineText, " \t")+1:]
 	r, size := utf8.DecodeRuneInString(tail)

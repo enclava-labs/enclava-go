@@ -507,7 +507,7 @@ func TestGitHubSyncTombstonesLegacyCommentItems(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Objects the pre-v1.2 adapter emitted: one per comment.
-	var legacies []source.Object
+	legacies := make([]source.Object, 0, 2)
 	for i, seed := range []struct{ id, kind, nativeID string }{
 		{"legacy-comment-100", "comment", "github:" + connID + ":acme/docs:comment:100"},
 		{"legacy-review-comment-900", "review_comment", "github:" + connID + ":acme/docs:review_comment:900"},

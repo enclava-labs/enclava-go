@@ -10,8 +10,8 @@ import (
 	"enclava-go/internal/jobs"
 )
 
-// deferCause is the handler-side "dependency unavailable" error.
-var deferCause = errors.New("extract: extraction worker unavailable")
+// errDeferCause is the handler-side "dependency unavailable" error.
+var errDeferCause = errors.New("extract: extraction worker unavailable")
 
 // rowOf reads the job through the owner-scoped service projection.
 func rowOf(t *testing.T, svc *jobs.Service, p auth.Principal, id string) jobs.Job {
@@ -24,7 +24,7 @@ func rowOf(t *testing.T, svc *jobs.Service, p auth.Principal, id string) jobs.Jo
 }
 
 // TestDeferRequeuesWithoutConsumingAttempt pins the FailureDeferred
-// contract: back to queued with the delay honoured, the claim's attempt
+// contract: back to queued with the delay honored, the claim's attempt
 // increment undone, counters persisted — after N deferrals attempts is
 // still 0 and only the next real claim consumes one.
 func TestDeferRequeuesWithoutConsumingAttempt(t *testing.T) {
@@ -34,7 +34,7 @@ func TestDeferRequeuesWithoutConsumingAttempt(t *testing.T) {
 	job := enqueue(t, svc, p, req(tenant, "k-defer", "op.embed", "h", 1))
 
 	claim := leaseJob(t, svc, job.ID)
-	if err := claim.Fail(ctx, jobs.Deferred(deferCause, 500*time.Millisecond), jobs.FailureDeferred); err != nil {
+	if err := claim.Fail(ctx, jobs.Deferred(errDeferCause, 500*time.Millisecond), jobs.FailureDeferred); err != nil {
 		t.Fatalf("defer: %v", err)
 	}
 	got := rowOf(t, svc, p, job.ID)
@@ -50,8 +50,8 @@ func TestDeferRequeuesWithoutConsumingAttempt(t *testing.T) {
 	if got.FirstDeferredAt == nil {
 		t.Fatal("first_deferred_at must be recorded on the first deferral")
 	}
-	if got.Error != deferCause.Error() {
-		t.Fatalf("error = %q, want %q", got.Error, deferCause.Error())
+	if got.Error != errDeferCause.Error() {
+		t.Fatalf("error = %q, want %q", got.Error, errDeferCause.Error())
 	}
 
 	// The delay gates the next claim: still pending immediately after.
@@ -65,7 +65,7 @@ func TestDeferRequeuesWithoutConsumingAttempt(t *testing.T) {
 	if claim.Job().Deferrals != 1 {
 		t.Fatalf("claim.Job().Deferrals = %d, want 1 (counters must reach the handler)", claim.Job().Deferrals)
 	}
-	if err := claim.Fail(ctx, jobs.Deferred(deferCause, time.Second), jobs.FailureDeferred); err != nil {
+	if err := claim.Fail(ctx, jobs.Deferred(errDeferCause, time.Second), jobs.FailureDeferred); err != nil {
 		t.Fatalf("second defer: %v", err)
 	}
 	got = rowOf(t, svc, p, job.ID)
@@ -112,7 +112,7 @@ func TestDeferStaleFenceRejected(t *testing.T) {
 	if err != nil || fresh == nil || fresh.Job().ID != job.ID {
 		t.Fatalf("reclaim: %v (%v)", fresh, err)
 	}
-	if err := stale.Fail(ctx, jobs.Deferred(deferCause, time.Second), jobs.FailureDeferred); !jobs.IsStaleFence(err) {
+	if err := stale.Fail(ctx, jobs.Deferred(errDeferCause, time.Second), jobs.FailureDeferred); !jobs.IsStaleFence(err) {
 		t.Fatalf("stale defer err = %v, want ErrStaleFence", err)
 	}
 	got := rowOf(t, svc, p, job.ID)
@@ -134,7 +134,7 @@ func TestRunnerDefersThenSucceeds(t *testing.T) {
 		"op.echo": func(ctx context.Context, lease *jobs.Claim, open jobs.InputFunc) (string, error) {
 			calls++
 			if calls == 1 {
-				return "", jobs.Deferred(deferCause, 20*time.Millisecond)
+				return "", jobs.Deferred(errDeferCause, 20*time.Millisecond)
 			}
 			if err := lease.MarkDispatched(ctx); err != nil {
 				return "", err
@@ -148,7 +148,9 @@ func TestRunnerDefersThenSucceeds(t *testing.T) {
 	go func() { done <- r.Run(runCtx) }()
 	defer func() {
 		stop()
-		<-done
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("runner: %v", err)
+		}
 	}()
 	final := waitStatus(t, svc, p, job.ID, jobs.StatusSucceeded, 5*time.Second)
 	if final.Attempt != 1 || final.Deferrals != 1 {

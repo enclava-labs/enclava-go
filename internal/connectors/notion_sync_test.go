@@ -170,15 +170,6 @@ func liveNotionChildren(w http.ResponseWriter, r *http.Request) {
 	}, "has_more": false})
 }
 
-func objectByNative(t *testing.T, f *notionSyncFixture, kind, nativeID string) source.Object {
-	t.Helper()
-	obj, err := f.sourceRepo.ObjectForNativeID(context.Background(), f.tenant, f.conn.ID, kind, nativeID)
-	if err != nil {
-		t.Fatalf("object %s/%s: %v", kind, nativeID, err)
-	}
-	return obj
-}
-
 // TestNotionSyncTombstonesLegacyBlockItems is the upgrade path: an instance
 // that synced with the old per-block adapter has page+block objects; the
 // first complete sync with page documents must tombstone every old block
