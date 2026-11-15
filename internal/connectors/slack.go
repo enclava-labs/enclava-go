@@ -273,15 +273,19 @@ func (a *slackAdapter) Content(ctx context.Context, conn source.Connection, curs
 			if msg.ThreadTS != "" && msg.ThreadTS != msg.TS {
 				continue
 			}
-			if slackSkippableMessage(msg) {
+			// A notice or tombstone with no replies carries no content; one
+			// heading a thread still produces the document from its replies.
+			if slackSkippableMessage(msg) && msg.ReplyCount == 0 {
 				continue
 			}
 			item, files, err := a.threadItem(ctx, channel, msg)
 			if err != nil {
 				return ContentPage{}, err
 			}
-			page.Items = append(page.Items, item)
-			state.Files = append(state.Files, files...)
+			if item != nil {
+				page.Items = append(page.Items, *item)
+				state.Files = append(state.Files, files...)
+			}
 		}
 		if next == "" {
 			state.HistoryDone = true
@@ -408,14 +412,17 @@ func slackSkippableMessage(msg slackMessage) bool {
 // threadItem assembles the one document a Slack thread produces: a message
 // block per message in time order, each with its own author, timestamp and
 // permalink, and the document itself linking to the root message. A message
-// with no replies is a thread of one under the same id scheme. File
-// attachments on any message queue as their own items parented to the thread.
-func (a *slackAdapter) threadItem(ctx context.Context, channel string, root slackMessage) (ContentItem, []slackQueuedFile, error) {
+// with no replies is a thread of one under the same id scheme. A tombstoned
+// or notice root emits no block of its own but the document still exists
+// for its replies, titled and linked from the first surviving message. A
+// thread whose every message is skipped produces no item. File attachments
+// on any message queue as their own items parented to the thread.
+func (a *slackAdapter) threadItem(ctx context.Context, channel string, root slackMessage) (*ContentItem, []slackQueuedFile, error) {
 	messages := []slackMessage{root}
 	if root.ReplyCount > 0 {
 		replies, err := a.threadReplies(ctx, channel, root.TS)
 		if err != nil {
-			return ContentItem{}, nil, err
+			return nil, nil, err
 		}
 		messages = append(messages, replies...)
 	}
@@ -425,10 +432,8 @@ func (a *slackAdapter) threadItem(ctx context.Context, channel string, root slac
 	nativeID := "slack:" + channel + ":thread:" + root.TS
 	rootLink, err := a.permalink(ctx, channel, root)
 	if err != nil {
-		return ContentItem{}, nil, err
+		return nil, nil, err
 	}
-	rootAuthor := a.messageAuthor(ctx, root)
-	rootText := slackPlainText(root.Text, func(id string) string { return a.userName(ctx, id) })
 
 	blocks := make([]source.StructuredBlock, 0, len(messages))
 	authors := []string{}
@@ -444,7 +449,7 @@ func (a *slackAdapter) threadItem(ctx context.Context, channel string, root slac
 		author := a.messageAuthor(ctx, msg)
 		link, err := a.permalink(ctx, channel, msg)
 		if err != nil {
-			return ContentItem{}, nil, err
+			return nil, nil, err
 		}
 		block := source.StructuredBlock{
 			Kind:     source.StructuredMessage,
@@ -489,7 +494,16 @@ func (a *slackAdapter) threadItem(ctx context.Context, channel string, root slac
 	if !latest.IsZero() {
 		updated = &latest
 	}
-	return ContentItem{
+	if len(blocks) == 0 {
+		// Every message was a notice or tombstone: no document.
+		return nil, nil, nil
+	}
+	first := blocks[0]
+	link := rootLink
+	if link == "" {
+		link = first.URL
+	}
+	item := ContentItem{
 		NativeID:       nativeID,
 		ParentNativeID: "slack:" + channel,
 		ParentKind:     "channel",
@@ -497,15 +511,16 @@ func (a *slackAdapter) threadItem(ctx context.Context, channel string, root slac
 		// The revision moves on a new reply (count) or an edit/newest
 		// message (ts), so an unchanged thread re-ingests nothing.
 		NativeRevision: latestTS + ":" + strconv.Itoa(len(messages)-1),
-		Title:          rootAuthor + " in " + container + ": " + strings.TrimSpace(slackTitleSnippet(rootText)),
+		Title:          first.Author + " in " + container + ": " + strings.TrimSpace(slackTitleSnippet(first.Text)),
 		Filename:       "slack-" + channel + "-thread-" + root.TS + ".blocks.json",
-		URL:            rootLink,
+		URL:            link,
 		CreatedAt:      created,
 		UpdatedAt:      updated,
 		Blocks:         blocks,
 		Container:      container,
 		Authors:        authors,
-	}, files, nil
+	}
+	return &item, files, nil
 }
 
 // threadReplies pages through conversations.replies until the whole thread

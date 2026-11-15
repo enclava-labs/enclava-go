@@ -698,6 +698,50 @@ func TestSlackUnchangedThreadKeepsRevision(t *testing.T) {
 	}
 }
 
+// TestSlackTombstonedRootKeepsReplies: a deleted root message still heads a
+// thread document built from its replies; a tombstone with no replies emits
+// nothing.
+func TestSlackTombstonedRootKeepsReplies(t *testing.T) {
+	fake := &fakeSlack{t: t,
+		history: []map[string]any{
+			{"subtype": "tombstone", "text": "<@U1> deleted a message", "ts": "1.000000", "thread_ts": "1.000000", "reply_count": 2},
+			{"subtype": "tombstone", "text": "<@U1> deleted a message", "ts": "3.000000", "thread_ts": "3.000000"},
+		},
+		replies: map[string][]map[string]any{"1.000000": {
+			{"user": "U2", "text": "still here", "ts": "1.000001", "thread_ts": "1.000000"},
+			{"user": "U1", "text": "and this", "ts": "1.000002", "thread_ts": "1.000000"},
+		}},
+	}
+	items := slackContentItems(t, fake)
+	if len(items) != 1 {
+		t.Fatalf("items = %+v", items)
+	}
+	thread := items[0]
+	if thread.NativeID != "slack:C1:thread:1.000000" || thread.Kind != "thread" || thread.NativeRevision != "1.000002:2" {
+		t.Fatalf("thread item = %+v", thread)
+	}
+	if len(thread.Blocks) != 2 {
+		t.Fatalf("blocks = %+v", thread.Blocks)
+	}
+	for i, want := range []struct{ ts, author, text string }{
+		{"1.000001", "Bob", "still here"},
+		{"1.000002", "Alice", "and this"},
+	} {
+		block := thread.Blocks[i]
+		if block.NativeID != want.ts || block.ParentNativeID != "1.000000" || block.Author != want.author || block.Text != want.text {
+			t.Fatalf("block %d = %+v", i, block)
+		}
+	}
+	// The document links to the root permalink and is titled from the first
+	// surviving message.
+	if thread.URL != "https://workspace.slack.com/archives/C1/p1000000" || thread.Title != "Bob in #engineering: still here" {
+		t.Fatalf("thread link/title = %q %q", thread.URL, thread.Title)
+	}
+	if strings.Join(thread.Authors, ",") != "Bob,Alice" {
+		t.Fatalf("authors = %v", thread.Authors)
+	}
+}
+
 // seedLegacySlackMessages runs one sync whose adapter still emits the
 // pre-upgrade per-message items, leaving their objects and versions behind.
 func seedLegacySlackMessages(t *testing.T) *connectorFixture {
