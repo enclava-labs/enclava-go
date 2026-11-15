@@ -35,7 +35,12 @@ func Chunk(document source.Document, profile source.ChunkProfile) ([]source.Chun
 		}
 	}
 	if profile.BoundaryStrategy == "auto" {
-		return chunkAuto(document, blocks, profile)
+		chunks, err := chunkAuto(document, blocks, profile)
+		if err != nil {
+			return nil, err
+		}
+		chunkLinks(chunks, blocks)
+		return chunks, nil
 	}
 	var chunks []source.Chunk
 	totalChunks := 0
@@ -159,6 +164,7 @@ func Chunk(document source.Document, profile source.ChunkProfile) ([]source.Chun
 		last := &chunks[len(chunks)-1]
 		last.Warnings = append(last.Warnings, fmt.Sprintf("truncated: document produced %d chunks; indexed the first %d", totalChunks, MaxChunksPerDocument))
 	}
+	chunkLinks(chunks, blocks)
 	return chunks, nil
 }
 
@@ -279,12 +285,7 @@ func boundaryGroups(blocks []source.Block, strategy string, size int) [][]source
 				groups = append(groups, []source.Block{block})
 				continue
 			}
-			if block.ParentID == "" {
-				emit()
-				groups = append(groups, []source.Block{block})
-				continue
-			}
-			if len(current) > 0 && current[0].ParentID != block.ParentID {
+			if len(current) > 0 && threadKey(current[0]) != threadKey(block) {
 				emit()
 			}
 			current = append(current, block)
@@ -446,6 +447,54 @@ func parentBlock(block source.Block, blocks map[string]source.Block, include boo
 		return source.Block{}
 	}
 	return blocks[block.ParentID]
+}
+
+// chunkLinks fills each chunk's Links: one entry per covered block whose
+// text starts inside the chunk (span ByteStart == 0), Offset at that text
+// start as a code-point offset into the chunk text. Split and overlap
+// continuations (ByteStart > 0) emit nothing — their block's anchor entry
+// lives in the chunk that contains its text start. Consecutive entries with
+// the same URL collapse to the first; blocks with no URL, author, timestamp
+// or native id (parsed uploads) emit nothing. Offsets are rebuilt by walking
+// the spans the way the chunk text was assembled, so they stay exact for
+// every strategy (auto joins heading spans with " > ", all other builders
+// use "\n").
+func chunkLinks(chunks []source.Chunk, blocks map[string]source.Block) {
+	for ci := range chunks {
+		c := &chunks[ci]
+		bytePos, runePos := 0, 0
+		for si := range c.Spans {
+			span := c.Spans[si]
+			block, ok := blocks[span.BlockID]
+			if !ok || !strings.HasPrefix(c.Text[bytePos:], block.Text[span.ByteStart:span.ByteEnd]) {
+				c.Links = nil // span/text disagreement: emit no links rather than wrong ones
+				break
+			}
+			piece := block.Text[span.ByteStart:span.ByteEnd]
+			if span.ByteStart == 0 {
+				loc := block.Locator
+				if loc.URL != "" || loc.Author != "" || loc.Timestamp != "" || loc.NativeID != "" {
+					last := len(c.Links) - 1
+					if last < 0 || c.Links[last].URL == "" || c.Links[last].URL != loc.URL {
+						c.Links = append(c.Links, source.ChunkLink{Offset: runePos, URL: loc.URL,
+							Author: loc.Author, Timestamp: loc.Timestamp, NativeID: loc.NativeID})
+					}
+				}
+			}
+			bytePos += len(piece)
+			runePos += utf8.RuneCountInString(piece)
+			if si+1 < len(c.Spans) {
+				switch {
+				case strings.HasPrefix(c.Text[bytePos:], " > "):
+					bytePos += 3
+					runePos += 3
+				case strings.HasPrefix(c.Text[bytePos:], "\n"):
+					bytePos++
+					runePos++
+				}
+			}
+		}
+	}
 }
 
 func chunkID(ref source.ObjectRef, profileID string, ordinal int, spans []source.Span) string {

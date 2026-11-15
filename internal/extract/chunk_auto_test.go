@@ -80,6 +80,7 @@ func checkAutoInvariants(t *testing.T, doc source.Document, profile source.Chunk
 		if chunk.Text != autoJoin(chunk.Spans, blocks) {
 			t.Fatalf("chunk %d text is not the join of its spans: %q", i, chunk.Text)
 		}
+		checkChunkLinks(t, chunk, blocks)
 		for _, span := range chunk.Spans {
 			if _, ok := blocks[span.BlockID]; !ok {
 				t.Fatalf("fabricated block reference %q", span.BlockID)
@@ -138,6 +139,65 @@ func checkAutoInvariants(t *testing.T, doc source.Document, profile source.Chunk
 	again, _ := Chunk(doc, profile)
 	if !reflect.DeepEqual(chunks, again) {
 		t.Fatal("chunking is not deterministic")
+	}
+}
+
+// checkChunkLinks verifies the Links property for one chunk: entries are
+// ordered by offset, consecutive entries never repeat a URL, every offset is
+// a code-point position inside the chunk text at which the linked block's
+// (rendered) text begins, and entry fields match that block's locator.
+// Chunks of documents whose blocks carry no link metadata have no entries.
+func checkChunkLinks(t *testing.T, chunk source.Chunk, blocks map[string]source.Block) {
+	t.Helper()
+	linkable := false
+	for id := range blocks {
+		if b := blocks[id]; b.Locator.URL != "" || b.Locator.Author != "" || b.Locator.Timestamp != "" || b.Locator.NativeID != "" {
+			linkable = true
+			break
+		}
+	}
+	if !linkable {
+		if len(chunk.Links) != 0 {
+			t.Fatalf("chunk %d has links although no block is linkable: %v", chunk.Ordinal, chunk.Links)
+		}
+		return
+	}
+	lastOffset, lastURL := -1, ""
+	for i, link := range chunk.Links {
+		if i > 0 && (link.Offset <= lastOffset || (link.URL != "" && link.URL == lastURL)) {
+			t.Fatalf("chunk %d links not strictly ordered or not collapsed: %v", chunk.Ordinal, chunk.Links)
+		}
+		lastOffset, lastURL = link.Offset, link.URL
+		if link.Offset < 0 || link.Offset >= utf8.RuneCountInString(chunk.Text) {
+			t.Fatalf("chunk %d link offset %d outside text of %d runes: %v", chunk.Ordinal, link.Offset, utf8.RuneCountInString(chunk.Text), chunk.Links)
+		}
+		boff := 0
+		for range link.Offset {
+			_, size := utf8.DecodeRuneInString(chunk.Text[boff:])
+			boff += size
+		}
+		rest := chunk.Text[boff:]
+		// The text at the offset either begins the block's text (whole-block
+		// span, or context heading) or is the block text's first piece (a
+		// split whose first part opens this chunk).
+		matchID, matchLen := "", 0
+		for id := range blocks {
+			b := blocks[id]
+			if len(b.Text) == 0 || len(b.Text) <= matchLen {
+				continue
+			}
+			if !strings.HasPrefix(rest, b.Text) && !strings.HasPrefix(b.Text, rest) {
+				continue
+			}
+			matchID, matchLen = id, len(b.Text)
+		}
+		if matchID == "" {
+			t.Fatalf("chunk %d: text at link offset %d does not begin any block: %q", chunk.Ordinal, link.Offset, rest)
+		}
+		match := blocks[matchID]
+		if match.Locator.URL != link.URL || match.Locator.Author != link.Author || match.Locator.Timestamp != link.Timestamp || match.Locator.NativeID != link.NativeID {
+			t.Fatalf("chunk %d link %+v does not match block %s locator %#v", chunk.Ordinal, link, match.ID, match.Locator)
+		}
 	}
 }
 
@@ -218,10 +278,56 @@ func autoDocs() map[string][]source.Block {
 		}
 		return blocks
 	}
+	linked := func() []source.Block {
+		// a structured connector page: heading + paragraphs, each with a
+		// deep link (same URL collapses to one entry per chunk)
+		url := "https://docs.example.test/release/12"
+		return []source.Block{
+			{ID: "lh", Kind: "heading", Text: "Release notes", Locator: source.Locator{URL: url, NativeID: "rel-12"}},
+			{ID: "lp1", Kind: "paragraph", ParentID: "lh", Text: paragraph(0, 6), Locator: source.Locator{URL: url}},
+			{ID: "lp2", Kind: "paragraph", ParentID: "lh", Text: paragraph(6, 6), Locator: source.Locator{URL: url}},
+			{ID: "lp3", Kind: "paragraph", ParentID: "lh", Text: paragraph(12, 4), Locator: source.Locator{URL: url}},
+		}
+	}
+	threadDoc := func() []source.Block {
+		// a Slack-like thread document: rendered messages with per-message
+		// permalinks; the root and its replies share a packing key
+		reply := func(i, from int) source.Block {
+			return source.Block{ID: fmt.Sprintf("r%d", i), Kind: "message", ParentID: "rt",
+				Text: paragraph(from, 3),
+				Locator: source.Locator{
+					URL: fmt.Sprintf("https://hooks.example.test/archives/C1/p%d", i), Author: []string{"bob", "carol", "dave"}[i-1],
+					Timestamp: fmt.Sprintf("2026-05-01T09:1%d:00Z", i), NativeID: fmt.Sprintf("m-%d", i),
+				}}
+		}
+		return []source.Block{
+			{ID: "rt", Kind: "message", Text: "alice (2026-05-01 09:15): deploying the new worker now",
+				Locator: source.Locator{URL: "https://hooks.example.test/archives/C1/p0", Author: "alice",
+					Timestamp: "2026-05-01T09:15:00Z", NativeID: "m-0"}},
+			reply(1, 30), reply(2, 33), reply(3, 36),
+		}
+	}
+	issueDoc := func() []source.Block {
+		// GitHub-issue shape: title, body sections, trailing comments —
+		// exercises the "mixed" auto mode with title-path message chunks
+		issue := "https://github.com/acme/repo/issues/12"
+		comment := func(i int, text string) source.Block {
+			return source.Block{ID: fmt.Sprintf("c%d", i), Kind: "message", ParentID: "ih", Text: text,
+				Locator: source.Locator{URL: fmt.Sprintf("%s#c%d", issue, i), Author: []string{"bob", "carol"}[i-1],
+					Timestamp: fmt.Sprintf("2026-05-0%dT10:00:00Z", i), NativeID: fmt.Sprintf("c-%d", i)}}
+		}
+		return []source.Block{
+			{ID: "ih", Kind: "heading", Text: "Worker crashes on large PDFs", Locator: source.Locator{URL: issue, NativeID: "issue-12"}},
+			{ID: "ib1", Kind: "paragraph", ParentID: "ih", Text: paragraph(0, 8), Locator: source.Locator{URL: issue}},
+			{ID: "ib2", Kind: "paragraph", ParentID: "ih", Text: paragraph(8, 8), Locator: source.Locator{URL: issue}},
+			comment(1, "bob (2026-05-01 10:00): same on our instance here"),
+			comment(2, "carol (2026-05-02 10:00): a fix is on the way"),
+		}
+	}
 	return map[string][]source.Block{
 		"prose": prose(), "headed": headed(), "messages": messages(), "code": code(),
 		"table-middle": tableMiddle(), "multibyte": multibyte(), "monolith": monolith(),
-		"all-headings": allHeadings(),
+		"all-headings": allHeadings(), "linked": linked(), "thread-doc": threadDoc(), "issue-doc": issueDoc(),
 	}
 }
 
@@ -359,14 +465,30 @@ func TestAutoMessagesNeverMergeAcrossThreads(t *testing.T) {
 				if block.Kind != "message" {
 					continue
 				}
-				if thread != "" && thread != block.ParentID {
-					t.Fatalf("chunk mixes threads %q and %q: %q", thread, block.ParentID, chunk.Text)
+				key := threadKey(block)
+				if thread != "" && thread != key {
+					t.Fatalf("chunk mixes threads %q and %q: %q", thread, key, chunk.Text)
 				}
-				thread = block.ParentID
+				thread = key
 			}
 		}
 		if len(chunks) < 2 {
 			t.Fatalf("threads were merged: %q", chunksTexts(chunks))
+		}
+		// v1.2: a thread root packs into the same run as its replies
+		for _, chunk := range chunks {
+			ids := map[string]bool{}
+			for _, span := range chunk.Spans {
+				ids[span.BlockID] = true
+			}
+			if ids["t1"] {
+				if !ids["a0"] {
+					t.Fatalf("thread root lost its replies: %q", chunk.Text)
+				}
+				if ids["t2"] || ids["b0"] {
+					t.Fatalf("thread root chunk crossed threads: %q", chunk.Text)
+				}
+			}
 		}
 	}
 }
