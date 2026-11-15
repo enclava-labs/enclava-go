@@ -18,7 +18,7 @@ import (
 const maxBuiltinOutputBytes = 64 << 10
 
 var builtinSchemas = map[string]json.RawMessage{
-	"knowledge.search": json.RawMessage(`{"type":"object","properties":{"collection_id":{"type":"string","minLength":1},"query":{"type":"string","minLength":1,"maxLength":8192}},"required":["collection_id","query"],"additionalProperties":false}`),
+	"knowledge.search": json.RawMessage(`{"type":"object","properties":{"collection_id":{"type":"string","minLength":1},"query":{"type":"string","minLength":1,"maxLength":8192},"container":{"type":"string","description":"Exact container match: #channel, owner/repo, or parent page path"},"author":{"type":"string","description":"Exact author match; covers the document author and every message/link author of a hit"},"updated_after":{"type":"string","description":"RFC 3339; only documents whose source updated_at is at or after this time"},"updated_before":{"type":"string","description":"RFC 3339; only documents whose source updated_at is before this time"}},"required":["collection_id","query"],"additionalProperties":false}`),
 	"evidence.read":    json.RawMessage(`{"type":"object","properties":{"evidence_id":{"type":"string","minLength":1}},"required":["evidence_id"],"additionalProperties":false}`),
 	"extract.submit":   json.RawMessage(`{"type":"object","properties":{"template_id":{"type":"string","minLength":1},"file_name":{"type":"string","minLength":1},"mime_type":{"type":"string","minLength":1},"content_base64":{"type":"string","minLength":1,"maxLength":2097152},"context":{"type":"object"}},"required":["template_id","file_name","mime_type","content_base64"],"additionalProperties":false}`),
 	"extract.status":   json.RawMessage(`{"type":"object","properties":{"job_id":{"type":"string","minLength":1}},"required":["job_id"],"additionalProperties":false}`),
@@ -96,6 +96,11 @@ func (b Builtins) Invoke(ctx context.Context, p auth.Principal, bot Instance, to
 		var in struct {
 			CollectionID string `json:"collection_id"`
 			Query        string `json:"query"`
+			// v1.2 metadata filters; validated by the rag service.
+			Container     string `json:"container"`
+			Author        string `json:"author"`
+			UpdatedAfter  string `json:"updated_after"`
+			UpdatedBefore string `json:"updated_before"`
 		}
 		if err := json.Unmarshal(args, &in); err != nil {
 			return BuiltinResult{}, ErrInvalidInput
@@ -135,7 +140,7 @@ func (b Builtins) Invoke(ctx context.Context, p auth.Principal, bot Instance, to
 				return BuiltinResult{}, source.ErrDenied
 			}
 		}
-		results, err := b.RAG.Search(ctx, p, rag.SearchInput{CollectionID: in.CollectionID, Query: in.Query, Limit: 5})
+		results, err := b.RAG.Search(ctx, p, rag.SearchInput{CollectionID: in.CollectionID, Query: in.Query, Limit: 5, Container: in.Container, Author: in.Author, UpdatedAfter: in.UpdatedAfter, UpdatedBefore: in.UpdatedBefore})
 		if err != nil {
 			return BuiltinResult{}, err
 		}

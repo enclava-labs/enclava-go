@@ -90,6 +90,10 @@ func (p *Parser) Parse(ctx context.Context, ref artifacts.Ref, opts ParseOptions
 	}
 	var blocks []parseBlock
 	switch format {
+	case "blocks":
+		var blockWarnings []string
+		blocks, blockWarnings, err = blocksBlocks(data)
+		warnings = append(warnings, blockWarnings...)
 	case "text":
 		blocks = plainBlocks(string(data))
 	case "markdown":
@@ -131,6 +135,7 @@ type parseBlock struct {
 	kind, text, language string
 	level, start, end    int
 	locator              source.Locator
+	parent               string // structured documents: parent_native_id, resolved to a block id by makeDocument
 }
 
 // Supported reports whether Parse accepts a document with this name and
@@ -141,6 +146,10 @@ func formatFor(name, contentType string) string {
 	ext := strings.ToLower(filepath.Ext(name))
 	media, _, _ := mime.ParseMediaType(strings.ToLower(strings.TrimSpace(contentType)))
 	switch {
+	case media == source.BlocksMIMEType:
+		// structured connector documents; checked before the "+json"
+		// suffix rule below
+		return "blocks"
 	case ext == ".md" || ext == ".markdown" || strings.Contains(media, "markdown"):
 		return "markdown"
 	case ext == ".html" || ext == ".htm" || media == "text/html":
@@ -199,10 +208,21 @@ func decodeText(data []byte) ([]byte, string) {
 
 func makeDocument(ref source.ObjectRef, artifact artifacts.Ref, in []parseBlock) source.Document {
 	out := source.Document{Ref: ref, Blocks: make([]source.Block, 0, len(in))}
-	var headings [6]string
+	// Pass 1 assigns block ids and indexes NativeID → id so structured
+	// documents can point at their thread root or section heading.
+	ids := make([]string, len(in))
+	byNative := make(map[string]string)
 	for i, b := range in {
 		h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d:%d:%s:%s", artifact.SHA256, i, b.start, b.end, b.kind, b.text)))
-		id := "block_" + hex.EncodeToString(h[:12])
+		ids[i] = "block_" + hex.EncodeToString(h[:12])
+		if b.locator.NativeID != "" {
+			if _, ok := byNative[b.locator.NativeID]; !ok {
+				byNative[b.locator.NativeID] = ids[i]
+			}
+		}
+	}
+	var headings [6]string
+	for i, b := range in {
 		parent := ""
 		if b.kind == "heading" && b.level > 0 && b.level <= len(headings) {
 			if b.level > 1 {
@@ -211,7 +231,7 @@ func makeDocument(ref source.ObjectRef, artifact artifacts.Ref, in []parseBlock)
 			for j := b.level - 1; j < len(headings); j++ {
 				headings[j] = ""
 			}
-			headings[b.level-1] = id
+			headings[b.level-1] = ids[i]
 		} else {
 			for j := len(headings) - 1; j >= 0; j-- {
 				if headings[j] != "" {
@@ -220,10 +240,15 @@ func makeDocument(ref source.ObjectRef, artifact artifacts.Ref, in []parseBlock)
 				}
 			}
 		}
+		if b.parent != "" {
+			// a structured parent (thread root, issue heading) wins over the
+			// heading stack; blocksBlocks only keeps resolvable references
+			parent = byNative[b.parent]
+		}
 		loc := b.locator
 		loc.HeadingLevel = b.level
 		loc.Language = b.language
-		out.Blocks = append(out.Blocks, source.Block{ID: id, Ordinal: i, Kind: b.kind, ParentID: parent, Text: b.text, ByteStart: b.start, ByteEnd: b.end, Locator: loc})
+		out.Blocks = append(out.Blocks, source.Block{ID: ids[i], Ordinal: i, Kind: b.kind, ParentID: parent, Text: b.text, ByteStart: b.start, ByteEnd: b.end, Locator: loc})
 	}
 	return out
 }

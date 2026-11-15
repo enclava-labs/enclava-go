@@ -8,8 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"enclava-go/internal/auth"
@@ -33,6 +37,113 @@ var ErrUtilityModelNotConfigured = errors.New("utility model is not configured")
 // was denied for the caller (no grant/route). The HTTP layer maps it to 403
 // `embedding_not_granted`; lexical search never produces it.
 var ErrSearchBindingDenied = errors.New("search embedding binding denied")
+
+// ErrInvalidSearchFilter reports a malformed metadata filter (container,
+// author or date bound). The HTTP layer maps it to 400
+// `invalid_search_filter`.
+var ErrInvalidSearchFilter = errors.New("invalid search filter")
+
+// searchMetadataFilters is the parsed form of SearchInput's v1.2 metadata
+// filters; nil means none are set.
+type searchMetadataFilters struct {
+	container     string
+	author        string
+	updatedAfter  *int64
+	updatedBefore *int64
+}
+
+// parseMetadataFilters normalizes the metadata filter fields. Malformed
+// input is ErrInvalidSearchFilter so callers can answer 400 before any
+// store work.
+func parseMetadataFilters(container, author, updatedAfter, updatedBefore string) (*searchMetadataFilters, error) {
+	f := &searchMetadataFilters{
+		container: strings.TrimSpace(container),
+		author:    strings.TrimSpace(author),
+	}
+	if f.container == "" && f.author == "" &&
+		strings.TrimSpace(updatedAfter) == "" && strings.TrimSpace(updatedBefore) == "" {
+		return nil, nil
+	}
+	var err error
+	if f.updatedAfter, err = parseTimeBound(updatedAfter, "updated_after"); err != nil {
+		return nil, err
+	}
+	if f.updatedBefore, err = parseTimeBound(updatedBefore, "updated_before"); err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// parseTimeBound parses an RFC 3339 bound into unix seconds — the unit
+// source_updated_ts carries in the index payload. Empty means unset.
+func parseTimeBound(raw, field string) (*int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	ts, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s must be an RFC 3339 timestamp", ErrInvalidSearchFilter, field)
+	}
+	unix := ts.Unix()
+	return &unix, nil
+}
+
+// qdrantClause builds the payload filter clauses; nil when none are set.
+// authors is a keyword array, so a match hits any entry — the document
+// authors plus every link author of the chunk.
+func (f *searchMetadataFilters) qdrantClause() map[string]any {
+	if f == nil {
+		return nil
+	}
+	var must []any
+	if f.container != "" {
+		must = append(must, map[string]any{"key": "container", "match": map[string]any{"value": f.container}})
+	}
+	if f.author != "" {
+		must = append(must, map[string]any{"key": "authors", "match": map[string]any{"value": f.author}})
+	}
+	if f.updatedAfter != nil || f.updatedBefore != nil {
+		rng := map[string]any{}
+		if f.updatedAfter != nil {
+			rng["gte"] = *f.updatedAfter
+		}
+		if f.updatedBefore != nil {
+			rng["lt"] = *f.updatedBefore
+		}
+		must = append(must, map[string]any{"key": "source_updated_ts", "range": rng})
+	}
+	if len(must) == 0 {
+		return nil
+	}
+	return map[string]any{"must": must}
+}
+
+// validateMetadataFilters reports malformed metadata filters before any
+// store or model work, so the API can answer 400 with a clear code.
+func validateMetadataFilters(input SearchInput) error {
+	_, err := parseMetadataFilters(input.Container, input.Author, input.UpdatedAfter, input.UpdatedBefore)
+	return err
+}
+
+// searchNarrower combines the raw legacy filter with the parsed metadata
+// filters into the one narrower clause AccessFilter appends to the access
+// must list — metadata filters AND with authorization, never replace it.
+func searchNarrower(input SearchInput) (map[string]any, error) {
+	meta, err := parseMetadataFilters(input.Container, input.Author, input.UpdatedAfter, input.UpdatedBefore)
+	if err != nil {
+		return nil, err
+	}
+	metaClause := meta.qdrantClause()
+	switch {
+	case metaClause == nil:
+		return input.Filter, nil
+	case len(input.Filter) == 0:
+		return metaClause, nil
+	default:
+		return map[string]any{"must": []any{input.Filter, metaClause}}, nil
+	}
+}
 
 func (s *Service) SetUtilityModel(model string) {
 	s.utilityModel = strings.TrimSpace(model)
@@ -109,6 +220,9 @@ func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInpu
 	if err := validateSearchQueryMode(input.Query, input.Mode); err != nil {
 		return nil, err
 	}
+	if err := validateMetadataFilters(input); err != nil {
+		return nil, err
+	}
 	if err := s.searchModels(ctx, p.TenantID, &input); err != nil {
 		return nil, err
 	}
@@ -127,6 +241,9 @@ func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInpu
 	// Evidence persists only for results that survive selection, so
 	// discarded hits never strand unreachable evidence rows.
 	if err := s.persistResultEvidence(ctx, p, results); err != nil {
+		return nil, err
+	}
+	if err := s.applyUploadLinks(ctx, p.TenantID, results); err != nil {
 		return nil, err
 	}
 	return results, nil
@@ -187,7 +304,11 @@ func (s *Service) searchCollection(ctx context.Context, p auth.Principal, collec
 	if limit > 50 {
 		limit = 50
 	}
-	filter := AccessFilter(p.TenantID, tokens, input.Filter)
+	narrower, err := searchNarrower(input)
+	if err != nil {
+		return nil, err
+	}
+	filter := AccessFilter(p.TenantID, tokens, narrower)
 	// Canonical source kinds resolve once per connection per collection.
 	connectionKinds := make(map[string]string)
 	chunkCache := make(map[string]map[string]DocumentChunk)
@@ -301,6 +422,7 @@ func (s *Service) queryIndex(ctx context.Context, p auth.Principal, collection C
 				return nil, err
 			}
 			if keep {
+				applyHitLinks(result, query)
 				results = append(results, *result)
 			}
 		}
@@ -385,7 +507,195 @@ func (s *Service) authorizeHit(ctx context.Context, p auth.Principal, collection
 		return nil, false, nil
 	}
 	result := SearchResult{DocumentID: objectID, CollectionID: collection.ID, ObjectVersionID: versionID, ChunkID: chunkID, Generation: generation, Spans: chunk.SpanRefs, ObservedSeq: version.ObservedSeq, ChunkStart: chunk.ChunkIndex, ChunkEnd: chunk.ChunkIndex, Score: point.Score, Content: chunk.Content, SourceURI: stringFromPayload(payload, "source_uri"), FileName: stringFromPayload(payload, "file_name"), HeaderPath: chunk.HeaderPath, Metadata: chunk.Metadata, CollectionName: collection.Name, SourceKind: s.sourceKindFor(ctx, p.TenantID, object, version, connectionKinds)}
+	// v1.2 source links: the payload is authoritative (no join at query
+	// time); the chunk row covers points written before the payload carried
+	// links. source_url falls back to source_uri for the same reason. All
+	// serialized links pass the scheme allow-list.
+	result.SourceURL = safeNativeLink(stringFromPayload(payload, "source_url"))
+	if result.SourceURL == "" {
+		result.SourceURL = safeNativeLink(result.SourceURI)
+	}
+	result.Author = stringFromPayload(payload, "author")
+	result.SourceCreatedAt = stringFromPayload(payload, "source_created_at")
+	result.SourceUpdatedAt = stringFromPayload(payload, "source_updated_at")
+	result.Container = stringFromPayload(payload, "container")
+	result.Links = sanitizeLinks(linksFromPayload(payload))
+	if result.Links == nil {
+		result.Links = sanitizeLinks(chunk.Links)
+	}
 	return &result, true, nil
+}
+
+// sanitizeLinks clears link URLs that are not on the scheme allow-list — a
+// connector cannot inject javascript: or similar into search results. The
+// entries survive with their offset/author metadata; a cleared URL just
+// means the entry never becomes a Link.
+func sanitizeLinks(links []source.ChunkLink) []source.ChunkLink {
+	if links == nil {
+		return nil // an absent list must stay absent so the chunk-row fallback applies
+	}
+	out := make([]source.ChunkLink, len(links))
+	copy(out, links)
+	for i := range out {
+		if out[i].URL != "" && safeNativeLink(out[i].URL) == "" {
+			out[i].URL = ""
+		}
+	}
+	return out
+}
+
+// linksFromPayload decodes the chunk links mirrored into the point payload
+// at embed time; absent or malformed payload links return nil so callers
+// fall back to the chunk row.
+func linksFromPayload(payload map[string]any) []source.ChunkLink {
+	raw, ok := payload["links"]
+	if !ok {
+		return nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var links []source.ChunkLink
+	if json.Unmarshal(data, &links) != nil {
+		return nil
+	}
+	return links
+}
+
+// applyHitLinks fills a hit's Link from its chunk links: the best entry by
+// lexical overlap with the query, whose author and timestamp then describe
+// the hit; without links everything stays document-level (payload values).
+func applyHitLinks(result *SearchResult, query string) {
+	if len(result.Links) == 0 {
+		return
+	}
+	chosen := pickDeepLink(result.Links, result.Content, query)
+	result.Link = chosen.URL
+	if result.Link == "" {
+		result.Link = result.SourceURL
+	}
+	if chosen.Author != "" {
+		result.Author = chosen.Author
+	}
+	if chosen.Timestamp != "" {
+		result.SourceCreatedAt, result.SourceUpdatedAt = chosen.Timestamp, chosen.Timestamp
+	}
+}
+
+// pickDeepLink chooses the link entry whose chunk text segment overlaps the
+// query words most (case-insensitive overlap over the code-point range from
+// the entry's offset to the next entry's offset); ties and hits without any
+// overlap keep the first entry.
+func pickDeepLink(links []source.ChunkLink, content, query string) source.ChunkLink {
+	best := links[0]
+	terms := words(query)
+	if len(terms) == 0 || len(links) == 1 {
+		return best
+	}
+	runes := []rune(content)
+	bestScore := 0
+	for i, link := range links {
+		if link.Offset < 0 || link.Offset >= len(runes) {
+			continue
+		}
+		end := len(runes)
+		if i+1 < len(links) {
+			if next := links[i+1].Offset; next > link.Offset && next < len(runes) {
+				end = next
+			}
+		}
+		segment := words(string(runes[link.Offset:end]))
+		score := 0
+		for term := range terms {
+			if _, ok := segment[term]; ok {
+				score++
+			}
+		}
+		if score > bestScore {
+			bestScore, best = score, link
+		}
+	}
+	return best
+}
+
+// words lowercases text and splits it into alphanumeric runs, so the overlap
+// metric ignores case and punctuation.
+func words(text string) map[string]struct{} {
+	out := make(map[string]struct{})
+	var current []rune
+	flush := func() {
+		if len(current) > 0 {
+			out[string(current)] = struct{}{}
+			current = current[:0]
+		}
+	}
+	for _, r := range strings.ToLower(text) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			current = append(current, r)
+			continue
+		}
+		flush()
+	}
+	flush()
+	return out
+}
+
+// applyUploadLinks gives linkless hits their link: the retained copy opened
+// at the first covered block's page when the block has one, else the
+// document URL. Called after evidence is minted so the evidence id exists.
+func (s *Service) applyUploadLinks(ctx context.Context, tenantID string, results []SearchResult) error {
+	var blockIDs []string
+	targets := make([]int, 0, len(results))
+	seen := make(map[string]struct{})
+	for i, result := range results {
+		if len(result.Links) > 0 || result.EvidenceID == "" {
+			continue // linked hits already carry their deep link
+		}
+		if len(result.Spans) == 0 || result.Spans[0].BlockID == "" {
+			if results[i].Link == "" {
+				results[i].Link = result.SourceURL
+			}
+			continue
+		}
+		if len(result.Locations) > 0 {
+			results[i].Link = retainedCopyLink(result.EvidenceID, result.Locations[0].Page, result.SourceURL)
+			continue
+		}
+		id := result.Spans[0].BlockID
+		if _, dup := seen[id]; !dup {
+			seen[id] = struct{}{}
+			blockIDs = append(blockIDs, id)
+		}
+		targets = append(targets, i)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	locators, err := s.repo.ListBlockLocators(ctx, tenantID, blockIDs)
+	if err != nil {
+		return err
+	}
+	for _, i := range targets {
+		locator := locators[results[i].Spans[0].BlockID]
+		results[i].Link = retainedCopyLink(results[i].EvidenceID, locator.Page, results[i].SourceURL)
+	}
+	return nil
+}
+
+// retainedCopyLink is the stored original opened at a page, or the document
+// URL when the first covered block has no page.
+func retainedCopyLink(evidenceID string, page *int, sourceURL string) string {
+	copyURL := "/api/v1/rag/evidence/" + url.PathEscape(evidenceID) + "/copy"
+	if page != nil {
+		return copyURL + "#page=" + strconv.Itoa(*page)
+	}
+	// No page: an external document URL beats the bare stored copy; an
+	// upload without one still opens its stored original.
+	if sourceURL != "" {
+		return sourceURL
+	}
+	return copyURL
 }
 
 func (s *Service) reauthorizeResults(ctx context.Context, p auth.Principal, results []SearchResult) ([]SearchResult, error) {
@@ -453,10 +763,23 @@ type SearchReadableOptions struct {
 	// Cursor resumes a previous search after its last returned result;
 	// opaque and validated before use — a malformed value is ErrInvalidInput.
 	Cursor string
+	// v1.2 metadata filters applied to every searched collection, ANDed
+	// with the access prefilter; validated before any store work.
+	Container     string
+	Author        string
+	UpdatedAfter  string
+	UpdatedBefore string
 }
 
 func (s *Service) SearchReadableWithOptions(ctx context.Context, p auth.Principal, query string, mode QueryMode, collectionIDs []string, limit int, options SearchReadableOptions) (SearchReadableResult, error) {
-	input := SearchInput{Rewrite: options.Rewrite, SelectSections: options.SelectSections}
+	input := SearchInput{
+		Rewrite: options.Rewrite, SelectSections: options.SelectSections,
+		Container: options.Container, Author: options.Author,
+		UpdatedAfter: options.UpdatedAfter, UpdatedBefore: options.UpdatedBefore,
+	}
+	if err := validateMetadataFilters(input); err != nil {
+		return SearchReadableResult{}, err
+	}
 	if err := s.searchModels(ctx, p.TenantID, &input); err != nil {
 		return SearchReadableResult{}, err
 	}
@@ -554,6 +877,9 @@ func (s *Service) SearchReadableWithOptions(ctx context.Context, p auth.Principa
 	}
 	for i := range results {
 		results[i].Locations = locations[i]
+	}
+	if err := s.applyUploadLinks(ctx, p.TenantID, results); err != nil {
+		return SearchReadableResult{}, err
 	}
 	facets := sourceKindFacets(results)
 	return SearchReadableResult{Results: results, Facets: facets, NextCursor: nextCursor}, nil

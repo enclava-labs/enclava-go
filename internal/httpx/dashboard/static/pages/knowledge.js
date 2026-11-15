@@ -75,8 +75,11 @@
     if (dims !== '') payload.embedding_dimensions = Number(dims);
     payload.embed_titles = form.elements.embed_titles.checked;
     payload.chunk_strategy = form.elements.chunk_strategy.value;
-    var profile = form.elements.chunk_profile_version_id.value;
-    if (profile) payload.chunk_profile_version_id = profile;
+    // Send a profile version only when the user picked a different one;
+    // resending the current version would undo a chunking change.
+    var profileSelect = form.elements.chunk_profile_version_id;
+    var profile = profileSelect.value;
+    if (profile && profile !== (profileSelect.dataset.current || '')) payload.chunk_profile_version_id = profile;
     payload.acl = form.elements.access.value === 'org' ? { audience: ['*'] } : {};
     function created(c) {
       Enclava.closeDrawer();
@@ -151,6 +154,16 @@
         Enclava.refresh();
       })
       .catch(function (e) { writeError(e, 'Reprocess failed'); });
+  }
+
+  function retryFailedDocuments(collectionID) {
+    Enclava.api('POST', '/api/v1/rag/collections/' + encodeURIComponent(collectionID) + '/reprocess-failed')
+      .then(function (body) {
+        var n = body && typeof body.requeued === 'number' ? body.requeued : 0;
+        Enclava.toast('success', n === 1 ? '1 document re-queued' : n + ' documents re-queued');
+        Enclava.refresh();
+      })
+      .catch(function (e) { writeError(e, 'Retry failed'); });
   }
 
   function deleteDocument(documentID) {
@@ -237,6 +250,9 @@
         break;
       case 'knowledge:retry':
         retryDocument(trigger.dataset.documentId);
+        break;
+      case 'knowledge:retry-failed':
+        if (trigger.dataset.collectionId) retryFailedDocuments(trigger.dataset.collectionId);
         break;
       case 'knowledge:filter':
         break; // chips are plain links — this hook exists for future grouping

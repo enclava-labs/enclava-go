@@ -52,20 +52,26 @@ func (s *Service) ResolveEvidence(ctx context.Context, p auth.Principal, ids []s
 		if resolution.Title == "" {
 			resolution.Title = version.OriginalFilename
 		}
+		locations, err := s.evidenceLocations(ctx, p.TenantID, record.SpanRefs)
+		if err != nil {
+			return nil, err
+		}
+		resolution.Locations = locations
 		resolution.NativeLink = safeNativeLink(stringFromPayload(provenance, "url"))
 		if resolution.NativeLink == "" {
 			resolution.NativeLink = safeNativeLink(stringFromPayload(provenance, "source_uri"))
+		}
+		// v1.2: the cited span's block carries its own deep link in the
+		// locator (message permalink, comment, anchored block); it wins over
+		// the document URL. safeNativeLink applies to both paths.
+		if blockLink := blockNativeLink(locations); blockLink != "" {
+			resolution.NativeLink = blockLink
 		}
 		if deep, err := s.githubDeepLink(ctx, p.TenantID, record, resolution.SourceKind, resolution.NativeLink); err != nil {
 			return nil, err
 		} else if deep != "" {
 			resolution.NativeLink = deep
 		}
-		locations, err := s.evidenceLocations(ctx, p.TenantID, record.SpanRefs)
-		if err != nil {
-			return nil, err
-		}
-		resolution.Locations = locations
 		if s.artifacts != nil && version.ArtifactRef != "" {
 			resolution.RetainedCopyLabel = "retained copy"
 			resolution.RetainedCopyURL = "/api/v1/rag/evidence/" + url.PathEscape(record.ID) + "/copy"
@@ -263,6 +269,19 @@ func safeNativeLink(raw string) string {
 	switch strings.ToLower(parsed.Scheme) {
 	case "https", "http", "slack", "notion":
 		return parsed.String()
+	}
+	return ""
+}
+
+// blockNativeLink is the first cited block's own deep link — the deep link
+// of the block where the citation starts. Blocks without a locator URL
+// resolve to nothing (the document URL wins); the same scheme allow-list
+// applies, so a connector cannot inject javascript: or similar.
+func blockNativeLink(locations []source.Locator) string {
+	for _, locator := range locations {
+		if link := safeNativeLink(locator.URL); link != "" {
+			return link
+		}
 	}
 	return ""
 }

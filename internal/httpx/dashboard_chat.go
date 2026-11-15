@@ -473,7 +473,7 @@ func (a *App) buildEvidenceCard(ctx context.Context, p auth.Principal, id string
 	card := evidenceCardData{
 		EvidenceID: res.ID,
 		Status:     status,
-		OpenHref:   res.NativeLink,
+		OpenHref:   safeSourceLink(res.NativeLink), // v1.2 deep link, dashboard-gated
 		CopyURL:    res.RetainedCopyURL,
 		Location:   evidenceLocationLine(res.Locations),
 		Document:   a.evidenceDocumentLabel(ctx, p.TenantID, res.Spans),
@@ -554,7 +554,7 @@ type chatSourceRow struct {
 	Title      string
 	Provider   string // "Slack"…; "" for uploads
 	Location   string
-	OpenHref   string // NativeLink, already scheme-checked in rag
+	OpenHref   string // NativeLink deep link through the dashboard URL gate
 }
 
 // handleDashboardChatSources serves GET /dashboard/partials/chat/sources
@@ -622,7 +622,7 @@ func (a *App) buildChatSources(ctx context.Context, p auth.Principal, raw string
 			Title:      title,
 			Provider:   sourceProviderLabel(res.SourceKind),
 			Location:   location,
-			OpenHref:   res.NativeLink,
+			OpenHref:   safeSourceLink(res.NativeLink),
 		})
 	}
 	return rows

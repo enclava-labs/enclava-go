@@ -14,6 +14,10 @@ const (
 	DocumentStatusFailed     = "failed"
 	DocumentStatusRemoved    = "removed"
 
+	// StatusWaitingForWorker is the status message of a document whose
+	// ingest is deferred until the extraction worker is reachable again.
+	StatusWaitingForWorker = "waiting for the extraction worker"
+
 	DefaultChunkSize    = 1000
 	DefaultChunkOverlap = 150
 
@@ -81,31 +85,37 @@ type Document struct {
 	Metadata         map[string]any `json:"metadata,omitempty"`
 	QdrantPointCount int            `json:"qdrant_point_count"`
 	ErrorMessage     string         `json:"error_message,omitempty"`
-	Warnings         []string       `json:"warnings,omitempty"`
-	CreatedAt        time.Time      `json:"created_at"`
-	UpdatedAt        time.Time      `json:"updated_at"`
-	ProcessedAt      *time.Time     `json:"processed_at,omitempty"`
+	// StatusMessage is the non-error progress note a deferred ingest records
+	// (for example "waiting for the extraction worker"); empty when none.
+	StatusMessage string     `json:"status_message,omitempty"`
+	Warnings      []string   `json:"warnings,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	ProcessedAt   *time.Time `json:"processed_at,omitempty"`
 }
 
 // DocumentChunk is one derived chunk row pinned to an immutable
 // chunk_profile_version_id; QdrantPointID is the row ID (Qdrant upserts are
 // keyed by it so stale generations cannot clobber a newer version's index).
 type DocumentChunk struct {
-	ID               string         `json:"id"`
-	DocumentID       string         `json:"document_id"`
-	CollectionID     string         `json:"collection_id"`
-	Generation       int64          `json:"generation"`
-	ChunkIndex       int            `json:"chunk_index"`
-	ParentChunkIndex int            `json:"parent_chunk_index,omitempty"`
-	Content          string         `json:"content"`
-	TokenCount       int            `json:"token_count"`
-	QdrantPointID    string         `json:"qdrant_point_id,omitempty"`
-	ByteStart        int            `json:"byte_start,omitempty"`
-	ByteEnd          int            `json:"byte_end,omitempty"`
-	SpanRefs         []source.Span  `json:"span_refs,omitempty"`
-	HeaderPath       string         `json:"header_path,omitempty"`
-	Metadata         map[string]any `json:"metadata,omitempty"`
-	CreatedAt        time.Time      `json:"created_at"`
+	ID               string        `json:"id"`
+	DocumentID       string        `json:"document_id"`
+	CollectionID     string        `json:"collection_id"`
+	Generation       int64         `json:"generation"`
+	ChunkIndex       int           `json:"chunk_index"`
+	ParentChunkIndex int           `json:"parent_chunk_index,omitempty"`
+	Content          string        `json:"content"`
+	TokenCount       int           `json:"token_count"`
+	QdrantPointID    string        `json:"qdrant_point_id,omitempty"`
+	ByteStart        int           `json:"byte_start,omitempty"`
+	ByteEnd          int           `json:"byte_end,omitempty"`
+	SpanRefs         []source.Span `json:"span_refs,omitempty"`
+	// Links mirrors source.Chunk.Links: the deep links persisted on the
+	// chunk row and mirrored into the Qdrant payload at embed time.
+	Links      []source.ChunkLink `json:"links,omitempty"`
+	HeaderPath string             `json:"header_path,omitempty"`
+	Metadata   map[string]any     `json:"metadata,omitempty"`
+	CreatedAt  time.Time          `json:"created_at"`
 }
 
 // IndexGeneration is one published (or staged) document generation and the
@@ -226,6 +236,13 @@ type SearchInput struct {
 	SelectSections bool           `json:"select_sections,omitempty"`
 	SectionModel   string         `json:"section_model,omitempty"`
 	Filter         map[string]any `json:"filter,omitempty"`
+	// v1.2 metadata filters, ANDed with the access prefilter — they can
+	// only narrow a search, never widen it. UpdatedAfter is inclusive,
+	// UpdatedBefore exclusive, both RFC 3339 against source_updated_at.
+	Container     string `json:"container,omitempty"`
+	Author        string `json:"author,omitempty"`
+	UpdatedAfter  string `json:"updated_after,omitempty"`
+	UpdatedBefore string `json:"updated_before,omitempty"`
 }
 
 type SearchResult struct {
@@ -250,6 +267,16 @@ type SearchResult struct {
 	SourceKind     string           `json:"source_kind,omitempty"`
 	CollectionName string           `json:"collection_name,omitempty"`
 	Locations      []source.Locator `json:"locations,omitempty"`
+	// v1.2 source links. SourceURL is the document URL (thread root,
+	// issue, page); Link is the best deep link for this hit; Links are all
+	// entries of the chunk. Timestamps are RFC 3339.
+	SourceURL       string             `json:"source_url,omitempty"`
+	Link            string             `json:"link,omitempty"`
+	Links           []source.ChunkLink `json:"links,omitempty"`
+	Author          string             `json:"author,omitempty"`
+	SourceCreatedAt string             `json:"source_created_at,omitempty"`
+	SourceUpdatedAt string             `json:"source_updated_at,omitempty"`
+	Container       string             `json:"container,omitempty"`
 }
 
 // SearchReadableResult is the bounded cross-collection search page: fused

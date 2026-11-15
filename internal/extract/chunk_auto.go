@@ -37,6 +37,8 @@ type autoBuilder struct {
 	carryLen int
 	pending  []source.Span // overlap carry seeded for the next chunk
 	runStart int           // first record of the current run (tiny-tail fixes)
+
+	messagePhase bool // mixed mode: trailing-messages phase reached
 }
 
 // chunkAuto implements the "auto" boundary strategy. Table groups go through
@@ -72,6 +74,19 @@ func chunkAuto(document source.Document, blocks map[string]source.Block, profile
 			b.addSectionBlock(block)
 		case "messages":
 			b.addMessageBlock(block)
+		case "mixed":
+			// sections, then trailing messages (GitHub issue: title, body,
+			// comments): the message phase starts a fresh run so no overlap
+			// crosses the boundary
+			if block.Kind == "message" {
+				if !b.messagePhase {
+					b.closeTextRun()
+					b.messagePhase = true
+				}
+				b.addMessageBlock(block)
+			} else {
+				b.addSectionBlock(block)
+			}
 		case "code":
 			b.addCodeBlock(block)
 		default:
@@ -85,7 +100,9 @@ func chunkAuto(document source.Document, blocks map[string]source.Block, profile
 
 // autoMode picks the first matching packing mode for the whole document. A
 // document that is (nearly) all headings — how connector "page" items map —
-// has no sections to build and falls through to prose.
+// has no sections to build and falls through to prose. "mixed" is a document
+// whose message blocks all trail the non-message blocks (GitHub issue: title
+// heading, body, then comments): sections first, then messages.
 func autoMode(blocks []source.Block) string {
 	headings, nonHeadings, messages, code := 0, 0, 0, 0
 	for i := range blocks {
@@ -102,6 +119,9 @@ func autoMode(blocks []source.Block) string {
 			nonHeadings++
 		}
 	}
+	if messages > 0 && messages < len(blocks) && trailingMessages(blocks) {
+		return "mixed"
+	}
 	if headings > 0 && nonHeadings > 0 && headings <= 4*nonHeadings {
 		return "sections"
 	}
@@ -112,6 +132,30 @@ func autoMode(blocks []source.Block) string {
 		return "code"
 	}
 	return "prose"
+}
+
+// trailingMessages reports whether every message block comes after every
+// non-message block, and both groups are non-empty.
+func trailingMessages(blocks []source.Block) bool {
+	seenMessage := false
+	for i := range blocks {
+		if blocks[i].Kind == "message" {
+			seenMessage = true
+		} else if seenMessage {
+			return false
+		}
+	}
+	return seenMessage
+}
+
+// threadKey is a message's packing identity: its parent when it has one,
+// else its own id (it is the thread root). A root and its replies therefore
+// share a key and pack into the same run; distinct roots never do.
+func threadKey(block source.Block) string {
+	if block.ParentID != "" {
+		return block.ParentID
+	}
+	return block.ID
 }
 
 // closeTextRun ends a packed run: the current chunk is flushed, a tiny tail is
@@ -248,7 +292,7 @@ func (b *autoBuilder) sameThread(block source.Block) bool {
 		return true
 	}
 	last := b.blocks[lastID]
-	return last.Kind == "message" && last.ParentID == block.ParentID
+	return last.Kind == "message" && threadKey(last) == threadKey(block)
 }
 
 // addCodeBlock packs consecutive code blocks, cutting oversized ones at line

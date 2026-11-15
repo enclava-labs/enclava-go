@@ -40,7 +40,43 @@ type FailureClass int
 const (
 	FailureFatal FailureClass = iota
 	FailureRetryable
+	// FailureDeferred requeues after Delay WITHOUT consuming an attempt:
+	// the handler could not run because a dependency was unavailable.
+	FailureDeferred
 )
+
+// DeferredError marks a handler error as "dependency unavailable, try
+// later": the job returns to queued after Delay and the attempt counter is
+// not consumed. Bounded by the caller (max wait, mid-parse drop counter).
+// Drop marks the subset where the dependency dropped the connection
+// mid-request — the input may be what crashed it — so callers can cap
+// those separately.
+type DeferredError struct {
+	Err   error
+	Delay time.Duration
+	Drop  bool
+}
+
+func (e DeferredError) Error() string { return e.Err.Error() }
+func (e DeferredError) Unwrap() error { return e.Err }
+
+// Deferred wraps err so the runner requeues the job after delay without
+// consuming an attempt.
+func Deferred(err error, delay time.Duration) error {
+	if err == nil {
+		return nil
+	}
+	return DeferredError{Err: err, Delay: delay}
+}
+
+// DeferredDrop is Deferred for a dependency that dropped the connection
+// mid-request; the deferral is counted toward the caller's drop cap.
+func DeferredDrop(err error, delay time.Duration) error {
+	if err == nil {
+		return nil
+	}
+	return DeferredError{Err: err, Delay: delay, Drop: true}
+}
 
 // RetryableError marks a handler error as safe to retry: Fail requeues the
 // job with backoff until max_attempts; anything else is terminal.
@@ -60,6 +96,10 @@ func Retryable(err error) error {
 // FailureClassFor maps a handler error to its class. Context cancellation
 // is NOT a failure — the runner routes it through release/unknown itself.
 func FailureClassFor(err error) FailureClass {
+	var de DeferredError
+	if errors.As(err, &de) {
+		return FailureDeferred
+	}
 	var re RetryableError
 	if errors.As(err, &re) {
 		return FailureRetryable
@@ -292,7 +332,18 @@ func (c *Claim) Complete(ctx context.Context, resultRef string) (string, error) 
 
 // Fail records the attempt error; FailureRetryable requeues with backoff
 // while attempts remain, otherwise the job is terminal failed.
+// FailureDeferred requeues after the error's delay WITHOUT consuming the
+// attempt (Claim already counted it — DeferJob undoes that increment).
 func (c *Claim) Fail(ctx context.Context, cause error, class FailureClass) error {
+	if class == FailureDeferred {
+		var de DeferredError
+		delay := time.Second
+		if errors.As(cause, &de) && de.Delay > 0 {
+			delay = de.Delay
+		}
+		doc := deferredDoc(cause)
+		return c.svc.repo.DeferJob(ctx, c.job.TenantID, c.JobID, c.Owner, c.FenceToken, c.attemptID, de.Drop, time.Now().Add(delay), doc)
+	}
 	retry := class == FailureRetryable && c.job.Attempt+1 < c.job.MaxAttempts
 	delay := retryDelay(c.svc.retryBase, c.job.Attempt)
 	doc := errorDoc(cause, class == FailureRetryable)
@@ -339,6 +390,20 @@ func errorDoc(err error, retryable bool) json.RawMessage {
 	b, merr := json.Marshal(map[string]any{"message": msg, "retryable": retryable})
 	if merr != nil {
 		return json.RawMessage(fmt.Sprintf(`{"message":%q,"retryable":false}`, msg))
+	}
+	return b
+}
+
+// deferredDoc marks the error doc as a deferral so projections can tell a
+// waiting job from a failed one — a deferred job stays queued.
+func deferredDoc(err error) json.RawMessage {
+	msg := "waiting for a dependency"
+	if err != nil {
+		msg = err.Error()
+	}
+	b, merr := json.Marshal(map[string]any{"message": msg, "retryable": true, "deferred": true})
+	if merr != nil {
+		return json.RawMessage(fmt.Sprintf(`{"message":%q,"retryable":true,"deferred":true}`, msg))
 	}
 	return b
 }

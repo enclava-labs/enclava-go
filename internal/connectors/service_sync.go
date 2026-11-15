@@ -80,6 +80,11 @@ func (s *Service) runContentStream(ctx context.Context, claim *jobs.Claim, princ
 				if err != nil {
 					return err
 				}
+				if observation.ProcessingError == "" {
+					if err := s.retireSuperseded(ctx, conn, item); err != nil {
+						return err
+					}
+				}
 				observations = append(observations, observation)
 				if observation.ProcessingError == "" && observation.ArtifactRef.ID != "" {
 					jobsToQueue = append(jobsToQueue, observation)
@@ -180,6 +185,19 @@ func (s *Service) observeContentItem(ctx context.Context, conn source.Connection
 		ObjectRef: source.ObjectRef{TenantID: conn.TenantID, ObjectID: object.ID, ObservedSeq: seq},
 	}
 	content := item.Content
+	if len(item.Blocks) > 0 {
+		encoded, encErr := source.EncodeBlocks(item.Blocks)
+		if encErr != nil {
+			observation.ProcessingError = encErr.Error()
+			observation.Payload = json.RawMessage(`{}`)
+			return observation, nil
+		}
+		content = encoded
+		item.MIMEType = source.BlocksMIMEType
+		if strings.TrimSpace(item.Filename) == "" {
+			item.Filename = "document.blocks.json"
+		}
+	}
 	if content == nil && item.Text != "" {
 		content = []byte(item.Text)
 	}
@@ -292,12 +310,12 @@ func provenanceValue(provenance, key string) string {
 }
 
 func connectorPayload(item ContentItem, filename, mimeType string) json.RawMessage {
-	payload, _ := json.Marshal(map[string]any{"native_id": item.NativeID, "parent_native_id": item.ParentNativeID, "kind": item.Kind, "native_revision": item.NativeRevision, "title": item.Title, "filename": filename, "mime_type": mimeType, "url": item.URL, "created_at": item.CreatedAt, "updated_at": item.UpdatedAt, "locator": item.Locator})
+	payload, _ := json.Marshal(map[string]any{"native_id": item.NativeID, "parent_native_id": item.ParentNativeID, "kind": item.Kind, "native_revision": item.NativeRevision, "title": item.Title, "filename": filename, "mime_type": mimeType, "url": item.URL, "created_at": item.CreatedAt, "updated_at": item.UpdatedAt, "locator": item.Locator, "container": item.Container, "authors": item.Authors})
 	return payload
 }
 
 func connectorProvenance(conn source.Connection, item ContentItem) string {
-	payload, _ := json.Marshal(map[string]any{"connection_id": conn.ID, "source_kind": conn.Kind, "native_id": item.NativeID, "title": item.Title, "source_uri": item.URL, "created_at": item.CreatedAt, "updated_at": item.UpdatedAt, "locator": item.Locator})
+	payload, _ := json.Marshal(map[string]any{"connection_id": conn.ID, "source_kind": conn.Kind, "native_id": item.NativeID, "title": item.Title, "source_uri": item.URL, "created_at": item.CreatedAt, "updated_at": item.UpdatedAt, "locator": item.Locator, "container": item.Container, "authors": item.Authors})
 	return string(payload)
 }
 
@@ -328,6 +346,31 @@ func connectorObjectID() (string, error) {
 		return "", fmt.Errorf("generate connector object id: %w", err)
 	}
 	return "src_" + base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// retireSuperseded marks deleted the objects an item replaces (legacy
+// per-message/comment/block items). Unknown ids are ignored, so listing them
+// costs nothing once the old objects are gone.
+func (s *Service) retireSuperseded(ctx context.Context, conn source.Connection, item ContentItem) error {
+	for _, nativeID := range item.Supersedes {
+		if nativeID == "" || nativeID == item.NativeID {
+			continue
+		}
+		object, err := s.canonical.ObjectForNativeIDCrossKind(ctx, conn.TenantID, conn.ID, nativeID)
+		if errors.Is(err, source.ErrDenied) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if object.DeletedAt != nil || object.TombstonedAt != nil {
+			continue
+		}
+		if err := s.canonical.MarkObjectDeleted(ctx, conn.TenantID, object.ID); err != nil && !errors.Is(err, source.ErrDenied) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Service) sweepMissingContent(ctx context.Context, state StreamState) error {

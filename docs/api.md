@@ -83,6 +83,12 @@ XLSX sheets over the cell cap, CSV/XLSX header rows leading each table
 chunk, and `truncated:` markers when a document exceeds the 4,096-chunk cap
 (only the first 4,096 chunks are indexed).
 
+The structured connector document format
+`application/vnd.enclava.blocks+json` is produced by source connectors only
+and is rejected on the upload endpoint with 415 and error code
+`unsupported_media_type`, whether it arrives as the file part's declared
+Content-Type or as detected MIME.
+
 Search prefilters indexed points by their `acl` access tokens and `published`
 flag, rather than enumerating every published document. Caller tokens cover
 the actor, delegated actor and tenant-wide access. Every hit is re-authorized
@@ -92,6 +98,47 @@ produced, so revocations take effect immediately. Each index fetches up to
 four times the per-index result limit, capped at 200 points per round, for
 at most three rounds (the initial round and two extra rounds); fewer results
 can be returned when post-checks discard hits.
+
+### Source links on search results (v1.2)
+
+Every result carries provenance links alongside `content`:
+
+| Field | Meaning |
+|---|---|
+| `source_url` | The document's URL: the Slack thread-root permalink, the GitHub issue/PR URL, the Notion page URL. Uploaded files have one only when `source_uri` was supplied at upload time. |
+| `link` | The best deep link for this hit. With per-block links it is the entry whose block text overlaps the query terms most (case-insensitive word overlap; ties and misses keep the first entry), and the hit's `author` and `source_created_at`/`source_updated_at` come from that entry. For uploads without block links it is the retained copy `/api/v1/rag/evidence/<evidence_id>/copy` with `#page=N` when the first covered block has a page; otherwise it repeats `source_url`. |
+| `links` | All deep-link entries of the chunk: `{offset, url, author, timestamp, native_id}` ordered by `offset` (code points into `content`). |
+| `author` | First author of the document, or the author of the block the hit starts in (see `link`). Uploads carry the uploader. |
+| `source_created_at`, `source_updated_at` | Source-native timestamps (RFC 3339): first/latest message, issue created/updated, page created/last-edited; uploads carry the upload time. |
+| `container` | Where the document lives: `#channel`, `owner/repo`, the parent page path; uploads carry the collection name. |
+
+Citations resolve the same deep links through the evidence API: `native_link`
+is the deep link of the cited block when it has one (message permalink,
+comment `html_url`, anchored Notion block), falling back to the document
+URL; GitHub repository files keep their `#L` line anchors. Every link passes
+a scheme allow-list (`https`, `http`, `slack`, `notion`).
+
+### Metadata filters (v1.2)
+
+Both search endpoints — `POST /api/v1/rag/search` and
+`POST /api/v1/rag/collections/{id}/search` — accept optional metadata
+filters, ANDed with the access prefilter (they can only narrow a search,
+never widen it; authorization is still re-checked per hit):
+
+| Field | Meaning |
+|---|---|
+| `container` | Exact match on the container: `#channel`, `owner/repo`, the parent page path; uploads carry the collection name. |
+| `author` | Exact match on authorship: the document's authors plus every message/link author of the hit's chunk (a Slack hit inside a thread matches the message's author). |
+| `updated_after` | RFC 3339, inclusive: only documents whose source `updated_at` is at or after this time. |
+| `updated_before` | RFC 3339, exclusive: only documents whose source `updated_at` is before this time. |
+
+A malformed timestamp is a 400 with error code `invalid_search_filter`. The
+chat `knowledge.search` tool exposes the same four parameters.
+
+Documents indexed before v1.2 carry no `container`/`authors`/date payload
+and are excluded by these filters until they are re-indexed (a re-upload or
+reprocess fills them); no migration rewrites existing points.
+
 
 `POST /api/v1/rag/search` has no per-collection or aggregate 2,000-document
 bound. It returns `search_scope_too_large` when more than 20 distinct
@@ -165,6 +212,29 @@ clause, …) read-only.
 
 Every `PUT` also queues any document still embedded under older settings, so
 repeating a `PUT` that failed midway finishes the re-embedding it started.
+
+### Resilient ingest and bulk retry
+
+A document is never failed because the extraction worker was down. When the
+worker is unreachable (dial failure, connection dropped mid-parse, HTTP 502 /
+503 / 504, worker-side timeout), the `rag.embed` job returns to `queued`
+without consuming an attempt — 15 s doubling to a 5 min cap — and the
+document stays `processing` with `warnings: ["waiting for the extraction
+worker"]`. Two bounds fail a document terminally so nothing waits silently:
+a worker that dropped the connection mid-parse 3 times on the same document
+fails it with "the extraction worker stopped while processing this
+document", and a worker that stays unavailable longer than
+`EXTRACT_WORKER_MAX_WAIT` (default `24h`) fails it with a matching message.
+Both are recoverable through reprocess once the worker is back.
+
+`GET /readyz/knowledge` additionally reports
+`"extraction_worker": "ok" | "unavailable"` whenever a worker socket is
+configured; it never changes the status code.
+
+`POST /api/v1/rag/collections/{id}/reprocess-failed` (scope `rag.manage`)
+requeues every failed document in the collection through the same pipeline
+as `POST /api/v1/rag/documents/{id}/reprocess`; documents the caller cannot
+read are skipped. Returns `202` with `{"requeued": n}`.
 
 ## 3. Connector sources and access
 

@@ -137,4 +137,11 @@ type Locator struct {
 	Section      string `json:"section,omitempty"`
 	HeadingLevel int    `json:"heading_level,omitempty"`
 	Language     string `json:"language,omitempty"`
+	// Per-block provenance from structured connector documents (v1.2):
+	// the deep link to this block, its author, its RFC 3339 timestamp and
+	// the provider's id for it. Empty for parsed files.
+	URL       string `json:"url,omitempty"`
+	Author    string `json:"author,omitempty"`
+	Timestamp string `json:"timestamp,omitempty"`
+	NativeID  string `json:"native_id,omitempty"`
 }

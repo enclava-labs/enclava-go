@@ -101,6 +101,12 @@ type JobsRepository interface {
 	// status=queued, lease_expires_at doubles as the not-before timestamp
 	// until the next claim) or transitions to terminal failed.
 	FailJob(ctx context.Context, tenantID, jobID, owner string, fence int64, attemptID string, retry bool, notBefore time.Time, errDoc json.RawMessage) error
+	// DeferJob requeues without consuming the attempt (FailureDeferred):
+	// job back to queued with notBefore as the run-after timestamp, the
+	// claim's attempt increment undone, deferral counters advanced (drop
+	// bumps drop_deferrals; first_deferred_at set once) and the open
+	// attempt closed as failed with errDoc.
+	DeferJob(ctx context.Context, tenantID, jobID, owner string, fence int64, attemptID string, drop bool, notBefore time.Time, errDoc json.RawMessage) error
 	// ReleaseJob abandons the lease without consuming the attempt's
 	// dispatch: job back to queued, unfinished attempt closed as unknown
 	// (its outcome was never observed).

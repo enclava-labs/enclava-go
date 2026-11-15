@@ -34,6 +34,20 @@ type Chunk struct {
 	Spans         []Span
 	ParentChunkID string
 	Warnings      []string
+	// Links maps code-point offsets inside Text to the deep link of the
+	// block that starts there (ordered by Offset; consecutive spans with
+	// the same URL collapse to one entry).
+	Links []ChunkLink
+}
+
+// ChunkLink is one deep-link entry of a chunk: Offset is the code-point
+// offset of the block's text inside the chunk text.
+type ChunkLink struct {
+	Offset    int    `json:"offset"`
+	URL       string `json:"url,omitempty"`
+	Author    string `json:"author,omitempty"`
+	Timestamp string `json:"timestamp,omitempty"`
+	NativeID  string `json:"native_id,omitempty"`
 }
 
 // ChunkProfile is one immutable, versioned processing profile. Sizes and

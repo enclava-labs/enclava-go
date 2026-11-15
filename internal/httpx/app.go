@@ -586,7 +586,13 @@ func (a *App) handleReadyzKnowledge(w http.ResponseWriter, r *http.Request) {
 	}
 	state := a.vectorStore.state(r.Context())
 	ready, _ := state["ready"].(bool)
-	payload := map[string]any{"ready": ready, "dependencies": map[string]any{"vector_store": state}}
+	deps := map[string]any{"vector_store": state}
+	// Neutral dependency report: a down extraction worker defers ingest jobs,
+	// it must not flip readiness — status codes stay vector-store-only.
+	if worker := extract.WorkerAvailability(); worker != "" {
+		deps["extraction_worker"] = worker
+	}
+	payload := map[string]any{"ready": ready, "dependencies": deps}
 	if !ready {
 		WriteJSON(w, http.StatusServiceUnavailable, payload)
 		return

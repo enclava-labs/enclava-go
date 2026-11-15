@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"unicode"
 	"unicode/utf8"
 
 	"enclava-go/internal/artifacts"
@@ -614,27 +615,26 @@ func parseOCRTSV(raw []byte) ([]parseBlock, error) {
 // sized marks Tesseract boxes (left,top,width,height); Poppler's are edges
 // (xMin,yMin,xMax,yMax). Offsets are renumbered for the merged blocks.
 func mergeLineWords(words []parseBlock, sized bool) []parseBlock {
-	type edges struct{ x0, y0, x1, y1 float64 }
-	parse := func(box string) (edges, bool) {
+	parse := func(box string) (pdfBox, bool) {
 		parts := strings.Split(box, ",")
 		if len(parts) != 4 {
-			return edges{}, false
+			return pdfBox{}, false
 		}
 		var v [4]float64
 		for i, part := range parts {
 			f, err := strconv.ParseFloat(part, 64)
 			if err != nil {
-				return edges{}, false
+				return pdfBox{}, false
 			}
 			v[i] = f
 		}
 		if sized {
-			return edges{v[0], v[1], v[0] + v[2], v[1] + v[3]}, true
+			return pdfBox{v[0], v[1], v[0] + v[2], v[1] + v[3]}, true
 		}
-		return edges{v[0], v[1], v[2], v[3]}, true
+		return pdfBox{v[0], v[1], v[2], v[3]}, true
 	}
 	out := make([]parseBlock, 0, len(words)/6+1)
-	var line edges
+	var line, prev pdfBox
 	open := false // out's last block is a line that can take more words
 	for _, word := range words {
 		box, ok := parse(word.locator.Box)
@@ -643,18 +643,23 @@ func mergeLineWords(words []parseBlock, sized bool) []parseBlock {
 			middle, height := (box.y0+box.y1)/2, box.y1-box.y0
 			samePage := last.locator.Page != nil && word.locator.Page != nil && *last.locator.Page == *word.locator.Page
 			if samePage && middle > line.y0 && middle < line.y1 && box.x0 >= line.x1-height/2 {
-				last.text += " " + word.text
-				line = edges{min(line.x0, box.x0), min(line.y0, box.y0), max(line.x1, box.x1), max(line.y1, box.y1)}
+				sep := " "
+				if smallCapsJoin(last.text, word.text, prev, box, line.y1-line.y0) {
+					sep = ""
+				}
+				last.text += sep + word.text
+				line = pdfBox{min(line.x0, box.x0), min(line.y0, box.y0), max(line.x1, box.x1), max(line.y1, box.y1)}
 				if sized {
 					last.locator.Box = fmt.Sprintf("%.0f,%.0f,%.0f,%.0f", line.x0, line.y0, line.x1-line.x0, line.y1-line.y0)
 				} else {
 					last.locator.Box = fmt.Sprintf("%f,%f,%f,%f", line.x0, line.y0, line.x1, line.y1)
 				}
+				prev = box
 				continue
 			}
 		}
 		out = append(out, word)
-		line, open = box, ok
+		line, prev, open = box, box, ok
 	}
 	offset := 0
 	for i := range out {
@@ -662,6 +667,54 @@ func mergeLineWords(words []parseBlock, sized bool) []parseBlock {
 		offset = out[i].end + 1
 	}
 	return out
+}
+
+// smallCapsGapRatio bounds the gap between a small-caps initial and its
+// tail. Poppler splits a small-caps word after the full-size capital and the
+// gap is effectively zero, while a real word space is a substantial fraction
+// of the line height.
+const smallCapsGapRatio = 0.25
+
+// smallCapsJoin reports whether word continues a merged line as the small-cap
+// tail of a word whose full-size initial Poppler emitted as a separate word:
+// the line's last token is a single uppercase letter, word is all capitals,
+// the letter's box is clearly taller than the tail's (the 1.25 factor matches
+// the similar-height bound in joinable), and their gap is under
+// smallCapsGapRatio of the line height ("L" + "EVELS" → "LEVELS",
+// "W" + "AR" → "WAR"). A real one-letter word ("A", "I") is set at the same
+// height as its neighbor and keeps its space; lowercase tails never qualify.
+func smallCapsJoin(lineText, word string, prev, box pdfBox, lineHeight float64) bool {
+	tail := lineText[strings.LastIndexAny(lineText, " \t")+1:]
+	r, size := utf8.DecodeRuneInString(tail)
+	if size != len(tail) || !unicode.IsUpper(r) {
+		return false
+	}
+	if !allCapsWord(word) {
+		return false
+	}
+	prevH, curH := prev.y1-prev.y0, box.y1-box.y0
+	if prevH <= 0 || curH <= 0 || prevH < curH*1.25 {
+		return false
+	}
+	return box.x0-prev.x1 < smallCapsGapRatio*lineHeight
+}
+
+// allCapsWord reports whether s is an all-capitals word: at least two runes,
+// at least one cased letter, and no lowercase letters — the shape of the
+// small-cap tail Poppler leaves after a word's initial capital ("EVELS",
+// "AR", "PHYSICAL,"). Digits and punctuation do not disqualify it.
+func allCapsWord(s string) bool {
+	if utf8.RuneCountInString(s) < 2 {
+		return false
+	}
+	upper := false
+	for _, r := range s {
+		if unicode.IsLower(r) {
+			return false
+		}
+		upper = upper || unicode.IsUpper(r)
+	}
+	return upper
 }
 
 func imageDimensions(data []byte) (int, error) {

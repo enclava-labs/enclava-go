@@ -71,6 +71,7 @@ type knowledgeCollectionData struct {
 	Docs             []knowledgeDocRow
 	DocMore          bool
 	AnyProcessing    bool
+	HasFailed        bool // writable collection holds ≥1 failed document — Retry failed gate
 	ReembedPending   int64
 	ReembedTotal     int64
 	Empty            dashboardEmpty
@@ -271,6 +272,9 @@ func (a *App) handleDashboardKnowledgeCollection(w http.ResponseWriter, r *http.
 		}
 		data.Docs, data.DocMore = knowledgeDocRows(docs), more
 		data.AnyProcessing = knowledgeAnyProcessing(data.Docs)
+		if data.Writable {
+			data.HasFailed = a.knowledgeHasFailed(ctx, p, c.ID)
+		}
 	case "sources":
 		data.Sources = a.knowledgeCollectionSources(ctx, p, c.ID)
 	case "settings":
@@ -343,21 +347,61 @@ func (a *App) knowledgeDocuments(w http.ResponseWriter, ctx context.Context, p a
 	return docs, more, true
 }
 
+// waitingForExtractionWorker is the status_message the deferred ingest path
+// records while a document waits on the extraction worker (v1.2).
+const waitingForExtractionWorker = rag.StatusWaitingForWorker
+
+// knowledgeStatusMessage resolves a document's non-error progress note: the
+// API field first, then the metadata key older payloads carry.
+func knowledgeStatusMessage(d rag.Document) string {
+	if msg := strings.TrimSpace(d.StatusMessage); msg != "" {
+		return msg
+	}
+	if msg, ok := d.Metadata["status_message"].(string); ok {
+		return strings.TrimSpace(msg)
+	}
+	return ""
+}
+
+// documentWaitingForWorker reports whether a processing document is parked
+// on the extraction worker — a neutral wait, never an error state.
+func documentWaitingForWorker(d rag.Document) bool {
+	return d.Status == rag.DocumentStatusProcessing &&
+		knowledgeStatusMessage(d) == waitingForExtractionWorker
+}
+
+// knowledgeHasFailed reports whether the collection holds at least one
+// failed document the caller can see — the gate for Retry failed. Read
+// through the same authorized listing; a read failure hides the button
+// rather than erroring the page.
+func (a *App) knowledgeHasFailed(ctx context.Context, p auth.Principal, collectionID string) bool {
+	docs, err := a.ragSvc.ListDocuments(ctx, p, collectionID, rag.DocumentStatusFailed, 1, 0)
+	if err != nil {
+		log.Printf("dashboard knowledge failed docs %s: %s", strconv.Quote(collectionID), strconv.Quote(err.Error()))
+		return false
+	}
+	return len(docs) > 0
+}
+
 // knowledgeDocRow projects a document for the table: the source URI becomes
 // an outbound link only when it is a safe http(s) target.
 type knowledgeDocRow struct {
 	rag.Document
-	OpenHref string
-	Provider string // "" → "Open in source"
+	OpenHref      string
+	Provider      string // "" → "Open in source"
+	StatusMessage string // resolved progress note (StatusMessage field or metadata)
+	Waiting       bool   // processing parked on the extraction worker — neutral badge
 }
 
 func knowledgeDocRows(docs []rag.Document) []knowledgeDocRow {
 	rows := make([]knowledgeDocRow, 0, len(docs))
 	for _, d := range docs {
 		rows = append(rows, knowledgeDocRow{
-			Document: d,
-			OpenHref: safeExternalLink(d.SourceURI),
-			Provider: sourceProviderLabel(d.SourceType),
+			Document:      d,
+			OpenHref:      safeExternalLink(d.SourceURI),
+			Provider:      sourceProviderLabel(d.SourceType),
+			StatusMessage: knowledgeStatusMessage(d),
+			Waiting:       documentWaitingForWorker(d),
 		})
 	}
 	return rows
@@ -505,16 +549,20 @@ func (a *App) handleDashboardKnowledgeDocuments(w http.ResponseWriter, r *http.R
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
+	rows := knowledgeDocRows(docs)
 	data := knowledgeCollectionData{
 		Collection:     c,
 		Writable:       writable,
 		Status:         status,
-		Docs:           knowledgeDocRows(docs),
+		Docs:           rows,
 		DocMore:        more,
-		AnyProcessing:  knowledgeAnyProcessing(knowledgeDocRows(docs)),
+		AnyProcessing:  knowledgeAnyProcessing(rows),
 		ReembedPending: pending,
 		ReembedTotal:   total,
 		Empty:          knowledgeDocumentsEmpty(status, caps, writable),
+	}
+	if writable {
+		data.HasFailed = a.knowledgeHasFailed(r.Context(), p, collectionID)
 	}
 	a.renderDashboardFragment(w, r, "knowledge_collection", "knowledge-documents", data)
 }

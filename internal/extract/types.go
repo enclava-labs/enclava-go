@@ -2,6 +2,7 @@ package extract
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"time"
 )
@@ -23,6 +24,14 @@ var (
 	// ErrInvalidOperation rejects an ?operation= value outside the
 	// member-facing extraction set (extract.process|extract.vision).
 	ErrInvalidOperation = errors.New("extract: invalid operation")
+	// ErrWorkerUnavailable marks a transient extraction-worker failure
+	// (dial error, connection reset/EOF, HTTP 502/503/504, worker timeout).
+	// Ingest defers such jobs instead of failing them.
+	ErrWorkerUnavailable = errors.New("extract: extraction worker unavailable")
+	// ErrWorkerDroppedMidParse wraps ErrWorkerUnavailable when the
+	// connection dropped after the request was sent (the document may be
+	// what crashed the worker); ingest caps these deferrals.
+	ErrWorkerDroppedMidParse = fmt.Errorf("%w: connection dropped mid-parse", ErrWorkerUnavailable)
 )
 
 // ProcessInput is one extraction request. Bytes are streamed into a durable

@@ -48,6 +48,18 @@ type ContentItem struct {
 	URL                      string
 	CreatedAt, UpdatedAt     *time.Time
 	Locator                  source.Locator
+	// Blocks, when non-empty, is the structured document form: the sync
+	// encodes it as a source.BlocksMIMEType body and ignores Content/Text.
+	Blocks []source.StructuredBlock
+	// Container is the channel, repository or parent page path ("#general",
+	// "owner/repo"); Authors are the distinct authors of the document.
+	Container string
+	Authors   []string
+	// Supersedes lists native ids of objects this item replaces (v1.2:
+	// per-message, per-comment and per-block items now folded into one
+	// document). Once the item is observed, those objects are marked
+	// deleted regardless of the listing's snapshot semantics.
+	Supersedes []string
 }
 
 type ContentPage struct {

@@ -168,6 +168,7 @@ type Service struct {
 	jobs                       *jobs.Service
 	authorizer                 *source.Authorizer
 	maxUploadMB                int64
+	workerMaxWait              time.Duration // EXTRACT_WORKER_MAX_WAIT; deferral.go owns the default
 }
 
 // NewService builds the ported rag.Service. artifactStore and jobSvc may be
@@ -604,6 +605,7 @@ func (s *Service) UpdateCollection(ctx context.Context, p auth.Principal, id str
 		// Only passages change: documents re-embed in place.
 		c.EmbedTitles = *input.EmbedTitles
 	}
+	priorProfileVersionID := c.ChunkProfileVersionID
 	if input.ChunkSize != nil || input.ChunkOverlap != nil || input.ChunkStrategy != nil {
 		chunkSize, chunkOverlap, chunkStrategy := c.ChunkSize, c.ChunkOverlap, c.ChunkStrategy
 		if input.ChunkSize != nil {
@@ -648,10 +650,14 @@ func (s *Service) UpdateCollection(ctx context.Context, p auth.Principal, id str
 		if versionID == "" {
 			return Collection{}, fmt.Errorf("%w: chunk_profile_version_id must name an immutable version", ErrInvalidInput)
 		}
-		if err := s.validateChunkProfileVersion(ctx, p.TenantID, versionID); err != nil {
-			return Collection{}, err
+		// A form that resends the current version alongside changed chunk
+		// settings must not undo the version those settings just created.
+		if versionID != priorProfileVersionID || c.ChunkProfileVersionID == priorProfileVersionID {
+			if err := s.validateChunkProfileVersion(ctx, p.TenantID, versionID); err != nil {
+				return Collection{}, err
+			}
+			c.ChunkProfileVersionID = versionID
 		}
-		c.ChunkProfileVersionID = versionID
 	}
 	if input.Metadata != nil {
 		c.Metadata = input.Metadata
@@ -1141,6 +1147,10 @@ func (s *Service) persistUpload(ctx context.Context, p auth.Principal, c Collect
 		"kind": kind, "input_artifact_ref": input.InputArtifact,
 		"result_job_id": input.ResultJobID, "result_artifact_ref": input.ResultArtifact,
 		"source_uri": strings.TrimSpace(input.SourceURI), "metadata": nonNilMap(input.Metadata),
+		// v1.2 document-level metadata: the collection is the container and
+		// the uploader owns authorship; both timestamps are the upload time.
+		"container": c.Name, "authors": []string{p.ActorID},
+		"created_at": time.Now().UTC(), "updated_at": time.Now().UTC(),
 	})
 	ver := source.ObjectVersion{
 		ObjectID: obj.ID, ObservedSeq: 1, ArtifactRef: ref.ID, SHA256: ref.SHA256,
@@ -1217,6 +1227,10 @@ func (s *Service) persistDocumentArtifact(ctx context.Context, p auth.Principal,
 		"result_job_id": input.ResultJobID, "result_artifact_ref": input.ResultArtifact,
 		"source_uri": strings.TrimSpace(input.SourceURI),
 		"metadata":   nonNilMap(input.Metadata),
+		// v1.2 document-level metadata: the collection is the container and
+		// the uploader owns authorship; both timestamps are the upload time.
+		"container": c.Name, "authors": []string{p.ActorID},
+		"created_at": time.Now().UTC(), "updated_at": time.Now().UTC(),
 	})
 	ver := source.ObjectVersion{
 		ObjectID:         obj.ID,
@@ -1399,7 +1413,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 			return "", err
 		}
 		for _, chunk := range previousChunks {
-			structuredChunks = append(structuredChunks, source.Chunk{Ordinal: chunk.ChunkIndex, Text: chunk.Content, Spans: chunk.SpanRefs})
+			structuredChunks = append(structuredChunks, source.Chunk{Ordinal: chunk.ChunkIndex, Text: chunk.Content, Spans: chunk.SpanRefs, Links: chunk.Links})
 		}
 	} else {
 		ref := artifacts.Ref{TenantID: job.TenantID, ID: ver.ArtifactRef, Kind: artifacts.KindOriginal}
@@ -1408,12 +1422,12 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 			Filename: ver.OriginalFilename, MIMEType: ver.MimeType, ObjectRef: objectRef,
 		})
 		if err != nil {
-			return "", err
+			return "", s.classifyParseError(ctx, claim, err)
 		}
 		if len(document.Blocks) == 0 {
 			return "", errors.New("document has no extractable text")
 		}
-		document = applyConnectorStructure(document, ver.Provenance)
+		document = applyConnectorStructure(document, ver)
 		if err := s.repo.SaveParsedDocument(ctx, "extract-v1", document); err != nil {
 			return "", err
 		}
@@ -1508,6 +1522,16 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	_ = json.Unmarshal([]byte(ver.Provenance), &provMeta)
 	docMetadata := mapFromPayload(provMeta, "metadata")
 	sourceURI := stringFromPayload(provMeta, "source_uri")
+	// Document-level link metadata (v1.2): mirrored into every point so
+	// query time never joins PostgreSQL for the document's provenance.
+	container := stringFromPayload(provMeta, "container")
+	author := firstAuthor(provMeta["authors"])
+	createdAt := stringFromPayload(provMeta, "created_at")
+	updatedAt := stringFromPayload(provMeta, "updated_at")
+	// Filter payload fields (v1.2): the authors keyword array and the
+	// numeric updated timestamp are what search filters match against.
+	docAuthors := authorList(provMeta["authors"])
+	updatedTs, hasUpdatedTs := rfc3339Unix(updatedAt)
 	for i, chunkText := range chunkTexts {
 		chunkID := newID("ragchunk")
 		pointID := newPointID()
@@ -1548,6 +1572,31 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 			}
 		}
 		payload["block_spans"] = spanPayload
+		if sourceURL := strings.TrimSpace(sourceURI); sourceURL != "" {
+			payload["source_url"] = sourceURL
+		}
+		if container != "" {
+			payload["container"] = container
+		}
+		if author != "" {
+			payload["author"] = author
+		}
+		if createdAt != "" {
+			payload["source_created_at"] = createdAt
+		}
+		if updatedAt != "" {
+			payload["source_updated_at"] = updatedAt
+		}
+		if links := structuredChunks[i].Links; len(links) > 0 {
+			payload["links"] = links
+			chunk.Links = links
+		}
+		if authors := chunkAuthors(docAuthors, structuredChunks[i].Links); len(authors) > 0 {
+			payload["authors"] = authors
+		}
+		if hasUpdatedTs {
+			payload["source_updated_ts"] = updatedTs
+		}
 		chunks = append(chunks, chunk)
 		points = append(points, QdrantPoint{
 			ID: pointID, Vector: vectors[i], Payload: payload,
@@ -1804,6 +1853,77 @@ func boolACL(acl map[string]any, key string) bool {
 func stringFromPayload(payload map[string]any, key string) string {
 	v, _ := payload[key].(string)
 	return v
+}
+
+// firstAuthor reads the first author of a provenance authors list (a JSON
+// array decodes as []any); uploads carry exactly the uploader.
+func firstAuthor(v any) string {
+	list, _ := v.([]any)
+	for _, item := range list {
+		if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// authorList reads every author of a provenance authors list.
+func authorList(v any) []string {
+	switch list := v.(type) {
+	case []any:
+		authors := make([]string, 0, len(list))
+		for _, item := range list {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				authors = append(authors, s)
+			}
+		}
+		return authors
+	case []string:
+		return list
+	default:
+		return nil
+	}
+}
+
+// chunkAuthors merges the document authors with every link author of the
+// chunk, deduplicated in first-seen order — the `authors` keyword array the
+// author search filter matches against.
+func chunkAuthors(docAuthors []string, links []source.ChunkLink) []string {
+	seen := make(map[string]struct{}, len(docAuthors)+len(links))
+	authors := make([]string, 0, len(seen))
+	add := func(author string) {
+		author = strings.TrimSpace(author)
+		if author == "" {
+			return
+		}
+		if _, dup := seen[author]; dup {
+			return
+		}
+		seen[author] = struct{}{}
+		authors = append(authors, author)
+	}
+	for _, author := range docAuthors {
+		add(author)
+	}
+	for _, link := range links {
+		add(link.Author)
+	}
+	return authors
+}
+
+// rfc3339Unix converts a provenance RFC 3339 timestamp to unix seconds for
+// the source_updated_ts range filter; unparsable values write nothing, so
+// the point simply lacks the field like indexes predating it.
+func rfc3339Unix(raw string) (int64, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	ts, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return 0, false
+	}
+	return ts.Unix(), true
 }
 
 func mapFromPayload(payload map[string]any, key string) map[string]any {
