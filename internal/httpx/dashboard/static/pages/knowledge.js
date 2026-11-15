@@ -153,6 +153,16 @@
       .catch(function (e) { writeError(e, 'Reprocess failed'); });
   }
 
+  function retryFailedDocuments(collectionID) {
+    Enclava.api('POST', '/api/v1/rag/collections/' + encodeURIComponent(collectionID) + '/reprocess-failed')
+      .then(function (body) {
+        var n = body && typeof body.requeued === 'number' ? body.requeued : 0;
+        Enclava.toast('success', n === 1 ? '1 document re-queued' : n + ' documents re-queued');
+        Enclava.refresh();
+      })
+      .catch(function (e) { writeError(e, 'Retry failed'); });
+  }
+
   function deleteDocument(documentID) {
     Enclava.api('DELETE', '/api/v1/rag/documents/' + encodeURIComponent(documentID))
       .then(function () {
@@ -237,6 +247,9 @@
         break;
       case 'knowledge:retry':
         retryDocument(trigger.dataset.documentId);
+        break;
+      case 'knowledge:retry-failed':
+        if (trigger.dataset.collectionId) retryFailedDocuments(trigger.dataset.collectionId);
         break;
       case 'knowledge:filter':
         break; // chips are plain links — this hook exists for future grouping

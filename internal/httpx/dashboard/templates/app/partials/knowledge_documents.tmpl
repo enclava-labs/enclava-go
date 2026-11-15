@@ -15,6 +15,10 @@
     <a class="chip{{if eq .Data.Status "failed"}} active{{end}}"{{if eq .Data.Status "failed"}} aria-current="true"{{end}} href="/dashboard/knowledge/{{.Data.Collection.ID}}/documents?status=failed">{{statusLabel "document" "failed"}}</a>
     <a class="chip{{if eq .Data.Status "removed"}} active{{end}}"{{if eq .Data.Status "removed"}} aria-current="true"{{end}} href="/dashboard/knowledge/{{.Data.Collection.ID}}/documents?status=removed">{{statusLabel "document" "removed"}}</a>
   </div>
+  {{if and .Data.Writable .Data.HasFailed}}<div class="row" style="margin:8px 0">
+    <button type="button" class="btn" data-action="knowledge:retry-failed" data-collection-id="{{.Data.Collection.ID}}">{{icon "refresh"}}Retry failed</button>
+    <span class="muted">Re-queue every failed document in this collection.</span>
+  </div>{{end}}
   <p id="knowledge-documents-error" class="field-error" role="alert" hidden></p>
 {{if .Data.Docs}}  <div class="tablewrap" role="region" tabindex="0" aria-label="Documents">
     <table>
@@ -29,7 +33,7 @@
       <tbody>
 {{range .Data.Docs}}        <tr>
           <td data-label="Document"><b>{{.FileName}}</b>{{if .OpenHref}}<span class="subline"><a href="{{.OpenHref}}" target="_blank" rel="noopener noreferrer">{{if .Provider}}Open in {{.Provider}}{{else}}Open in source{{end}}</a></span>{{else if .SourceURI}}<span class="subline">{{.SourceURI}}</span>{{end}}</td>
-          <td data-label="Status">{{if dashboardNonTerminal .Status}}<span class="pulse" aria-hidden="true">●</span>{{end}}{{statusPill "document" .Status}}{{if .Warnings}} {{statusPill "document" "warning"}}{{range .Warnings}}<span class="subline">{{.}}</span>{{end}}{{end}}{{if .ErrorMessage}}{{$action := dashboardErrorAction .ErrorMessage $.Can}}<span class="subline">{{$action.Text}}{{if $action.Href}} <a href="{{$action.Href}}">{{if eq $action.Href "/dashboard/models/pricing"}}Set price{{else}}View details{{end}}</a>{{end}}</span>{{end}}</td>
+          <td data-label="Status">{{if dashboardNonTerminal .Status}}<span class="pulse" aria-hidden="true">●</span>{{end}}{{if .Waiting}}{{statusPill "document" "waiting"}}{{else}}{{statusPill "document" .Status}}{{end}}{{if .StatusMessage}}<span class="subline">{{.StatusMessage}}</span>{{end}}{{if .Warnings}} {{statusPill "document" "warning"}}{{range .Warnings}}<span class="subline">{{.}}</span>{{end}}{{end}}{{if .ErrorMessage}}{{$action := dashboardErrorAction .ErrorMessage $.Can}}<span class="subline">{{$action.Text}}{{if $action.Href}} <a href="{{$action.Href}}">{{if eq $action.Href "/dashboard/models/pricing"}}Set price{{else}}View details{{end}}</a>{{end}}</span>{{end}}</td>
           <td data-label="Updated">{{relTime .UpdatedAt}}</td>
 {{if $.Data.Writable}}          <td data-label="Actions">
             <span class="row">

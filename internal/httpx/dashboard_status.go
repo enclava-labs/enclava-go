@@ -47,6 +47,7 @@ var dashboardStatusLabels = map[string]dashboardStatusRow{
 	"changed":      {Label: "Changed", Tone: "warn"},
 	"invited":      {Label: "Invited", Tone: "warn"},
 	"queued":       {Label: "Queued", Tone: "neutral", NonTerminal: true},
+	"waiting":      {Label: "Waiting", Tone: "neutral", NonTerminal: true},
 	"cancelled":    {Label: "Stopped", Tone: "neutral"},
 	"stopped":      {Label: "Stopped", Tone: "neutral"},
 	"paused":       {Label: "Paused", Tone: "neutral"},
