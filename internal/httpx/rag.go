@@ -67,6 +67,12 @@ func (a *App) handleRAGCollectionByID(w http.ResponseWriter, r *http.Request, pr
 			a.handleRAGSearch(w, r, principal, collectionID)
 			return
 		}
+		// Bulk "Retry failed" for the collection page — same pipeline as the
+		// per-document reprocess route (handler in rag_reprocess_failed.go).
+		if parts[1] == "reprocess-failed" && len(parts) == 2 {
+			a.handleRAGCollectionReprocessFailed(w, r, principal, collectionID)
+			return
+		}
 		// …/documents: GET is the authorized, status-filtered document list
 		// (08-03); POST is the bounded multipart upload (OA-17) — the real
 		// durable ingest under rag.manage, streaming into the artifact store.

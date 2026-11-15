@@ -106,6 +106,10 @@ type Config struct {
 	// (EXTRACT_MAX_OUTPUT_TOKENS, 0 = send no explicit cap and let the
 	// gateway default injection and model-limit clamp apply).
 	ExtractMaxOutputTokens int64
+	// ExtractWorkerMaxWait bounds how long one ingest job stays continuously
+	// deferred for the extraction worker before it fails terminally
+	// (EXTRACT_WORKER_MAX_WAIT, default 24h).
+	ExtractWorkerMaxWait time.Duration
 }
 
 func Load() (Config, error) {
@@ -172,9 +176,10 @@ func Load() (Config, error) {
 		ExtractMaxOutputTokens:          getEnvInt64("EXTRACT_MAX_OUTPUT_TOKENS", 0),
 	}
 	for name, target := range map[string]*time.Duration{
-		"JOB_TIMEOUT":           &cfg.JobTimeout,
-		"JOB_RETENTION":         &cfg.JobRetention,
-		"INDEX_RETIREMENT_SOAK": &cfg.IndexRetirementSoak,
+		"JOB_TIMEOUT":             &cfg.JobTimeout,
+		"JOB_RETENTION":           &cfg.JobRetention,
+		"INDEX_RETIREMENT_SOAK":   &cfg.IndexRetirementSoak,
+		"EXTRACT_WORKER_MAX_WAIT": &cfg.ExtractWorkerMaxWait,
 	} {
 		if raw := os.Getenv(name); raw != "" {
 			value, err := time.ParseDuration(raw)
@@ -183,6 +188,9 @@ func Load() (Config, error) {
 			}
 			*target = value
 		}
+	}
+	if cfg.ExtractWorkerMaxWait == 0 {
+		cfg.ExtractWorkerMaxWait = 24 * time.Hour
 	}
 	if raw := os.Getenv("METRICS_AUTH_DISABLED"); raw != "" {
 		if _, err := strconv.ParseBool(raw); err != nil {

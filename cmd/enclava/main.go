@@ -314,6 +314,7 @@ func serve() error {
 	ragSvc.SetUtilityModel(cfg.UtilityModel)
 	ragSvc.SetDefaultModelResolver(inferenceSvc.DefaultModel)
 	ragSvc.SetIndexRetirementSoak(cfg.IndexRetirementSoak)
+	ragSvc.SetExtractWorkerMaxWait(cfg.ExtractWorkerMaxWait)
 	previewSvc := extract.NewPreviewService(chunkProfilesRepo, jobsRepoPG, jobsSvc, artifactStore, sourceRepo, cfg.MaxUploadSizeMB)
 	// Dashboard-managed credentials first, SECRET_BINDINGS as the fallback.
 	credentialSvc, err := credentials.NewService(postgres.NewCredentialsRepo(pgDB), cfg.SecretsKey, secretResolver, cfg.PublicBaseURL)

@@ -168,6 +168,7 @@ type Service struct {
 	jobs                       *jobs.Service
 	authorizer                 *source.Authorizer
 	maxUploadMB                int64
+	workerMaxWait              time.Duration // EXTRACT_WORKER_MAX_WAIT; deferral.go owns the default
 }
 
 // NewService builds the ported rag.Service. artifactStore and jobSvc may be
@@ -1408,7 +1409,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 			Filename: ver.OriginalFilename, MIMEType: ver.MimeType, ObjectRef: objectRef,
 		})
 		if err != nil {
-			return "", err
+			return "", s.classifyParseError(ctx, claim, err)
 		}
 		if len(document.Blocks) == 0 {
 			return "", errors.New("document has no extractable text")
