@@ -70,6 +70,22 @@ func safeExternalLink(raw string) string {
 	return ""
 }
 
+// safeSourceLink admits the deep links v1.2 emits: http(s) targets plus
+// same-origin absolute-path URLs such as the retained-copy
+// "/api/v1/rag/evidence/<id>/copy" link. Protocol-relative ("//host") and
+// scheme-relative tricks stay rejected — defence in depth on top of the
+// rag service's own scheme gate.
+func safeSourceLink(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || strings.Contains(trimmed, "\\") {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "/") && !strings.HasPrefix(trimmed, "//") {
+		return trimmed
+	}
+	return safeExternalLink(trimmed)
+}
+
 // dashboardSourceRule is the single read rule every synced object follows:
 // the destination collection's readers, and only they, can read what the
 // source syncs. Rendered verbatim; <collection> interpolates the name.

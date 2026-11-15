@@ -155,20 +155,25 @@ func TestDashboardSourceLinkSafety(t *testing.T) {
 		t.Fatalf("unsafe uri rendered wrong: %s", rendered)
 	}
 
-	// Search: the row's link renders only when OpenHref was populated.
+	// Search: the title deep-links and the container link renders only when
+	// it differs from the primary target — both built through the same
+	// searchResultRowFor projection the handler runs.
 	rendered = renderFrag(t, "search", "search-results", searchViewData{
 		Query: "q", Mode: "hybrid",
 		Results: &searchResultsData{Query: "q", Rows: []searchResultRow{
-			{Title: "Hit", EvidenceID: "ev1", SourceKind: "github",
-				OpenHref: "https://github.com/o/r/blob/s/a.go", Provider: "GitHub"},
-			{Title: "Plain", EvidenceID: "ev2", SourceKind: "upload"},
+			searchResultRowFor(rag.SearchResult{
+				FileName: "Hit", SourceKind: "github", EvidenceID: "ev1",
+				Link:      "https://github.com/o/r/blob/s/a.go",
+				SourceURL: "https://github.com/o/r",
+			}),
+			searchResultRowFor(rag.SearchResult{FileName: "Plain", SourceKind: "upload", EvidenceID: "ev2"}),
 		}},
 	}, dashboardCaps{})
 	if !strings.Contains(rendered, `href="https://github.com/o/r/blob/s/a.go"`) ||
-		!strings.Contains(rendered, "Open in GitHub") {
-		t.Fatalf("search link missing: %s", rendered)
+		!strings.Contains(rendered, "Open issue") {
+		t.Fatalf("search deep links missing: %s", rendered)
 	}
-	if strings.Count(rendered, "Open in") != 1 {
-		t.Fatalf("link rendered without a safe href: %s", rendered)
+	if strings.Count(rendered, `target="_blank"`) != 2 {
+		t.Fatalf("expected title + container links on one row only: %s", rendered)
 	}
 }

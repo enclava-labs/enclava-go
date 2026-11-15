@@ -15,14 +15,14 @@
     {{range .Rows}}
     <div class="result" data-source-kind="{{.SourceKind}}">
       <div class="row">
-        <span style="flex:1" class="result-title">{{.Title}}</span>
+        <span style="flex:1" class="result-title">{{if .TitleHref}}<a href="{{.TitleHref}}" target="_blank" rel="noopener noreferrer">{{.Title}}</a>{{else}}{{.Title}}{{end}}</span>
         <span class="muted">{{icon "file"}} {{term .SourceKind}}</span>
       </div>
-      <div class="result-meta">{{.Collection}}{{if .Location}} · {{.Location}}{{end}}</div>
+      <div class="result-meta">{{.Collection}}{{if .Location}} · {{.Location}}{{end}}{{if .Author}} · {{.Author}}{{end}}{{if .Container}} · {{.Container}}{{end}}{{if .Stamp}} · {{relTime .Stamp}}{{end}}</div>
       <div class="result-snippet">{{mark .Content $.Data.Query}}</div>
       {{if .EvidenceID}}<div class="row" style="margin-top:8px">
         <button type="button" class="btn" data-action="evidence:open" data-evidence-id="{{.EvidenceID}}">View evidence</button>
-        {{if .OpenHref}}<a class="btn ghost" href="{{.OpenHref}}" target="_blank" rel="noopener noreferrer">{{if .Provider}}Open in {{.Provider}}{{else}}Open in source{{end}}</a>{{end}}
+        {{if .SourceHref}}<a class="btn ghost" href="{{.SourceHref}}" target="_blank" rel="noopener noreferrer">{{.SourceLabel}}</a>{{end}}
         <a class="btn ghost" data-action="search:ask-about" data-evidence-id="{{.EvidenceID}}" href="/dashboard/chat?evidence={{urlquery .EvidenceID}}">Ask about this</a>
       </div>{{end}}
     </div>

@@ -68,14 +68,89 @@ type searchResultsData struct {
 // location line, snippet and the evidence id — the ONLY thing Ask-about-this
 // carries across to Chat (passage text never crosses client-side, D-17).
 type searchResultRow struct {
-	Title      string
-	Collection string
-	Location   string
-	Content    string
-	SourceKind string
-	EvidenceID string
-	OpenHref   string // safe http(s) source link, "" otherwise
-	Provider   string // display label ("Slack"…); "" for uploads
+	Title       string
+	TitleHref   string // safe deep link for the title (Link → SourceURL → SourceURI)
+	Collection  string
+	Location    string
+	Author      string
+	Container   string
+	Stamp       string // RFC3339 source timestamp (updated, else created); "" when absent
+	Content     string
+	SourceKind  string
+	EvidenceID  string
+	SourceHref  string // secondary container link, only when it differs from TitleHref
+	SourceLabel string // "Open thread"/"Open issue"/"Open page"/"Open in <provider>"
+}
+
+// searchResultRowFor projects one service result into its row: title and
+// location stay text-only, and every outbound href passes safeSourceLink so
+// only http(s) or same-origin paths ever reach the template.
+func searchResultRowFor(res rag.SearchResult) searchResultRow {
+	title := strings.TrimSpace(res.FileName)
+	if title == "" {
+		title = "Untitled document" // raw ids are never primary labels (OA-34)
+	}
+	collection := res.CollectionName
+	if collection == "" {
+		collection = "Collection"
+	}
+	row := searchResultRow{
+		Title:      title,
+		Collection: collection,
+		Location:   evidenceLocationLine(res.Locations),
+		Author:     strings.TrimSpace(res.Author),
+		Container:  strings.TrimSpace(res.Container),
+		Content:    res.Content,
+		SourceKind: res.SourceKind,
+		EvidenceID: res.EvidenceID,
+	}
+	// The title opens the chunk's deep link first, then the document URL,
+	// then the legacy source URI — the first one that survives the gate.
+	row.TitleHref = firstSafeSourceLink(res.Link, res.SourceURL, res.SourceURI)
+	// The container-level link earns its own action only when it lands
+	// somewhere different from the title's target.
+	if secondary := safeSourceLink(res.SourceURL); secondary != "" && secondary != row.TitleHref {
+		row.SourceHref = secondary
+		row.SourceLabel = sourceContainerLinkLabel(res.SourceKind, sourceProviderLabel(res.SourceKind))
+	}
+	// Updated wins over created; either must parse as a timestamp before it
+	// reaches relTime (which would render a bare "—" for junk).
+	for _, stamp := range []string{res.SourceUpdatedAt, res.SourceCreatedAt} {
+		if _, ok := dashboardAsTime(strings.TrimSpace(stamp)); ok {
+			row.Stamp = strings.TrimSpace(stamp)
+			break
+		}
+	}
+	return row
+}
+
+// firstSafeSourceLink returns the first candidate that survives the
+// scheme/relative-path gate, "" when none does.
+func firstSafeSourceLink(candidates ...string) string {
+	for _, candidate := range candidates {
+		if safe := safeSourceLink(candidate); safe != "" {
+			return safe
+		}
+	}
+	return ""
+}
+
+// sourceContainerLinkLabel names the secondary link by source kind:
+// threads for chat sources, issues for trackers, pages for documents;
+// everything else falls back to the provider name.
+func sourceContainerLinkLabel(kind, provider string) string {
+	switch strings.TrimSpace(kind) {
+	case "slack":
+		return "Open thread"
+	case "github", "gitlab", "jira", "linear":
+		return "Open issue"
+	case "notion":
+		return "Open page"
+	}
+	if provider != "" {
+		return "Open in " + provider
+	}
+	return "Open in source"
 }
 
 // searchMode whitelist: invalid/absent falls back to hybrid (D-19 contract —
@@ -195,24 +270,7 @@ func (a *App) buildSearchView(w http.ResponseWriter, r *http.Request) (searchVie
 	results := &searchResultsData{Query: view.Query, Facets: out.Facets, NextCursor: out.NextCursor}
 	results.Rows = make([]searchResultRow, 0, len(out.Results))
 	for _, res := range out.Results {
-		title := strings.TrimSpace(res.FileName)
-		if title == "" {
-			title = "Untitled document" // raw ids are never primary labels (OA-34)
-		}
-		collection := res.CollectionName
-		if collection == "" {
-			collection = "Collection"
-		}
-		results.Rows = append(results.Rows, searchResultRow{
-			Title:      title,
-			Collection: collection,
-			Location:   evidenceLocationLine(res.Locations),
-			Content:    res.Content,
-			SourceKind: res.SourceKind,
-			EvidenceID: res.EvidenceID,
-			OpenHref:   safeExternalLink(res.SourceURI),
-			Provider:   sourceProviderLabel(res.SourceKind),
-		})
+		results.Rows = append(results.Rows, searchResultRowFor(res))
 	}
 	view.Results = results
 	return view, true
