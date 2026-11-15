@@ -1,6 +1,7 @@
 package connectors
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -187,27 +188,66 @@ func TestSlackContentPagesStayWithinBoundAcrossThreads(t *testing.T) {
 	for _, item := range items {
 		ids = append(ids, item.NativeID)
 	}
-	want := "slack:C1:3.000000 slack:C1:1.000001 slack:file:F1 slack:C1:1.000002 slack:C1:1.000003 slack:C1:1.000004"
+	want := "slack:C1:thread:3.000000 slack:C1:thread:1.000001 slack:file:F1"
 	if strings.Join(ids, " ") != want {
 		t.Fatalf("items = %v, want %s", ids, want)
 	}
-	latest, root, reply := items[0], items[1], items[3]
-	if latest.Text != "#engineering · Bob · 1970-01-01 00:00 UTC\nlater @Alice see #ops, docs (https://example.com) & @here" {
-		t.Fatalf("latest text = %q", latest.Text)
+	latest, root, file := items[0], items[1], items[2]
+	if latest.Kind != "thread" || latest.Title != "Bob in #engineering: later @Alice see #ops, docs (https://example.com)" ||
+		latest.ParentNativeID != "slack:C1" || latest.ParentKind != "channel" ||
+		latest.Container != "#engineering" || strings.Join(latest.Authors, ",") != "Bob" ||
+		latest.NativeRevision != "3.000000:0" || latest.URL != "https://workspace.slack.com/archives/C1/p3000000" {
+		t.Fatalf("standalone thread item = %+v", latest)
 	}
-	if latest.ParentNativeID != "slack:C1" || latest.ParentKind != "channel" || latest.Title != "engineering" || latest.URL != "https://workspace.slack.com/archives/C1/p3000000" {
-		t.Fatalf("latest item = %+v", latest)
+	if len(latest.Blocks) != 1 {
+		t.Fatalf("standalone thread blocks = %+v", latest.Blocks)
 	}
-	if root.URL != "https://workspace.slack.com/archives/C1/p1000001" || root.ParentNativeID != "slack:C1" {
-		t.Fatalf("root item = %+v", root)
+	block := latest.Blocks[0]
+	if block.Kind != source.StructuredMessage || block.Text != "later @Alice see #ops, docs (https://example.com) & @here" ||
+		block.Author != "Bob" || block.NativeID != "3.000000" || block.ParentNativeID != "" ||
+		block.CreatedAt != "1970-01-01T00:00:03Z" || block.UpdatedAt != "" ||
+		block.URL != "https://workspace.slack.com/archives/C1/p3000000" {
+		t.Fatalf("standalone block = %+v", block)
 	}
-	if reply.ParentNativeID != "slack:C1:1.000001" || reply.ParentKind != "message" ||
-		reply.Text != "#engineering · thread reply · Bob · 1970-01-01 00:00 UTC\nfirst reply" ||
+	if root.Kind != "thread" || root.NativeID != "slack:C1:thread:1.000001" || root.Title != "Alice in #engineering: root" ||
+		root.NativeRevision != "1.000004:3" || root.URL != "https://workspace.slack.com/archives/C1/p1000001" ||
+		strings.Join(root.Authors, ",") != "Alice,Bob" {
+		t.Fatalf("thread item = %+v", root)
+	}
+	if len(root.Blocks) != 4 {
+		t.Fatalf("thread blocks = %+v", root.Blocks)
+	}
+	// The broadcast reply appears in channel history and in
+	// conversations.replies; the thread document must contain it once.
+	broadcasts := 0
+	for i, b := range root.Blocks {
+		if b.Text == "also sent to channel" {
+			broadcasts++
+		}
+		if b.NativeID != []string{"1.000001", "1.000002", "1.000003", "1.000004"}[i] {
+			t.Fatalf("block %d out of time order: %+v", i, b)
+		}
+		if i == 0 {
+			if b.ParentNativeID != "" || b.Author != "Alice" || b.Text != "root" ||
+				b.URL != "https://workspace.slack.com/archives/C1/p1000001" {
+				t.Fatalf("root block = %+v", b)
+			}
+		} else if b.ParentNativeID != "1.000001" {
+			t.Fatalf("reply block missing thread parent: %+v", b)
+		}
+	}
+	if broadcasts != 1 {
+		t.Fatalf("broadcast reply duplicated: %d blocks", broadcasts)
+	}
+	if reply := root.Blocks[1]; reply.Author != "Bob" || reply.Text != "first reply" ||
 		reply.URL != "https://workspace.slack.com/archives/C1/p1000002?cid=C1&thread_ts=1.000001" {
-		t.Fatalf("reply item = %+v", reply)
+		t.Fatalf("reply block = %+v", reply)
 	}
-	if fake.count("/auth.test") != 1 || fake.count("/conversations.info") != 1 || fake.count("/users.list") != 1 || fake.count("/users.info") != 1 {
-		t.Fatalf("lookups were not cached per sync: auth.test=%d conversations.info=%d users.list=%d users.info=%d", fake.count("/auth.test"), fake.count("/conversations.info"), fake.count("/users.list"), fake.count("/users.info"))
+	if file.ParentNativeID != "slack:C1:thread:1.000001" || file.ParentKind != "thread" || file.Kind != "file" {
+		t.Fatalf("file item = %+v", file)
+	}
+	if fake.count("/auth.test") != 1 || fake.count("/conversations.info") != 1 || fake.count("/users.list") != 1 || fake.count("/users.info") != 1 || fake.count("/conversations.replies") != 1 {
+		t.Fatalf("lookups were not cached per sync: auth.test=%d conversations.info=%d users.list=%d users.info=%d conversations.replies=%d", fake.count("/auth.test"), fake.count("/conversations.info"), fake.count("/users.list"), fake.count("/users.info"), fake.count("/conversations.replies"))
 	}
 }
 
@@ -226,7 +266,7 @@ func TestSlackChannelTitleUnavailable(t *testing.T) {
 		t.Fatalf("page=%+v conversations.info=%d err=%v", page, fake.count("/conversations.info"), err)
 	}
 	for _, item := range page.Items {
-		if item.Title != "" || !strings.HasPrefix(item.Text, "Alice · ") {
+		if item.Container != "#C1" || len(item.Blocks) != 1 || item.Blocks[0].Text != map[string]string{"slack:C1:thread:1": "a", "slack:C1:thread:2": "b"}[item.NativeID] {
 			t.Fatalf("unexpected item without channel title: %+v", item)
 		}
 	}
@@ -319,7 +359,7 @@ func TestSlackWithoutChannelSyncsEveryMemberChannel(t *testing.T) {
 			break
 		}
 	}
-	if got := strings.Join(items, " "); got != "slack:C1:2.000000#general slack:C1:1.000000#general slack:C2:3.000000#random" {
+	if got := strings.Join(items, " "); got != "slack:C1:thread:2.000000#alice in #general: second slack:C1:thread:1.000000#alice in #general: first slack:C2:thread:3.000000#bob in #random: elsewhere" {
 		t.Fatalf("content = %s", got)
 	}
 }
@@ -493,5 +533,323 @@ func TestSlackLegacyCursorRunsFull(t *testing.T) {
 	page, err := a.Content(context.Background(), conn, Cursor("raw-legacy-cursor"), 10)
 	if err != nil || !page.Snapshot || len(page.Items) != 1 || page.Checkpoint == "" {
 		t.Fatalf("legacy cursor page = %+v, %v", page, err)
+	}
+}
+
+// slackThreadFixture returns a fake workspace with one thread (root plus the
+// given replies) and one standalone message.
+func slackThreadFixture(t *testing.T, replies []map[string]any) *fakeSlack {
+	t.Helper()
+	return &fakeSlack{t: t,
+		history: []map[string]any{
+			{"user": "U1", "text": "root message", "ts": "1.000000", "thread_ts": "1.000000", "reply_count": len(replies)},
+			{"user": "U2", "text": "standalone", "ts": "2.000000"},
+		},
+		replies: map[string][]map[string]any{"1.000000": replies},
+	}
+}
+
+func slackContentItems(t *testing.T, fake *fakeSlack) []ContentItem {
+	t.Helper()
+	a, conn := newSlackTestAdapter(t, fake)
+	var items []ContentItem
+	var cursor Cursor
+	for pages := 0; ; pages++ {
+		if pages > 10 {
+			t.Fatal("content listing did not terminate")
+		}
+		page, err := a.Content(context.Background(), conn, cursor, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		items = append(items, page.Items...)
+		if cursor = page.NextCursor; cursor == "" {
+			return items
+		}
+	}
+}
+
+func threadItemByID(t *testing.T, items []ContentItem, nativeID string) ContentItem {
+	t.Helper()
+	for _, item := range items {
+		if item.NativeID == nativeID {
+			return item
+		}
+	}
+	t.Fatalf("item %s not found in %+v", nativeID, items)
+	return ContentItem{}
+}
+
+// TestSlackThreadRepliesPaginate: a thread larger than one replies page is
+// fetched to the end and lands in a single document.
+func TestSlackThreadRepliesPaginate(t *testing.T) {
+	replies := make([]map[string]any, 0, 205)
+	for i := 1; i <= 205; i++ {
+		replies = append(replies, map[string]any{"user": "U1", "text": fmt.Sprintf("reply %03d", i), "ts": fmt.Sprintf("1.%06d", i), "thread_ts": "1.000000"})
+	}
+	fake := slackThreadFixture(t, replies)
+	items := slackContentItems(t, fake)
+	thread := threadItemByID(t, items, "slack:C1:thread:1.000000")
+	if len(thread.Blocks) != 206 || thread.NativeRevision != "1.000205:205" {
+		t.Fatalf("thread = %d blocks revision %q", len(thread.Blocks), thread.NativeRevision)
+	}
+	if thread.Blocks[1].NativeID != "1.000001" || thread.Blocks[205].NativeID != "1.000205" {
+		t.Fatalf("block order = %q .. %q", thread.Blocks[1].NativeID, thread.Blocks[205].NativeID)
+	}
+	if got := fake.count("/conversations.replies"); got != 2 {
+		t.Fatalf("conversations.replies calls = %d, want 2 pages", got)
+	}
+}
+
+// TestSlackStandaloneMessageIsThreadOfOne: a message with no replies is a
+// thread document of one block under the same id scheme, and its files parent
+// to that document.
+func TestSlackStandaloneMessageIsThreadOfOne(t *testing.T) {
+	fake := &fakeSlack{t: t, history: []map[string]any{
+		{"user": "U1", "text": "hello <@U2>", "ts": "5.000000", "files": []map[string]any{{"id": "F9"}}},
+	}}
+	items := slackContentItems(t, fake)
+	if len(items) != 2 {
+		t.Fatalf("items = %+v", items)
+	}
+	thread := items[0]
+	if thread.NativeID != "slack:C1:thread:5.000000" || thread.Kind != "thread" || thread.NativeRevision != "5.000000:0" ||
+		thread.Title != "Alice in #engineering: hello @Bob" || thread.URL != "https://workspace.slack.com/archives/C1/p5000000" ||
+		len(thread.Blocks) != 1 {
+		t.Fatalf("standalone item = %+v", thread)
+	}
+	if thread.Blocks[0].Text != "hello @Bob" || thread.Blocks[0].ParentNativeID != "" {
+		t.Fatalf("standalone block = %+v", thread.Blocks[0])
+	}
+	file := items[1]
+	if file.NativeID != "slack:file:F9" || file.ParentNativeID != "slack:C1:thread:5.000000" || file.ParentKind != "thread" {
+		t.Fatalf("file item = %+v", file)
+	}
+}
+
+// TestSlackEditedMessageChangesRevision: an edit moves the thread revision
+// and updated_at even though no reply was added.
+func TestSlackEditedMessageChangesRevision(t *testing.T) {
+	fake := slackThreadFixture(t, []map[string]any{
+		{"user": "U2", "text": "first", "ts": "1.000002", "thread_ts": "1.000000"},
+		{"user": "U1", "text": "second", "ts": "1.000003", "thread_ts": "1.000000"},
+	})
+	before := threadItemByID(t, slackContentItems(t, fake), "slack:C1:thread:1.000000")
+	if before.NativeRevision != "1.000003:2" {
+		t.Fatalf("revision before edit = %q", before.NativeRevision)
+	}
+	fake.replies["1.000000"][1]["edited"] = map[string]any{"user": "U1", "ts": "5.000000"}
+	fake.replies["1.000000"][1]["text"] = "second, edited"
+	after := threadItemByID(t, slackContentItems(t, fake), "slack:C1:thread:1.000000")
+	if after.NativeRevision != "5.000000:2" {
+		t.Fatalf("revision after edit = %q, want edit ts to lead", after.NativeRevision)
+	}
+	if after.UpdatedAt == nil || after.UpdatedAt.Unix() != 5 {
+		t.Fatalf("updated_at = %v", after.UpdatedAt)
+	}
+	edited := after.Blocks[2]
+	if edited.NativeID != "1.000003" || edited.Text != "second, edited" || edited.UpdatedAt != "1970-01-01T00:00:05Z" {
+		t.Fatalf("edited block = %+v", edited)
+	}
+}
+
+// TestSlackDeletedReplyChangesThread: a reply that disappears upstream leaves
+// the thread document on the next listing.
+func TestSlackDeletedReplyChangesThread(t *testing.T) {
+	fake := slackThreadFixture(t, []map[string]any{
+		{"user": "U2", "text": "kept", "ts": "1.000002", "thread_ts": "1.000000"},
+		{"user": "U1", "text": "deleted later", "ts": "1.000003", "thread_ts": "1.000000"},
+	})
+	before := threadItemByID(t, slackContentItems(t, fake), "slack:C1:thread:1.000000")
+	if len(before.Blocks) != 3 || before.NativeRevision != "1.000003:2" {
+		t.Fatalf("before = %d blocks %q", len(before.Blocks), before.NativeRevision)
+	}
+	fake.replies["1.000000"] = fake.replies["1.000000"][:1]
+	after := threadItemByID(t, slackContentItems(t, fake), "slack:C1:thread:1.000000")
+	if len(after.Blocks) != 2 || after.NativeRevision != "1.000002:1" {
+		t.Fatalf("after = %d blocks %q", len(after.Blocks), after.NativeRevision)
+	}
+	if after.Blocks[1].Text != "kept" {
+		t.Fatalf("remaining block = %+v", after.Blocks[1])
+	}
+}
+
+// TestSlackUnchangedThreadKeepsRevision: listing the same thread twice yields
+// the same revision and byte-identical blocks, so the sync dedupes it.
+func TestSlackUnchangedThreadKeepsRevision(t *testing.T) {
+	fake := slackThreadFixture(t, []map[string]any{
+		{"user": "U2", "text": "a reply", "ts": "1.000002", "thread_ts": "1.000000"},
+	})
+	first := threadItemByID(t, slackContentItems(t, fake), "slack:C1:thread:1.000000")
+	second := threadItemByID(t, slackContentItems(t, fake), "slack:C1:thread:1.000000")
+	if first.NativeRevision != second.NativeRevision {
+		t.Fatalf("revisions differ: %q vs %q", first.NativeRevision, second.NativeRevision)
+	}
+	firstBody, err := source.EncodeBlocks(first.Blocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBody, err := source.EncodeBlocks(second.Blocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(firstBody, secondBody) {
+		t.Fatal("unchanged thread encoded different blocks")
+	}
+}
+
+// TestSlackTombstonedRootKeepsReplies: a deleted root message still heads a
+// thread document built from its replies; a tombstone with no replies emits
+// nothing.
+func TestSlackTombstonedRootKeepsReplies(t *testing.T) {
+	fake := &fakeSlack{t: t,
+		history: []map[string]any{
+			{"subtype": "tombstone", "text": "<@U1> deleted a message", "ts": "1.000000", "thread_ts": "1.000000", "reply_count": 2},
+			{"subtype": "tombstone", "text": "<@U1> deleted a message", "ts": "3.000000", "thread_ts": "3.000000"},
+		},
+		replies: map[string][]map[string]any{"1.000000": {
+			{"user": "U2", "text": "still here", "ts": "1.000001", "thread_ts": "1.000000"},
+			{"user": "U1", "text": "and this", "ts": "1.000002", "thread_ts": "1.000000"},
+		}},
+	}
+	items := slackContentItems(t, fake)
+	if len(items) != 1 {
+		t.Fatalf("items = %+v", items)
+	}
+	thread := items[0]
+	if thread.NativeID != "slack:C1:thread:1.000000" || thread.Kind != "thread" || thread.NativeRevision != "1.000002:2" {
+		t.Fatalf("thread item = %+v", thread)
+	}
+	if len(thread.Blocks) != 2 {
+		t.Fatalf("blocks = %+v", thread.Blocks)
+	}
+	for i, want := range []struct{ ts, author, text string }{
+		{"1.000001", "Bob", "still here"},
+		{"1.000002", "Alice", "and this"},
+	} {
+		block := thread.Blocks[i]
+		if block.NativeID != want.ts || block.ParentNativeID != "1.000000" || block.Author != want.author || block.Text != want.text {
+			t.Fatalf("block %d = %+v", i, block)
+		}
+	}
+	// The document links to the root permalink and is titled from the first
+	// surviving message.
+	if thread.URL != "https://workspace.slack.com/archives/C1/p1000000" || thread.Title != "Bob in #engineering: still here" {
+		t.Fatalf("thread link/title = %q %q", thread.URL, thread.Title)
+	}
+	if strings.Join(thread.Authors, ",") != "Bob,Alice" {
+		t.Fatalf("authors = %v", thread.Authors)
+	}
+}
+
+// seedLegacySlackMessages runs one sync whose adapter still emits the
+// pre-upgrade per-message items, leaving their objects and versions behind.
+func seedLegacySlackMessages(t *testing.T) *connectorFixture {
+	t.Helper()
+	adapter := &testAdapter{capabilities: AdapterCapabilities{Content: true}}
+	adapter.content = func(context.Context, source.Connection, Cursor, int) (ContentPage, error) {
+		return ContentPage{Items: []ContentItem{
+			{NativeID: "slack:C1:1.000000", Kind: "message", ParentNativeID: "slack:C1", ParentKind: "channel", Text: "root message"},
+			{NativeID: "slack:C1:1.000002", Kind: "message", ParentNativeID: "slack:C1:1.000000", ParentKind: "message", Text: "a reply"},
+			{NativeID: "slack:C1:2.000000", Kind: "message", ParentNativeID: "slack:C1", ParentKind: "channel", Text: "standalone"},
+		}, Completeness: CompletenessComplete, Snapshot: true}, nil
+	}
+	f := newConnectorFixture(t, adapter)
+	f.schedule(t)
+	if _, err := f.runNext(t); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// useRealSlackAdapter points the fixture's Slack factory at the fake Slack
+// server and marks the source for reconciled full listings.
+func useRealSlackAdapter(t *testing.T, f *connectorFixture, fake *fakeSlack) {
+	t.Helper()
+	server := httptest.NewServer(fake)
+	t.Cleanup(server.Close)
+	f.svc.setAllowPrivateBaseURL(true)
+	f.svc.SetSyncDependencies(AdapterFactories{SourceKindSlack: func(c source.Connection) (Adapter, error) {
+		return NewSlackAdapter(c, fixedCredential("test-token"))
+	}}, f.observations, f.artifacts, f.sourceRepo)
+	ctx := context.Background()
+	conn, err := f.sourceRepo.GetConnection(ctx, f.tenant, f.connection.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Config = map[string]any{"channel_id": "C1", "base_url": server.URL, "reconcile": "true"}
+	if err := f.sourceRepo.UpdateConnection(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func legacyMessageDeleted(t *testing.T, f *connectorFixture, nativeID string) bool {
+	t.Helper()
+	ctx := context.Background()
+	object, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "message", nativeID)
+	if err != nil {
+		t.Fatalf("legacy object %s: %v", nativeID, err)
+	}
+	stored, err := f.sourceRepo.GetObject(ctx, f.tenant, object.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stored.DeletedAt != nil
+}
+
+// TestSlackCompleteSyncTombstonesPerMessageItems: the first complete
+// reconciled listing after the upgrade observes only thread documents, so
+// the sweep tombstones the old per-message items.
+func TestSlackCompleteSyncTombstonesPerMessageItems(t *testing.T) {
+	f := seedLegacySlackMessages(t)
+	fake := slackThreadFixture(t, []map[string]any{
+		{"user": "U2", "text": "a reply", "ts": "1.000002", "thread_ts": "1.000000"},
+	})
+	// The seeded messages used ts 1.000000/1.000002/2.000000; align the fake
+	// thread root with the seeded standalone message's ts is unnecessary —
+	// what matters is that no slack:C1:<ts> item is emitted any more.
+	useRealSlackAdapter(t, f, fake)
+	f.schedule(t)
+	if _, err := f.runNext(t); err != nil {
+		t.Fatal(err)
+	}
+	for _, nativeID := range []string{"slack:C1:1.000000", "slack:C1:1.000002", "slack:C1:2.000000"} {
+		if !legacyMessageDeleted(t, f, nativeID) {
+			t.Fatalf("old per-message item %s survived the complete sync", nativeID)
+		}
+	}
+	ctx := context.Background()
+	for _, nativeID := range []string{"slack:C1:thread:1.000000", "slack:C1:thread:2.000000"} {
+		if _, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, f.connection.ID, "thread", nativeID); err != nil {
+			t.Fatalf("thread document %s missing after sync: %v", nativeID, err)
+		}
+	}
+}
+
+// TestSlackIncompleteSyncKeepsPerMessageItems: a listing that fails before
+// its terminal page deletes nothing, even under reconcile.
+func TestSlackIncompleteSyncKeepsPerMessageItems(t *testing.T) {
+	f := seedLegacySlackMessages(t)
+	fake := &fakeSlack{t: t}
+	fake.override = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/conversations.history" {
+			return false
+		}
+		if r.URL.Query().Get("cursor") == "" {
+			_, _ = fmt.Fprint(w, `{"ok":true,"messages":[{"user":"U1","text":"root","ts":"1.000000","thread_ts":"1.000000","reply_count":1}],"has_more":true,"response_metadata":{"next_cursor":"p2"}}`)
+			return true
+		}
+		_, _ = fmt.Fprint(w, `{"ok":false,"error":"internal_error"}`)
+		return true
+	}
+	useRealSlackAdapter(t, f, fake)
+	f.schedule(t)
+	if _, err := f.runNext(t); err == nil {
+		t.Fatal("interrupted listing unexpectedly succeeded")
+	}
+	for _, nativeID := range []string{"slack:C1:1.000000", "slack:C1:1.000002", "slack:C1:2.000000"} {
+		if legacyMessageDeleted(t, f, nativeID) {
+			t.Fatalf("incomplete sync deleted %s", nativeID)
+		}
 	}
 }
