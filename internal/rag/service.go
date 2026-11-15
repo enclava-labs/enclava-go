@@ -1142,6 +1142,10 @@ func (s *Service) persistUpload(ctx context.Context, p auth.Principal, c Collect
 		"kind": kind, "input_artifact_ref": input.InputArtifact,
 		"result_job_id": input.ResultJobID, "result_artifact_ref": input.ResultArtifact,
 		"source_uri": strings.TrimSpace(input.SourceURI), "metadata": nonNilMap(input.Metadata),
+		// v1.2 document-level metadata: the collection is the container and
+		// the uploader owns authorship; both timestamps are the upload time.
+		"container": c.Name, "authors": []string{p.ActorID},
+		"created_at": time.Now().UTC(), "updated_at": time.Now().UTC(),
 	})
 	ver := source.ObjectVersion{
 		ObjectID: obj.ID, ObservedSeq: 1, ArtifactRef: ref.ID, SHA256: ref.SHA256,
@@ -1218,6 +1222,10 @@ func (s *Service) persistDocumentArtifact(ctx context.Context, p auth.Principal,
 		"result_job_id": input.ResultJobID, "result_artifact_ref": input.ResultArtifact,
 		"source_uri": strings.TrimSpace(input.SourceURI),
 		"metadata":   nonNilMap(input.Metadata),
+		// v1.2 document-level metadata: the collection is the container and
+		// the uploader owns authorship; both timestamps are the upload time.
+		"container": c.Name, "authors": []string{p.ActorID},
+		"created_at": time.Now().UTC(), "updated_at": time.Now().UTC(),
 	})
 	ver := source.ObjectVersion{
 		ObjectID:         obj.ID,
@@ -1400,7 +1408,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 			return "", err
 		}
 		for _, chunk := range previousChunks {
-			structuredChunks = append(structuredChunks, source.Chunk{Ordinal: chunk.ChunkIndex, Text: chunk.Content, Spans: chunk.SpanRefs})
+			structuredChunks = append(structuredChunks, source.Chunk{Ordinal: chunk.ChunkIndex, Text: chunk.Content, Spans: chunk.SpanRefs, Links: chunk.Links})
 		}
 	} else {
 		ref := artifacts.Ref{TenantID: job.TenantID, ID: ver.ArtifactRef, Kind: artifacts.KindOriginal}
@@ -1414,7 +1422,7 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		if len(document.Blocks) == 0 {
 			return "", errors.New("document has no extractable text")
 		}
-		document = applyConnectorStructure(document, ver.Provenance)
+		document = applyConnectorStructure(document, ver)
 		if err := s.repo.SaveParsedDocument(ctx, "extract-v1", document); err != nil {
 			return "", err
 		}
@@ -1509,6 +1517,12 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	_ = json.Unmarshal([]byte(ver.Provenance), &provMeta)
 	docMetadata := mapFromPayload(provMeta, "metadata")
 	sourceURI := stringFromPayload(provMeta, "source_uri")
+	// Document-level link metadata (v1.2): mirrored into every point so
+	// query time never joins PostgreSQL for the document's provenance.
+	container := stringFromPayload(provMeta, "container")
+	author := firstAuthor(provMeta["authors"])
+	createdAt := stringFromPayload(provMeta, "created_at")
+	updatedAt := stringFromPayload(provMeta, "updated_at")
 	for i, chunkText := range chunkTexts {
 		chunkID := newID("ragchunk")
 		pointID := newPointID()
@@ -1549,6 +1563,25 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 			}
 		}
 		payload["block_spans"] = spanPayload
+		if sourceURL := strings.TrimSpace(sourceURI); sourceURL != "" {
+			payload["source_url"] = sourceURL
+		}
+		if container != "" {
+			payload["container"] = container
+		}
+		if author != "" {
+			payload["author"] = author
+		}
+		if createdAt != "" {
+			payload["source_created_at"] = createdAt
+		}
+		if updatedAt != "" {
+			payload["source_updated_at"] = updatedAt
+		}
+		if links := structuredChunks[i].Links; len(links) > 0 {
+			payload["links"] = links
+			chunk.Links = links
+		}
 		chunks = append(chunks, chunk)
 		points = append(points, QdrantPoint{
 			ID: pointID, Vector: vectors[i], Payload: payload,
@@ -1805,6 +1838,18 @@ func boolACL(acl map[string]any, key string) bool {
 func stringFromPayload(payload map[string]any, key string) string {
 	v, _ := payload[key].(string)
 	return v
+}
+
+// firstAuthor reads the first author of a provenance authors list (a JSON
+// array decodes as []any); uploads carry exactly the uploader.
+func firstAuthor(v any) string {
+	list, _ := v.([]any)
+	for _, item := range list {
+		if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 func mapFromPayload(payload map[string]any, key string) map[string]any {

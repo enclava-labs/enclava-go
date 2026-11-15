@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"enclava-go/internal/auth"
 	"enclava-go/internal/inference"
@@ -331,6 +332,11 @@ type reauthRepo struct {
 	point      *QdrantSearchPoint
 	bindings   []IndexBinding
 	evidence   []EvidenceRecord
+	// Optional chunk-row material for v1.2 link tests.
+	chunkContent string
+	chunkSpans   []source.Span
+	chunkLinks   []source.ChunkLink
+	locator      source.Locator
 }
 
 func (r *reauthRepo) GetCollection(_ context.Context, _ string, id string) (Collection, error) {
@@ -382,7 +388,19 @@ func (r *reauthRepo) GetDocument(_ context.Context, _, _ string) (Document, erro
 }
 
 func (r *reauthRepo) ListGenerationChunks(_ context.Context, _, _, _ string, _ int64) ([]DocumentChunk, error) {
-	return []DocumentChunk{{ID: "chunk-1", Content: "secret"}}, nil
+	chunk := DocumentChunk{ID: "chunk-1", Content: "secret", SpanRefs: r.chunkSpans, Links: r.chunkLinks}
+	if r.chunkContent != "" {
+		chunk.Content = r.chunkContent
+	}
+	return []DocumentChunk{chunk}, nil
+}
+
+func (r *reauthRepo) ListBlockLocators(_ context.Context, _ string, blockIDs []string) (map[string]source.Locator, error) {
+	out := make(map[string]source.Locator, len(blockIDs))
+	for _, id := range blockIDs {
+		out[id] = r.locator
+	}
+	return out, nil
 }
 
 type revokingVectors struct {
@@ -500,5 +518,143 @@ func TestSearchSkipsDeniedEmbeddingBinding(t *testing.T) {
 	repo.bindings = repo.bindings[:1]
 	if _, err := svc.Search(context.Background(), principal, SearchInput{CollectionID: "col", Query: "hello", Mode: QuerySemantic}); !errors.Is(err, inference.ErrDenied) {
 		t.Fatalf("all denied = %v", err)
+	}
+}
+
+// TestPickDeepLinkByLexicalOverlap: the entry whose chunk text segment
+// overlaps the query words most wins; ties and hits without overlap keep
+// the first entry. Offsets are code points, so multibyte text stays exact.
+func TestPickDeepLinkByLexicalOverlap(t *testing.T) {
+	first := "die Rechnung: unterwegs"
+	second := "the invoice total is 42"
+	content := first + "\n" + second
+	links := []source.ChunkLink{
+		{Offset: 0, URL: "https://hooks.slack.com/p1"},
+		{Offset: utf8.RuneCountInString(first) + 1, URL: "https://hooks.slack.com/p2"},
+	}
+	if got := pickDeepLink(links, content, "invoice total"); got.URL != links[1].URL {
+		t.Fatalf("overlap picked %q, want the second entry", got.URL)
+	}
+	if got := pickDeepLink(links, content, "rechnung unterwegs"); got.URL != links[0].URL {
+		t.Fatalf("unicode overlap picked %q, want the first entry", got.URL)
+	}
+	if got := pickDeepLink(links, content, "nothing matches here"); got.URL != links[0].URL {
+		t.Fatalf("no overlap picked %q, want the first entry", got.URL)
+	}
+	if got := pickDeepLink(links, content, "INVOICE  TOTAL"); got.URL != links[1].URL {
+		t.Fatalf("case-insensitive overlap picked %q, want the second entry", got.URL)
+	}
+	// A single entry returns immediately, whatever the query says.
+	if got := pickDeepLink(links[:1], content, "invoice"); got.URL != links[0].URL {
+		t.Fatalf("single entry picked %q", got.URL)
+	}
+}
+
+// applyHitLinks promotes the chosen entry's author and timestamp to the hit
+// and never touches document-level values when the entry carries none.
+func TestApplyHitLinksAuthorTimestamps(t *testing.T) {
+	result := &SearchResult{
+		Author: "uploader", SourceCreatedAt: "2026-01-01T00:00:00Z", SourceUpdatedAt: "2026-01-05T00:00:00Z",
+		Links: []source.ChunkLink{{Offset: 0, URL: "https://hooks.slack.com/p1"}},
+	}
+	applyHitLinks(result, "anything")
+	if result.Author != "uploader" || result.SourceCreatedAt != "2026-01-01T00:00:00Z" || result.SourceUpdatedAt != "2026-01-05T00:00:00Z" {
+		t.Fatalf("document-level authorship replaced: %+v", result)
+	}
+	result.Links[0].Author = "ada"
+	result.Links[0].Timestamp = "2026-01-02T03:04:05Z"
+	applyHitLinks(result, "anything")
+	if result.Author != "ada" || result.SourceCreatedAt != "2026-01-02T03:04:05Z" || result.SourceUpdatedAt != "2026-01-02T03:04:05Z" {
+		t.Fatalf("entry authorship not promoted: %+v", result)
+	}
+	// Linkless hits stay untouched.
+	plain := &SearchResult{Link: "", Author: "uploader"}
+	applyHitLinks(plain, "anything")
+	if plain.Link != "" || plain.Author != "uploader" {
+		t.Fatalf("linkless hit mutated: %+v", plain)
+	}
+}
+
+// sanitizeLinks clears only URLs off the scheme allow-list; the entries and
+// their metadata survive, and all-safe input round-trips unchanged.
+func TestSanitizeLinks(t *testing.T) {
+	links := []source.ChunkLink{
+		{Offset: 0, URL: "javascript:alert(1)", Author: "evil"},
+		{Offset: 5, URL: "slack://C1/p1"},
+	}
+	got := sanitizeLinks(links)
+	if len(got) != 2 || got[0].URL != "" || got[0].Author != "evil" || got[1].URL != "slack://C1/p1" {
+		t.Fatalf("sanitized links = %+v", got)
+	}
+	if changed := sanitizeLinks([]source.ChunkLink{{Offset: 0, URL: "https://hooks.slack.com/p2"}}); len(changed) != 1 || changed[0].URL != "https://hooks.slack.com/p2" {
+		t.Fatalf("safe links mutated: %+v", changed)
+	}
+}
+
+// TestSearchDeepLinkFromPayload: payload links drive the hit's deep link and
+// authorship through the full Search flow, and the chosen entry wins over
+// the document-level author.
+func TestSearchDeepLinkFromPayload(t *testing.T) {
+	repo, principal := searchReauthFixture()
+	content := "first message about deploys\nsecond message about invoices"
+	secondOffset := utf8.RuneCountInString("first message about deploys\n")
+	repo.chunkContent = content
+	repo.chunkSpans = []source.Span{{BlockID: "blk_1"}}
+	repo.chunkLinks = []source.ChunkLink{
+		{Offset: 0, URL: "https://hooks.slack.com/archives/C/m1", Author: "ada", Timestamp: "2026-01-01T00:00:00Z"},
+		{Offset: secondOffset, URL: "https://hooks.slack.com/archives/C/m2", Author: "bob", Timestamp: "2026-01-02T00:00:00Z"},
+	}
+	repo.point.Payload["content"] = content
+	repo.point.Payload["source_uri"] = "https://hooks.slack.com/archives/C/m1"
+	repo.point.Payload["container"] = "#borgz"
+	repo.point.Payload["author"] = "ada"
+	repo.point.Payload["source_created_at"] = "2026-01-01T00:00:00Z"
+	repo.point.Payload["source_updated_at"] = "2026-01-02T00:00:00Z"
+	svc := &Service{repo: repo, vectorStore: &fixedRetrievalVectors{point: *repo.point}, authorizer: source.NewAuthorizer(repo)}
+
+	results, err := svc.Search(context.Background(), principal, SearchInput{CollectionID: "col", Query: "second message invoices", Mode: QueryLexical})
+	if err != nil || len(results) != 1 {
+		t.Fatalf("search: %#v err=%v", results, err)
+	}
+	r := results[0]
+	if r.SourceURL != "https://hooks.slack.com/archives/C/m1" || r.Container != "#borgz" {
+		t.Fatalf("source_url=%q container=%q", r.SourceURL, r.Container)
+	}
+	if r.Link != "https://hooks.slack.com/archives/C/m2" || r.Author != "bob" || r.SourceCreatedAt != "2026-01-02T00:00:00Z" {
+		t.Fatalf("deep link fields = %q %q %q", r.Link, r.Author, r.SourceCreatedAt)
+	}
+	if len(r.Links) != 2 || r.Links[1].Offset != secondOffset {
+		t.Fatalf("chunk links = %+v", r.Links)
+	}
+	if r.EvidenceID == "" {
+		t.Fatalf("evidence not minted")
+	}
+}
+
+// TestSearchUploadLinkFromChunkRow: a linkless hit falls back to the
+// retained-copy deep link when the first covered block has a page, and to
+// the document URL when it does not.
+func TestSearchUploadLinkFromChunkRow(t *testing.T) {
+	repo, principal := searchReauthFixture()
+	page := 7
+	repo.chunkSpans = []source.Span{{BlockID: "blk_1"}}
+	repo.locator = source.Locator{Page: &page}
+	repo.point.Payload["source_uri"] = "https://files.example.test/doc/1"
+	svc := &Service{repo: repo, vectorStore: &fixedRetrievalVectors{point: *repo.point}, authorizer: source.NewAuthorizer(repo)}
+
+	results, err := svc.Search(context.Background(), principal, SearchInput{CollectionID: "col", Query: "hello", Mode: QueryLexical})
+	if err != nil || len(results) != 1 {
+		t.Fatalf("search: %#v err=%v", results, err)
+	}
+	r := results[0]
+	if !strings.HasPrefix(r.Link, "/api/v1/rag/evidence/") || !strings.HasSuffix(r.Link, "/copy#page=7") || !strings.Contains(r.Link, r.EvidenceID) {
+		t.Fatalf("upload link = %q", r.Link)
+	}
+
+	// No page on the first covered block: the document URL wins.
+	repo.locator = source.Locator{Section: "Intro"}
+	results, err = svc.Search(context.Background(), principal, SearchInput{CollectionID: "col", Query: "hello", Mode: QueryLexical})
+	if err != nil || len(results) != 1 || results[0].Link != "https://files.example.test/doc/1" {
+		t.Fatalf("no-page fallback: %#v err=%v", results, err)
 	}
 }

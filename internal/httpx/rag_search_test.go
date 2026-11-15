@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"strings"
 	"testing"
 
@@ -912,5 +913,46 @@ func TestRAGUploadReadableCollectionWithoutWritePermission(t *testing.T) {
 	rec := uploadMultipart(t, f, key, "file", "read-only.txt", "content", 0)
 	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "write access to this collection") {
 		t.Fatalf("read-only upload = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestRAGUploadRejectsBlocksMIME: the structured connector document format
+// is produced by connectors only — an upload claiming that MIME type is a
+// 415 with a clear code, and nothing is persisted.
+func TestRAGUploadRejectsBlocksMIME(t *testing.T) {
+	f := seedUploadApp(t)
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", `form-data; name="file"; filename="thread.blocks.json"`)
+	header.Set("Content-Type", source.BlocksMIMEType)
+	part, err := form.CreatePart(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte(`{"blocks":[{"kind":"message","text":"hi"}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := form.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rag/collections/"+f.collectionID+"/documents", &body)
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+f.managerKey)
+	rec := httptest.NewRecorder()
+	f.app.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("blocks upload = %d body=%s, want 415", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "unsupported_media_type") {
+		t.Fatalf("error code missing: %s", rec.Body.String())
+	}
+	var versions int
+	if err := f.db.SQL.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM source_object_versions WHERE tenant_id=$1`, f.tenant).Scan(&versions); err != nil {
+		t.Fatal(err)
+	}
+	if versions != 0 {
+		t.Fatalf("rejected upload left %d versions", versions)
 	}
 }

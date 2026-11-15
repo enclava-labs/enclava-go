@@ -310,7 +310,7 @@ func provenanceValue(provenance, key string) string {
 }
 
 func connectorPayload(item ContentItem, filename, mimeType string) json.RawMessage {
-	payload, _ := json.Marshal(map[string]any{"native_id": item.NativeID, "parent_native_id": item.ParentNativeID, "kind": item.Kind, "native_revision": item.NativeRevision, "title": item.Title, "filename": filename, "mime_type": mimeType, "url": item.URL, "created_at": item.CreatedAt, "updated_at": item.UpdatedAt, "locator": item.Locator})
+	payload, _ := json.Marshal(map[string]any{"native_id": item.NativeID, "parent_native_id": item.ParentNativeID, "kind": item.Kind, "native_revision": item.NativeRevision, "title": item.Title, "filename": filename, "mime_type": mimeType, "url": item.URL, "created_at": item.CreatedAt, "updated_at": item.UpdatedAt, "locator": item.Locator, "container": item.Container, "authors": item.Authors})
 	return payload
 }
 

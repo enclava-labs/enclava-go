@@ -83,6 +83,12 @@ XLSX sheets over the cell cap, CSV/XLSX header rows leading each table
 chunk, and `truncated:` markers when a document exceeds the 4,096-chunk cap
 (only the first 4,096 chunks are indexed).
 
+The structured connector document format
+`application/vnd.enclava.blocks+json` is produced by source connectors only
+and is rejected on the upload endpoint with 415 and error code
+`unsupported_media_type`, whether it arrives as the file part's declared
+Content-Type or as detected MIME.
+
 Search prefilters indexed points by their `acl` access tokens and `published`
 flag, rather than enumerating every published document. Caller tokens cover
 the actor, delegated actor and tenant-wide access. Every hit is re-authorized
@@ -92,6 +98,26 @@ produced, so revocations take effect immediately. Each index fetches up to
 four times the per-index result limit, capped at 200 points per round, for
 at most three rounds (the initial round and two extra rounds); fewer results
 can be returned when post-checks discard hits.
+
+### Source links on search results (v1.2)
+
+Every result carries provenance links alongside `content`:
+
+| Field | Meaning |
+|---|---|
+| `source_url` | The document's URL: the Slack thread-root permalink, the GitHub issue/PR URL, the Notion page URL. Uploaded files have one only when `source_uri` was supplied at upload time. |
+| `link` | The best deep link for this hit. With per-block links it is the entry whose block text overlaps the query terms most (case-insensitive word overlap; ties and misses keep the first entry), and the hit's `author` and `source_created_at`/`source_updated_at` come from that entry. For uploads without block links it is the retained copy `/api/v1/rag/evidence/<evidence_id>/copy` with `#page=N` when the first covered block has a page; otherwise it repeats `source_url`. |
+| `links` | All deep-link entries of the chunk: `{offset, url, author, timestamp, native_id}` ordered by `offset` (code points into `content`). |
+| `author` | First author of the document, or the author of the block the hit starts in (see `link`). Uploads carry the uploader. |
+| `source_created_at`, `source_updated_at` | Source-native timestamps (RFC 3339): first/latest message, issue created/updated, page created/last-edited; uploads carry the upload time. |
+| `container` | Where the document lives: `#channel`, `owner/repo`, the parent page path; uploads carry the collection name. |
+
+Citations resolve the same deep links through the evidence API: `native_link`
+is the deep link of the cited block when it has one (message permalink,
+comment `html_url`, anchored Notion block), falling back to the document
+URL; GitHub repository files keep their `#L` line anchors. Every link passes
+a scheme allow-list (`https`, `http`, `slack`, `notion`).
+
 
 `POST /api/v1/rag/search` has no per-collection or aggregate 2,000-document
 bound. It returns `search_scope_too_large` when more than 20 distinct

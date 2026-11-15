@@ -94,21 +94,24 @@ type Document struct {
 // chunk_profile_version_id; QdrantPointID is the row ID (Qdrant upserts are
 // keyed by it so stale generations cannot clobber a newer version's index).
 type DocumentChunk struct {
-	ID               string         `json:"id"`
-	DocumentID       string         `json:"document_id"`
-	CollectionID     string         `json:"collection_id"`
-	Generation       int64          `json:"generation"`
-	ChunkIndex       int            `json:"chunk_index"`
-	ParentChunkIndex int            `json:"parent_chunk_index,omitempty"`
-	Content          string         `json:"content"`
-	TokenCount       int            `json:"token_count"`
-	QdrantPointID    string         `json:"qdrant_point_id,omitempty"`
-	ByteStart        int            `json:"byte_start,omitempty"`
-	ByteEnd          int            `json:"byte_end,omitempty"`
-	SpanRefs         []source.Span  `json:"span_refs,omitempty"`
-	HeaderPath       string         `json:"header_path,omitempty"`
-	Metadata         map[string]any `json:"metadata,omitempty"`
-	CreatedAt        time.Time      `json:"created_at"`
+	ID               string        `json:"id"`
+	DocumentID       string        `json:"document_id"`
+	CollectionID     string        `json:"collection_id"`
+	Generation       int64         `json:"generation"`
+	ChunkIndex       int           `json:"chunk_index"`
+	ParentChunkIndex int           `json:"parent_chunk_index,omitempty"`
+	Content          string        `json:"content"`
+	TokenCount       int           `json:"token_count"`
+	QdrantPointID    string        `json:"qdrant_point_id,omitempty"`
+	ByteStart        int           `json:"byte_start,omitempty"`
+	ByteEnd          int           `json:"byte_end,omitempty"`
+	SpanRefs         []source.Span `json:"span_refs,omitempty"`
+	// Links mirrors source.Chunk.Links: the deep links persisted on the
+	// chunk row and mirrored into the Qdrant payload at embed time.
+	Links      []source.ChunkLink `json:"links,omitempty"`
+	HeaderPath string             `json:"header_path,omitempty"`
+	Metadata   map[string]any     `json:"metadata,omitempty"`
+	CreatedAt  time.Time          `json:"created_at"`
 }
 
 // IndexGeneration is one published (or staged) document generation and the

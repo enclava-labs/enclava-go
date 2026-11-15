@@ -216,6 +216,12 @@ func (a *App) handleRAGCollectionDocumentsUpload(w http.ResponseWriter, r *http.
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
+	// Structured connector documents are produced only by connectors
+	// (source-synced); they are never accepted as uploads.
+	if mimeType == source.BlocksMIMEType {
+		WriteOpenAIError(w, http.StatusUnsupportedMediaType, "structured connector blocks (application/vnd.enclava.blocks+json) are produced by connectors only and cannot be uploaded", "invalid_request_error", "unsupported_media_type")
+		return
+	}
 	// Tenant/owner/provenance stay server-owned: only the stream, its size,
 	// detected MIME and the sanitized filename cross the boundary.
 	out, err := a.ragSvc.UploadDocument(r.Context(), principal, collectionID, rag.UploadDocumentInput{
