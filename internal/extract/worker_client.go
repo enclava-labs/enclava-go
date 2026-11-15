@@ -162,7 +162,9 @@ func parseViaWorker(ctx context.Context, data []byte, format string) ([]parseBlo
 			if eb.Code == "timeout" {
 				// The worker gave up on its own processing — retryable
 				// downstream, never a document defect.
-				return nil, nil, fmt.Errorf("%w: worker timed out parsing this document", ErrWorkerUnavailable)
+				// Counted toward the mid-parse drop cap: a document that
+				// always exhausts the worker's budget must not loop.
+				return nil, nil, fmt.Errorf("%w: worker timed out parsing this document", ErrWorkerDroppedMidParse)
 			}
 			return nil, nil, workerSentinelError(eb.Code, eb.Message)
 		}
@@ -175,7 +177,7 @@ func parseViaWorker(ctx context.Context, data []byte, format string) ([]parseBlo
 	dec := json.NewDecoder(io.LimitReader(resp.Body, maxWorkerResponse+1))
 	if err := dec.Decode(&out); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil, nil, fmt.Errorf("%w: %s", ErrWorkerDroppedMidParse, err)
+			return nil, nil, fmt.Errorf("%w: %w", ErrWorkerDroppedMidParse, err)
 		}
 		return nil, nil, fmt.Errorf("extract worker response: %w", err)
 	}
@@ -203,13 +205,17 @@ func parseViaWorker(ctx context.Context, data []byte, format string) ([]parseBlo
 func classifyWorkerTransportError(err error) error {
 	var opErr *net.OpError
 	if errors.As(err, &opErr) && opErr.Op == "dial" {
-		return fmt.Errorf("%w: %s", ErrWorkerUnavailable, err)
+		return fmt.Errorf("%w: %w", ErrWorkerUnavailable, err)
 	}
+	// A client-side timeout means the worker took the request and never
+	// answered in time; like a drop, the document may be the cause.
+	var netErr net.Error
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
-		return fmt.Errorf("%w: %s", ErrWorkerDroppedMidParse, err)
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) ||
+		(errors.As(err, &netErr) && netErr.Timeout()) {
+		return fmt.Errorf("%w: %w", ErrWorkerDroppedMidParse, err)
 	}
-	return fmt.Errorf("%w: %s", ErrWorkerUnavailable, err)
+	return fmt.Errorf("%w: %w", ErrWorkerUnavailable, err)
 }
 
 // WorkerAvailability reports the cached capability probe for readiness:

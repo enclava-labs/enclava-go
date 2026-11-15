@@ -94,8 +94,9 @@ func TestWorkerUnavailableSentinels(t *testing.T) {
 				_, _ = w.Write([]byte(`{"code":"timeout","message":"context deadline exceeded"}`))
 			})))
 			err := workerParseErr(t)
-			if !errors.Is(err, ErrWorkerUnavailable) || errors.Is(err, ErrWorkerDroppedMidParse) {
-				t.Fatalf("timeout code: err = %v, want ErrWorkerUnavailable only", err)
+			// A worker-side timeout counts toward the mid-parse drop cap.
+			if !errors.Is(err, ErrWorkerDroppedMidParse) {
+				t.Fatalf("timeout code: err = %v, want ErrWorkerDroppedMidParse", err)
 			}
 		},
 	}
