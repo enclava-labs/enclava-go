@@ -30,7 +30,7 @@ const (
 
 	// waitingMessage is the neutral document-side state while a job is
 	// deferred for the extraction worker (never an error).
-	waitingMessage = "waiting for the extraction worker"
+	waitingMessage = StatusWaitingForWorker
 )
 
 // SetExtractWorkerMaxWait bounds how long one job may stay continuously

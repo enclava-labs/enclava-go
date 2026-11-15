@@ -3230,9 +3230,10 @@ func TestSearchSourceLinksAndDeepLinkChoice(t *testing.T) {
 	if r.Links[0].Author != "ada" || r.Links[0].Offset != 0 || r.Links[1].NativeID != "m2" {
 		t.Fatalf("chunk link fields lost: %+v", r.Links)
 	}
-	// No overlap: the first entry wins. Its URL is unsafe, so no deep link.
+	// No overlap: the first entry wins. Its URL is unsafe, so the hit falls
+	// back to the document URL.
 	results, err = f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "unrelated gibberish", Limit: 5})
-	if err != nil || len(results) != 1 || results[0].Link != "" {
+	if err != nil || len(results) != 1 || results[0].Link != "https://hooks.slack.com/archives/C1/p_root" {
 		t.Fatalf("no-overlap fallback: %#v err=%v", results, err)
 	}
 

@@ -457,6 +457,9 @@ func applyHitLinks(result *SearchResult, query string) {
 	}
 	chosen := pickDeepLink(result.Links, result.Content, query)
 	result.Link = chosen.URL
+	if result.Link == "" {
+		result.Link = result.SourceURL
+	}
 	if chosen.Author != "" {
 		result.Author = chosen.Author
 	}
@@ -568,10 +571,16 @@ func (s *Service) applyUploadLinks(ctx context.Context, tenantID string, results
 // retainedCopyLink is the stored original opened at a page, or the document
 // URL when the first covered block has no page.
 func retainedCopyLink(evidenceID string, page *int, sourceURL string) string {
-	if page == nil {
+	copyURL := "/api/v1/rag/evidence/" + url.PathEscape(evidenceID) + "/copy"
+	if page != nil {
+		return copyURL + "#page=" + strconv.Itoa(*page)
+	}
+	// No page: an external document URL beats the bare stored copy; an
+	// upload without one still opens its stored original.
+	if sourceURL != "" {
 		return sourceURL
 	}
-	return "/api/v1/rag/evidence/" + url.PathEscape(evidenceID) + "/copy#page=" + strconv.Itoa(*page)
+	return copyURL
 }
 
 func (s *Service) reauthorizeResults(ctx context.Context, p auth.Principal, results []SearchResult) ([]SearchResult, error) {

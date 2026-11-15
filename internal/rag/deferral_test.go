@@ -124,8 +124,8 @@ func TestEmbedDefersWhenWorkerDown(t *testing.T) {
 	if d.Status != rag.DocumentStatusProcessing {
 		t.Fatalf("document status = %q, want processing", d.Status)
 	}
-	if len(d.Warnings) != 1 || d.Warnings[0] != "waiting for the extraction worker" {
-		t.Fatalf("document warnings = %v, want the waiting message", d.Warnings)
+	if d.StatusMessage != rag.StatusWaitingForWorker || len(d.Warnings) != 0 {
+		t.Fatalf("document status message = %q warnings = %v, want the waiting message as status only", d.StatusMessage, d.Warnings)
 	}
 	if d.ErrorMessage != "" {
 		t.Fatalf("document error = %q, want empty (not failed)", d.ErrorMessage)

@@ -879,6 +879,19 @@ func scanDocument(scanner interface {
 			d.Status = rag.DocumentStatusProcessing
 		}
 	}
+	// The deferred-ingest marker rides the generation's warnings; surface
+	// it as the document's neutral status message, not as a warning.
+	kept := d.Warnings[:0]
+	for _, w := range d.Warnings {
+		if w == rag.StatusWaitingForWorker {
+			if d.Status == rag.DocumentStatusProcessing {
+				d.StatusMessage = w
+			}
+			continue
+		}
+		kept = append(kept, w)
+	}
+	d.Warnings = kept
 	var prov map[string]any
 	if provenance.Valid {
 		_ = json.Unmarshal([]byte(provenance.String), &prov)

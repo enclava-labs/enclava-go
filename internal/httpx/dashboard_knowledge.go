@@ -349,7 +349,7 @@ func (a *App) knowledgeDocuments(w http.ResponseWriter, ctx context.Context, p a
 
 // waitingForExtractionWorker is the status_message the deferred ingest path
 // records while a document waits on the extraction worker (v1.2).
-const waitingForExtractionWorker = "waiting for the extraction worker"
+const waitingForExtractionWorker = rag.StatusWaitingForWorker
 
 // knowledgeStatusMessage resolves a document's non-error progress note: the
 // API field first, then the metadata key older payloads carry.

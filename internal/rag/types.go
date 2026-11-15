@@ -14,6 +14,10 @@ const (
 	DocumentStatusFailed     = "failed"
 	DocumentStatusRemoved    = "removed"
 
+	// StatusWaitingForWorker is the status message of a document whose
+	// ingest is deferred until the extraction worker is reachable again.
+	StatusWaitingForWorker = "waiting for the extraction worker"
+
 	DefaultChunkSize    = 1000
 	DefaultChunkOverlap = 150
 
