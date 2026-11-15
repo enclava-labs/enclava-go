@@ -81,10 +81,13 @@ type Document struct {
 	Metadata         map[string]any `json:"metadata,omitempty"`
 	QdrantPointCount int            `json:"qdrant_point_count"`
 	ErrorMessage     string         `json:"error_message,omitempty"`
-	Warnings         []string       `json:"warnings,omitempty"`
-	CreatedAt        time.Time      `json:"created_at"`
-	UpdatedAt        time.Time      `json:"updated_at"`
-	ProcessedAt      *time.Time     `json:"processed_at,omitempty"`
+	// StatusMessage is the non-error progress note a deferred ingest records
+	// (for example "waiting for the extraction worker"); empty when none.
+	StatusMessage string     `json:"status_message,omitempty"`
+	Warnings      []string   `json:"warnings,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	ProcessedAt   *time.Time `json:"processed_at,omitempty"`
 }
 
 // DocumentChunk is one derived chunk row pinned to an immutable

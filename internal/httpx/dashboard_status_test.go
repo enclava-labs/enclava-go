@@ -33,6 +33,7 @@ func TestStatusVocabulary(t *testing.T) {
 		"changed":      {"Changed", "warn"},
 		"invited":      {"Invited", "warn"},
 		"queued":       {"Queued", "neutral"},
+		"waiting":      {"Waiting", "neutral"}, // v1.2: deferred on the extraction worker
 		"cancelled":    {"Stopped", "neutral"},
 		"stopped":      {"Stopped", "neutral"},
 		"paused":       {"Paused", "neutral"},
