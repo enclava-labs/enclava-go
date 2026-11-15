@@ -1523,6 +1523,10 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 	author := firstAuthor(provMeta["authors"])
 	createdAt := stringFromPayload(provMeta, "created_at")
 	updatedAt := stringFromPayload(provMeta, "updated_at")
+	// Filter payload fields (v1.2): the authors keyword array and the
+	// numeric updated timestamp are what search filters match against.
+	docAuthors := authorList(provMeta["authors"])
+	updatedTs, hasUpdatedTs := rfc3339Unix(updatedAt)
 	for i, chunkText := range chunkTexts {
 		chunkID := newID("ragchunk")
 		pointID := newPointID()
@@ -1581,6 +1585,12 @@ func (s *Service) attemptEmbed(ctx context.Context, claim *jobs.Claim) (string, 
 		if links := structuredChunks[i].Links; len(links) > 0 {
 			payload["links"] = links
 			chunk.Links = links
+		}
+		if authors := chunkAuthors(docAuthors, structuredChunks[i].Links); len(authors) > 0 {
+			payload["authors"] = authors
+		}
+		if hasUpdatedTs {
+			payload["source_updated_ts"] = updatedTs
 		}
 		chunks = append(chunks, chunk)
 		points = append(points, QdrantPoint{
@@ -1850,6 +1860,65 @@ func firstAuthor(v any) string {
 		}
 	}
 	return ""
+}
+
+// authorList reads every author of a provenance authors list.
+func authorList(v any) []string {
+	switch list := v.(type) {
+	case []any:
+		authors := make([]string, 0, len(list))
+		for _, item := range list {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				authors = append(authors, s)
+			}
+		}
+		return authors
+	case []string:
+		return list
+	default:
+		return nil
+	}
+}
+
+// chunkAuthors merges the document authors with every link author of the
+// chunk, deduplicated in first-seen order — the `authors` keyword array the
+// author search filter matches against.
+func chunkAuthors(docAuthors []string, links []source.ChunkLink) []string {
+	seen := make(map[string]struct{}, len(docAuthors)+len(links))
+	authors := make([]string, 0, len(seen))
+	add := func(author string) {
+		author = strings.TrimSpace(author)
+		if author == "" {
+			return
+		}
+		if _, dup := seen[author]; dup {
+			return
+		}
+		seen[author] = struct{}{}
+		authors = append(authors, author)
+	}
+	for _, author := range docAuthors {
+		add(author)
+	}
+	for _, link := range links {
+		add(link.Author)
+	}
+	return authors
+}
+
+// rfc3339Unix converts a provenance RFC 3339 timestamp to unix seconds for
+// the source_updated_ts range filter; unparsable values write nothing, so
+// the point simply lacks the field like indexes predating it.
+func rfc3339Unix(raw string) (int64, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	ts, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return 0, false
+	}
+	return ts.Unix(), true
 }
 
 func mapFromPayload(payload map[string]any, key string) map[string]any {

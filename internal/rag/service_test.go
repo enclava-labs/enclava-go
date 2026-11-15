@@ -148,11 +148,12 @@ func addEmbeddingEndpoint(t *testing.T, db *postgres.DB, tenant, endpointID, mod
 func newTestID() string { return fmt.Sprintf("t%d", time.Now().UnixNano()) }
 
 type fakeVectorStore struct {
-	points    map[string][]rag.QdrantPoint
-	lastQuery []float64
-	queried   []string // index names, in query order
-	onPayload func()
-	ensureErr error
+	points     map[string][]rag.QdrantPoint
+	lastQuery  []float64
+	lastFilter map[string]any // the filter the service handed the store, for filter-construction assertions
+	queried    []string       // index names, in query order
+	onPayload  func()
+	ensureErr  error
 }
 
 func newFakeVectorStore() *fakeVectorStore {
@@ -333,6 +334,7 @@ func (f *fakeVectorStore) SearchHybrid(ctx context.Context, collection string, v
 
 func (f *fakeVectorStore) Query(ctx context.Context, collection string, input rag.QueryInput) ([]rag.QdrantSearchPoint, error) {
 	f.lastQuery = input.DenseVector
+	f.lastFilter = input.Filter
 	f.queried = append(f.queried, collection)
 	points, err := f.SearchHybrid(ctx, collection, input.DenseVector, input.Limit+input.Offset, input.Filter)
 	if err != nil {

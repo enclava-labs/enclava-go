@@ -275,12 +275,17 @@ func (a *App) handleRAGSearchReadable(w http.ResponseWriter, r *http.Request, pr
 		Cursor         string        `json:"cursor"`
 		Rewrite        bool          `json:"rewrite"`
 		SelectSections bool          `json:"select_sections"`
+		// v1.2 metadata filters, ANDed with the access prefilter.
+		Container     string `json:"container"`
+		Author        string `json:"author"`
+		UpdatedAfter  string `json:"updated_after"`
+		UpdatedBefore string `json:"updated_before"`
 	}
 	if err := DecodeJSON(r, &request); err != nil {
 		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
 		return
 	}
-	result, err := a.ragSvc.SearchReadableWithOptions(r.Context(), principal, request.Query, request.Mode, request.CollectionIDs, request.Limit, rag.SearchReadableOptions{Rewrite: request.Rewrite, SelectSections: request.SelectSections, Cursor: request.Cursor})
+	result, err := a.ragSvc.SearchReadableWithOptions(r.Context(), principal, request.Query, request.Mode, request.CollectionIDs, request.Limit, rag.SearchReadableOptions{Rewrite: request.Rewrite, SelectSections: request.SelectSections, Cursor: request.Cursor, Container: request.Container, Author: request.Author, UpdatedAfter: request.UpdatedAfter, UpdatedBefore: request.UpdatedBefore})
 	if err != nil {
 		a.writeRAGNotFoundOrBadRequest(w, err, "rag_search_failed")
 		return
@@ -363,6 +368,11 @@ func (a *App) handleRAGSearch(w http.ResponseWriter, r *http.Request, principal 
 		Limit          int           `json:"limit"`
 		Rewrite        bool          `json:"rewrite"`
 		SelectSections bool          `json:"select_sections"`
+		// v1.2 metadata filters, ANDed with the access prefilter.
+		Container     string `json:"container"`
+		Author        string `json:"author"`
+		UpdatedAfter  string `json:"updated_after"`
+		UpdatedBefore string `json:"updated_before"`
 	}
 	if err := DecodeJSON(r, &request); err != nil {
 		WriteOpenAIError(w, http.StatusBadRequest, "invalid JSON payload", "invalid_request_error", "invalid_json")
@@ -370,6 +380,7 @@ func (a *App) handleRAGSearch(w http.ResponseWriter, r *http.Request, principal 
 	}
 	results, err := a.ragSvc.Search(r.Context(), principal, rag.SearchInput{
 		CollectionID: collectionID, Query: request.Query, Mode: request.Mode, Limit: request.Limit, Rewrite: request.Rewrite, SelectSections: request.SelectSections,
+		Container: request.Container, Author: request.Author, UpdatedAfter: request.UpdatedAfter, UpdatedBefore: request.UpdatedBefore,
 	})
 	if err != nil {
 		a.writeRAGNotFoundOrBadRequest(w, err, "rag_search_failed")
@@ -522,6 +533,10 @@ func (a *App) writeRAGNotFoundOrBadRequest(w http.ResponseWriter, err error, cod
 	}
 	if errors.Is(err, rag.ErrProfileNotFound) {
 		WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "unknown_chunk_profile_version")
+		return
+	}
+	if errors.Is(err, rag.ErrInvalidSearchFilter) {
+		WriteOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_search_filter")
 		return
 	}
 	if errors.Is(err, sql.ErrNoRows) || errors.Is(err, source.ErrDenied) {

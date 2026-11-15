@@ -118,6 +118,27 @@ comment `html_url`, anchored Notion block), falling back to the document
 URL; GitHub repository files keep their `#L` line anchors. Every link passes
 a scheme allow-list (`https`, `http`, `slack`, `notion`).
 
+### Metadata filters (v1.2)
+
+Both search endpoints — `POST /api/v1/rag/search` and
+`POST /api/v1/rag/collections/{id}/search` — accept optional metadata
+filters, ANDed with the access prefilter (they can only narrow a search,
+never widen it; authorization is still re-checked per hit):
+
+| Field | Meaning |
+|---|---|
+| `container` | Exact match on the container: `#channel`, `owner/repo`, the parent page path; uploads carry the collection name. |
+| `author` | Exact match on authorship: the document's authors plus every message/link author of the hit's chunk (a Slack hit inside a thread matches the message's author). |
+| `updated_after` | RFC 3339, inclusive: only documents whose source `updated_at` is at or after this time. |
+| `updated_before` | RFC 3339, exclusive: only documents whose source `updated_at` is before this time. |
+
+A malformed timestamp is a 400 with error code `invalid_search_filter`. The
+chat `knowledge.search` tool exposes the same four parameters.
+
+Documents indexed before v1.2 carry no `container`/`authors`/date payload
+and are excluded by these filters until they are re-indexed (a re-upload or
+reprocess fills them); no migration rewrites existing points.
+
 
 `POST /api/v1/rag/search` has no per-collection or aggregate 2,000-document
 bound. It returns `search_scope_too_large` when more than 20 distinct

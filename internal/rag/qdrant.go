@@ -190,6 +190,15 @@ var payloadIndexes = []struct{ key, schema string }{
 	{"acl", "keyword"},
 	{"published", "bool"},
 	{"access_enabled", "bool"},
+	// v1.2 metadata-filter fields: container and authors are keyword
+	// (authors is an array — document authors plus the chunk's link
+	// authors), source_updated_ts an integer for range filters. ensurePayloadIndexes
+	// runs for existing collections too, so older indexes gain them on
+	// first touch; points written before the fields exist stay filterless
+	// until a re-index.
+	{"container", "keyword"},
+	{"authors", "keyword"},
+	{"source_updated_ts", "integer"},
 }
 
 func (c *QdrantClient) ensurePayloadIndexes(ctx context.Context, collection string) error {

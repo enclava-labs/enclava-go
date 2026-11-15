@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -36,6 +37,113 @@ var ErrUtilityModelNotConfigured = errors.New("utility model is not configured")
 // was denied for the caller (no grant/route). The HTTP layer maps it to 403
 // `embedding_not_granted`; lexical search never produces it.
 var ErrSearchBindingDenied = errors.New("search embedding binding denied")
+
+// ErrInvalidSearchFilter reports a malformed metadata filter (container,
+// author or date bound). The HTTP layer maps it to 400
+// `invalid_search_filter`.
+var ErrInvalidSearchFilter = errors.New("invalid search filter")
+
+// searchMetadataFilters is the parsed form of SearchInput's v1.2 metadata
+// filters; nil means none are set.
+type searchMetadataFilters struct {
+	container     string
+	author        string
+	updatedAfter  *int64
+	updatedBefore *int64
+}
+
+// parseMetadataFilters normalizes the metadata filter fields. Malformed
+// input is ErrInvalidSearchFilter so callers can answer 400 before any
+// store work.
+func parseMetadataFilters(container, author, updatedAfter, updatedBefore string) (*searchMetadataFilters, error) {
+	f := &searchMetadataFilters{
+		container: strings.TrimSpace(container),
+		author:    strings.TrimSpace(author),
+	}
+	if f.container == "" && f.author == "" &&
+		strings.TrimSpace(updatedAfter) == "" && strings.TrimSpace(updatedBefore) == "" {
+		return nil, nil
+	}
+	var err error
+	if f.updatedAfter, err = parseTimeBound(updatedAfter, "updated_after"); err != nil {
+		return nil, err
+	}
+	if f.updatedBefore, err = parseTimeBound(updatedBefore, "updated_before"); err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// parseTimeBound parses an RFC 3339 bound into unix seconds — the unit
+// source_updated_ts carries in the index payload. Empty means unset.
+func parseTimeBound(raw, field string) (*int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	ts, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s must be an RFC 3339 timestamp", ErrInvalidSearchFilter, field)
+	}
+	unix := ts.Unix()
+	return &unix, nil
+}
+
+// qdrantClause builds the payload filter clauses; nil when none are set.
+// authors is a keyword array, so a match hits any entry — the document
+// authors plus every link author of the chunk.
+func (f *searchMetadataFilters) qdrantClause() map[string]any {
+	if f == nil {
+		return nil
+	}
+	var must []any
+	if f.container != "" {
+		must = append(must, map[string]any{"key": "container", "match": map[string]any{"value": f.container}})
+	}
+	if f.author != "" {
+		must = append(must, map[string]any{"key": "authors", "match": map[string]any{"value": f.author}})
+	}
+	if f.updatedAfter != nil || f.updatedBefore != nil {
+		rng := map[string]any{}
+		if f.updatedAfter != nil {
+			rng["gte"] = *f.updatedAfter
+		}
+		if f.updatedBefore != nil {
+			rng["lt"] = *f.updatedBefore
+		}
+		must = append(must, map[string]any{"key": "source_updated_ts", "range": rng})
+	}
+	if len(must) == 0 {
+		return nil
+	}
+	return map[string]any{"must": must}
+}
+
+// validateMetadataFilters reports malformed metadata filters before any
+// store or model work, so the API can answer 400 with a clear code.
+func validateMetadataFilters(input SearchInput) error {
+	_, err := parseMetadataFilters(input.Container, input.Author, input.UpdatedAfter, input.UpdatedBefore)
+	return err
+}
+
+// searchNarrower combines the raw legacy filter with the parsed metadata
+// filters into the one narrower clause AccessFilter appends to the access
+// must list — metadata filters AND with authorization, never replace it.
+func searchNarrower(input SearchInput) (map[string]any, error) {
+	meta, err := parseMetadataFilters(input.Container, input.Author, input.UpdatedAfter, input.UpdatedBefore)
+	if err != nil {
+		return nil, err
+	}
+	metaClause := meta.qdrantClause()
+	switch {
+	case metaClause == nil:
+		return input.Filter, nil
+	case len(input.Filter) == 0:
+		return metaClause, nil
+	default:
+		return map[string]any{"must": []any{input.Filter, metaClause}}, nil
+	}
+}
 
 func (s *Service) SetUtilityModel(model string) {
 	s.utilityModel = strings.TrimSpace(model)
@@ -110,6 +218,9 @@ const (
 
 func (s *Service) Search(ctx context.Context, p auth.Principal, input SearchInput) ([]SearchResult, error) {
 	if err := validateSearchQueryMode(input.Query, input.Mode); err != nil {
+		return nil, err
+	}
+	if err := validateMetadataFilters(input); err != nil {
 		return nil, err
 	}
 	if err := s.searchModels(ctx, p.TenantID, &input); err != nil {
@@ -193,7 +304,11 @@ func (s *Service) searchCollection(ctx context.Context, p auth.Principal, collec
 	if limit > 50 {
 		limit = 50
 	}
-	filter := AccessFilter(p.TenantID, tokens, input.Filter)
+	narrower, err := searchNarrower(input)
+	if err != nil {
+		return nil, err
+	}
+	filter := AccessFilter(p.TenantID, tokens, narrower)
 	// Canonical source kinds resolve once per connection per collection.
 	connectionKinds := make(map[string]string)
 	chunkCache := make(map[string]map[string]DocumentChunk)
@@ -648,10 +763,23 @@ type SearchReadableOptions struct {
 	// Cursor resumes a previous search after its last returned result;
 	// opaque and validated before use — a malformed value is ErrInvalidInput.
 	Cursor string
+	// v1.2 metadata filters applied to every searched collection, ANDed
+	// with the access prefilter; validated before any store work.
+	Container     string
+	Author        string
+	UpdatedAfter  string
+	UpdatedBefore string
 }
 
 func (s *Service) SearchReadableWithOptions(ctx context.Context, p auth.Principal, query string, mode QueryMode, collectionIDs []string, limit int, options SearchReadableOptions) (SearchReadableResult, error) {
-	input := SearchInput{Rewrite: options.Rewrite, SelectSections: options.SelectSections}
+	input := SearchInput{
+		Rewrite: options.Rewrite, SelectSections: options.SelectSections,
+		Container: options.Container, Author: options.Author,
+		UpdatedAfter: options.UpdatedAfter, UpdatedBefore: options.UpdatedBefore,
+	}
+	if err := validateMetadataFilters(input); err != nil {
+		return SearchReadableResult{}, err
+	}
 	if err := s.searchModels(ctx, p.TenantID, &input); err != nil {
 		return SearchReadableResult{}, err
 	}
