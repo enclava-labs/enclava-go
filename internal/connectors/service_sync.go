@@ -80,6 +80,11 @@ func (s *Service) runContentStream(ctx context.Context, claim *jobs.Claim, princ
 				if err != nil {
 					return err
 				}
+				if observation.ProcessingError == "" {
+					if err := s.retireSuperseded(ctx, conn, item); err != nil {
+						return err
+					}
+				}
 				observations = append(observations, observation)
 				if observation.ProcessingError == "" && observation.ArtifactRef.ID != "" {
 					jobsToQueue = append(jobsToQueue, observation)
@@ -341,6 +346,31 @@ func connectorObjectID() (string, error) {
 		return "", fmt.Errorf("generate connector object id: %w", err)
 	}
 	return "src_" + base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// retireSuperseded marks deleted the objects an item replaces (legacy
+// per-message/comment/block items). Unknown ids are ignored, so listing them
+// costs nothing once the old objects are gone.
+func (s *Service) retireSuperseded(ctx context.Context, conn source.Connection, item ContentItem) error {
+	for _, nativeID := range item.Supersedes {
+		if nativeID == "" || nativeID == item.NativeID {
+			continue
+		}
+		object, err := s.canonical.ObjectForNativeIDCrossKind(ctx, conn.TenantID, conn.ID, nativeID)
+		if errors.Is(err, source.ErrDenied) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if object.DeletedAt != nil || object.TombstonedAt != nil {
+			continue
+		}
+		if err := s.canonical.MarkObjectDeleted(ctx, conn.TenantID, object.ID); err != nil && !errors.Is(err, source.ErrDenied) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Service) sweepMissingContent(ctx context.Context, state StreamState) error {

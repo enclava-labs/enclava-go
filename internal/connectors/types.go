@@ -55,6 +55,11 @@ type ContentItem struct {
 	// "owner/repo"); Authors are the distinct authors of the document.
 	Container string
 	Authors   []string
+	// Supersedes lists native ids of objects this item replaces (v1.2:
+	// per-message, per-comment and per-block items now folded into one
+	// document). Once the item is observed, those objects are marked
+	// deleted regardless of the listing's snapshot semantics.
+	Supersedes []string
 }
 
 type ContentPage struct {
