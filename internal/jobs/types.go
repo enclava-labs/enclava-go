@@ -86,10 +86,17 @@ type Job struct {
 	LeaseExpiresAt    *time.Time
 	Attempt           int
 	MaxAttempts       int
-	Error             string
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
-	CompletedAt       *time.Time
+	// Deferral bookkeeping (migration 061): Deferrals counts requeues that
+	// consumed NO attempt because a dependency was unavailable;
+	// DropDeferrals the subset where the dependency dropped the connection
+	// mid-request; FirstDeferredAt anchors the continuous-wait bound.
+	Deferrals       int
+	DropDeferrals   int
+	FirstDeferredAt *time.Time
+	Error           string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	CompletedAt     *time.Time
 	// OutcomeReason classifies a terminal unknown outcome ("interrupted"
 	// when the request was already sent — usage may have been billed);
 	// OutcomeReservationID is the billing hold that stayed liable.
