@@ -314,6 +314,7 @@ func (g *GitHubAdapter) discussionItem(ctx context.Context, c source.Connection,
 	blocks = append(blocks, source.StructuredBlock{
 		Kind: source.StructuredHeading, Level: 1, Text: title,
 		URL: r.HTMLURL, Author: author, CreatedAt: r.CreatedAt,
+		NativeID: "title",
 	})
 	blocks = append(blocks, markdownStructureBlocks(r.Body, r.HTMLURL, author, r.CreatedAt)...)
 
@@ -341,6 +342,9 @@ func (g *GitHubAdapter) discussionItem(ctx context.Context, c source.Connection,
 				Author:    cm.User.Login,
 				CreatedAt: created,
 				NativeID:  nativeKind + ":" + strconv.FormatInt(cm.ID, 10),
+				// Comments hang off the title heading so mixed-mode chunking
+				// packs them as one discussion under the issue title.
+				ParentNativeID: "title",
 			}})
 		}
 	}
@@ -476,7 +480,8 @@ func markdownStructureBlocks(body, link, author, createdAt string) []source.Stru
 			flushParagraph()
 			text := strings.TrimSpace(ghHeadingClose.ReplaceAllString(strings.TrimSpace(m[2]), ""))
 			if text != "" {
-				emit(source.StructuredBlock{Kind: source.StructuredHeading, Level: len(m[1]), Text: text})
+				// Body headings sit below the issue title (level 1).
+				emit(source.StructuredBlock{Kind: source.StructuredHeading, Level: min(len(m[1])+1, 6), Text: text})
 			}
 			continue
 		}

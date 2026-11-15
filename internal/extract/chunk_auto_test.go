@@ -191,6 +191,21 @@ func checkChunkLinks(t *testing.T, chunk source.Chunk, blocks map[string]source.
 			}
 			matchID, matchLen = id, len(b.Text)
 		}
+		if matchID == "" && link.Offset == 0 {
+			// A chunk that opens mid-block links that block at offset 0: the
+			// opening text is a piece from inside the block's text.
+			piece := rest
+			if i := strings.IndexByte(piece, '\n'); i >= 0 {
+				piece = piece[:i]
+			}
+			for id := range blocks {
+				b := blocks[id]
+				if piece != "" && strings.Contains(b.Text, piece) && b.Locator.URL == link.URL && b.Locator.NativeID == link.NativeID {
+					matchID = id
+					break
+				}
+			}
+		}
 		if matchID == "" {
 			t.Fatalf("chunk %d: text at link offset %d does not begin any block: %q", chunk.Ordinal, link.Offset, rest)
 		}

@@ -449,11 +449,11 @@ func parentBlock(block source.Block, blocks map[string]source.Block, include boo
 	return blocks[block.ParentID]
 }
 
-// chunkLinks fills each chunk's Links: one entry per covered block whose
-// text starts inside the chunk (span ByteStart == 0), Offset at that text
-// start as a code-point offset into the chunk text. Split and overlap
-// continuations (ByteStart > 0) emit nothing — their block's anchor entry
-// lives in the chunk that contains its text start. Consecutive entries with
+// chunkLinks fills each chunk's Links: one entry per covered block span,
+// Offset at that span's text as a code-point offset into the chunk text. A
+// chunk that opens mid-block (split or overlap continuation) still links to
+// that block at offset 0, so every hit inside it keeps its deep link.
+// Consecutive entries with
 // the same URL collapse to the first; blocks with no URL, author, timestamp
 // or native id (parsed uploads) emit nothing. Offsets are rebuilt by walking
 // the spans the way the chunk text was assembled, so they stay exact for
@@ -471,7 +471,7 @@ func chunkLinks(chunks []source.Chunk, blocks map[string]source.Block) {
 				break
 			}
 			piece := block.Text[span.ByteStart:span.ByteEnd]
-			if span.ByteStart == 0 {
+			{
 				loc := block.Locator
 				if loc.URL != "" || loc.Author != "" || loc.Timestamp != "" || loc.NativeID != "" {
 					last := len(c.Links) - 1

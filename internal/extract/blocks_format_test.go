@@ -453,3 +453,31 @@ func blocksByID(t *testing.T, doc source.Document) map[string]source.Block {
 	}
 	return byID
 }
+
+// TestBlocksSplitMessageKeepsLinkInContinuation: a message longer than the
+// chunk size is split; every chunk after the first still links to it at
+// offset 0, so a hit in the tail of a long message keeps its deep link.
+func TestBlocksSplitMessageKeepsLinkInContinuation(t *testing.T) {
+	long := strings.Repeat("The rollout continues across every region without incident. ", 20)
+	blocks := []source.StructuredBlock{
+		{Kind: "message", Text: long, Author: "alice", CreatedAt: "2026-05-01T09:15:00Z", URL: "https://hooks.example.test/archives/C1/pm1", NativeID: "m1"},
+	}
+	parser, ref := testParser(t, blocksBody(t, blocks), source.BlocksMIMEType)
+	doc, err := parser.Parse(context.Background(), ref, ParseOptions{Filename: "document.blocks.json", MIMEType: source.BlocksMIMEType,
+		ObjectRef: source.ObjectRef{TenantID: "tenant", ObjectID: "object", ObservedSeq: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks, err := Chunk(doc, autoProfile(300, 40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) < 2 {
+		t.Fatalf("expected the message to split, got %d chunk(s)", len(chunks))
+	}
+	for _, chunk := range chunks {
+		if len(chunk.Links) == 0 || chunk.Links[0].Offset != 0 || chunk.Links[0].NativeID != "m1" {
+			t.Fatalf("chunk %d lost its deep link: %+v", chunk.Ordinal, chunk.Links)
+		}
+	}
+}

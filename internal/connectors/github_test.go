@@ -240,9 +240,9 @@ func TestGitHubMarkdownStructureBlocks(t *testing.T) {
 		level    int
 		language string
 	}{
-		{source.StructuredHeading, "Details", 2, ""},
+		{source.StructuredHeading, "Details", 3, ""},
 		{source.StructuredParagraph, "Intro line one\nline two.", 0, ""},
-		{source.StructuredHeading, "Steps", 3, ""},
+		{source.StructuredHeading, "Steps", 4, ""},
 		{source.StructuredListItem, "alpha", 0, ""},
 		{source.StructuredListItem, "beta", 0, ""},
 		{source.StructuredCode, "fmt.Println()", 0, "go"},
