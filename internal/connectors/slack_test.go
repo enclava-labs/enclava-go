@@ -883,3 +883,23 @@ func TestSlackDeltaSyncRetiresSupersededMessages(t *testing.T) {
 		}
 	}
 }
+
+// TestSlackShapeUpgradeForcesOneFullRun: a checkpoint from before thread
+// documents (no shape) runs full even when its last full listing is recent,
+// so old threads are re-listed and their per-message items retired; the
+// checkpoint it writes records the new shape, so the next run is a delta.
+func TestSlackShapeUpgradeForcesOneFullRun(t *testing.T) {
+	fake := &fakeSlack{t: t, history: []map[string]any{{"user": "U1", "text": "hello", "ts": "1728000000.000000"}}}
+	a, conn := newSlackTestAdapter(t, fake)
+	conn.Config["reconcile"] = "true"
+	recent := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+	legacy := encodeSlackContentCursor(slackContentCursor{FullAt: recent, Oldest: map[string]string{"C1": "1728000000.000000"}})
+	page, err := a.Content(context.Background(), conn, legacy, 10)
+	if err != nil || !page.Snapshot || page.Checkpoint == "" {
+		t.Fatalf("pre-v1.2 checkpoint did not run full: %+v, %v", page, err)
+	}
+	page, err = a.Content(context.Background(), conn, page.Checkpoint, 10)
+	if err != nil || page.Snapshot {
+		t.Fatalf("run after the upgrade full pass was not a delta: %+v, %v", page, err)
+	}
+}

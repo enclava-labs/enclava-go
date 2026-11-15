@@ -49,7 +49,15 @@ type slackContentCursor struct {
 	Started string            `json:"started,omitempty"`
 	Oldest  map[string]string `json:"oldest,omitempty"`
 	Seen    map[string]string `json:"seen,omitempty"`
+	// Shape is the document shape of the last completed full listing. A
+	// source whose last full run predates slackDocumentShape runs full once,
+	// so every old thread is re-listed and its per-message items retired.
+	Shape int `json:"shape,omitempty"`
 }
+
+// slackDocumentShape: 2 = one document per thread (v1.2); absent/0 = one
+// item per message.
+const slackDocumentShape = 2
 
 // slackQueuedFile is a file attachment waiting for its own item; ParentID is
 // the thread document it was shared in. Cursors written before threads
@@ -100,9 +108,10 @@ func decodeSlackContentCursor(cursor Cursor) (slackContentCursor, error) {
 // from: no position, the full-listing time advanced on full runs, and each
 // channel's watermark. Full runs drop channels that were not listed.
 func (c slackContentCursor) checkpoint() slackContentCursor {
-	out := slackContentCursor{FullAt: c.FullAt, Oldest: map[string]string{}}
+	out := slackContentCursor{FullAt: c.FullAt, Oldest: map[string]string{}, Shape: c.Shape}
 	if c.Full {
 		out.FullAt = c.Started
+		out.Shape = slackDocumentShape
 	}
 	if !c.Full {
 		for channel, ts := range c.Oldest {
@@ -199,7 +208,7 @@ func (a *slackAdapter) Content(ctx context.Context, conn source.Connection, curs
 		// No channel in progress: a completed run's checkpoint (or nothing)
 		// starts the next run, full when fullSyncDue says so, else a delta
 		// that re-reads each channel from its Oldest watermark.
-		state.Full = fullSyncDue(conn.Config, slackCursorTime(state.FullAt), time.Now())
+		state.Full = state.Shape < slackDocumentShape || fullSyncDue(conn.Config, slackCursorTime(state.FullAt), time.Now())
 		state.Started = time.Now().UTC().Format(time.RFC3339)
 		state.Seen = nil
 		if state.Full {
