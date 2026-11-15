@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -49,6 +50,7 @@ var workerCaps struct {
 	sync.Mutex
 	cached    *NativeCapabilities
 	lastProbe time.Time
+	available bool // last capability fetch reached the worker
 }
 
 func probeNativeWorker() NativeCapabilities {
@@ -67,8 +69,10 @@ func probeNativeWorker() NativeCapabilities {
 	caps, err := fetchWorkerCapabilities(probeCtx)
 	cancel()
 	if err != nil {
+		workerCaps.available = false
 		return NativeCapabilities{Reason: "extract worker unreachable: " + err.Error()}
 	}
+	workerCaps.available = true
 	workerCaps.cached = &caps
 	caps.Languages = append([]string(nil), caps.Languages...)
 	return caps
@@ -148,20 +152,31 @@ func parseViaWorker(ctx context.Context, data []byte, format string) ([]parseBlo
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
-		return nil, nil, fmt.Errorf("extract worker unreachable: %w", err)
+		return nil, nil, classifyWorkerTransportError(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		var eb workerErrorBody
 		if json.Unmarshal(body, &eb) == nil && eb.Code != "" {
+			if eb.Code == "timeout" {
+				// The worker gave up on its own processing — retryable
+				// downstream, never a document defect.
+				return nil, nil, fmt.Errorf("%w: worker timed out parsing this document", ErrWorkerUnavailable)
+			}
 			return nil, nil, workerSentinelError(eb.Code, eb.Message)
+		}
+		if resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
+			return nil, nil, fmt.Errorf("%w: worker returned %s", ErrWorkerUnavailable, resp.Status)
 		}
 		return nil, nil, fmt.Errorf("extract worker returned %s", resp.Status)
 	}
 	var out workerParseResponse
 	dec := json.NewDecoder(io.LimitReader(resp.Body, maxWorkerResponse+1))
 	if err := dec.Decode(&out); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, nil, fmt.Errorf("%w: %s", ErrWorkerDroppedMidParse, err)
+		}
 		return nil, nil, fmt.Errorf("extract worker response: %w", err)
 	}
 	blocks := make([]parseBlock, 0, len(out.Blocks))
@@ -178,6 +193,40 @@ func parseViaWorker(ctx context.Context, data []byte, format string) ([]parseBlo
 		}
 	}
 	return blocks, out.Warnings, nil
+}
+
+// classifyWorkerTransportError maps a failed worker round-trip onto the
+// deferral sentinels: failures at dial time mean the worker is not running
+// (unavailable); reset/EOF after the request went out mean it died
+// mid-parse — the document may be what crashed it — so ingest caps those
+// separately. Everything else keeps its plain error.
+func classifyWorkerTransportError(err error) error {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return fmt.Errorf("%w: %s", ErrWorkerUnavailable, err)
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return fmt.Errorf("%w: %s", ErrWorkerDroppedMidParse, err)
+	}
+	return fmt.Errorf("%w: %s", ErrWorkerUnavailable, err)
+}
+
+// WorkerAvailability reports the cached capability probe for readiness:
+// "" when no worker socket is configured, otherwise "ok" or "unavailable".
+// The probe is cached (workerRetryInterval), so readiness polling never
+// hammers the socket.
+func WorkerAvailability() string {
+	if nativeWorkerPath() == "" {
+		return ""
+	}
+	probeNativeWorker()
+	workerCaps.Lock()
+	defer workerCaps.Unlock()
+	if workerCaps.available {
+		return "ok"
+	}
+	return "unavailable"
 }
 
 func workerSentinelError(code, message string) error {
