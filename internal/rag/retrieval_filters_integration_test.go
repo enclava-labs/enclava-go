@@ -156,7 +156,7 @@ func newMetaLiveFixture(t *testing.T, qdrantURL string) *metaLiveFixture {
 		svc: svc, repo: repo, vector: vector, tenant: tenant,
 		principal: auth.Principal{
 			TenantID: tenant, ActorID: user.ID, ActorKind: auth.ActorKindUser, UserID: user.ID,
-			CredentialID: "meta-live-key", CredentialKind: auth.CredentialKindAPIKey,
+			CredentialID: "key_test", CredentialKind: auth.CredentialKindAPIKey,
 			Scopes:              map[string]struct{}{"rag": {}, "rag.manage": {}},
 			AllowedModelsAll:    true,
 			AllowedEndpointsAll: true,
