@@ -3123,6 +3123,180 @@ func TestResolveEvidenceNonGitHubLinkUnchanged(t *testing.T) {
 	}
 }
 
+// stageLinkedDoc stages a connector thread document whose blocks carry their
+// own deep links: the first block's URL is unsafe and must never surface, the
+// second is the message the hit lands in. The chunk links and point payload
+// mirror exactly what the embed path writes for such a document.
+func (f *fixture) stageLinkedDoc(t *testing.T, collection rag.Collection, objectID string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := f.repo.UpsertObject(ctx, source.Object{
+		TenantID: f.tenant, ID: objectID, Kind: "message", NativeID: "slack:C1:thread",
+		AuthorizationMode: source.AuthorizationCollection, OwnerActorID: f.principal.ActorID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repo.InsertObjectVersion(ctx, f.tenant, source.ObjectVersion{
+		ObjectID: objectID, ObservedSeq: 1, ArtifactRef: "art_" + objectID, SHA256: "sha_" + objectID,
+		ByteSize: 30, MimeType: source.BlocksMIMEType, OriginalFilename: objectID + ".blocks.json",
+		Provenance: `{"source_kind":"slack","title":"ada in #borgz: deploy","source_uri":"https://hooks.slack.com/archives/C1/p_root",` +
+			`"container":"#borgz","authors":["ada","bob"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repo.AddCollectionItem(ctx, f.tenant, collection.ID, objectID, f.principal.ActorID); err != nil {
+		t.Fatal(err)
+	}
+	content := "deploy broken\ninvoice total 42"
+	parsed := source.Document{
+		Ref: source.ObjectRef{TenantID: f.tenant, ObjectID: objectID, ObservedSeq: 1},
+		Blocks: []source.Block{
+			{ID: "blk_js_" + objectID, Ordinal: 0, Kind: "message", Text: "deploy broken", ByteStart: 0, ByteEnd: 13,
+				Locator: source.Locator{URL: "javascript:alert(1)", Author: "ada", Timestamp: "2026-01-01T00:00:00Z", NativeID: "m1"}},
+			{ID: "blk_ok_" + objectID, Ordinal: 1, Kind: "message", Text: "invoice total 42", ByteStart: 14, ByteEnd: 30,
+				Locator: source.Locator{URL: "https://hooks.slack.com/archives/C1/p2", Author: "bob", Timestamp: "2026-01-02T09:00:00Z", NativeID: "m2"}},
+		},
+	}
+	if err := f.repo.SaveParsedDocument(ctx, "rag-structured-v1", parsed); err != nil {
+		t.Fatal(err)
+	}
+	links := []source.ChunkLink{
+		{Offset: 0, URL: "javascript:alert(1)", Author: "ada", Timestamp: "2026-01-01T00:00:00Z", NativeID: "m1"},
+		{Offset: 14, URL: "https://hooks.slack.com/archives/C1/p2", Author: "bob", Timestamp: "2026-01-02T09:00:00Z", NativeID: "m2"},
+	}
+	profileID, err := f.repo.EnsureChunkProfile(ctx, f.tenant, "rag-"+collection.ID+"-structured", 200, 20, rag.ChunkStrategyFixed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunkID := "chk_" + objectID
+	chunks := []rag.DocumentChunk{{
+		ID: chunkID, DocumentID: objectID, CollectionID: collection.ID, Generation: 1,
+		ChunkIndex: 0, Content: content, TokenCount: 6, Links: links,
+		SpanRefs: []source.Span{
+			{Ref: parsed.Ref, BlockID: "blk_js_" + objectID, ByteStart: 0, ByteEnd: 13},
+			{Ref: parsed.Ref, BlockID: "blk_ok_" + objectID, ByteStart: 14, ByteEnd: 30},
+		},
+	}}
+	if err := f.repo.ReplaceVersionChunksAndStage(ctx, f.tenant, collection.ID, objectID, objectID+"#1", 1, 1, profileID, chunks); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repo.MarkGenerationState(ctx, f.tenant, collection.ID, objectID+"#1", 1, "published"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.vector.UpsertPoints(ctx, collection.QdrantCollection, []rag.QdrantPoint{{
+		ID: "pt_" + objectID, Payload: map[string]any{
+			"tenant_id": f.tenant, "document_id": objectID, "object_version_id": objectID + "#1",
+			"generation": int64(1), "chunk_id": chunkID, "file_name": objectID + ".blocks.json",
+			"source_uri": "https://hooks.slack.com/archives/C1/p_root", "source_url": "https://hooks.slack.com/archives/C1/p_root",
+			"author": "ada", "source_created_at": "2026-01-01T00:00:00Z", "source_updated_at": "2026-01-02T00:00:00Z",
+			"container": "#borgz", "content": content, "access_enabled": true,
+			"links": []map[string]any{
+				{"offset": 0, "url": "javascript:alert(1)", "author": "ada", "timestamp": "2026-01-01T00:00:00Z", "native_id": "m1"},
+				{"offset": 14, "url": "https://hooks.slack.com/archives/C1/p2", "author": "bob", "timestamp": "2026-01-02T09:00:00Z", "native_id": "m2"},
+			},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSearchSourceLinksAndDeepLinkChoice: payload links survive search with
+// the allow-list applied (the unsafe entry's URL is dropped, the entry
+// itself kept), the best deep link is chosen by lexical overlap with the
+// query, and the chosen entry's author/timestamp describe the hit.
+func TestSearchSourceLinksAndDeepLinkChoice(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	f.stageLinkedDoc(t, c, "obj_links")
+
+	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "invoice total", Limit: 5})
+	if err != nil || len(results) != 1 {
+		t.Fatalf("search: %#v err=%v", results, err)
+	}
+	r := results[0]
+	if r.SourceURL != "https://hooks.slack.com/archives/C1/p_root" || r.Container != "#borgz" {
+		t.Fatalf("document-level fields: source_url=%q container=%q", r.SourceURL, r.Container)
+	}
+	if r.Link != "https://hooks.slack.com/archives/C1/p2" {
+		t.Fatalf("deep link = %q, want the overlapped message permalink", r.Link)
+	}
+	if r.Author != "bob" || r.SourceCreatedAt != "2026-01-02T09:00:00Z" || r.SourceUpdatedAt != "2026-01-02T09:00:00Z" {
+		t.Fatalf("hit authorship = %q %q %q, want the chosen entry's", r.Author, r.SourceCreatedAt, r.SourceUpdatedAt)
+	}
+	if len(r.Links) != 2 || r.Links[0].URL != "" || r.Links[1].URL != "https://hooks.slack.com/archives/C1/p2" {
+		t.Fatalf("chunk links = %+v, want the unsafe URL dropped but the entry kept", r.Links)
+	}
+	if r.Links[0].Author != "ada" || r.Links[0].Offset != 0 || r.Links[1].NativeID != "m2" {
+		t.Fatalf("chunk link fields lost: %+v", r.Links)
+	}
+	// No overlap: the first entry wins. Its URL is unsafe, so no deep link.
+	results, err = f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "unrelated gibberish", Limit: 5})
+	if err != nil || len(results) != 1 || results[0].Link != "" {
+		t.Fatalf("no-overlap fallback: %#v err=%v", results, err)
+	}
+
+	// SearchReadable carries the same fields with resolved locations.
+	page, err := f.svc.SearchReadable(ctx, f.principal, "invoice total", rag.QueryLexical, []string{c.ID}, 5)
+	if err != nil || len(page.Results) != 1 {
+		t.Fatalf("readable search: %#v err=%v", page, err)
+	}
+	r = page.Results[0]
+	if r.Link != "https://hooks.slack.com/archives/C1/p2" || len(r.Locations) == 0 {
+		t.Fatalf("readable hit = link %q locations %d", r.Link, len(r.Locations))
+	}
+}
+
+// TestEvidenceNativeLinkIsBlockDeepLink: the citation resolves the cited
+// block's own deep link; the unsafe block URL never surfaces.
+func TestEvidenceNativeLinkIsBlockDeepLink(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	f.stageLinkedDoc(t, c, "obj_ev")
+
+	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "invoice total", Limit: 5})
+	if err != nil || len(results) != 1 || results[0].EvidenceID == "" {
+		t.Fatalf("search: %#v err=%v", results, err)
+	}
+	resolved, err := f.svc.ResolveEvidence(ctx, f.principal, []string{results[0].EvidenceID})
+	if err != nil || len(resolved) != 1 {
+		t.Fatalf("resolve: %#v err=%v", resolved, err)
+	}
+	if resolved[0].NativeLink != "https://hooks.slack.com/archives/C1/p2" {
+		t.Fatalf("native link = %q, want the cited block's permalink", resolved[0].NativeLink)
+	}
+	if strings.Contains(resolved[0].NativeLink, "javascript") {
+		t.Fatalf("unsafe scheme surfaced: %q", resolved[0].NativeLink)
+	}
+}
+
+// TestSearchUploadLinkOpensRetainedCopyAtPage: a linkless upload hit links
+// to the stored copy at the first covered block's page.
+func TestSearchUploadLinkOpensRetainedCopyAtPage(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c := f.collection(t)
+	f.stageSearchDoc(t, c, "obj_up", "upload page body", `{"kind":"upload"}`)
+
+	results, err := f.svc.Search(ctx, f.principal, rag.SearchInput{CollectionID: c.ID, Query: "upload page", Limit: 5})
+	if err != nil || len(results) != 1 {
+		t.Fatalf("search: %#v err=%v", results, err)
+	}
+	r := results[0]
+	if !strings.HasPrefix(r.Link, "/api/v1/rag/evidence/") || !strings.HasSuffix(r.Link, "/copy#page=3") {
+		t.Fatalf("upload link = %q, want the retained copy at page 3", r.Link)
+	}
+	if !strings.Contains(r.Link, r.EvidenceID) {
+		t.Fatalf("upload link %q does not reference evidence %q", r.Link, r.EvidenceID)
+	}
+	// stageSearchDoc's source_uri is an urn: the allow-list drops it, so
+	// source_url stays empty.
+	if r.SourceURL != "" {
+		t.Fatalf("source_url = %q, want the unsafe scheme dropped", r.SourceURL)
+	}
+}
+
 // TestServiceChunkStrategyDefaultAndSwitch: create defaults to auto, invalid
 // values are caller errors, a strategy switch mints and binds a new immutable
 // profile version, and a size-only update keeps the current strategy.

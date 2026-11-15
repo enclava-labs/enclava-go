@@ -67,6 +67,10 @@ func (s *Service) IngestJobHandler() jobs.HandlerFunc {
 			Kind           string         `json:"kind"`
 			URL            string         `json:"url"`
 			Locator        source.Locator `json:"locator"`
+			Container      string         `json:"container"`
+			Authors        []string       `json:"authors"`
+			CreatedAt      string         `json:"created_at"`
+			UpdatedAt      string         `json:"updated_at"`
 		}
 		if payload, ok := job.Policy["observation_payload"]; ok {
 			b, _ := json.Marshal(payload)
@@ -89,6 +93,18 @@ func (s *Service) IngestJobHandler() jobs.HandlerFunc {
 			"kind":             observed.Kind,
 			"source_uri":       observed.URL,
 			"locator":          observed.Locator,
+		}
+		if observed.Container != "" {
+			provenanceFields["container"] = observed.Container
+		}
+		if len(observed.Authors) > 0 {
+			provenanceFields["authors"] = observed.Authors
+		}
+		if observed.CreatedAt != "" {
+			provenanceFields["created_at"] = observed.CreatedAt
+		}
+		if observed.UpdatedAt != "" {
+			provenanceFields["updated_at"] = observed.UpdatedAt
 		}
 		if observed.Title != nil {
 			provenanceFields["title"] = *observed.Title
@@ -129,13 +145,19 @@ func (s *Service) IngestJobHandler() jobs.HandlerFunc {
 // blocks. Block parents stay within the parsed document (blocks.parent_id is
 // a block reference); the item's parent object (channel, thread, page) is
 // already recorded on source_objects.parent_object_id.
-func applyConnectorStructure(document source.Document, raw string) source.Document {
+//
+// Structured blocks documents (source.BlocksMIMEType) are skipped: their
+// blocks already carry their own kinds and per-block locators.
+func applyConnectorStructure(document source.Document, ver source.ObjectVersion) source.Document {
+	if ver.MimeType == source.BlocksMIMEType {
+		return document
+	}
 	var metadata struct {
 		ConnectionID string         `json:"connection_id"`
 		Kind         string         `json:"kind"`
 		Locator      source.Locator `json:"locator"`
 	}
-	if json.Unmarshal([]byte(raw), &metadata) != nil || metadata.ConnectionID == "" {
+	if json.Unmarshal([]byte(ver.Provenance), &metadata) != nil || metadata.ConnectionID == "" {
 		return document
 	}
 	for i := range document.Blocks {
@@ -203,6 +225,13 @@ func embeddingTexts(c Collection, obj source.Object, ver source.ObjectVersion, c
 	embed := c.PassagePrefix
 	if c.EmbedTitles && title != "" {
 		embed += title + "\n"
+	}
+	// Connector documents embed their container ("#channel", "owner/repo",
+	// parent page) so a one-line Slack message still carries where it lives.
+	if obj.ConnectionID != "" {
+		if container := strings.TrimSpace(stringFromPayload(provenance, "container")); container != "" {
+			embed += container + "\n"
+		}
 	}
 	embed += chunk
 	metadataText := strings.Join(semantic, "\n")

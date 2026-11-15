@@ -1282,6 +1282,13 @@ func (r *RAGRepo) ReplaceVersionChunksAndStage(ctx context.Context, tenantID, co
 			if err != nil {
 				return fmt.Errorf("marshal chunk locator: %w", err)
 			}
+			if ch.Links == nil {
+				ch.Links = []source.ChunkLink{}
+			}
+			links, err := json.Marshal(ch.Links)
+			if err != nil {
+				return fmt.Errorf("marshal chunk links: %w", err)
+			}
 			start, end := ch.ByteStart, ch.ByteEnd
 			if len(ch.SpanRefs) == 0 && end == 0 {
 				end = len(ch.Content)
@@ -1290,10 +1297,10 @@ func (r *RAGRepo) ReplaceVersionChunksAndStage(ctx context.Context, tenantID, co
 				INSERT INTO chunks
 				    (tenant_id, id, object_version_id, chunk_profile_version_id,
 				     ordinal, text, byte_start, byte_end, span_refs, owner_actor_id,
-				     collection_id, generation, block_path, locator, qdrant_point_id)
-				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,NULL,$10,$11,$12,$13::jsonb,$14)`,
+				     collection_id, generation, block_path, locator, links, qdrant_point_id)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,NULL,$10,$11,$12,$13::jsonb,$14::jsonb,$15)`,
 				tenantID, ch.ID, versionID, profileVersionID, ch.ChunkIndex,
-				ch.Content, start, end, spanRefs, collectionID, generation, ch.HeaderPath, locator, ch.QdrantPointID); err != nil {
+				ch.Content, start, end, spanRefs, collectionID, generation, ch.HeaderPath, locator, links, ch.QdrantPointID); err != nil {
 				return fmt.Errorf("insert generation chunk: %w", err)
 			}
 		}
@@ -1764,7 +1771,7 @@ func (r *RAGRepo) GetChunkProfile(ctx context.Context, tenantID, id string) (sou
 func (r *RAGRepo) ListGenerationChunks(ctx context.Context, tenantID, collectionID, versionID string, generation int64) ([]rag.DocumentChunk, error) {
 	rows, err := r.db.SQL.QueryContext(ctx, `
 		SELECT k.id, v.object_id, k.collection_id, k.generation, k.ordinal, k.text,
-		       k.byte_start, k.byte_end, k.span_refs, k.block_path, k.locator, k.qdrant_point_id, k.created_at
+		       k.byte_start, k.byte_end, k.span_refs, k.block_path, k.locator, k.links, k.qdrant_point_id, k.created_at
 		FROM chunks k
 		JOIN source_object_versions v ON v.tenant_id = k.tenant_id AND v.id = k.object_version_id
 		WHERE k.tenant_id=$1 AND k.collection_id=$2 AND k.object_version_id=$3 AND k.generation=$4
@@ -1776,8 +1783,8 @@ func (r *RAGRepo) ListGenerationChunks(ctx context.Context, tenantID, collection
 	var result []rag.DocumentChunk
 	for rows.Next() {
 		var chunk rag.DocumentChunk
-		var spans, metadata []byte
-		if err := rows.Scan(&chunk.ID, &chunk.DocumentID, &chunk.CollectionID, &chunk.Generation, &chunk.ChunkIndex, &chunk.Content, &chunk.ByteStart, &chunk.ByteEnd, &spans, &chunk.HeaderPath, &metadata, &chunk.QdrantPointID, &chunk.CreatedAt); err != nil {
+		var spans, metadata, links []byte
+		if err := rows.Scan(&chunk.ID, &chunk.DocumentID, &chunk.CollectionID, &chunk.Generation, &chunk.ChunkIndex, &chunk.Content, &chunk.ByteStart, &chunk.ByteEnd, &spans, &chunk.HeaderPath, &metadata, &links, &chunk.QdrantPointID, &chunk.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan generation chunk: %w", err)
 		}
 		if err := json.Unmarshal(spans, &chunk.SpanRefs); err != nil {
@@ -1785,6 +1792,9 @@ func (r *RAGRepo) ListGenerationChunks(ctx context.Context, tenantID, collection
 		}
 		if err := json.Unmarshal(metadata, &chunk.Metadata); err != nil {
 			return nil, fmt.Errorf("decode chunk metadata: %w", err)
+		}
+		if err := json.Unmarshal(links, &chunk.Links); err != nil {
+			return nil, fmt.Errorf("decode chunk links: %w", err)
 		}
 		result = append(result, chunk)
 	}

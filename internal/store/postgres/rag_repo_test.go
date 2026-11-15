@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"enclava-go/internal/auth"
@@ -765,5 +766,97 @@ func TestRAGRepoAccessProjectionReads(t *testing.T) {
 		if id == tenant {
 			t.Fatalf("fully projected tenant still needs backfill")
 		}
+	}
+}
+
+// TestRAGRepoChunkLinksRoundTrip: v1.2 chunk deep links and the per-block
+// locator provenance (URL/author/timestamp/native id) persist and reload
+// unchanged; chunks written without links read back empty.
+func TestRAGRepoChunkLinksRoundTrip(t *testing.T) {
+	db := testdb.New(t)
+	ctx := context.Background()
+	tenant := testdb.SeedTenant(t, db, "links")
+	repo := postgres.NewRAGRepo(db)
+	if err := repo.InsertCollection(ctx, rag.Collection{
+		TenantID: tenant, ID: "ragcol_links", Name: "Links", OwnerActorID: "user_links",
+		QdrantCollection: "rag_ragcol_links", EmbeddingModel: "m",
+		ChunkSize: 100, ChunkOverlap: 10, ChunkStrategy: rag.ChunkStrategyFixed, IsActive: true,
+	}); err != nil {
+		t.Fatalf("insert collection: %v", err)
+	}
+	obj, err := repo.UpsertObject(ctx, source.Object{
+		TenantID: tenant, ID: "obj_links", Kind: "message", NativeID: "slack:C1:thread",
+		AuthorizationMode: source.AuthorizationCollection, OwnerActorID: "user_links",
+	})
+	if err != nil {
+		t.Fatalf("upsert object: %v", err)
+	}
+	if err := repo.InsertObjectVersion(ctx, tenant, source.ObjectVersion{
+		ObjectID: obj.ID, ObservedSeq: 1, ArtifactRef: "art_links", SHA256: "sha_links",
+		ByteSize: 30, MimeType: source.BlocksMIMEType, OriginalFilename: "thread.blocks.json",
+	}); err != nil {
+		t.Fatalf("insert version: %v", err)
+	}
+	if err := repo.AddCollectionItem(ctx, tenant, "ragcol_links", obj.ID, "user_links"); err != nil {
+		t.Fatalf("add item: %v", err)
+	}
+	parsed := source.Document{
+		Ref: source.ObjectRef{TenantID: tenant, ObjectID: obj.ID, ObservedSeq: 1},
+		Blocks: []source.Block{
+			{ID: "blk_m1", Ordinal: 0, Kind: "message", Text: "deploy broken", ByteStart: 0, ByteEnd: 13,
+				Locator: source.Locator{URL: "https://hooks.slack.com/archives/C1/p1", Author: "ada", Timestamp: "2026-01-01T00:00:00Z", NativeID: "m1"}},
+			{ID: "blk_m2", Ordinal: 1, Kind: "message", Text: "invoice total 42", ByteStart: 14, ByteEnd: 30,
+				Locator: source.Locator{URL: "https://hooks.slack.com/archives/C1/p2", Author: "bob", Timestamp: "2026-01-02T09:00:00Z", NativeID: "m2"}},
+		},
+	}
+	if err := repo.SaveParsedDocument(ctx, "rag-structured-v1", parsed); err != nil {
+		t.Fatalf("save parsed document: %v", err)
+	}
+	locators, err := repo.ListBlockLocators(ctx, tenant, []string{"blk_m1", "blk_m2"})
+	if err != nil {
+		t.Fatalf("list block locators: %v", err)
+	}
+	want := source.Locator{URL: "https://hooks.slack.com/archives/C1/p1", Author: "ada", Timestamp: "2026-01-01T00:00:00Z", NativeID: "m1"}
+	if locators["blk_m1"] != want {
+		t.Fatalf("block locator round trip = %+v, want %+v", locators["blk_m1"], want)
+	}
+
+	links := []source.ChunkLink{
+		{Offset: 0, URL: "https://hooks.slack.com/archives/C1/p1", Author: "ada", Timestamp: "2026-01-01T00:00:00Z", NativeID: "m1"},
+		{Offset: 14, URL: "https://hooks.slack.com/archives/C1/p2", Author: "bob", Timestamp: "2026-01-02T09:00:00Z", NativeID: "m2"},
+	}
+	profileID, err := repo.EnsureChunkProfile(ctx, tenant, "rag-ragcol_links-structured", 100, 10, rag.ChunkStrategyFixed)
+	if err != nil {
+		t.Fatalf("ensure profile: %v", err)
+	}
+	chunks := []rag.DocumentChunk{{
+		ID: "chk_links", DocumentID: obj.ID, CollectionID: "ragcol_links", Generation: 1,
+		ChunkIndex: 0, Content: parsed.Blocks[0].Text + "\n" + parsed.Blocks[1].Text, TokenCount: 6,
+		Links: links,
+		SpanRefs: []source.Span{
+			{Ref: parsed.Ref, BlockID: "blk_m1", ByteStart: 0, ByteEnd: 13},
+			{Ref: parsed.Ref, BlockID: "blk_m2", ByteStart: 14, ByteEnd: 30},
+		},
+	}}
+	versionID := obj.ID + "#1"
+	if err := repo.ReplaceVersionChunksAndStage(ctx, tenant, "ragcol_links", obj.ID, versionID, 1, 1, profileID, chunks); err != nil {
+		t.Fatalf("stage chunks: %v", err)
+	}
+	got, err := repo.ListGenerationChunks(ctx, tenant, "ragcol_links", versionID, 1)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("list generation chunks: %d err=%v", len(got), err)
+	}
+	if !reflect.DeepEqual(got[0].Links, links) {
+		t.Fatalf("chunk links round trip = %+v, want %+v", got[0].Links, links)
+	}
+
+	// A generation staged without links reads back empty, never null/garbage.
+	chunks[0].ID, chunks[0].Links, chunks[0].Generation = "chk_plain", nil, 2
+	if err := repo.ReplaceVersionChunksAndStage(ctx, tenant, "ragcol_links", obj.ID, versionID, 1, 2, profileID, chunks); err != nil {
+		t.Fatalf("stage second generation: %v", err)
+	}
+	got, err = repo.ListGenerationChunks(ctx, tenant, "ragcol_links", versionID, 2)
+	if err != nil || len(got) != 1 || len(got[0].Links) != 0 {
+		t.Fatalf("linkless chunk = %#v err=%v", got, err)
 	}
 }
