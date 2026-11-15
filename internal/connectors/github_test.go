@@ -528,7 +528,7 @@ func TestGitHubSyncTombstonesLegacyCommentItems(t *testing.T) {
 		}
 		legacies = append(legacies, obj)
 	}
-	assertAlive := func(wantDeleted bool) {
+	assertAlive := func(wantDeleted bool, legacies ...source.Object) {
 		t.Helper()
 		for _, legacy := range legacies {
 			stored, err := f.sourceRepo.GetObject(ctx, f.tenant, legacy.ID)
@@ -543,14 +543,17 @@ func TestGitHubSyncTombstonesLegacyCommentItems(t *testing.T) {
 			}
 		}
 	}
-	// An interrupted listing (the pulls phase fails) deletes nothing.
+	// An interrupted listing (the pulls phase fails) deletes nothing it did
+	// not replace: the observed issue document retires its own comment
+	// (Supersedes), the unseen PR's review comment survives.
 	if _, err := f.svc.SyncSourceWindowed(ctx, f.principal, connID, 1); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.runNext(t); err == nil {
 		t.Fatal("sync with failing pulls phase unexpectedly succeeded")
 	}
-	assertAlive(false)
+	assertAlive(true, legacies[0])
+	assertAlive(false, legacies[1])
 	// The first complete snapshot sync folds comments into the issue
 	// document and tombstones the legacy comment items.
 	failPulls.Store(false)
@@ -560,7 +563,7 @@ func TestGitHubSyncTombstonesLegacyCommentItems(t *testing.T) {
 	if _, err := f.runNext(t); err != nil {
 		t.Fatal(err)
 	}
-	assertAlive(true)
+	assertAlive(true, legacies...)
 	obj, err := f.sourceRepo.ObjectForNativeID(ctx, f.tenant, connID, "issues", "github:"+connID+":acme/docs:issues:99")
 	if err != nil {
 		t.Fatal(err)

@@ -322,8 +322,14 @@ func (g *GitHubAdapter) discussionItem(ctx context.Context, c source.Connection,
 		block   source.StructuredBlock
 	}
 	var messages []message
+	// Before v1.2 issue and review comments were their own items; the
+	// discussion document retires them.
+	var superseded []string
 	collect := func(comments []ghComment, nativeKind string) {
 		for _, cm := range comments {
+			if nativeKind != "review" {
+				superseded = append(superseded, fmt.Sprintf("github:%s:%s:%s:%d", c.ID, g.owner+"/"+g.repo, nativeKind, cm.ID))
+			}
 			if strings.TrimSpace(cm.Body) == "" {
 				continue
 			}
@@ -391,6 +397,7 @@ func (g *GitHubAdapter) discussionItem(ctx context.Context, c source.Connection,
 		Blocks:         blocks,
 		Container:      g.owner + "/" + g.repo,
 		Authors:        authors,
+		Supersedes:     superseded,
 	}, nil
 }
 

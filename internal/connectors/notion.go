@@ -279,6 +279,10 @@ func (t *notionTraversal) walkPage(ctx context.Context, id, parent, parentKind s
 		item.MIMEType = source.BlocksMIMEType
 		item.Filename = "document.blocks.json"
 	}
+	// Before v1.2 every block was its own item keyed by its block id.
+	for _, block := range item.Blocks {
+		item.Supersedes = append(item.Supersedes, block.NativeID)
+	}
 	t.items = append(t.items, item)
 	if err := t.countNode(); err != nil {
 		return err
