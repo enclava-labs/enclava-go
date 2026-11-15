@@ -605,6 +605,7 @@ func (s *Service) UpdateCollection(ctx context.Context, p auth.Principal, id str
 		// Only passages change: documents re-embed in place.
 		c.EmbedTitles = *input.EmbedTitles
 	}
+	priorProfileVersionID := c.ChunkProfileVersionID
 	if input.ChunkSize != nil || input.ChunkOverlap != nil || input.ChunkStrategy != nil {
 		chunkSize, chunkOverlap, chunkStrategy := c.ChunkSize, c.ChunkOverlap, c.ChunkStrategy
 		if input.ChunkSize != nil {
@@ -649,10 +650,14 @@ func (s *Service) UpdateCollection(ctx context.Context, p auth.Principal, id str
 		if versionID == "" {
 			return Collection{}, fmt.Errorf("%w: chunk_profile_version_id must name an immutable version", ErrInvalidInput)
 		}
-		if err := s.validateChunkProfileVersion(ctx, p.TenantID, versionID); err != nil {
-			return Collection{}, err
+		// A form that resends the current version alongside changed chunk
+		// settings must not undo the version those settings just created.
+		if versionID != priorProfileVersionID || c.ChunkProfileVersionID == priorProfileVersionID {
+			if err := s.validateChunkProfileVersion(ctx, p.TenantID, versionID); err != nil {
+				return Collection{}, err
+			}
+			c.ChunkProfileVersionID = versionID
 		}
-		c.ChunkProfileVersionID = versionID
 	}
 	if input.Metadata != nil {
 		c.Metadata = input.Metadata

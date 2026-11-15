@@ -75,8 +75,11 @@
     if (dims !== '') payload.embedding_dimensions = Number(dims);
     payload.embed_titles = form.elements.embed_titles.checked;
     payload.chunk_strategy = form.elements.chunk_strategy.value;
-    var profile = form.elements.chunk_profile_version_id.value;
-    if (profile) payload.chunk_profile_version_id = profile;
+    // Send a profile version only when the user picked a different one;
+    // resending the current version would undo a chunking change.
+    var profileSelect = form.elements.chunk_profile_version_id;
+    var profile = profileSelect.value;
+    if (profile && profile !== (profileSelect.dataset.current || '')) payload.chunk_profile_version_id = profile;
     payload.acl = form.elements.access.value === 'org' ? { audience: ['*'] } : {};
     function created(c) {
       Enclava.closeDrawer();

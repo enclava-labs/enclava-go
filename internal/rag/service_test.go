@@ -3370,6 +3370,27 @@ func TestServiceChunkStrategyDefaultAndSwitch(t *testing.T) {
 	if resized.ChunkStrategy != rag.ChunkStrategyAuto || resized.ChunkSize != 200 {
 		t.Fatalf("size-only update = %d/%q, want 200/auto", resized.ChunkSize, resized.ChunkStrategy)
 	}
+
+	// The settings form resends the collection's current profile version
+	// with every save; that must not undo a strategy change in the same PUT.
+	current := resized.ChunkProfileVersionID
+	back, err := f.svc.UpdateCollection(ctx, f.principal, fixed.ID, rag.UpdateCollectionInput{
+		ChunkStrategy:         &[]string{rag.ChunkStrategyFixed}[0],
+		ChunkProfileVersionID: &current,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.ChunkStrategy != rag.ChunkStrategyFixed || back.ChunkProfileVersionID == current {
+		t.Fatalf("strategy change with resent version = %q / %s, want fixed on a new version", back.ChunkStrategy, back.ChunkProfileVersionID)
+	}
+	reread, err := f.svc.GetCollection(ctx, f.principal, fixed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reread.ChunkStrategy != rag.ChunkStrategyFixed {
+		t.Fatalf("persisted strategy = %q, want fixed", reread.ChunkStrategy)
+	}
 }
 
 // TestServiceChunkStrategyPinnedProfileReadOnly: re-posting the read-only
