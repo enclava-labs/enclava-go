@@ -89,8 +89,8 @@ func TestEnsureCollectionCreateRaceAccepted(t *testing.T) {
 	if err := client.EnsureCollection(context.Background(), "race", 2); err != nil {
 		t.Fatalf("racing ensure = %v, want success on compatible winner schema", err)
 	}
-	if gets != 2 || len(indexCreates) != 4 {
-		t.Fatalf("gets=%d index creates=%#v, want a schema re-verify and 4 payload indexes", gets, indexCreates)
+	if gets != 2 || len(indexCreates) != 7 {
+		t.Fatalf("gets=%d index creates=%#v, want a schema re-verify and 7 payload indexes", gets, indexCreates)
 	}
 }
 
@@ -299,7 +299,7 @@ func TestUpsertSplitsLargeDocumentsUnderQdrantBodyLimit(t *testing.T) {
 }
 
 // TestEnsureCollectionRememberedAcrossEmbeds: every embed used to re-check
-// the schema and re-create the 4 payload indexes; after the first successful
+// the schema and re-create the payload indexes; after the first successful
 // ensure the client must answer from memory and leave the server alone.
 func TestEnsureCollectionRememberedAcrossEmbeds(t *testing.T) {
 	gets, indexPuts, collectionPuts := 0, 0, 0
@@ -325,8 +325,8 @@ func TestEnsureCollectionRememberedAcrossEmbeds(t *testing.T) {
 			t.Fatalf("ensure %d: %v", i, err)
 		}
 	}
-	if gets != 1 || indexPuts != 4 || collectionPuts != 0 {
-		t.Fatalf("gets=%d index puts=%d collection puts=%d, want 1/4/0 for two ensures", gets, indexPuts, collectionPuts)
+	if gets != 1 || indexPuts != 7 || collectionPuts != 0 {
+		t.Fatalf("gets=%d index puts=%d collection puts=%d, want 1/7/0 for two ensures", gets, indexPuts, collectionPuts)
 	}
 }
 
@@ -359,8 +359,8 @@ func TestEnsureCollectionRefreshedAfterDeleteCollection(t *testing.T) {
 	if err := client.EnsureCollection(context.Background(), "docs", 2); err != nil {
 		t.Fatal(err)
 	}
-	if gets != 2 || indexPuts != 8 {
-		t.Fatalf("gets=%d index puts=%d, want 2/8 after a delete", gets, indexPuts)
+	if gets != 2 || indexPuts != 14 {
+		t.Fatalf("gets=%d index puts=%d, want 2/14 after a delete", gets, indexPuts)
 	}
 }
 
@@ -413,8 +413,8 @@ func TestUpsert404ForgetsEnsuredCollection(t *testing.T) {
 	if err := client.EnsureCollection(context.Background(), "docs", 2); err != nil {
 		t.Fatal(err)
 	}
-	if gets != 5 || indexPuts != 12 || pointPuts != 1 {
-		t.Fatalf("gets=%d index puts=%d point puts=%d, want 5/12/1", gets, indexPuts, pointPuts)
+	if gets != 5 || indexPuts != 21 || pointPuts != 1 {
+		t.Fatalf("gets=%d index puts=%d point puts=%d, want 5/21/1", gets, indexPuts, pointPuts)
 	}
 }
 

@@ -236,6 +236,13 @@ type SearchInput struct {
 	SelectSections bool           `json:"select_sections,omitempty"`
 	SectionModel   string         `json:"section_model,omitempty"`
 	Filter         map[string]any `json:"filter,omitempty"`
+	// v1.2 metadata filters, ANDed with the access prefilter — they can
+	// only narrow a search, never widen it. UpdatedAfter is inclusive,
+	// UpdatedBefore exclusive, both RFC 3339 against source_updated_at.
+	Container     string `json:"container,omitempty"`
+	Author        string `json:"author,omitempty"`
+	UpdatedAfter  string `json:"updated_after,omitempty"`
+	UpdatedBefore string `json:"updated_before,omitempty"`
 }
 
 type SearchResult struct {
