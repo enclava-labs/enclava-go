@@ -257,6 +257,7 @@ func (t *notionTraversal) walkPage(ctx context.Context, id, parent, parentKind s
 	item := ContentItem{
 		NativeID: id, ParentNativeID: parent, ParentKind: parentKind,
 		Kind: "page", NativeRevision: page.LastEdited, Title: title, URL: page.URL,
+		Filename:  notionFilename(title),
 		CreatedAt: notionTime(page.CreatedTime), UpdatedAt: notionTime(page.LastEdited),
 		Container: strings.Join(ancestors, " / "),
 	}
@@ -277,7 +278,6 @@ func (t *notionTraversal) walkPage(ctx context.Context, id, parent, parentKind s
 		}
 		item.Content = encoded
 		item.MIMEType = source.BlocksMIMEType
-		item.Filename = "document.blocks.json"
 	}
 	// Before v1.2 every block was its own item keyed by its block id.
 	for _, block := range item.Blocks {
@@ -635,4 +635,22 @@ func validNotionPageURL(raw string) bool {
 	return host == "notion.so" || strings.HasSuffix(host, ".notion.so") ||
 		host == "notion.com" || strings.HasSuffix(host, ".notion.com") ||
 		host == "notion.site" || strings.HasSuffix(host, ".notion.site")
+}
+
+// notionFilename names a page document after its title so search results
+// and document lists show the page, not a generic blocks file.
+func notionFilename(title string) string {
+	name := strings.Map(func(r rune) rune {
+		if r == '/' || r == '\\' || r < 0x20 {
+			return '-'
+		}
+		return r
+	}, strings.TrimSpace(title))
+	if runes := []rune(name); len(runes) > 120 {
+		name = string(runes[:120])
+	}
+	if name == "" {
+		name = "page"
+	}
+	return name + ".blocks.json"
 }

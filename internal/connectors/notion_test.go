@@ -321,7 +321,7 @@ func TestNotionEmptyPageSyncsEmptyBlocksDocument(t *testing.T) {
 		t.Fatalf("items = %+v", items)
 	}
 	item := items[0]
-	if len(item.Blocks) != 0 || item.MIMEType != source.BlocksMIMEType || item.Filename != "document.blocks.json" {
+	if len(item.Blocks) != 0 || item.MIMEType != source.BlocksMIMEType || item.Filename != "Empty Page.blocks.json" {
 		t.Fatalf("empty page item = %+v", item)
 	}
 	var doc source.BlocksDocument
