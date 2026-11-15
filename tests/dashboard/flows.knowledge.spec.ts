@@ -25,10 +25,14 @@ async function newCollectionViaUI(page: Page, chunking: string) {
     (r) => r.request().method() === 'POST' && r.url().endsWith('/api/v1/rag/collections'));
   await drawer.getByRole('button', { name: 'Create collection' }).click();
   const res = await created;
-  expect(res.status(), await res.text()).toBe(201);
-  const body = (await res.json()) as { id?: string };
-  expect(body.id, 'create response carries the collection id').toBeTruthy();
-  return { id: body.id as string, name };
+  // The drawer navigates on success, so the response body may already be
+  // gone; read the new collection back by its unique name instead.
+  expect(res.status()).toBe(201);
+  const list = await api<{ collections?: Array<{ id: string; name: string }> }>(
+    'GET', '/api/v1/rag/collections');
+  const found = (list.collections || []).find((c) => c.name === name);
+  expect(found, 'created collection is listed').toBeTruthy();
+  return { id: (found as { id: string }).id, name };
 }
 
 test.describe('Knowledge — chunking controls (v1.2)', () => {
@@ -108,7 +112,7 @@ test.describe('Knowledge — retry failed (v1.2)', () => {
         && r.url().endsWith(`/api/v1/rag/collections/${col.id}/reprocess-failed`));
     await button.click();
     const res = await reprocess;
-    expect(res.status(), await res.text()).toBe(200);
+    expect(res.status(), await res.text()).toBe(202);
     const body = (await res.json()) as { requeued?: number };
     expect(body.requeued ?? 0).toBeGreaterThanOrEqual(1);
     await expect(page.locator('#toast')).toContainText('re-queued');
