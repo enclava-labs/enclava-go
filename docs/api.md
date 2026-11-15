@@ -166,6 +166,29 @@ clause, …) read-only.
 Every `PUT` also queues any document still embedded under older settings, so
 repeating a `PUT` that failed midway finishes the re-embedding it started.
 
+### Resilient ingest and bulk retry
+
+A document is never failed because the extraction worker was down. When the
+worker is unreachable (dial failure, connection dropped mid-parse, HTTP 502 /
+503 / 504, worker-side timeout), the `rag.embed` job returns to `queued`
+without consuming an attempt — 15 s doubling to a 5 min cap — and the
+document stays `processing` with `warnings: ["waiting for the extraction
+worker"]`. Two bounds fail a document terminally so nothing waits silently:
+a worker that dropped the connection mid-parse 3 times on the same document
+fails it with "the extraction worker stopped while processing this
+document", and a worker that stays unavailable longer than
+`EXTRACT_WORKER_MAX_WAIT` (default `24h`) fails it with a matching message.
+Both are recoverable through reprocess once the worker is back.
+
+`GET /readyz/knowledge` additionally reports
+`"extraction_worker": "ok" | "unavailable"` whenever a worker socket is
+configured; it never changes the status code.
+
+`POST /api/v1/rag/collections/{id}/reprocess-failed` (scope `rag.manage`)
+requeues every failed document in the collection through the same pipeline
+as `POST /api/v1/rag/documents/{id}/reprocess`; documents the caller cannot
+read are skipped. Returns `202` with `{"requeued": n}`.
+
 ## 3. Connector sources and access
 
 `POST /api/v1/connectors/sources` creates a connector source and

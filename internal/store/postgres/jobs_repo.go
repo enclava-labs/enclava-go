@@ -54,7 +54,8 @@ const jobColumns = `tenant_id::text, id, operation, status, connection_id,
 	object_id, observed_revision, idempotency_key, input_hash, input_ref,
 	principal, submitter_key, policy, attempts, max_attempts, fence_token,
 	lease_owner, lease_expires_at, dispatched_attempt_id, result_ref, progress, error,
-	submitted_at, updated_at, started_at, finished_at, deleted_at`
+	submitted_at, updated_at, started_at, finished_at, deleted_at,
+	deferrals, drop_deferrals, first_deferred_at`
 
 // scanJobRow decodes jobColumns order plus any caller-supplied trailing
 func scanJobRow(s rowScanner, extra ...any) (jobs.JobRow, error) {
@@ -62,16 +63,17 @@ func scanJobRow(s rowScanner, extra ...any) (jobs.JobRow, error) {
 	var connID, objectID, inputRef, submitterKey, resultRef, dispatched sql.NullString
 	var observed sql.NullInt64
 	var leaseOwner sql.NullString
-	var leaseExpires, startedAt, finishedAt, deletedAt sql.NullTime
+	var leaseExpires, startedAt, finishedAt, deletedAt, firstDeferredAt sql.NullTime
 	var principal, policy, progress, errDoc []byte
-	dests := make([]any, 0, 27+len(extra))
+	dests := make([]any, 0, 30+len(extra))
 	dests = append(dests,
 		&row.TenantID, &row.ID, &row.Operation, &row.Status, &connID,
 		&objectID,
 		&observed, &row.IdempotencyKey, &row.InputHash, &inputRef, &principal,
 		&submitterKey, &policy, &row.Attempt, &row.MaxAttempts, &row.FenceToken,
 		&leaseOwner, &leaseExpires, &dispatched, &resultRef, &progress, &errDoc,
-		&row.CreatedAt, &row.UpdatedAt, &startedAt, &finishedAt, &deletedAt)
+		&row.CreatedAt, &row.UpdatedAt, &startedAt, &finishedAt, &deletedAt,
+		&row.Deferrals, &row.DropDeferrals, &firstDeferredAt)
 	dests = append(dests, extra...)
 	if err := s.Scan(dests...); err != nil {
 		return jobs.JobRow{}, err
@@ -109,6 +111,10 @@ func scanJobRow(s rowScanner, extra ...any) (jobs.JobRow, error) {
 	if finishedAt.Valid {
 		t := finishedAt.Time
 		row.CompletedAt = &t
+	}
+	if firstDeferredAt.Valid {
+		t := firstDeferredAt.Time
+		row.FirstDeferredAt = &t
 	}
 	if deletedAt.Valid {
 		t := deletedAt.Time
@@ -717,6 +723,53 @@ func (r *JobsRepo) FailJob(ctx context.Context, tenantID, jobID, owner string, f
 		}
 		return nil
 	})
+}
+
+// DeferJob requeues without consuming the attempt: the job returns to
+// queued with notBefore as the run-after timestamp (lease_expires_at again
+// doubles as not-before until the next claim), the claim's attempt
+// increment is undone, deferral counters advance and the still-open attempt
+// closes as failed with the deferral error doc.
+func (r *JobsRepo) DeferJob(ctx context.Context, tenantID, jobID, owner string, fence int64, attemptID string, drop bool, notBefore time.Time, errDoc json.RawMessage) error {
+	return WithTx(ctx, r.db.SQL, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE jobs
+			SET status = 'queued',
+			    lease_owner = NULL,
+			    lease_expires_at = $5::timestamptz,
+			    dispatched_attempt_id = NULL,
+			    error = $6::jsonb, updated_at = now(),
+			    finished_at = NULL,
+			    attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+			    deferrals = deferrals + 1,
+			    drop_deferrals = drop_deferrals + $7,
+			    first_deferred_at = COALESCE(first_deferred_at, now())
+			WHERE tenant_id = $1 AND id = $2 AND status = 'running'
+			  AND lease_owner = $3 AND fence_token = $4`,
+			tenantID, jobID, owner, fence, notBefore, errDoc, boolToInt(drop))
+		if ferr := fenced(res, err); ferr != nil {
+			return fmt.Errorf("defer job: %w", ferr)
+		}
+		res, err = tx.ExecContext(ctx, `
+			UPDATE job_attempts
+			SET status = 'failed', finished_at = now(), error = $3::jsonb
+			WHERE tenant_id = $1 AND id = $2 AND finished_at IS NULL`,
+			tenantID, attemptID, errDoc)
+		if err != nil {
+			return fmt.Errorf("finish attempt: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return jobs.ErrStaleFence
+		}
+		return nil
+	})
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // ReleaseJob abandons the lease without consuming dispatch: the job returns
