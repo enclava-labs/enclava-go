@@ -520,6 +520,11 @@ func (a *slackAdapter) threadItem(ctx context.Context, channel string, root slac
 		Container:      container,
 		Authors:        authors,
 	}
+	// Before v1.2 every message was its own item; retire those once the
+	// thread document exists.
+	for _, msg := range messages {
+		item.Supersedes = append(item.Supersedes, "slack:"+channel+":"+msg.TS)
+	}
 	return &item, files, nil
 }
 

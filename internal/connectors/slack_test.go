@@ -766,6 +766,11 @@ func seedLegacySlackMessages(t *testing.T) *connectorFixture {
 // server and marks the source for reconciled full listings.
 func useRealSlackAdapter(t *testing.T, f *connectorFixture, fake *fakeSlack) {
 	t.Helper()
+	useSlackAdapterWithConfig(t, f, fake, map[string]any{"reconcile": "true"})
+}
+
+func useSlackAdapterWithConfig(t *testing.T, f *connectorFixture, fake *fakeSlack, extra map[string]any) {
+	t.Helper()
 	server := httptest.NewServer(fake)
 	t.Cleanup(server.Close)
 	f.svc.setAllowPrivateBaseURL(true)
@@ -777,7 +782,10 @@ func useRealSlackAdapter(t *testing.T, f *connectorFixture, fake *fakeSlack) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn.Config = map[string]any{"channel_id": "C1", "base_url": server.URL, "reconcile": "true"}
+	conn.Config = map[string]any{"channel_id": "C1", "base_url": server.URL}
+	for k, v := range extra {
+		conn.Config[k] = v
+	}
 	if err := f.sourceRepo.UpdateConnection(ctx, conn); err != nil {
 		t.Fatal(err)
 	}
@@ -847,9 +855,31 @@ func TestSlackIncompleteSyncKeepsPerMessageItems(t *testing.T) {
 	if _, err := f.runNext(t); err == nil {
 		t.Fatal("interrupted listing unexpectedly succeeded")
 	}
+	// The adapter fails within its first page, so nothing was observed and
+	// nothing may be deleted.
 	for _, nativeID := range []string{"slack:C1:1.000000", "slack:C1:1.000002", "slack:C1:2.000000"} {
 		if legacyMessageDeleted(t, f, nativeID) {
 			t.Fatalf("incomplete sync deleted %s", nativeID)
+		}
+	}
+}
+
+// TestSlackDeltaSyncRetiresSupersededMessages: without reconcile no listing
+// is a snapshot, yet a thread document still retires the per-message items
+// it replaces (the upgrade path for sources that never reconcile).
+func TestSlackDeltaSyncRetiresSupersededMessages(t *testing.T) {
+	f := seedLegacySlackMessages(t)
+	fake := slackThreadFixture(t, []map[string]any{
+		{"user": "U2", "text": "a reply", "ts": "1.000002", "thread_ts": "1.000000"},
+	})
+	useSlackAdapterWithConfig(t, f, fake, nil)
+	f.schedule(t)
+	if _, err := f.runNext(t); err != nil {
+		t.Fatal(err)
+	}
+	for _, nativeID := range []string{"slack:C1:1.000000", "slack:C1:1.000002", "slack:C1:2.000000"} {
+		if !legacyMessageDeleted(t, f, nativeID) {
+			t.Fatalf("old per-message item %s survived a non-reconciled sync", nativeID)
 		}
 	}
 }
