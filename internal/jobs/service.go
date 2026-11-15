@@ -40,7 +40,30 @@ type FailureClass int
 const (
 	FailureFatal FailureClass = iota
 	FailureRetryable
+	// FailureDeferred requeues after Delay WITHOUT consuming an attempt:
+	// the handler could not run because a dependency was unavailable.
+	FailureDeferred
 )
+
+// DeferredError marks a handler error as "dependency unavailable, try
+// later": the job returns to queued after Delay and the attempt counter is
+// not consumed. Bounded by the caller (max wait, mid-parse drop counter).
+type DeferredError struct {
+	Err   error
+	Delay time.Duration
+}
+
+func (e DeferredError) Error() string { return e.Err.Error() }
+func (e DeferredError) Unwrap() error { return e.Err }
+
+// Deferred wraps err so the runner requeues the job after delay without
+// consuming an attempt.
+func Deferred(err error, delay time.Duration) error {
+	if err == nil {
+		return nil
+	}
+	return DeferredError{Err: err, Delay: delay}
+}
 
 // RetryableError marks a handler error as safe to retry: Fail requeues the
 // job with backoff until max_attempts; anything else is terminal.
@@ -60,6 +83,10 @@ func Retryable(err error) error {
 // FailureClassFor maps a handler error to its class. Context cancellation
 // is NOT a failure — the runner routes it through release/unknown itself.
 func FailureClassFor(err error) FailureClass {
+	var de DeferredError
+	if errors.As(err, &de) {
+		return FailureDeferred
+	}
 	var re RetryableError
 	if errors.As(err, &re) {
 		return FailureRetryable

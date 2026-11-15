@@ -48,6 +48,13 @@ type ContentItem struct {
 	URL                      string
 	CreatedAt, UpdatedAt     *time.Time
 	Locator                  source.Locator
+	// Blocks, when non-empty, is the structured document form: the sync
+	// encodes it as a source.BlocksMIMEType body and ignores Content/Text.
+	Blocks []source.StructuredBlock
+	// Container is the channel, repository or parent page path ("#general",
+	// "owner/repo"); Authors are the distinct authors of the document.
+	Container string
+	Authors   []string
 }
 
 type ContentPage struct {

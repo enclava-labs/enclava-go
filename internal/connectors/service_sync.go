@@ -180,6 +180,19 @@ func (s *Service) observeContentItem(ctx context.Context, conn source.Connection
 		ObjectRef: source.ObjectRef{TenantID: conn.TenantID, ObjectID: object.ID, ObservedSeq: seq},
 	}
 	content := item.Content
+	if len(item.Blocks) > 0 {
+		encoded, encErr := source.EncodeBlocks(item.Blocks)
+		if encErr != nil {
+			observation.ProcessingError = encErr.Error()
+			observation.Payload = json.RawMessage(`{}`)
+			return observation, nil
+		}
+		content = encoded
+		item.MIMEType = source.BlocksMIMEType
+		if strings.TrimSpace(item.Filename) == "" {
+			item.Filename = "document.blocks.json"
+		}
+	}
 	if content == nil && item.Text != "" {
 		content = []byte(item.Text)
 	}
@@ -297,7 +310,7 @@ func connectorPayload(item ContentItem, filename, mimeType string) json.RawMessa
 }
 
 func connectorProvenance(conn source.Connection, item ContentItem) string {
-	payload, _ := json.Marshal(map[string]any{"connection_id": conn.ID, "source_kind": conn.Kind, "native_id": item.NativeID, "title": item.Title, "source_uri": item.URL, "created_at": item.CreatedAt, "updated_at": item.UpdatedAt, "locator": item.Locator})
+	payload, _ := json.Marshal(map[string]any{"connection_id": conn.ID, "source_kind": conn.Kind, "native_id": item.NativeID, "title": item.Title, "source_uri": item.URL, "created_at": item.CreatedAt, "updated_at": item.UpdatedAt, "locator": item.Locator, "container": item.Container, "authors": item.Authors})
 	return string(payload)
 }
 

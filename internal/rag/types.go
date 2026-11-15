@@ -250,6 +250,16 @@ type SearchResult struct {
 	SourceKind     string           `json:"source_kind,omitempty"`
 	CollectionName string           `json:"collection_name,omitempty"`
 	Locations      []source.Locator `json:"locations,omitempty"`
+	// v1.2 source links. SourceURL is the document URL (thread root,
+	// issue, page); Link is the best deep link for this hit; Links are all
+	// entries of the chunk. Timestamps are RFC 3339.
+	SourceURL       string             `json:"source_url,omitempty"`
+	Link            string             `json:"link,omitempty"`
+	Links           []source.ChunkLink `json:"links,omitempty"`
+	Author          string             `json:"author,omitempty"`
+	SourceCreatedAt string             `json:"source_created_at,omitempty"`
+	SourceUpdatedAt string             `json:"source_updated_at,omitempty"`
+	Container       string             `json:"container,omitempty"`
 }
 
 // SearchReadableResult is the bounded cross-collection search page: fused
