@@ -33,7 +33,21 @@
     </article>
     {{end}}
   {{else}}
-    {{template "empty" .Data.ThreadEmpty}}
+    {{if .Data.Welcome.AssistantName}}{{/* Empty thread with a usable
+        assistant: the welcome names it, states the grounding truth and
+        offers starter questions (chat:starter fills the composer, never
+        auto-sends). No usable assistant keeps the shared empty state. */}}
+    <div class="welcome">
+      <p class="welcome-title">Ask {{.Data.Welcome.AssistantName}}</p>
+      <p class="muted">{{.Data.Welcome.Grounding}}</p>
+      <p class="help">Don't see an assistant you expected? Ask an administrator to grant your role access.</p>
+      <div class="starters">
+        {{range .Data.Welcome.Starters}}<button type="button" class="starter" data-action="chat:starter">{{.}}</button>{{end}}
+      </div>
+    </div>
+    {{else}}
+      {{template "empty" .Data.ThreadEmpty}}
+    {{end}}
   {{end}}
 </div>
 {{end}}

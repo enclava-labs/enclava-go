@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -538,7 +539,10 @@ func TestDashboardChatThreadFragmentIsolation(t *testing.T) {
 		t.Fatalf("foreign thread fragment = %d, want 404", rec.Code)
 	}
 	rec = f.chatGet(t, sess, csrf, "/dashboard/partials/chat/thread")
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "No conversation open yet") {
+	// The empty thread with a usable assistant renders the welcome (name +
+	// starters) instead of the generic empty state.
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Ask Contract Reviewer") ||
+		!strings.Contains(rec.Body.String(), `data-action="chat:starter"`) {
 		t.Fatalf("empty thread fragment = %d body=%s", rec.Code, rec.Body.String())
 	}
 }
@@ -630,5 +634,160 @@ func TestDashboardChatConversationSelectsItsAssistant(t *testing.T) {
 	}
 	if !strings.Contains(body, `data-assistant="`+other.ID+`"`) {
 		t.Fatalf("composer missing pinned data-assistant: %s", body)
+	}
+}
+
+// TestChatStarters pins the pure starter-question table: collection-aware
+// for attached knowledge (first two collections quoted), generic otherwise,
+// blank entries skipped, always at most three.
+func TestChatStarters(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"no collections", nil, []string{
+			"What can you help me with?",
+			"Draft a short summary of a document I paste in",
+			"Explain a clause in plain language",
+		}},
+		{"blank entries count as none", []string{"  ", ""}, []string{
+			"What can you help me with?",
+			"Draft a short summary of a document I paste in",
+			"Explain a clause in plain language",
+		}},
+		{"one collection", []string{"Contracts"}, []string{
+			"Summarise the key points in Contracts",
+			"What topics does Contracts cover?",
+			"What should I know before relying on Contracts?",
+		}},
+		{"two collections", []string{"Contracts", "HR handbook"}, []string{
+			"Summarise the key points in Contracts",
+			"What topics does Contracts cover?",
+			"Summarise the key points in HR handbook",
+		}},
+		{"three collections still cap at three starters", []string{"A", "B", "C"}, []string{
+			"Summarise the key points in A",
+			"What topics does A cover?",
+			"Summarise the key points in B",
+		}},
+	}
+	for _, tc := range cases {
+		if got := chatStarters(tc.in); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: chatStarters(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestDashboardChatWelcomeAndDisabledPicker covers the unified-composer
+// states: the grantless caller keeps the shared empty state with the picker
+// disabled next to the note; a granted assistant gets the welcome (name,
+// grounding truth, three starters) that quotes only collections the caller
+// may see; and the SelectedDisabled page still renders exactly ONE picker
+// (enabled, with options) beside the note so another conversation is one
+// click away.
+func TestDashboardChatWelcomeAndDisabledPicker(t *testing.T) {
+	f := newChatFixture(t)
+	ctx := context.Background()
+	bot := f.seedAssistant(t)
+	sess, csrf, memberID := f.memberSession(t, "welcome-member@example.com", bot.ID, "chat-model-1")
+
+	// Grantless member: no welcome, ONE disabled empty picker, note copy.
+	gsess, gcsrf, _ := f.memberSession(t, "welcome-grantless@example.com", "", "")
+	rec := f.chatGet(t, gsess, gcsrf, "/dashboard/chat")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("grantless page = %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `class="welcome"`) || strings.Contains(body, "Ask Contract Reviewer") {
+		t.Fatalf("grantless member saw a welcome block: %s", body)
+	}
+	if strings.Count(body, `id="assistantSelect"`) != 1 || strings.Count(body, "Ask an administrator to grant your role access") != 1 {
+		t.Fatalf("grantless picker missing/duplicated or grant help missing (renders in the title attribute): %s", body)
+	}
+	if !strings.Contains(body, "composer-note") || !strings.Contains(body, "ask an admin to grant access") {
+		t.Fatalf("grantless note state lost its copy: %s", body)
+	}
+
+	// Granted assistant, no knowledge: welcome with model-alone grounding
+	// and the three generic starters.
+	rec = f.chatGet(t, sess, csrf, "/dashboard/chat")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("welcome page = %d body=%s", rec.Code, rec.Body.String())
+	}
+	body = rec.Body.String()
+	for _, want := range []string{
+		"Ask Contract Reviewer",
+		"No knowledge attached · answers come from the model alone",
+		"What can you help me with?",
+		`data-action="chat:starter"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("welcome missing %q: %s", want, body)
+		}
+	}
+	if got := strings.Count(body, `data-action="chat:starter"`); got != 3 {
+		t.Fatalf("starter count = %d, want 3: %s", got, body)
+	}
+
+	// Attach a caller-visible and a caller-hidden collection: the welcome
+	// names only the visible one (ListCollections is the enforced list).
+	visible, err := f.app.ragSvc.CreateCollection(ctx, f.adminAuth, rag.CreateCollectionInput{
+		Name: "welcome-docs", ACL: map[string]any{"public": true},
+	})
+	if err != nil {
+		t.Fatalf("seed visible collection: %v", err)
+	}
+	if _, err := f.app.ragSvc.CreateCollection(ctx, f.adminAuth, rag.CreateCollectionInput{
+		Name: "secret-docs", ACL: map[string]any{},
+	}); err != nil {
+		t.Fatalf("seed hidden collection: %v", err)
+	}
+	if _, err := f.chatSvc.Update(ctx, f.adminAuth, bot.ID, chatbot.UpdateChatbotInput{
+		RAGCollectionIDs: []string{visible.ID, "coll_hidden_unknown"},
+	}); err != nil {
+		t.Fatalf("attach collections: %v", err)
+	}
+	rec = f.chatGet(t, sess, csrf, "/dashboard/chat")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("grounded welcome page = %d", rec.Code)
+	}
+	body = rec.Body.String()
+	for _, want := range []string{
+		"Grounded in welcome-docs · answers cite their sources",
+		"Summarise the key points in welcome-docs",
+		"What topics does welcome-docs cover?",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("grounded welcome missing %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "secret-docs") {
+		t.Fatal("welcome named a collection the caller cannot see")
+	}
+
+	// SelectedDisabled: the conversation's assistant is still listed but
+	// disabled — the note replaces the composer, the picker stays (enabled,
+	// with options) so the caller can pick another assistant.
+	enabled := false
+	if _, err := f.chatSvc.Update(ctx, f.adminAuth, bot.ID, chatbot.UpdateChatbotInput{
+		IsEnabled: &enabled,
+	}); err != nil {
+		t.Fatalf("disable assistant: %v", err)
+	}
+	f.seedConversation(t, "conv_disabled", memberID, bot.ID, "hello from the past")
+	rec = f.chatGet(t, sess, csrf, "/dashboard/chat/conv_disabled")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disabled page = %d body=%s", rec.Code, rec.Body.String())
+	}
+	body = rec.Body.String()
+	if strings.Contains(body, `data-action="chat:send"`) || !strings.Contains(body, "no longer available") {
+		t.Fatalf("disabled state lost the note/composer split: %s", body)
+	}
+	if strings.Count(body, `id="assistantSelect"`) != 1 {
+		t.Fatalf("disabled state must render exactly one picker: %s", body)
+	}
+	if !strings.Contains(body, `<option value="`+bot.ID+`" selected>`) {
+		t.Fatalf("disabled state dropped its assistant from the picker: %s", body)
 	}
 }

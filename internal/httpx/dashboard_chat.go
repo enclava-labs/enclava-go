@@ -56,10 +56,23 @@ type chatViewData struct {
 	EvidenceIDsAttr string
 	History         chatHistoryData
 	Thread          *chatThreadData
+	// Welcome drives the empty-thread block (name, grounding line, starter
+	// questions); zero when no assistant is usable so the shared empty state
+	// renders instead.
+	Welcome chatWelcome
 	// Shared empty states (caller-gated in fillEmptyStates).
 	HistoryEmpty    dashboardEmpty
 	AssistantsEmpty dashboardEmpty
 	ThreadEmpty     dashboardEmpty
+}
+
+// chatWelcome is the empty-thread welcome: who answers, what grounds the
+// answers, and up to three starter questions chat.js drops into the composer
+// (never auto-sends).
+type chatWelcome struct {
+	AssistantName string
+	Grounding     string
+	Starters      []string
 }
 
 func (d chatViewData) DashboardTitle() string  { return "Chat" }
@@ -132,6 +145,113 @@ func (d *chatViewData) fillEmptyStates(caps dashboardCaps) {
 		Text: "No conversation open yet — pick an assistant and ask your first question."}
 }
 
+// chatStarters proposes at most three first questions for the empty-thread
+// welcome: collection-aware when the assistant carries knowledge, generic
+// otherwise. Pure — the template stays dumb and the test stays table-driven.
+func chatStarters(collectionNames []string) []string {
+	names := make([]string, 0, len(collectionNames))
+	for _, n := range collectionNames {
+		if n = strings.TrimSpace(n); n != "" {
+			names = append(names, n)
+		}
+	}
+	if len(names) == 0 {
+		return []string{
+			"What can you help me with?",
+			"Draft a short summary of a document I paste in",
+			"Explain a clause in plain language",
+		}
+	}
+	starters := []string{
+		"Summarise the key points in " + names[0],
+		"What topics does " + names[0] + " cover?",
+	}
+	if len(names) > 1 {
+		starters = append(starters, "Summarise the key points in "+names[1])
+	} else {
+		starters = append(starters, "What should I know before relying on "+names[0]+"?")
+	}
+	return starters
+}
+
+// chatGroundingLine is the welcome's one-line grounding truth: visible
+// collection names when any resolve, "attached knowledge" when the assistant
+// carries collections the caller cannot name, model-alone when none attached.
+func chatGroundingLine(attached int, names []string) string {
+	switch {
+	case attached == 0:
+		return "No knowledge attached · answers come from the model alone"
+	case len(names) == 0:
+		return "Grounded in attached knowledge · answers cite their sources"
+	default:
+		return "Grounded in " + chatNameJoin(names) + " · answers cite their sources"
+	}
+}
+
+// chatNameJoin renders "A", "A and B", "A, B and C" — capped at three names
+// with an "and N more" tail so the welcome line stays short.
+func chatNameJoin(names []string) string {
+	shown := names
+	if len(names) > 3 {
+		shown = names[:3]
+	}
+	var b strings.Builder
+	for i, n := range shown {
+		if i > 0 {
+			if i == len(shown)-1 {
+				b.WriteString(" and ")
+			} else {
+				b.WriteString(", ")
+			}
+		}
+		b.WriteString(n)
+	}
+	if extra := len(names) - len(shown); extra > 0 {
+		b.WriteString(" and " + strconv.Itoa(extra) + " more")
+	}
+	return b.String()
+}
+
+// buildChatWelcome resolves the welcome for the caller's effective selection
+// (SelectedAssistant when granted, else the first granted assistant — the
+// same option the picker renders selected). Collection names come from
+// ListCollections, the authorization-enforced list, so only collections the
+// caller may see are ever named.
+func (a *App) buildChatWelcome(ctx context.Context, p auth.Principal, bots []chatbot.Instance, selected string) chatWelcome {
+	if len(bots) == 0 {
+		return chatWelcome{}
+	}
+	bot := bots[0]
+	for _, b := range bots {
+		if b.ID == selected {
+			bot = b
+			break
+		}
+	}
+	var names []string
+	if a.ragSvc != nil && len(bot.RAGCollectionIDs) > 0 {
+		collections, err := a.ragSvc.ListCollections(ctx, p)
+		if err != nil {
+			log.Printf("dashboard chat welcome: collections: %v", err)
+		} else {
+			byID := make(map[string]string, len(collections))
+			for _, c := range collections {
+				byID[c.ID] = c.Name
+			}
+			for _, id := range bot.RAGCollectionIDs {
+				if n := strings.TrimSpace(byID[id]); n != "" {
+					names = append(names, n)
+				}
+			}
+		}
+	}
+	return chatWelcome{
+		AssistantName: bot.Name,
+		Grounding:     chatGroundingLine(len(bot.RAGCollectionIDs), names),
+		Starters:      chatStarters(names),
+	}
+}
+
 // listAssistants returns the audience- AND grant-enforced assistant list
 // (chatbotSvc.List verbatim, D-25). An empty result is the truthful deny
 // state — the picker stays empty and Send stays disabled.
@@ -199,6 +319,8 @@ func (a *App) handleDashboardChatPage(w http.ResponseWriter, r *http.Request) {
 	data.fillEmptyStates(caps)
 	if data.NoAssistants = len(data.Assistants) == 0; data.NoAssistants {
 		data.ThreadEmpty = data.AssistantsEmpty
+	} else {
+		data.Welcome = a.buildChatWelcome(r.Context(), p, data.Assistants, data.SelectedAssistant)
 	}
 	a.renderDashboard(w, r, "chat", data)
 }
@@ -250,6 +372,11 @@ func (a *App) handleDashboardChatThread(w http.ResponseWriter, r *http.Request) 
 	data.Assistants = a.listAssistants(r.Context(), p)
 	if data.NoAssistants = len(data.Assistants) == 0; data.NoAssistants {
 		data.ThreadEmpty = data.AssistantsEmpty
+	} else if data.ConversationID == "" {
+		// The composer resets into the empty thread; ?assistant= (sent by
+		// chat.js's new-chat fetch) keeps the welcome on the picked assistant.
+		data.SelectedAssistant = strings.TrimSpace(r.URL.Query().Get("assistant"))
+		data.Welcome = a.buildChatWelcome(r.Context(), p, data.Assistants, data.SelectedAssistant)
 	}
 	if data.ConversationID != "" && !a.appendChatThread(w, r, &data) {
 		return
