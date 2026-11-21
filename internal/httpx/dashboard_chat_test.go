@@ -657,19 +657,19 @@ func TestChatStarters(t *testing.T) {
 			"Explain a clause in plain language",
 		}},
 		{"one collection", []string{"Contracts"}, []string{
-			"Summarise the key points in Contracts",
+			"Summarize the key points in Contracts",
 			"What topics does Contracts cover?",
 			"What should I know before relying on Contracts?",
 		}},
 		{"two collections", []string{"Contracts", "HR handbook"}, []string{
-			"Summarise the key points in Contracts",
+			"Summarize the key points in Contracts",
 			"What topics does Contracts cover?",
-			"Summarise the key points in HR handbook",
+			"Summarize the key points in HR handbook",
 		}},
 		{"three collections still cap at three starters", []string{"A", "B", "C"}, []string{
-			"Summarise the key points in A",
+			"Summarize the key points in A",
 			"What topics does A cover?",
-			"Summarise the key points in B",
+			"Summarize the key points in B",
 		}},
 	}
 	for _, tc := range cases {
@@ -755,7 +755,7 @@ func TestDashboardChatWelcomeAndDisabledPicker(t *testing.T) {
 	body = rec.Body.String()
 	for _, want := range []string{
 		"Grounded in welcome-docs · answers cite their sources",
-		"Summarise the key points in welcome-docs",
+		"Summarize the key points in welcome-docs",
 		"What topics does welcome-docs cover?",
 	} {
 		if !strings.Contains(body, want) {

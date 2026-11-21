@@ -163,11 +163,11 @@ func chatStarters(collectionNames []string) []string {
 		}
 	}
 	starters := []string{
-		"Summarise the key points in " + names[0],
+		"Summarize the key points in " + names[0],
 		"What topics does " + names[0] + " cover?",
 	}
 	if len(names) > 1 {
-		starters = append(starters, "Summarise the key points in "+names[1])
+		starters = append(starters, "Summarize the key points in "+names[1])
 	} else {
 		starters = append(starters, "What should I know before relying on "+names[0]+"?")
 	}

@@ -56,7 +56,7 @@ type dashboardBar struct {
 // baseline, columns capped at 28px laid left-to-right in order, a muted
 // y-max label top-left, the first/last day under the baseline, the latest
 // value above its bar and a per-column title tooltip. Zero days render as a
-// 1px stub so gaps stay visible. CSS owns every colour; this emits structure
+// 1px stub so gaps stay visible. CSS owns every color; this emits structure
 // and geometry only.
 func bars(values []dashboardBar) template.HTML {
 	if len(values) == 0 {

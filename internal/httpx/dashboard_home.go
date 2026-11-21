@@ -34,7 +34,7 @@ const (
 
 // homeData is Home's page model. Layout picks the role shape ("triage" for
 // admins and no-work members, "ask" for chat/search members — homeLayout);
-// DashboardModule returns "home": the only page behaviour, the ask-box
+// DashboardModule returns "home": the only page behavior, the ask-box
 // handoff, lives in static/pages/home.js (D-20 delegation via data hooks).
 type homeData struct {
 	Layout          string
@@ -325,10 +325,10 @@ func homeLayout(caps dashboardCaps) string {
 // attentionLine is the triage header status prefix: the open-item count, or
 // the calm sentence when nothing needs attention.
 func (d homeData) AttentionLine() string {
-	switch n := len(d.Attention); {
-	case n == 0:
+	switch n := len(d.Attention); n {
+	case 0:
 		return "Nothing needs attention"
-	case n == 1:
+	case 1:
 		return "1 thing needs attention"
 	default:
 		return fmt.Sprintf("%d things need attention", n)

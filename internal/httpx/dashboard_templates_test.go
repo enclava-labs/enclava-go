@@ -180,7 +180,7 @@ func TestBars(t *testing.T) {
 		{Label: "2026-11-20 · 20 requests", Value: 20, Date: "2026-11-20"},
 	}))
 	if !strings.Contains(got, `class="barchart" role="img"`) || !strings.Contains(got, `aria-label="Daily requests from 1 Nov to 20 Nov · 60 total"`) {
-		t.Fatalf("bars must summarise range and total for AT, got %s", got)
+		t.Fatalf("bars must summarize range and total for AT, got %s", got)
 	}
 	if n := strings.Count(got, `class="bar-col`); n != 4 {
 		t.Fatalf("bars must render one column per value, got %d in %s", n, got)
@@ -201,7 +201,7 @@ func TestBars(t *testing.T) {
 		t.Errorf("tallest bar must scale to full height, got %s", got)
 	}
 	if strings.Contains(got, "background") || strings.Contains(got, "fill") || strings.Contains(got, "#") {
-		t.Errorf("bars must not inline colours — CSS owns color, got %s", got)
+		t.Errorf("bars must not inline colors — CSS owns color, got %s", got)
 	}
 	if empty := string(bars(nil)); !strings.Contains(empty, `class="bar"`) || strings.Contains(empty, "bar-col") {
 		t.Fatalf("empty histogram must render the placeholder frame, got %s", empty)
