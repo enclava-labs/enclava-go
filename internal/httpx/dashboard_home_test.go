@@ -1,6 +1,7 @@
 // dashboard_home_test.go — the /dashboard Home page (OA-31) against real
-// services: per-role section composition (§6.2), the six manager attention
-// kinds with their fix links, member-scoped own-work attention, the
+// services: per-role section composition and the role-based layout decision
+// (triage vs ask), the six manager attention kinds with their fix links,
+// member-scoped own-work attention, the
 // zero-filled sparkline asserted on seeded known daily values, per-currency
 // spend, the polling running fragment, explicit /dashboard registration
 // (no mux 301), the subtree designed-404 contract and the operation-filtered
@@ -142,17 +143,25 @@ func TestDashboardHomeMemberSeesOwnSectionsOnly(t *testing.T) {
 	if _, err := f.ragSvc.CreateCollection(f.ctx, member, rag.CreateCollectionInput{Name: "Team Notes"}); err != nil {
 		t.Fatalf("create collection: %v", err)
 	}
-	f.enqueue(t, member, extract.OperationProcess, "home-extract-1")
+	// Own failed work first — the failure helpers lease any bystander job
+	// they claim, so the still-queued extraction is seeded LAST and keeps
+	// the running section live (the ask layout renders it only when
+	// something actually holds).
 	f.failExtraction(t, member, "home-extract-failed")
 	f.seedFailedRun(t, member, "run-home", "conv-fail-run")
+	f.enqueue(t, member, extract.OperationProcess, "home-extract-1")
 
 	body := homeGet(t, f, "/dashboard", sess)
 
+	// Chat+search member → the ask layout: composer leads, no KPI grid.
+	if !strings.Contains(body, `id="homeAsk"`) || strings.Contains(body, `id="homeKPIs"`) {
+		t.Fatalf("chat/search member must get the ask layout (ask box, no KPI strip)\n%s", body)
+	}
 	for _, want := range []string{
-		"Needs attention", "Running now", "Confidential inference",
-		"Recent conversations", "Start a chat", "Recent extractions", "Your knowledge",
-		"Bot bot-granted", "/dashboard/chat/conv-home", "/dashboard/chat?assistant=bot-granted",
-		"Team Notes", "Your extraction failed", "Your assistant run failed",
+		"Needs attention", "Running now",
+		"Recent chats", "Knowledge", "Team Notes",
+		"Bot bot-granted", `value="bot-granted"`, "Search only",
+		"/dashboard/chat/conv-home", "Your extraction failed", "Your assistant run failed",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("member home missing %q\n%s", want, body)
@@ -162,7 +171,7 @@ func TestDashboardHomeMemberSeesOwnSectionsOnly(t *testing.T) {
 		t.Fatal("granted member must see the granted assistant, not the empty state")
 	}
 	if strings.Contains(body, "bot-hidden") || strings.Contains(body, "Bot bot-hidden") {
-		t.Fatal("assistant without a grant item leaked into Start a chat")
+		t.Fatal("assistant without a grant item leaked into the ask targets")
 	}
 	// Member kinds only: no manager rows, no KPI grid.
 	for _, forbidden := range []string{
@@ -187,10 +196,15 @@ func TestDashboardHomeGrantlessMemberSeesEmptyState(t *testing.T) {
 		t.Fatalf("create bot: %v", err)
 	}
 	body := homeGet(t, f, "/dashboard", sess)
-	if !strings.Contains(body, "No assistants you can use yet — ask an admin to grant access.") {
-		t.Fatalf("grantless member must see the grant-needed empty state\n%s", body)
+	// Ask layout, no assistants granted: only the search-only composer is
+	// offered — the grant truth is the absence of any assistant target.
+	if !strings.Contains(body, `id="homeAsk"`) || !strings.Contains(body, "Search only") {
+		t.Fatalf("grantless member must get the search-only ask box\n%s", body)
 	}
-	if strings.Contains(body, "Any Bot") {
+	if !strings.Contains(body, `data-search-only class="visually-hidden" checked`) {
+		t.Fatalf("search-only target must be the checked ask target\n%s", body)
+	}
+	if strings.Contains(body, "Any Bot") || strings.Contains(body, `value="bot-any"`) {
 		t.Fatal("tenant-wide audience must not bypass the empty stored grant")
 	}
 }
@@ -217,6 +231,10 @@ func TestDashboardHomeAdminKPIsSparkAndSpend(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("admin home missing %q\n%s", want, body)
 		}
+	}
+	// Admin (billing.view) → the triage layout: KPI strip, no ask box.
+	if !strings.Contains(body, `id="homeKPIs"`) || strings.Contains(body, `id="homeAsk"`) {
+		t.Fatalf("admin must get the triage layout (KPI strip, no ask box)\n%s", body)
 	}
 	// The spark polyline must equal spark() over the zero-filled 30-slot
 	// series recomputed from the seeded rows — SVG presence proves nothing.
@@ -385,6 +403,37 @@ func TestDashboardHomeExtractionTotalExcludesOtherOperations(t *testing.T) {
 	}
 	if strings.Contains(body, "Extract · ") || strings.Contains(body, "Sync") {
 		t.Fatalf("non-extraction job labels leaked into Recent extractions\n%s", body)
+	}
+}
+
+// TestDashboardHomeLayoutDecision — homeLayout's role table: admins (any of
+// models.manage/access.manage/billing.view) get the triage desk; chat/search
+// members the ask-first page; members with neither keep triage so the page
+// never renders an unusable composer. Home also loads its page module again.
+func TestDashboardHomeLayoutDecision(t *testing.T) {
+	cases := []struct {
+		name string
+		caps dashboardCaps
+		want string
+	}{
+		{"billing admin", dashboardCaps{BillingView: true}, "triage"},
+		{"models admin", dashboardCaps{ModelsManage: true}, "triage"},
+		{"access admin", dashboardCaps{AccessManage: true}, "triage"},
+		{"admin caps never force ask", dashboardCaps{BillingView: true, Chat: true, Search: true}, "triage"},
+		{"chat member", dashboardCaps{Chat: true}, "ask"},
+		{"search member", dashboardCaps{Search: true}, "ask"},
+		{"chat+search member", dashboardCaps{Chat: true, Search: true, Extract: true}, "ask"},
+		{"extract-only member keeps triage", dashboardCaps{Extract: true}, "triage"},
+		{"no caps", dashboardCaps{}, "triage"},
+	}
+	for _, tc := range cases {
+		if got := homeLayout(tc.caps); got != tc.want {
+			t.Errorf("%s: homeLayout = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	d := homeData{}
+	if d.DashboardModule() != "home" {
+		t.Fatalf("DashboardModule = %q, want home", d.DashboardModule())
 	}
 }
 

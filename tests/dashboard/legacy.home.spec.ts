@@ -1,8 +1,9 @@
 import { Page } from '@playwright/test';
 import { test, expect, seedData } from './fixtures';
 
-// home.spec.ts — per-role Home (OA-31) browser coverage: section composition
-// per capability (§6.2), the zero-filled 30-point
+// home.spec.ts — per-role Home (OA-31) browser coverage: the role-based
+// layouts (triage for admins, ask-first for chat/search members), the
+// zero-filled 30-point
 // sparkline, real extraction totals, grant-shaped member visibility (D-25)
 // and the running-now polling lifecycle (OA-36). Every prerequisite is
 // seeded through the real /api/v1 surface with the admin session; a seed
@@ -121,17 +122,25 @@ test.describe('Home /dashboard — admin', () => {
 
     await page.goto(`${BASE}/dashboard`);
 
-    // §6.2 order: attention → KPIs → running → confidential → conversations
-    // → start a chat → extractions → knowledge.
-    const ids = ['#homeAttention', '#homeKPIs', '#homeRunningSection', '#homeConfidential', '#homeStartChat', '#homeKnowledge'];
-    const tops: Array<{ id: string; y: number }> = [];
-    for (const id of ids) {
-      const el = page.locator(id);
-      await expect(el).toBeVisible();
-      tops.push({ id, y: (await el.boundingBox())!.y });
+    // Triage layout: attention → KPI strip → two-column desk (left:
+    // conversations → extractions → running; right: start a chat →
+    // knowledge → confidential). No ask box on the admin layout.
+    const left = ['#homeConversations', '#homeExtractions', '#homeRunningSection'];
+    const right = ['#homeStartChat', '#homeKnowledge', '#homeConfidential'];
+    for (const id of [...left, ...right]) {
+      await expect(page.locator(id)).toBeVisible();
     }
-    expect(tops.map(t => t.id)).toEqual(ids); // every section present
-    expect([...tops].sort((a, b) => a.y - b.y).map(t => t.id)).toEqual(tops.map(t => t.id));
+    const y = async (id: string) => (await page.locator(id).boundingBox())!.y;
+    expect(await y('#homeAttention')).toBeLessThan(await y('#homeKPIs'));
+    expect(await y('#homeKPIs')).toBeLessThan(await y('#homeConversations'));
+    expect(await y('#homeKPIs')).toBeLessThan(await y('#homeStartChat'));
+    for (let i = 1; i < left.length; i++) {
+      expect(await y(left[i])).toBeGreaterThan(await y(left[i - 1]));
+    }
+    for (let i = 1; i < right.length; i++) {
+      expect(await y(right[i])).toBeGreaterThan(await y(right[i - 1]));
+    }
+    await expect(page.locator('#homeAsk')).toHaveCount(0);
 
     // KPI grid: spark polyline has exactly 30 points (zero-filled window).
     const points = await page.locator('#homeKPIs svg.spark polyline').getAttribute('points');
@@ -212,9 +221,17 @@ test.describe('Home /dashboard — members (grant-shaped, D-25)', () => {
       await seedText(member, '/api/v1/extract/jobs', 'member-e2e.txt', 'Total: 1,00 EUR\n');
 
       await member.goto(`${BASE}/dashboard`);
-      await expect(member.locator('#homeStartChat')).toContainText('E2E Granted Assistant');
-      await expect(member.locator(`#homeStartChat a[href="/dashboard/chat?assistant=${bot.id}"]`)).toBeVisible();
-      await expect(member.locator('#homeStartChat')).not.toContainText('E2E Hidden Assistant');
+      // Ask layout: the composer is the first surface; the granted
+      // assistant is a target chip (first = checked), the ungranted one
+      // never appears and there is no KPI strip.
+      const ask = member.locator('#homeAsk');
+      await expect(ask).toBeVisible();
+      await expect(ask).toContainText('E2E Granted Assistant');
+      const granted = ask.locator(`input[name="assistant"][value="${bot.id}"]`);
+      await expect(granted).toBeChecked();
+      await expect(ask.locator(`input[name="assistant"][value="${hidden.id}"]`)).toHaveCount(0);
+      await expect(ask).toContainText('Search only');
+      await expect(ask).not.toContainText('E2E Hidden Assistant');
       await expect(member.locator('#homeConversations')).toContainText('No conversations yet.');
       await expect(member.locator('#homeExtractions')).toContainText('1 total');
       // Own attention kinds only; no manager rows, no KPI grid.
@@ -229,7 +246,7 @@ test.describe('Home /dashboard — members (grant-shaped, D-25)', () => {
     }
   });
 
-  test('a grantless member sees the grant-needed empty state, never a fake list', async ({ page }) => {
+  test('a grantless member gets the search-only composer, never a fake assistant chip', async ({ page }) => {
     await login(page);
     await api(page, 'POST', '/api/v1/chatbots', { name: 'E2E Deny Assistant', model: 'gpt-test', audience: ['*'] });
     const stamp = Date.now();
@@ -253,9 +270,14 @@ test.describe('Home /dashboard — members (grant-shaped, D-25)', () => {
     try {
       await login(member, email, password);
       await member.goto(`${BASE}/dashboard`);
-      await expect(member.locator('#homeStartChat')).toContainText(
-        'No assistants you can use yet — ask an admin to grant access.');
-      await expect(member.locator('#homeStartChat a.tile, #homeStartChat .card')).toHaveCount(0);
+      // Ask layout, no assistants granted: only the Search-only target is
+      // offered (checked) — never a fake assistant chip.
+      const ask = member.locator('#homeAsk');
+      await expect(ask).toBeVisible();
+      await expect(ask).toContainText('Search only');
+      await expect(ask.locator('input[name="assistant"][data-search-only]')).toBeChecked();
+      await expect(ask.locator('input[name="assistant"]:not([data-search-only])')).toHaveCount(0);
+      await expect(ask).not.toContainText('E2E Deny Assistant');
     } finally {
       await member.context().close();
     }

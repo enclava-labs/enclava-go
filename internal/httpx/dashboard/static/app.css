@@ -1129,3 +1129,91 @@ form>.grid+.row,form>.field+.row,form>.field-error+.row{margin-top:14px}
   .head>.headcopy+*{margin-left:auto}
 }
 /* --- end UI review polish --- */
+
+/* --- home redesign --- */
+/* Two Home layouts (dashboard_home.go homeLayout): "triage" (admins, dense
+   desk) and "ask" (chat/search members, composer first). List cards are
+   zero-padding cards of 1px-separated rows; everything reuses the tokens. */
+
+.list-card{
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:0;
+  min-width:0;
+  overflow:hidden;
+}
+.list-row{display:flex;align-items:center;gap:11px;padding:11px 14px;border-bottom:1px solid var(--border);min-width:0}
+.list-row:last-child{border-bottom:0}
+a.list-row{text-decoration:none;color:inherit}
+a.list-row:hover{background:var(--raised)}
+.list-icon{color:var(--accent-fg);flex:0 0 auto;display:inline-flex}
+.list-copy{flex:1;min-width:0}
+.list-title{display:block;font-weight:600;font-size:13.5px;overflow-wrap:anywhere}
+.list-copy .muted{display:block;font-size:12px;margin-top:2px;overflow-wrap:anywhere}
+.list-empty{gap:10px}
+.list-empty a{color:var(--accent-fg);font-size:13px;font-weight:600;text-decoration:none;white-space:nowrap}
+.list-empty a:hover{text-decoration:underline}
+
+/* Triage: the two-column desk (1 column under 960px). */
+.home-cols{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:22px;align-items:start}
+.home-cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}
+.home-col{min-width:0}
+.home-cols .section{margin-top:0}
+.home-col .section+.section{margin-top:18px}
+.head-side{display:inline-flex;align-items:center;gap:10px}
+
+/* Triage: one dense KPI card, four rule-separated cells (2x2 on phone). */
+.kpi-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));padding:0;overflow:hidden}
+.kpi-cell{padding:16px;min-width:0}
+.kpi-cell+.kpi-cell{border-left:1px solid var(--border)}
+.kpi-cell .kpi-value{font-size:21px}
+.kpi-cell .kpi-spend{font-size:17px}
+
+/* Ask layout: centred 720px column, composer first. */
+.home-ask{max-width:720px;margin:0 auto}
+.home-ask-head{text-align:center;margin:8px 0 4px}
+.home-ask-head .crumb{margin-bottom:8px}
+.home-ask-head h1{font-size:24px;letter-spacing:-.025em;margin:0}
+.home-ask-sub{color:var(--muted);font-size:13px;margin:8px auto 0;max-width:520px}
+.home-ask-empty{margin:16px 0 0;text-align:center}
+.ask-box{
+  display:block;
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:12px;
+  padding:10px 12px;
+  margin-top:16px;
+}
+.ask-box:focus-within{border-color:var(--accent)}
+.ask-box textarea{
+  display:block;
+  width:100%;
+  resize:none;
+  border:0;
+  background:transparent;
+  padding:4px 4px 0;
+  min-height:52px;
+}
+.ask-box textarea:focus-visible{outline:none} /* the box border is the focus indicator */
+.ask-foot{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px}
+.ask-targets{display:flex;gap:7px;flex-wrap:wrap;align-items:center;min-width:0}
+.ask-foot .btn{margin-left:auto}
+label.chip{cursor:pointer}
+.ask-box .chip:has(input:checked){color:var(--accent-fg);border-color:var(--accent);background:var(--accentbg)}
+.ask-box .chip:focus-within{outline:2px solid var(--accent);outline-offset:2px}
+.home-foot{margin-top:26px;text-align:center;font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+
+/* Ask: three list columns collapse on phone; triage columns collapse under
+   960px (the desk grid needs the room longer). */
+@media (max-width:959px){
+  .home-cols{grid-template-columns:1fr}
+}
+@media (max-width:759px){
+  .home-cols-3{grid-template-columns:1fr}
+  .kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .kpi-cell:nth-child(odd){border-left:0}
+  .kpi-cell:nth-child(n+3){border-top:1px solid var(--border)}
+  .kpi-cell{padding:13px}
+}
+/* --- end home redesign --- */

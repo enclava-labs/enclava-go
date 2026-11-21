@@ -12,6 +12,7 @@ package httpx
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -31,9 +32,12 @@ const (
 	homeExtractionsLimit   = 5  // recent extraction rows shown on Home
 )
 
-// homeData is Home's page model; DashboardModule is empty (D-20): Home is
-// links plus the shared polling machinery — no page module.
+// homeData is Home's page model. Layout picks the role shape ("triage" for
+// admins and no-work members, "ask" for chat/search members — homeLayout);
+// DashboardModule returns "home": the only page behaviour, the ask-box
+// handoff, lives in static/pages/home.js (D-20 delegation via data hooks).
 type homeData struct {
+	Layout          string
 	Greeting        string
 	Attention       []AttentionItem
 	AttentionLive   bool // any non-terminal attention row → the fragment polls
@@ -54,7 +58,7 @@ type homeData struct {
 }
 
 func (d homeData) DashboardTitle() string  { return "Home" }
-func (d homeData) DashboardModule() string { return "" }
+func (d homeData) DashboardModule() string { return "home" }
 
 // homeKPIs carries the billing.view-gated grid. Spark is the zero-filled
 // 30-day request series (floats for the phase-7 spark() helper — no second
@@ -174,6 +178,7 @@ func (a *App) handleDashboardHomeAttention(w http.ResponseWriter, r *http.Reques
 func (a *App) dashboardHomeData(ctx context.Context, caps dashboardCaps) homeData {
 	p, _ := auth.PrincipalFromContext(ctx)
 	d := homeData{
+		Layout:    homeLayout(caps),
 		Greeting:  homeGreeting(time.Now()),
 		Attention: []AttentionItem{},
 	}
@@ -301,6 +306,47 @@ func (d *homeData) fillEmptyStates(caps dashboardCaps) {
 		d.ExtractionsEmpty.ActionLabel, d.ExtractionsEmpty.ActionHref = "New extraction", "/dashboard/extract"
 	}
 	d.CollectionsEmpty = dashboardEmpty{Icon: "knowledge", Text: "No collections you can search yet."}
+}
+
+// homeLayout picks the page shape: admins (any of models.manage /
+// access.manage / billing.view) get the triage desk; chat or search members
+// get the ask-first page. Members with neither capability keep the triage
+// layout so the page never renders a composer they cannot use.
+func homeLayout(caps dashboardCaps) string {
+	if caps.ModelsManage || caps.AccessManage || caps.BillingView {
+		return "triage"
+	}
+	if caps.Chat || caps.Search {
+		return "ask"
+	}
+	return "triage"
+}
+
+// attentionLine is the triage header status prefix: the open-item count, or
+// the calm sentence when nothing needs attention.
+func (d homeData) AttentionLine() string {
+	switch n := len(d.Attention); {
+	case n == 0:
+		return "Nothing needs attention"
+	case n == 1:
+		return "1 thing needs attention"
+	default:
+		return fmt.Sprintf("%d things need attention", n)
+	}
+}
+
+// ConfLine is the confidential status sentence shared by the triage desc and
+// the ask footer: omitted with no endpoints, the verified-relative stamp
+// when every endpoint is verified, the X-of-Y count otherwise. Exported for
+// template calls (html/template can only invoke exported methods).
+func (d homeData) ConfLine(conf confidentialSummary) string {
+	if conf.Total == 0 {
+		return ""
+	}
+	if conf.Verified >= conf.Total {
+		return "confidential inference verified " + string(relTime(conf.CheckedAt))
+	}
+	return fmt.Sprintf("%d of %d confidential endpoints verified", conf.Verified, conf.Total)
 }
 
 // homeGreeting picks the daypart word for the greeting card.
