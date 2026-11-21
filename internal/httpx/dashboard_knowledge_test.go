@@ -225,6 +225,35 @@ func TestDashboardKnowledgeCollectionTabs(t *testing.T) {
 			t.Fatalf("manager %s = %d, want 200", path, got.Code)
 		}
 	}
+
+	// The collection owner gets the page primary action: the upload label and
+	// hidden file input now live in the page header (outside the swapped
+	// documents panel), never inside the panel or on the other tabs.
+	own := sessionDo(t, f.app, http.MethodPost, "/api/v1/rag/collections", `{"name":"Owned library"}`, mgr, mgrCSRF)
+	if own.Code != http.StatusCreated {
+		t.Fatalf("owned collection create = %d body=%s", own.Code, own.Body.String())
+	}
+	ownedID, _ := decodeJSON(t, own)["id"].(string)
+	ownBase := "/dashboard/knowledge/" + ownedID
+	ownPage := f.get(t, mgr, mgrCSRF, ownBase)
+	if ownPage.Code != http.StatusOK {
+		t.Fatalf("owner collection page = %d body=%s", ownPage.Code, ownPage.Body.String())
+	}
+	ownBody := ownPage.Body.String()
+	for _, want := range []string{`<label class="btn primary" for="knowledge-upload-file">`, `data-knowledge-upload-input`} {
+		if !strings.Contains(ownBody, want) {
+			t.Fatalf("owner collection page missing header upload control %q", want)
+		}
+	}
+	if strings.Index(ownBody, `for="knowledge-upload-file"`) > strings.Index(ownBody, `id="knowledge-documents"`) {
+		t.Fatal("upload control must sit in the page header, before the swapped documents panel")
+	}
+	if frag := f.get(t, mgr, mgrCSRF, "/dashboard/partials/knowledge/documents?collection="+ownedID); strings.Contains(frag.Body.String(), "data-knowledge-upload-input") || strings.Contains(frag.Body.String(), `for="knowledge-upload-file"`) {
+		t.Fatalf("documents fragment must not carry the upload control, got %s", frag.Body.String())
+	}
+	if settings := f.get(t, mgr, mgrCSRF, ownBase+"/settings"); strings.Contains(settings.Body.String(), "knowledge-upload-file") {
+		t.Fatal("settings tab must not render the upload control")
+	}
 }
 
 // TestDashboardKnowledgeMemberDenials covers the member 403 pages on the

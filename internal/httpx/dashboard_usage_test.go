@@ -117,7 +117,7 @@ func TestDashboardUsageOverviewRanges(t *testing.T) {
 	if !strings.Contains(default30, `href="/dashboard/usage?range=30" aria-current="page"`) {
 		t.Fatalf("default range must be 30: %s", default30)
 	}
-	if got := strings.Count(default30, "<rect"); got != 2 {
+	if got := strings.Count(default30, `class="bar-col`); got != 2 {
 		t.Fatalf("30-day chart bars = %d, want 2 (day -1 and -10): %s", got, default30)
 	}
 	if !strings.Contains(default30, ">2,000<") {
@@ -128,7 +128,7 @@ func TestDashboardUsageOverviewRanges(t *testing.T) {
 	if !strings.Contains(seven, `href="/dashboard/usage?range=7" aria-current="page"`) {
 		t.Fatalf("range=7 chip must be active: %s", seven)
 	}
-	if got := strings.Count(seven, "<rect"); got != 1 {
+	if got := strings.Count(seven, `class="bar-col`); got != 1 {
 		t.Fatalf("7-day chart bars = %d, want 1: %s", got, seven)
 	}
 	if strings.Contains(seven, ">2,000<") {
@@ -136,7 +136,7 @@ func TestDashboardUsageOverviewRanges(t *testing.T) {
 	}
 
 	ninety := render("?range=90")
-	if got := strings.Count(ninety, "<rect"); got != 4 {
+	if got := strings.Count(ninety, `class="bar-col`); got != 4 {
 		t.Fatalf("90-day chart bars = %d, want 4: %s", got, ninety)
 	}
 	if !strings.Contains(ninety, ">4,000<") {
@@ -144,7 +144,7 @@ func TestDashboardUsageOverviewRanges(t *testing.T) {
 	}
 	// Each bar's native tooltip names its UTC day and its request count
 	// (one settled usage record per seeded day).
-	if !strings.Contains(ninety, now.Add(-24*time.Hour).Format("2006-01-02")+" · 1 request") {
+	if !strings.Contains(ninety, now.Add(-24*time.Hour).Format("2 Jan")+" · 1 request") {
 		t.Fatalf("daily bar title missing day+count: %s", ninety)
 	}
 	// Spend by model/team/key tables render real rows from the same window.

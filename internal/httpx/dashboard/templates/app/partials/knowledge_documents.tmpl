@@ -46,11 +46,7 @@
     </table>
   </div>
 {{else}}{{template "empty" .Data.Empty}}
-{{end}}{{if .Data.Writable}}  <div class="row" style="margin-top:12px">
-    <input type="file" id="knowledge-upload-file" class="visually-hidden" data-knowledge-upload-input aria-label="Choose a document to upload">
-{{if .Data.Docs}}    <label class="btn primary" for="knowledge-upload-file">{{icon "upload"}}Upload document</label>{{end}}
-  </div>
-{{else}}  <p class="row readonly-note" style="margin-top:12px"><span class="pill readonly">Read-only</span><span class="muted">Ask a knowledge manager to grant write access.</span></p>
+{{end}}{{if not .Data.Writable}}  <p class="row readonly-note" style="margin-top:12px"><span class="pill readonly">Read-only</span><span class="muted">Ask a knowledge manager to grant write access.</span></p>
 {{end}}</div>
 {{end}}
 {{define "knowledge-reembed-progress"}}

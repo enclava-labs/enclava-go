@@ -1129,3 +1129,86 @@ form>.grid+.row,form>.field+.row,form>.field-error+.row{margin-top:14px}
   .head>.headcopy+*{margin-left:auto}
 }
 /* --- end UI review polish --- */
+
+/* --- small items --- */
+/* Six UI-review fixes; overrides only — nothing above is reordered. */
+
+/* 1. Daily requests chart (dashboard_charts.go bars()): readable from one
+   point to ninety — 1px baseline, ≤28px columns left-to-right, muted y-max
+   top-left, first/last day under the baseline, latest value above its bar,
+   zero days as a 1px stub. */
+.barchart{min-width:0;padding-bottom:20px}
+.bar-ymax{display:block;font-size:11px;color:var(--muted);margin-bottom:3px}
+.bar{gap:1px;border-bottom:1px solid var(--border);margin-bottom:0}
+.bar i{position:relative;flex:0 1 28px;min-width:2px;max-width:28px}
+.bar i.bar-zero{height:1px;opacity:.45}
+.bar-latest b{
+  position:absolute;
+  bottom:calc(100% + 3px);
+  left:50%;
+  transform:translateX(-50%);
+  font-size:11px;
+  font-weight:600;
+  color:var(--text);
+  white-space:nowrap;
+}
+.bar em{
+  position:absolute;
+  top:calc(100% + 5px);
+  left:0;
+  font-size:11px;
+  font-style:normal;
+  color:var(--muted);
+  white-space:nowrap;
+}
+.bar i:last-child:not(:only-child) em{left:auto;right:0}
+
+/* 2. Sidebar collapse control: lives in the top row next to the organisation
+   button; flips to "expand" and stays centred in the collapsed rail. */
+.sidebar-top{display:flex;align-items:center;gap:6px}
+.sidebar-top .org{flex:1 1 auto;min-width:0}
+.sidebar-top .desktop-collapse{flex:none}
+.desktop-collapse svg{transition:transform .2s}
+.collapsed .desktop-collapse svg{transform:rotate(180deg)}
+.collapsed .sidebar-top{flex-direction:column;gap:8px}
+.collapsed .sidebar-top .org{flex:none;width:44px;padding:0}
+.collapsed .chev{display:none}
+
+/* 3. Phone tab bars: fade the edge(s) that hide scrollable tabs; no
+   scrollbar. Desktop is untouched while nothing overflows. */
+.tabs{overflow-x:auto;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tabs.can-scroll-right{
+  -webkit-mask-image:linear-gradient(to right,transparent calc(100% - 28px),currentColor);
+  mask-image:linear-gradient(to right,transparent calc(100% - 28px),currentColor);
+}
+.tabs.can-scroll-left{
+  -webkit-mask-image:linear-gradient(to left,transparent calc(100% - 28px),currentColor);
+  mask-image:linear-gradient(to left,transparent calc(100% - 28px),currentColor);
+}
+.tabs.can-scroll-left.can-scroll-right{
+  -webkit-mask-image:linear-gradient(to right,transparent,currentColor 28px,currentColor calc(100% - 28px),transparent);
+  mask-image:linear-gradient(to right,transparent,currentColor 28px,currentColor calc(100% - 28px),transparent);
+}
+
+/* 4. Compact empty states: one left-aligned row — icon · text · action —
+   dashed outline when standalone, plain inside a card. */
+.empty{
+  flex-direction:row;
+  flex-wrap:wrap;
+  align-items:center;
+  justify-content:flex-start;
+  gap:10px;
+  text-align:left;
+  padding:14px 16px;
+  border:1px dashed var(--border);
+  border-radius:10px;
+}
+.empty svg{width:20px;height:20px;color:var(--muted);flex:none}
+.empty p{flex:1 1 auto;min-width:0}
+.empty .btn{margin-top:0;margin-left:auto;flex:none;padding:6px 12px;font-size:13px}
+.card .empty{border:0;padding:2px 0}
+@media (max-width:759px){
+  .empty .btn{flex-basis:100%;margin-left:0}
+}
+/* --- end small items --- */

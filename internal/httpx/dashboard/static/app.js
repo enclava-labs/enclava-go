@@ -781,6 +781,27 @@
     if (thread) thread.scrollTop = thread.scrollHeight;
   });
 
+  // ── Tab bars: edge fades on the side(s) with more content, and the active
+  // tab starts centred in the scroller (phone overflow, UX review). ──
+  function updateTabFades() {
+    document.querySelectorAll('.tabs').forEach((tabs) => {
+      const max = tabs.scrollWidth - tabs.clientWidth;
+      tabs.classList.toggle('can-scroll-left', tabs.scrollLeft > 1);
+      tabs.classList.toggle('can-scroll-right', tabs.scrollLeft < max - 1);
+    });
+  }
+  let tabFadeRaf = 0;
+  document.querySelectorAll('.tabs').forEach((tabs) => {
+    tabs.addEventListener('scroll', () => {
+      if (tabFadeRaf) return;
+      tabFadeRaf = requestAnimationFrame(() => { tabFadeRaf = 0; updateTabFades(); });
+    }, { passive: true });
+  });
+  window.addEventListener('resize', updateTabFades);
+  const activeTab = document.querySelector('.tabs .tab.active');
+  if (activeTab) activeTab.scrollIntoView({ inline: 'center', block: 'nearest' });
+  updateTabFades();
+
   // Restore the persisted desktop rail (≥760 only — <760 is the mobile drawer).
   try {
     if (localStorage.getItem('enclava-nav-collapsed') === '1' &&

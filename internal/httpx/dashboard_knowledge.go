@@ -252,6 +252,15 @@ func (a *App) handleDashboardKnowledgeCollection(w http.ResponseWriter, r *http.
 		Everyone:   knowledgeAccessLabel(c) == "Everyone",
 	}
 	data.Writable = caps.KnowledgeManage && rag.CollectionWritable(c, p)
+	// The page's primary action is the upload: label + hidden file input live
+	// in the header (outside the swapped documents panel) like every other
+	// page's primary action. The label opens the input natively; knowledge.js
+	// keeps the change wiring.
+	if tab == "documents" && data.Writable {
+		data.Header.Actions = template.HTML( //nolint:gosec // Fixed markup and trusted icon only.
+			`<label class="btn primary" for="knowledge-upload-file">` + string(icon("upload")) + `Upload document</label>` +
+				`<input type="file" id="knowledge-upload-file" class="visually-hidden" data-knowledge-upload-input aria-label="Choose a document to upload">`)
+	}
 	data.Empty = knowledgeDocumentsEmpty(knowledgeDocumentStatus(r.URL.Query().Get("status")), caps, data.Writable)
 	data.SourcesEmpty = knowledgeSourcesEmpty(c.ID, caps)
 	ctx := r.Context()

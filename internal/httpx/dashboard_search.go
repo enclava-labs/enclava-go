@@ -10,6 +10,7 @@
 package httpx
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -99,10 +100,14 @@ func searchResultRowFor(res rag.SearchResult) searchResultRow {
 		Collection: collection,
 		Location:   evidenceLocationLine(res.Locations),
 		Author:     strings.TrimSpace(res.Author),
-		Container:  strings.TrimSpace(res.Container),
 		Content:    res.Content,
 		SourceKind: res.SourceKind,
 		EvidenceID: res.EvidenceID,
+	}
+	// Uploads name the collection as their container — repeating it in the
+	// meta line reads as a duplicate, so it is dropped (case/trim-insensitive).
+	if container := strings.TrimSpace(res.Container); container != "" && !strings.EqualFold(container, collection) {
+		row.Container = container
 	}
 	// The title opens the chunk's deep link first, then the document URL,
 	// then the legacy source URI — the first one that survives the gate.
@@ -122,6 +127,59 @@ func searchResultRowFor(res rag.SearchResult) searchResultRow {
 		}
 	}
 	return row
+}
+
+// looksLikeUserID reports whether an author value is an internal user id
+// (user_<hex>, as issued by the identity store) rather than a human name
+// carried through from a connector.
+func looksLikeUserID(author string) bool {
+	rest, ok := strings.CutPrefix(author, "user_")
+	if !ok || rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if !(r >= '0' && r <= '9') && !(r >= 'a' && r <= 'f') && !(r >= 'A' && r <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveSearchAuthors swaps internal user ids in row authors for the person's
+// display name — one tenant lookup per result page, never one query per row.
+// An id that resolves to nothing is omitted: raw internal ids are never
+// primary labels (OA-34). Human names from connectors pass through untouched.
+func (a *App) resolveSearchAuthors(ctx context.Context, tenantID string, rows []searchResultRow) {
+	ids := map[string]struct{}{}
+	for _, row := range rows {
+		if looksLikeUserID(row.Author) {
+			ids[row.Author] = struct{}{}
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	names := map[string]string{}
+	if a.identity != nil {
+		if users, err := a.identity.ListUsers(ctx, tenantID); err == nil {
+			for _, u := range users {
+				label := strings.TrimSpace(u.DisplayName)
+				if label == "" {
+					label = strings.TrimSpace(u.Email)
+				}
+				if label != "" {
+					names[u.ID] = label
+				}
+			}
+		} else {
+			log.Printf("dashboard search author lookup: %v", err)
+		}
+	}
+	for i := range rows {
+		if looksLikeUserID(rows[i].Author) {
+			rows[i].Author = names[rows[i].Author] // unresolvable → omitted
+		}
+	}
 }
 
 // firstSafeSourceLink returns the first candidate that survives the
@@ -272,6 +330,7 @@ func (a *App) buildSearchView(w http.ResponseWriter, r *http.Request) (searchVie
 	for _, res := range out.Results {
 		results.Rows = append(results.Rows, searchResultRowFor(res))
 	}
+	a.resolveSearchAuthors(ctx, p.TenantID, results.Rows)
 	view.Results = results
 	return view, true
 }

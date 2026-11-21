@@ -242,6 +242,7 @@ func (a *App) usageOverview(ctx context.Context, tenantID string, days int) (usa
 		out.Daily = append(out.Daily, dashboardBar{
 			Label: day + " · " + dashboardCountInt(n) + " " + noun,
 			Value: float64(n),
+			Date:  day,
 		})
 	}
 
