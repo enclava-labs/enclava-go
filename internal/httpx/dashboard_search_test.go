@@ -161,7 +161,7 @@ func (f *searchFixture) collection(t *testing.T, name string, audience []string)
 // stageSearchDoc persists a collection-mode object + published generation
 // with one span-backed chunk and registers its point — the same real
 // retained-chunk shape the JSON search route seeds.
-func (f *searchFixture) stageSearchDoc(t *testing.T, collection rag.Collection, objectID, fileName, content, provenance string, audience []string) {
+func (f *searchFixture) stageSearchDoc(t *testing.T, collection rag.Collection, objectID, fileName, content, provenance, author string, audience []string) {
 	t.Helper()
 	ctx := context.Background()
 	repo := postgres.NewRAGRepo(f.db)
@@ -211,6 +211,7 @@ func (f *searchFixture) stageSearchDoc(t *testing.T, collection rag.Collection, 
 			"tenant_id": f.tenant, "document_id": objectID, "object_version_id": objectID + "#1",
 			"generation": int64(1), "chunk_id": chunkID, "file_name": fileName,
 			"source_uri": "urn:test:" + objectID, "content": content, "access_enabled": true,
+			"author": author,
 		},
 	})
 }
@@ -228,7 +229,7 @@ func TestDashboardSearchPageAndPartial(t *testing.T) {
 	f := newSearchFixture(t)
 	sess, csrf, memberID := f.member(t, "search-member@example.test")
 	col := f.collection(t, "Contracts", []string{memberID})
-	f.stageSearchDoc(t, col, "obj_a", "Agreement.pdf", "the renewal contract clause", `{"kind":"upload"}`, []string{memberID})
+	f.stageSearchDoc(t, col, "obj_a", "Agreement.pdf", "the renewal contract clause", `{"kind":"upload"}`, "", []string{memberID})
 
 	page := f.get(t, sess, csrf, "/dashboard/search")
 	if page.Code != http.StatusOK {
@@ -272,9 +273,9 @@ func TestDashboardSearchFusionAndACLPrivacy(t *testing.T) {
 	colB := f.collection(t, "Beta", []string{memberID})
 	outsider := "actor_outsider"
 	secret := f.collection(t, "Secret", []string{outsider})
-	f.stageSearchDoc(t, colA, "obj_aa", "Alpha Doc.pdf", "shared corpus alpha", `{"kind":"upload"}`, []string{memberID})
-	f.stageSearchDoc(t, colB, "obj_bb", "Beta Doc.pdf", "shared corpus beta", `{"source_kind":"notion"}`, []string{memberID})
-	f.stageSearchDoc(t, secret, "obj_ss", "Secret Doc.pdf", "shared corpus secret", `{"source_kind":"vault"}`, []string{outsider})
+	f.stageSearchDoc(t, colA, "obj_aa", "Alpha Doc.pdf", "shared corpus alpha", `{"kind":"upload"}`, "", []string{memberID})
+	f.stageSearchDoc(t, colB, "obj_bb", "Beta Doc.pdf", "shared corpus beta", `{"source_kind":"notion"}`, "", []string{memberID})
+	f.stageSearchDoc(t, secret, "obj_ss", "Secret Doc.pdf", "shared corpus secret", `{"source_kind":"vault"}`, "", []string{outsider})
 
 	res := f.get(t, sess, csrf, "/dashboard/partials/search/results?q=corpus&mode=lexical")
 	if res.Code != http.StatusOK {
@@ -323,7 +324,7 @@ func TestDashboardSearchModes(t *testing.T) {
 	f := newSearchFixture(t)
 	sess, csrf, memberID := f.member(t, "search-modes@example.test")
 	col := f.collection(t, "Modes", []string{memberID})
-	f.stageSearchDoc(t, col, "obj_m", "Modes.pdf", "semantic benefit vector content", `{"kind":"upload"}`, []string{memberID})
+	f.stageSearchDoc(t, col, "obj_m", "Modes.pdf", "semantic benefit vector content", `{"kind":"upload"}`, "", []string{memberID})
 
 	before := f.exec.calls
 	lexical := f.get(t, sess, csrf, "/dashboard/partials/search/results?q=benefit&mode=lexical")
@@ -370,7 +371,7 @@ func TestDashboardSearchResultMarkup(t *testing.T) {
 	f := newSearchFixture(t)
 	sess, csrf, memberID := f.member(t, "search-markup@example.test")
 	col := f.collection(t, "Markup", []string{memberID})
-	f.stageSearchDoc(t, col, "obj_x", "Agreement.pdf", "the <script>alert(1)</script> renewal clause", `{"kind":"upload"}`, []string{memberID})
+	f.stageSearchDoc(t, col, "obj_x", "Agreement.pdf", "the <script>alert(1)</script> renewal clause", `{"kind":"upload"}`, "", []string{memberID})
 
 	partial := f.get(t, sess, csrf, "/dashboard/partials/search/results?q=renewal&mode=lexical")
 	body := partial.Body.String()
@@ -409,12 +410,108 @@ func TestDashboardSearchEmbeddingDenialInline(t *testing.T) {
 	f := newSearchFixture(t)
 	sess, csrf, memberID := f.member(t, "search-no-embedding@example.test")
 	col := f.collection(t, "Contracts", []string{memberID})
-	f.stageSearchDoc(t, col, "obj_denied", "Agreement.pdf", "renewal contract", `{"kind":"upload"}`, []string{memberID})
+	f.stageSearchDoc(t, col, "obj_denied", "Agreement.pdf", "renewal contract", `{"kind":"upload"}`, "", []string{memberID})
 	f.app.ragSvc = rag.NewService(postgres.NewRAGRepo(f.db), f.vector, deniedEmbeddingExecutor{}, "embed-test", nil, nil)
 	for _, path := range []string{"/dashboard/search", "/dashboard/partials/search/results"} {
 		got := f.get(t, sess, csrf, path+"?q=renewal&mode=semantic")
 		if got.Code != http.StatusOK || !strings.Contains(got.Body.String(), "Semantic search needs an embedding model granted to your role") || !strings.Contains(got.Body.String(), "Keyword search still works.") {
 			t.Fatalf("%s = %d: %s", path, got.Code, got.Body.String())
+		}
+	}
+}
+
+// TestSearchResultRowContainerDedup — uploads name the collection as their
+// container; the meta line must not print the same name twice
+// (case/trim-insensitive), while a genuinely different container survives.
+func TestSearchResultRowContainerDedup(t *testing.T) {
+	cases := []struct {
+		name          string
+		collection    string
+		container     string
+		wantContainer string
+	}{
+		{"same name", "Contracts", "Contracts", ""},
+		{"same name, different case", "Contracts", "contracts", ""},
+		{"same name, padded", "Contracts", "  Contracts  ", ""},
+		{"different container", "Contracts", "#eng", "#eng"},
+		{"empty container", "Contracts", "", ""},
+	}
+	for _, tc := range cases {
+		row := searchResultRowFor(rag.SearchResult{
+			FileName: "d.txt", SourceKind: "upload",
+			CollectionName: tc.collection, Container: tc.container,
+		})
+		if row.Container != tc.wantContainer {
+			t.Fatalf("%s: Container = %q, want %q", tc.name, row.Container, tc.wantContainer)
+		}
+		if row.Collection != "Contracts" {
+			t.Fatalf("%s: Collection = %q, want Contracts", tc.name, row.Collection)
+		}
+	}
+}
+
+// TestLooksLikeUserID — the id-vs-human-name gate for search authors.
+func TestLooksLikeUserID(t *testing.T) {
+	for author, want := range map[string]bool{
+		"user_2020da9685aa11bb22cc33dd": true,
+		"user_DeadBeef":                 true,
+		"user_":                         false,
+		"user_maja":                     false,
+		"user shell":                    false,
+		"Maja Novak":                    false,
+		"":                              false,
+	} {
+		if got := looksLikeUserID(author); got != want {
+			t.Fatalf("looksLikeUserID(%q) = %v, want %v", author, got, want)
+		}
+	}
+}
+
+// TestResolveSearchAuthorsOmit — without an identity store an internal id
+// resolves to nobody and is omitted entirely; connector names pass through.
+func TestResolveSearchAuthorsOmit(t *testing.T) {
+	rows := []searchResultRow{
+		{Author: "user_2020da9685aa11bb22cc33dd"},
+		{Author: "Ana Ruiz"},
+		{Author: ""},
+	}
+	(&App{}).resolveSearchAuthors(context.Background(), "tenant", rows)
+	if rows[0].Author != "" {
+		t.Fatalf("unresolvable internal id = %q, want omitted", rows[0].Author)
+	}
+	if rows[1].Author != "Ana Ruiz" {
+		t.Fatalf("connector author = %q, want untouched", rows[1].Author)
+	}
+	if rows[2].Author != "" {
+		t.Fatalf("empty author = %q, want empty", rows[2].Author)
+	}
+}
+
+// TestDashboardSearchAuthorResolution renders the shared fragment with one
+// upload authored by a real member: the meta line carries the display name,
+// never the raw internal id; an id resolving to nobody is omitted; a
+// connector author name passes through untouched.
+func TestDashboardSearchAuthorResolution(t *testing.T) {
+	f := newSearchFixture(t)
+	sess, csrf, memberID := f.member(t, "author-member@example.test")
+	col := f.collection(t, "Meta Checks", []string{memberID})
+	if _, err := f.db.SQL.ExecContext(context.Background(),
+		`UPDATE users SET display_name = 'Maja Novak' WHERE id = $1`, memberID); err != nil {
+		t.Fatal(err)
+	}
+	f.stageSearchDoc(t, col, "obj_meta1", "Uploaded.pdf", "authorcheck uploaded brief", `{"kind":"upload"}`, memberID, []string{memberID})
+	f.stageSearchDoc(t, col, "obj_meta2", "Ghost.pdf", "authorcheck ghost brief", `{"kind":"upload"}`, "user_"+strings.Repeat("f", 24), []string{memberID})
+	f.stageSearchDoc(t, col, "obj_meta3", "Connect.pdf", "authorcheck connector brief", `{"source_kind":"slack"}`, "Ana Ruiz", []string{memberID})
+
+	body := f.get(t, sess, csrf, "/dashboard/partials/search/results?q=authorcheck&mode=lexical").Body.String()
+	for _, want := range []string{"Maja Novak", "Ana Ruiz", "Uploaded.pdf", "Connect.pdf"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("results missing %q in %s", want, body)
+		}
+	}
+	for _, raw := range []string{"user_" + strings.Repeat("a", 24), "user_" + strings.Repeat("f", 24)} {
+		if strings.Contains(body, raw) {
+			t.Fatalf("raw internal id %q leaked into results", raw)
 		}
 	}
 }

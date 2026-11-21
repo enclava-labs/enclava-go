@@ -1,151 +1,188 @@
-{{define "content"}}{{/* Home /dashboard (OA-31) — §6.2 section order:
-     Needs attention → KPIs → Running now → Confidential inference → Recent
-     conversations → Start a chat → Recent extractions → Your knowledge.
-     Sections render only when the caller's Caps allow; a held section with
-     an empty list renders the shared .empty state. Component classes only
-     (D-16); no scripts, no hx-on (D-20). */}}
+{{define "content"}}{{/* Home /dashboard (OA-31) — two role layouts. The Go
+     model picks the shape (homeLayout): "triage" for admins and members with
+     no chat/search capability, "ask" for chat/search members. Sections render
+     only when the caller's Caps allow; a held section with an empty list
+     renders the compact inline empty state, never the tall empty block.
+     Component classes only (D-16); no scripts, no hx-on (D-20) — home.js owns
+     the ask-box handoff. The section ids stay stable for the fragments and
+     the browser suite. */}}
+{{if eq .Data.Layout "triage"}}
 <header class="head">
   <div class="headcopy">
     <div class="crumb">{{.Org}} / Home</div>
-    <h1>Home</h1>
-    <p class="desc">Your workspace at a glance — work, health and what needs attention.</p>
+    <h1>{{.Data.Greeting}}, {{.User.Name}}</h1>
+    <p class="desc">{{$conf := .Data.ConfLine .Conf}}{{.Data.AttentionLine}}{{if $conf}} · {{$conf}}{{end}}</p>
   </div>
   {{if .Can.Chat}}<a class="btn primary" href="/dashboard/chat">{{icon "plus" 15}}New chat</a>{{end}}
 </header>
 
-<section class="card section home-greeting">
-  <b>{{.Data.Greeting}}, {{.User.Name}}</b>
-  <div class="card-sub">Here’s what’s happening across {{.Org}} today.</div>
-</section>
+{{template "home-attention" .}}
+{{template "home-kpis" .}}
 
-<section class="section" id="homeAttention">
+<div class="home-cols">
+  <div class="home-col">
+    {{template "home-conversations" .}}
+    {{template "home-extractions" .}}
+    {{template "home-running" .}}
+  </div>
+  <div class="home-col">
+    {{template "home-startchat" .}}
+    {{template "home-knowledge" .}}
+    {{template "home-confidential" .}}
+  </div>
+</div>
+{{else}}
+<div class="home-ask">
+  <header class="home-ask-head">
+    <div class="crumb">{{.Org}} / Home</div>
+    <h1>What do you need from {{.Org}}’s knowledge?</h1>
+    <p class="home-ask-sub">Answers cite the passages they came from. Only content you can access is used.</p>
+  </header>
+
+  {{template "home-askbox" .}}
+  {{template "home-attention" .}}
+
+  <div class="home-cols home-cols-3">
+    {{template "home-conversations" .}}
+    {{template "home-extractions" .}}
+    {{template "home-knowledge" .}}
+  </div>
+
+  {{template "home-running" .}}
+  {{template "home-foot" .}}
+</div>
+{{end}}
+{{end}}
+
+{{define "empty-inline"}}{{/* Compact single-row empty state for the Home
+     list cards: the shared sentence plus a small text action when granted. */}}
+<div class="list-row list-empty">
+  <span class="muted">{{.Text}}</span>
+  {{if and .ActionLabel .ActionHref}}<a href="{{.ActionHref}}">{{.ActionLabel}}</a>{{end}}
+</div>
+{{end}}
+
+{{define "home-attention"}}<section class="section" id="homeAttention">
   <div class="section-head"><h2>Needs attention</h2></div>
   {{template "frag-attention" .}}
-</section>
+</section>{{end}}
 
-
-{{if .Can.BillingView}}
-<section class="section" id="homeKPIs">
+{{define "home-kpis"}}{{if .Can.BillingView}}<section class="section" id="homeKPIs">
   <div class="section-head"><h2>At a glance</h2><span class="muted">Last 30 days</span></div>
-  <div class="grid four">
-    <div class="card kpi">
+  <div class="card kpi-strip">
+    <div class="kpi-cell">
       <div class="kpi-label">Requests · 30d</div>
       <div class="kpi-value">{{count .Data.KPIs.Requests30d}}</div>
       {{spark .Data.KPIs.Spark}}
     </div>
-    <div class="card kpi">
+    <div class="kpi-cell">
       <div class="kpi-label">Spend · 30d</div>
       {{range .Data.KPIs.Spend}}
-      <div class="row"><span class="kpi-value">{{money .AmountMicros .Currency}}</span><span class="muted">{{.Currency}}</span></div>
+      <div class="row"><span class="kpi-value kpi-spend">{{money .AmountMicros .Currency}}</span><span class="muted">{{.Currency}}</span></div>
       {{if and $.Data.KPIs.Budget (eq $.Data.KPIs.Budget.Progress.Currency .Currency)}}<span class="progress"><i style="width: {{$.Data.KPIs.Budget.Percent}}%"></i></span><span class="muted">of budget</span>{{end}}
       {{else}}<div class="kpi-value">—</div><span class="muted">No spend recorded</span>{{end}}
       {{range .Data.KPIs.Unsettled}}<div class="muted">+ {{money .AmountMicros .Currency}} {{.Currency}} unsettled</div>{{end}}
     </div>
-    <div class="card kpi">
+    <div class="kpi-cell">
       <div class="kpi-label">Knowledge documents</div>
       <div class="kpi-value">{{count .Data.KPIs.Documents}}</div>
     </div>
-    <div class="card kpi">
+    <div class="kpi-cell">
       <div class="kpi-label">Assistant conversations</div>
       <div class="kpi-value">{{count .Data.KPIs.Conversations}}</div>
     </div>
   </div>
-</section>
-{{end}}
+</section>{{end}}{{end}}
 
-<section class="section" id="homeRunningSection">
+{{define "home-running"}}{{/* The polling fragment is served by the same
+     handlers in both layouts; in "ask" the section only appears while work
+     actually holds (the fragment itself always stays pollable). */}}{{if or (eq .Data.Layout "triage") .Data.Running.Rows}}<section class="section" id="homeRunningSection">
   <div class="section-head"><h2>Running now</h2></div>
   {{template "frag-running" .}}
-</section>
+</section>{{end}}{{end}}
 
-<section class="section" id="homeConfidential">
+{{define "home-conversations"}}{{if .Can.Chat}}<section class="section" id="homeConversations">
+  <div class="section-head"><h2>{{if eq .Data.Layout "ask"}}Recent chats{{else}}Recent conversations{{end}}</h2><a href="/dashboard/chat">All chats</a></div>
+  {{if .Data.Conversations}}<div class="list-card">
+  {{range .Data.Conversations}}<a class="list-row" href="/dashboard/chat/{{.ID}}">
+    <span class="list-icon">{{icon "chat"}}</span>
+    <span class="list-copy"><span class="list-title">{{if .Title}}{{.Title}}{{else}}Untitled conversation{{end}}</span><span class="muted">{{.AssistantName}} · {{relTime .UpdatedAt}}</span></span>
+  </a>
+  {{end}}</div>
+  {{else}}<div class="list-card">{{template "empty-inline" .Data.ConversationsEmpty}}</div>{{end}}
+</section>{{end}}{{end}}
+
+{{define "home-startchat"}}{{if .Can.Chat}}<section class="section" id="homeStartChat">
+  <div class="section-head"><h2>Start a chat</h2></div>
+  {{if .Data.Assistants}}<div class="list-card">
+  {{range .Data.Assistants}}<a class="list-row" href="/dashboard/chat?assistant={{.ID}}">
+    <span class="list-icon">{{icon "assistant"}}</span>
+    <span class="list-copy"><span class="list-title">{{.Name}}</span>{{if .Description}}<span class="muted">{{.Description}}</span>{{end}}</span>
+  </a>
+  {{end}}</div>
+  {{else}}<div class="list-card">{{template "empty-inline" .Data.AssistantsEmpty}}</div>{{end}}
+</section>{{end}}{{end}}
+
+{{define "home-extractions"}}{{if .Can.Extract}}<section class="section" id="homeExtractions">
+  <div class="section-head"><h2>Recent extractions</h2><span class="head-side"><span class="muted">{{count .Data.ExtractionTotal}} total</span><a href="/dashboard/extract?tab=jobs">All extractions</a></span></div>
+  {{if .Data.Extractions}}<div class="list-card">
+  {{range .Data.Extractions}}<div class="list-row">
+    <span class="list-icon">{{icon "extract"}}</span>
+    <span class="list-copy"><span class="list-title">{{if .FileName}}{{.FileName}}{{else}}Extraction{{end}}</span><span class="muted">{{relTime .CreatedAt}}</span></span>
+    {{statusPill "job" .Status}}
+  </div>
+  {{end}}</div>
+  {{else}}<div class="list-card">{{template "empty-inline" .Data.ExtractionsEmpty}}</div>{{end}}
+</section>{{end}}{{end}}
+
+{{define "home-knowledge"}}{{if .Can.Search}}<section class="section" id="homeKnowledge">
+  <div class="section-head"><h2>{{if eq .Data.Layout "ask"}}Knowledge{{else}}Your knowledge{{end}}</h2><a href="/dashboard/knowledge">All collections</a></div>
+  {{if .Data.Collections}}<div class="list-card">
+  {{range .Data.Collections}}<a class="list-row" href="/dashboard/knowledge/{{.ID}}">
+    <span class="list-icon">{{icon "knowledge"}}</span>
+    <span class="list-copy"><span class="list-title">{{.Name}}</span><span class="muted">Updated {{relTime .UpdatedAt}}</span></span>
+  </a>
+  {{end}}</div>
+  {{else}}<div class="list-card">{{template "empty-inline" .Data.CollectionsEmpty}}</div>{{end}}
+</section>{{end}}{{end}}
+
+{{define "home-confidential"}}<section class="section" id="homeConfidential">
   <div class="section-head"><h2>Confidential inference</h2></div>
-  <div class="card">
-    <div class="row">
-      {{if .Conf.Total}}<b>Confidential · {{.Conf.Verified}}/{{.Conf.Total}} verified</b>
-      <span class="muted">Checked {{relTime .Conf.CheckedAt}}</span>
-      {{else}}<b>No confidential endpoints</b>{{end}}
+  <div class="list-card">
+    <div class="list-row">
+      <span class="list-icon">{{icon "shield"}}</span>
+      <span class="list-copy">{{if .Conf.Total}}<span class="list-title">Confidential · {{.Conf.Verified}}/{{.Conf.Total}} verified</span><span class="muted">Checked {{relTime .Conf.CheckedAt}}</span>{{else}}<span class="list-title">No confidential endpoints</span>{{end}}</span>
     </div>
-    {{range .Conf.Endpoints}}
-    <div class="row">
-      <span>{{.Label}}</span>
-      {{statusPill "confidential" .State.String}}
+    {{range .Conf.Endpoints}}<div class="list-row">
+      <span class="list-icon">{{icon "shield"}}</span>
+      <span class="list-copy"><span class="list-title">{{.Label}}</span>{{if .LastError}}<span class="muted">{{.LastError}}</span>{{end}}</span>
       {{if .VerifiedAt}}<span class="muted">Checked {{relTime .VerifiedAt}}</span>{{end}}
-      {{if .LastError}}<span class="muted">{{.LastError}}</span>{{end}}
+      {{statusPill "confidential" .State.String}}
     </div>
     {{end}}
   </div>
-</section>
+</section>{{end}}
 
-{{if .Can.Chat}}
-<section class="section" id="homeConversations">
-  <div class="section-head"><h2>Recent conversations</h2></div>
-  {{if .Data.Conversations}}
-  <div class="stack">
-  {{range .Data.Conversations}}
-    <a class="activity-row" href="/dashboard/chat/{{.ID}}">
-      <span class="activity-icon">{{icon "chat"}}</span>
-      <div class="activity-copy">
-        <div>{{if .Title}}{{.Title}}{{else}}Untitled conversation{{end}}</div>
-        <span class="muted">{{.AssistantName}} · {{relTime .UpdatedAt}}</span>
-      </div>
-    </a>
-  {{end}}
-  </div>
-  {{else}}{{template "empty" .Data.ConversationsEmpty}}{{end}}
-</section>
-
-<section class="section" id="homeStartChat">
-  <div class="section-head"><h2>Start a chat</h2></div>
-  {{if .Data.Assistants}}
-  <div class="grid three">
-  {{range .Data.Assistants}}
-    <a class="card" href="/dashboard/chat?assistant={{.ID}}">
-      <div class="card-title">{{.Name}}</div>
-      {{if .Description}}<span class="muted">{{.Description}}</span>{{end}}
-    </a>
-  {{end}}
-  </div>
-  {{else}}{{template "empty" .Data.AssistantsEmpty}}{{end}}
-</section>
-{{end}}
-
-{{if .Can.Extract}}
-<section class="section" id="homeExtractions">
-  <div class="section-head"><h2>Recent extractions</h2><span class="muted">{{count .Data.ExtractionTotal}} total</span></div>
-  {{if .Data.Extractions}}
-  <div class="stack">
-  {{range .Data.Extractions}}
-    <div class="activity-row">
-      <span class="activity-icon">{{icon "extract"}}</span>
-      <div class="activity-copy">
-        <div>{{if .FileName}}{{.FileName}}{{else}}Extraction{{end}}</div>
-        <span class="muted">{{relTime .CreatedAt}}</span>
-      </div>
-      {{statusPill "job" .Status}}
+{{define "home-askbox"}}{{/* The ask-first composer (layout "ask"): a plain
+   GET form — home.js turns the draft into the chat handoff or a search
+   query; without JS the form still lands on the chat page. A chat-capable
+   caller with no assistants and no search capability gets the grant truth
+   instead of an unusable box. */}}
+{{if and .Can.Chat (not .Data.Assistants) (not .Can.Search)}}
+<p class="muted home-ask-empty">{{.Data.AssistantsEmpty.Text}}</p>
+{{else}}
+<form class="ask-box" id="homeAsk" method="get" action="/dashboard/chat">
+  <textarea id="homeAskText" rows="2" aria-label="Message" placeholder="Ask about a contract, a policy, an invoice…"></textarea>
+  <div class="ask-foot">
+    <div class="ask-targets">
+      {{if .Can.Chat}}{{range $i, $a := .Data.Assistants}}<label class="chip"><input type="radio" name="assistant" value="{{$a.ID}}" class="visually-hidden"{{if eq $i 0}} checked{{end}}>{{$a.Name}}</label>
+      {{end}}{{end}}
+      {{if .Can.Search}}<label class="chip"><input type="radio" name="assistant" value="" data-search-only class="visually-hidden"{{if or (not .Can.Chat) (not .Data.Assistants)}} checked{{end}}>Search only</label>{{end}}
     </div>
-  {{end}}
+    <button type="submit" class="btn primary" aria-label="Send">{{icon "send" 15}}</button>
   </div>
-  {{else}}{{template "empty" .Data.ExtractionsEmpty}}{{end}}
-</section>
-{{end}}
+</form>
+{{if and .Can.Chat (not .Data.Assistants)}}<p class="muted home-ask-empty">{{.Data.AssistantsEmpty.Text}}</p>{{end}}
+{{end}}{{end}}
 
-{{if .Can.Search}}
-<section class="section" id="homeKnowledge">
-  <div class="section-head"><h2>Your knowledge</h2></div>
-  {{if .Data.Collections}}
-  <div class="stack">
-  {{range .Data.Collections}}
-    <a class="activity-row" href="/dashboard/knowledge/{{.ID}}">
-      <span class="activity-icon">{{icon "knowledge"}}</span>
-      <div class="activity-copy">
-        <div>{{.Name}}</div>
-        <span class="muted">Updated {{relTime .UpdatedAt}}</span>
-      </div>
-    </a>
-  {{end}}
-  </div>
-  {{else}}{{template "empty" .Data.CollectionsEmpty}}{{end}}
-</section>
-{{end}}
-{{end}}
+{{define "home-foot"}}{{$conf := .Data.ConfLine .Conf}}{{if $conf}}<footer class="home-foot muted">{{$conf}}</footer>{{end}}{{end}}

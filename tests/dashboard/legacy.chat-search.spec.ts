@@ -319,7 +319,9 @@ test.describe('Chat run flow (OA-32)', () => {
     await page.click('.head [data-action="chat:new"]');
     await expect(page).toHaveURL(new RegExp('/dashboard/chat$'));
     await expect(page.locator('#composer')).toHaveValue('');
-    await expect(page.locator('#chatThread')).toContainText('No conversation open yet');
+    // An empty thread now renders the assistant welcome with starter questions.
+    await expect(page.locator('#chatThread .welcome')).toContainText('Ask ');
+    await expect(page.locator('#chatThread .bubble')).toHaveCount(0);
 
     // The previous conversation is still reloadable at its adopted URL.
     await page.goto(`${BASE}/dashboard/chat/${convID}`);
@@ -445,7 +447,7 @@ test.describe('Chat surfaces and grants (OA-32)', () => {
     await page.goto(`${BASE}/dashboard/chat`);
     await expect(page.locator('#assistantSelect')).toBeDisabled();
     await expect(page.locator('#assistantSelect option')).toHaveCount(0);
-    await expect(page.locator('.thread-head')).toContainText('ask an admin to grant access');
+    await expect(page.locator('.composer-note')).toContainText('ask an admin to grant access');
     await expect(page.locator('[data-action="chat:send"]')).toHaveCount(0); // composer is hidden for a grantless member
   });
 });

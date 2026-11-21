@@ -18,7 +18,7 @@
     </div>
   {{end}}
   </div>
-  {{else}}{{template "empty" .Data.Running.Empty}}{{end}}
+  {{else}}{{template "empty-inline" .Data.Running.Empty}}{{end}}
 </div>{{end}}
 
 {{define "frag-attention"}}{{/* Needs-attention rows carry the shared
@@ -36,6 +36,6 @@
     </div>
   {{end}}
   </div>
-  {{else}}{{template "empty" .Data.AttentionEmpty}}{{end}}
+  {{else}}{{template "empty-inline" .Data.AttentionEmpty}}{{end}}
 </div>
 {{end}}

@@ -277,7 +277,10 @@
     // User-initiated navigation: push, not replace.
     history.pushState(null, '', '/dashboard/chat');
     if (window.htmx) {
-      htmx.ajax('GET', '/dashboard/partials/chat/thread', { target: '#chatThread', swap: 'outerHTML' }).catch(() => {});
+      // The welcome + starters follow the picker's current assistant.
+      const sel = el('assistantSelect');
+      const q = sel && sel.value ? '?assistant=' + encodeURIComponent(sel.value) : '';
+      htmx.ajax('GET', '/dashboard/partials/chat/thread' + q, { target: '#chatThread', swap: 'outerHTML' }).catch(() => {});
     }
     window.Enclava.refresh(); // history drops the selected mark
     if (ta) ta.focus();
@@ -565,6 +568,17 @@
         case 'chat:send':
           send();
           return;
+        case 'chat:starter':
+          // Starter questions prefill, focus and caret-to-end — never auto-send.
+          {
+            const ta = el('composer');
+            if (!ta) return;
+            ta.value = (action.textContent || '').trim();
+            ta.focus();
+            const end = ta.value.length;
+            ta.setSelectionRange(end, end);
+          }
+          return;
         case 'chat:new':
           newChat();
           return;
@@ -585,10 +599,20 @@
   });
 
   // A different assistant inside an open conversation never posts to it:
-  // the picker's selection belongs to the NEXT conversation.
+  // the picker's selection belongs to the NEXT conversation. With no
+  // conversation open the change re-renders server-side (welcome + starters
+  // follow the picked assistant) — but never when state would be lost
+  // (preloaded evidence or a typed draft).
   document.addEventListener('change', (e) => {
-    if (e.target instanceof Element && e.target.id === 'assistantSelect' && state.conversation) {
+    if (!(e.target instanceof Element) || e.target.id !== 'assistantSelect') return;
+    if (state.conversation) {
       newChat();
+      return;
+    }
+    const box = el('chatComposer');
+    if ((box && box.dataset.evidence) || composerText()) return;
+    if (e.target.value) {
+      location.href = '/dashboard/chat?assistant=' + encodeURIComponent(e.target.value);
     }
   });
 
@@ -619,11 +643,42 @@
     panel.classList.toggle('sheet', narrow && panel.innerHTML.trim() !== '');
   }
 
+  // ── Draft hand-off from Home ────────────────────────────────────────────
+  // The Home ask box stashes {assistant, text} under 'enclava:chat:draft'
+  // then navigates to /dashboard/chat?assistant=<id>. The key is ALWAYS
+  // removed; a malformed payload, missing composer or open conversation
+  // degrades to a prefill (or nothing) — never a throw, never an auto-send
+  // to the wrong assistant (send only when the asked-for option exists).
+  function consumeDraft() {
+    let draft = null;
+    try {
+      draft = JSON.parse(sessionStorage.getItem('enclava:chat:draft') || 'null');
+    } catch { draft = null; }
+    try { sessionStorage.removeItem('enclava:chat:draft'); } catch { /* storage unavailable */ }
+    if (!draft || typeof draft !== 'object' || typeof draft.text !== 'string' || !draft.text.trim()) return;
+    const ta = el('composer');
+    if (!ta) return;
+    let matched = false;
+    const select = el('assistantSelect');
+    if (select && typeof draft.assistant === 'string') {
+      for (const opt of select.options) {
+        if (opt.value === draft.assistant) {
+          select.value = draft.assistant;
+          matched = true;
+          break;
+        }
+      }
+    }
+    ta.value = draft.text;
+    if (!state.conversation && matched) send();
+  }
+
   // On load: conversation state from the URL, bubbles bound, and any
   // server-rendered queued/running marker resumes polling mid-run.
   document.addEventListener('DOMContentLoaded', () => {
     state.conversation = conversationFromURL();
     bindAll(document);
+    consumeDraft();
     const panel = document.querySelector('.evidence-panel');
     if (panel) {
       new MutationObserver(syncEvidenceSheet).observe(panel, { childList: true });

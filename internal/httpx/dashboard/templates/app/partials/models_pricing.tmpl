@@ -1,37 +1,70 @@
-{{define "frag-models-pricing"}}{{/* Pricing matrix (OA-27): one row per
-     model @ endpoint binding and priced capability the endpoint advertises,
-     columns Input / Cached input / Output per 1M tokens. Unpriced required
-     cells carry the exact refusal copy; one row-level Set price control
-     opens a single form for all three categories (P-05) that saves the
-     entered units atomically through the pricing batch write. Cells carry
-     their stored rate as data-* so the form prefills the set the row shows
-     (the coverage rule is whole-set — never a per-unit merge).
-     data-price-row/data-price-cell hook the browser spec and refresh swaps. */}}
+{{define "frag-models-pricing"}}{{/* Pricing matrix (OA-27): one group per
+     model @ endpoint binding, one sub-row per priced capability the endpoint
+     advertises, columns Input / Cached input / Output per 1M tokens. A group
+     collapses to a header row (toggle, status pill, per-unit summary that
+     reads "varies" when its priced capabilities disagree). Sub-rows keep the
+     exact refusal copy in title + visually-hidden span (the visible cells
+     stay quiet) and one row-level Set price control that opens a single form
+     for all three categories (P-05) saving the entered units atomically
+     through the pricing batch write. Cells carry their stored rate as data-*
+     so the form prefills the set the row shows (the coverage rule is
+     whole-set — never a per-unit merge). data-price-group /
+     data-price-row / data-price-cell hook the browser spec and refresh
+     swaps; models.js re-opens remembered groups and re-applies the filter
+     after each swap. */}}
 <section class="section" id="models-pricing" hx-get="/dashboard/partials/models/pricing" hx-trigger="refresh from:body" hx-swap="outerHTML">
   <div class="card">
     {{if .Data.Error}}<div class="attention">{{icon "alert"}}<p>{{.Data.Error}}</p></div>{{end}}
-    {{if .Data.Rows}}
+    {{if .Data.Groups}}
+    {{if ge (len .Data.Groups) 2}}
+    <div class="filters" role="group" aria-label="Filter models">
+      <button type="button" class="chip active" data-price-filter="all" aria-pressed="true">All · {{len .Data.Groups}}</button>
+      <button type="button" class="chip" data-price-filter="unpriced" aria-pressed="false">Needs prices · {{.Data.GroupsNeedPrices}}</button>
+      <button type="button" class="chip" data-price-filter="priced" aria-pressed="false">Priced · {{.Data.GroupsPriced}}</button>
+    </div>
+    {{end}}
     <div class="tablewrap" role="region" tabindex="0" aria-label="Pricing">
       <table>
         <thead>
           <tr>
-            <th scope="col">Model @ endpoint</th>
+            <th scope="col">Model</th>
+            <th scope="col">Status</th>
             <th scope="col">Input</th>
             <th scope="col">Cached input</th>
             <th scope="col">Output</th>
             <th scope="col"><span class="visually-hidden">Actions</span></th>
           </tr>
         </thead>
-        <tbody>
-          {{range .Data.Rows}}
-          <tr data-price-row="{{.EndpointID}}|{{.Model}}|{{.Capability}}">
-            <td data-label="Model @ endpoint"><b>{{.Model}}</b><span class="subline">{{.CapabilityLabel}} · @{{.EndpointID}}{{if .Upstream}} → {{.Upstream}}{{end}}</span></td>
+        {{range .Data.Groups}}
+        <tbody data-price-group="{{.EndpointID}}|{{.Model}}" data-state="{{.State}}"{{if .Open}} class="open"{{end}}>
+          <tr class="group-row">
+            <td data-label="Model">
+              <button type="button" class="group-toggle" data-action="models:price-group" aria-expanded="{{if .Open}}true{{else}}false{{end}}">
+                <span class="caret" aria-hidden="true">{{icon "chevronRight" 13}}</span>
+                <span class="group-name"><b>{{.Model}}</b><span class="subline">@{{.EndpointID}}{{if .Upstream}} → {{.Upstream}}{{end}} · {{.Total}} capabilities</span></span>
+              </button>
+            </td>
+            <td data-label="Status">
+              {{if eq .State "priced"}}<span class="pill good"><i class="dot"></i>Priced</span>
+              {{else if eq .State "unpriced"}}<span class="pill warn"><i class="dot"></i>Unpriced · requests refused</span>
+              {{else}}<span class="pill warn"><i class="dot"></i>{{.Unpriced}} of {{.Total}} unpriced</span>{{end}}
+            </td>
+            {{range .Summary}}<td data-label="{{.UnitLabel}}">{{if .Priced}}<b>{{.Text}}</b>{{else}}<span class="muted">—</span>{{end}}</td>{{end}}
+            <td data-label="Actions"></td>
+          </tr>
+          {{range .Rows}}
+          <tr class="sub-row" data-price-row="{{.EndpointID}}|{{.Model}}|{{.Capability}}">
+            <td data-label="Capability">{{.CapabilityLabel}}</td>
+            <td data-label="Status">{{if .Unpriced}}<span class="pill warn"><i class="dot"></i>Requests refused</span>{{else}}<span class="pill good"><i class="dot"></i>Priced</span>{{end}}</td>
             {{$row := .}}
             {{range .Cells}}
-            <td data-label="{{.UnitLabel}}" data-price-cell="{{$row.EndpointID}}|{{.Unit}}"{{if .Priced}} data-rate-micros="{{.RateMicros}}" data-unit-quantity="{{.UnitQuantity}}" data-currency="{{.Currency}}"{{end}}>
-              {{if .Priced}}<b>{{tokenPrice .RateMicros .UnitQuantity .Currency}}</b><span class="subline">per 1,000,000 tokens · via {{$row.Basis}}</span>
-              {{else if .Required}}<span class="price-warning">{{.UnitLabel}} not priced — requests refused</span>
-              {{else}}<span class="muted">{{.UnitLabel}} not priced</span>{{end}}
+            <td data-label="{{.UnitLabel}}" data-price-cell="{{$row.EndpointID}}|{{.Unit}}"
+              {{if .Priced}}data-rate-micros="{{.RateMicros}}" data-unit-quantity="{{.UnitQuantity}}" data-currency="{{.Currency}}" title="via {{$row.Basis}}"
+              {{else if .Required}}title="{{.UnitLabel}} not priced — requests refused"
+              {{else}}title="{{.UnitLabel}} not priced"{{end}}>
+              {{if .Priced}}<b>{{tokenPrice .RateMicros .UnitQuantity .Currency}}</b>
+              {{else if .Required}}<span class="muted">—</span><span class="visually-hidden">{{.UnitLabel}} not priced — requests refused</span>
+              {{else}}<span class="muted">n/a</span>{{end}}
             </td>
             {{end}}
             <td data-label="Actions"><button type="button" class="btn{{if not .Unpriced}} ghost{{end}}" data-action="models:price"
@@ -42,8 +75,10 @@
           </tr>
           {{end}}
         </tbody>
+        {{end}}
       </table>
     </div>
+    <p class="help muted">Prices are per 1,000,000 tokens.</p>
     {{else if not .Data.Error}}{{template "empty" .Data.Empty}}{{end}}
   </div>
 </section>

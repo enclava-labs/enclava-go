@@ -996,3 +996,463 @@ ul.dev-endpoints li{padding:3px 0;font-size:12px}
 .moneysign{align-self:center;color:var(--muted);font-size:13px;min-width:14px}
 .field-warn{color:var(--amber)}
 /* --- end 3H pricing --- */
+
+/* --- UI review polish (2026-11) --- */
+/* Layout and alignment fixes from the full-UI screenshot review. Component
+   classes only; no template contract changes. */
+
+/* Native chrome that leaked through: fieldset groove, default accent,
+   unstyled disclosure and select arrows. */
+fieldset{border:0;padding:0;margin:0;min-width:0}
+legend{padding:0}
+legend.label{margin-bottom:8px}
+input[type="checkbox"],input[type="radio"]{accent-color:var(--accent)}
+summary{cursor:pointer;color:var(--muted);font-size:13px}
+details[open]>summary{margin-bottom:8px}
+select.field{
+  appearance:none;
+  padding-right:34px;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238d99a7' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;
+  background-position:right 12px center;
+}
+
+/* Sidebar group titles were 10px. */
+.group-title{font-size:11px}
+
+/* Links: titles, table cells and whole-row links read as links by weight
+   and colour; the underline returns on hover/focus. */
+td a:not(.btn),.result-title a,.section-head a{text-decoration:none;font-weight:600}
+td a:not(.btn):hover,.result-title a:hover,.section-head a:hover{text-decoration:underline}
+a.activity-row,a.card{text-decoration:none;color:inherit}
+a.activity-row{border-radius:7px;padding-left:8px;padding-right:8px;margin:0 -8px}
+a.activity-row:hover{background:var(--panel)}
+a.card:hover{border-color:var(--accent)}
+a.card .card-title{color:var(--accent-fg)}
+.stack:has(>.activity-row){gap:0}
+.activity-copy .muted{font-size:12px}
+.muted>svg{vertical-align:-3px}
+
+/* Tables: headers never wrap, sublines stop collapsing their column to one
+   character per line, cell rows wrap instead of pushing actions off-card. */
+th{white-space:nowrap}
+td .subline{overflow-wrap:break-word}
+td .row{flex-wrap:wrap;gap:6px}
+td .avatar{display:inline-grid;vertical-align:middle;margin-right:6px}
+td .avatar+b{white-space:nowrap}
+td .chip{padding:3px 9px;font-size:12px}
+@media (min-width:760px){
+  td:first-child{min-width:150px}
+  td[data-label="Actions"],td:last-child:has(>.btn){white-space:nowrap}
+  td .btn{padding:6px 10px;font-size:13px}
+}
+
+/* A card whose only content is a table is one box, not two. */
+.card:has(>.tablewrap:only-child){padding:0;border:0;background:none}
+/* A titled card with a table: the table sits flush inside the card. */
+@media (min-width:760px){
+  .card>.section-head+.tablewrap:last-child{
+    border:0;
+    border-top:1px solid var(--border);
+    border-radius:0 0 9px 9px;
+    margin:14px -17px -17px;
+  }
+}
+
+/* Vertical rhythm inside cards and forms: labels, button rows and tables
+   no longer touch the element above them. */
+.card>.label,form>.label{margin-top:14px}
+.card>.label:first-child,form>.label:first-child{margin-top:0}
+.card>.row+.row,.card>.tablewrap+.row,.card>.empty+p,
+form>.grid+.row,form>.field+.row,form>.field-error+.row{margin-top:14px}
+.card>p{margin:8px 0 0}
+.card>.section-head+p{margin-top:0}
+#sources-credentials .stack>.label{margin-bottom:-6px}
+.admin-tag{
+  font-size:11px;
+  color:var(--muted);
+  background:var(--raised);
+  border-radius:999px;
+  padding:3px 8px;
+}
+
+/* Usage overview: KPI tiles are cards, stacked cards keep a gap, and the
+   breakdown tables get room for five columns. */
+#usage-overview>.grid.four{margin-bottom:16px}
+#usage-overview>.card+.card{margin-top:16px}
+@media (min-width:760px){
+  #usage-overview .grid.three{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+
+/* Chat fits the viewport: the composer stays on screen without page scroll. */
+@media (min-width:760px){
+  .content:has(>.thread-layout){padding-bottom:20px}
+  .thread-layout{height:calc(100vh - 156px);min-height:480px}
+}
+.composer textarea{border-radius:7px}
+.compose-foot{align-items:center;margin-top:4px}
+
+/* Connector credentials: one card per provider on a two-column grid, with
+   a ruled sub-section per credential type. */
+#sources-credentials{display:grid;gap:16px;align-items:start}
+#sources-credentials>:not([data-cred-provider]){grid-column:1/-1;margin:0}
+#sources-credentials>[data-cred-provider]{
+  margin:0;
+  min-width:0;
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:17px;
+}
+#sources-credentials .section-head{margin-bottom:4px}
+#sources-credentials [data-cred-provider]>p{margin:0 0 10px;font-size:13px}
+#sources-credentials h3{
+  font-size:13px;
+  margin:16px 0 10px;
+  padding-top:14px;
+  border-top:1px solid var(--border);
+}
+#sources-credentials .stack{gap:10px}
+#sources-credentials .stack>.help{margin:0}
+#sources-credentials code{
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:12px;
+  overflow-wrap:anywhere;
+}
+#sources-credentials .row{flex-wrap:wrap}
+@media (min-width:1100px){
+  #sources-credentials{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+
+/* Phone: the page action always sits on the right of the header row. */
+@media (max-width:759px){
+  .head>.headcopy+*{margin-left:auto}
+}
+/* --- end UI review polish --- */
+
+/* --- small items --- */
+/* Six UI-review fixes; overrides only — nothing above is reordered. */
+
+/* 1. Daily requests chart (dashboard_charts.go bars()): readable from one
+   point to ninety — 1px baseline, ≤28px columns left-to-right, muted y-max
+   top-left, first/last day under the baseline, latest value above its bar,
+   zero days as a 1px stub. */
+.barchart{min-width:0;padding-bottom:20px}
+.bar-ymax{display:block;font-size:11px;color:var(--muted);margin-bottom:3px}
+.bar{gap:1px;border-bottom:1px solid var(--border);margin-bottom:0}
+.bar i{position:relative;flex:0 1 28px;min-width:2px;max-width:28px}
+.bar i.bar-zero{height:1px;opacity:.45}
+.bar-latest b{
+  position:absolute;
+  bottom:calc(100% + 3px);
+  left:50%;
+  transform:translateX(-50%);
+  font-size:11px;
+  font-weight:600;
+  color:var(--text);
+  white-space:nowrap;
+}
+.bar em{
+  position:absolute;
+  top:calc(100% + 5px);
+  left:0;
+  font-size:11px;
+  font-style:normal;
+  color:var(--muted);
+  white-space:nowrap;
+}
+.bar i:last-child:not(:only-child) em{left:auto;right:0}
+
+/* 2. Sidebar collapse control: lives in the top row next to the organisation
+   button; flips to "expand" and stays centred in the collapsed rail. */
+.sidebar-top{display:flex;align-items:center;gap:6px}
+.sidebar-top .org{flex:1 1 auto;min-width:0}
+.sidebar-top .desktop-collapse{flex:none}
+.desktop-collapse svg{transition:transform .2s}
+.collapsed .desktop-collapse svg{transform:rotate(180deg)}
+.collapsed .sidebar-top{flex-direction:column;gap:8px}
+.collapsed .sidebar-top .org{flex:none;width:44px;padding:0}
+.collapsed .chev{display:none}
+
+/* 3. Phone tab bars: fade the edge(s) that hide scrollable tabs; no
+   scrollbar. Desktop is untouched while nothing overflows. */
+.tabs{overflow-x:auto;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tabs.can-scroll-right{
+  -webkit-mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent);
+  mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent);
+}
+.tabs.can-scroll-left{
+  -webkit-mask-image:linear-gradient(to left,#000 calc(100% - 28px),transparent);
+  mask-image:linear-gradient(to left,#000 calc(100% - 28px),transparent);
+}
+.tabs.can-scroll-left.can-scroll-right{
+  -webkit-mask-image:linear-gradient(to right,transparent,#000 28px,#000 calc(100% - 28px),transparent);
+  mask-image:linear-gradient(to right,transparent,#000 28px,#000 calc(100% - 28px),transparent);
+}
+
+/* 4. Compact empty states: one left-aligned row — icon · text · action —
+   dashed outline when standalone, plain inside a card. */
+.empty{
+  flex-direction:row;
+  flex-wrap:wrap;
+  align-items:center;
+  justify-content:flex-start;
+  gap:10px;
+  text-align:left;
+  padding:14px 16px;
+  border:1px dashed var(--border);
+  border-radius:10px;
+}
+.empty svg{width:20px;height:20px;color:var(--muted);flex:none}
+.empty p{flex:1 1 auto;min-width:0}
+.empty .btn{margin-top:0;margin-left:auto;flex:none;padding:6px 12px;font-size:13px}
+.card .empty{border:0;padding:2px 0}
+@media (max-width:759px){
+  .empty .btn{flex-basis:100%;margin-left:0}
+}
+/* --- end small items --- */
+/* --- pricing grouped --- */
+/* Models pricing matrix (OA-27 review): one collapsed group per model @
+   endpoint. The toggle button is the expand control; the caret turns when
+   open; sub-rows stay hidden until then. */
+#models-pricing .group-toggle{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  width:100%;
+  padding:0;
+  background:none;
+  border:0;
+  text-align:left;
+  color:inherit;
+}
+#models-pricing .group-toggle .caret{
+  display:inline-flex;
+  flex:0 0 auto;
+  color:var(--muted);
+  transition:transform .15s;
+}
+#models-pricing .group-toggle[aria-expanded="true"] .caret svg{transform:rotate(90deg)}
+#models-pricing .group-toggle .group-name{min-width:0}
+#models-pricing .group-toggle .subline{display:block;font-weight:400}
+#models-pricing tbody[data-price-group]:not(.open)>tr.sub-row{display:none}
+
+/* Phone: one card per group — the header row reads as the card title with
+   the toggle and status pill (per-unit summaries live on the sub-rows),
+   sub-rows keep the labeled-cell stacking the global rules apply. */
+@media (max-width:759px){
+  #models-pricing tbody[data-price-group]{
+    border:1px solid var(--border);
+    background:var(--panel);
+    border-radius:9px;
+    margin-bottom:9px;
+    padding:4px 12px 8px;
+  }
+  #models-pricing tr{border:0;background:none;margin:0;padding:0;border-radius:0}
+  #models-pricing tr.sub-row{border-top:1px solid var(--border);margin-top:4px;padding-top:2px}
+  #models-pricing tr.group-row td{display:block;padding:6px 0;text-align:left}
+  #models-pricing tr.group-row td::before{content:none}
+  #models-pricing tr.group-row td[data-label="Status"]{padding-top:0}
+  #models-pricing tr.group-row td[data-label="Input"],
+  #models-pricing tr.group-row td[data-label="Cached input"],
+  #models-pricing tr.group-row td[data-label="Output"],
+  #models-pricing tr.group-row td[data-label="Actions"]{display:none}
+}
+/* --- end pricing grouped --- */
+/* --- chat composer --- */
+/* ONE bordered box (was a borderless strip): textarea on top, picker +
+   evidence note on the left of the footer, icon Send on the right. */
+.composer{
+  margin:0 12px 12px;
+  padding:6px 12px 8px;
+  border:1px solid var(--border);
+  border-radius:12px;
+  background:var(--panel);
+}
+.composer:focus-within{border-color:var(--accent)}
+.composer textarea.field{
+  border:0;
+  background:transparent;
+  height:auto;
+  min-height:44px;
+  padding:8px 2px;
+}
+.compose-foot{gap:10px;flex-wrap:wrap}
+.compose-left{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}
+.compose-left #evidenceChip{font-size:12px;min-width:0}
+/* Compact pill pickers: the composer footer and the composer-note replacement. */
+.composer select.field,
+.composer-note select.field{
+  width:auto;
+  max-width:240px;
+  padding:4px 26px 4px 12px;
+  font-size:13px;
+  border-radius:999px;
+  background-position:right 9px center;
+  background-color:var(--raised);
+}
+.composer-send{padding:7px;border-radius:999px;flex:none}
+/* Disabled/disabled-assistant note keeps its picker so a new conversation
+   stays one click away; the note is a flex row, not a bare text strip. */
+.composer-note{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.composer-note .muted{min-width:0}
+/* Empty-thread welcome: who answers, what grounds it, starter questions. */
+.welcome{
+  flex:1;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  gap:4px;
+  text-align:center;
+  padding:30px 20px;
+  max-width:560px;
+  margin:0 auto;
+  width:100%;
+}
+.welcome-title{margin:0;font-size:17px;font-weight:700}
+.welcome .help{margin-top:0}
+.starters{display:flex;flex-direction:column;align-items:stretch;gap:8px;margin-top:14px;width:100%;max-width:420px}
+.starter{
+  border:1px solid var(--border);
+  background:var(--raised);
+  color:var(--text);
+  border-radius:999px;
+  padding:8px 16px;
+  font-size:13px;
+  text-align:center;
+  overflow-wrap:anywhere;
+}
+.starter:hover{border-color:var(--accent);color:var(--accent-fg);filter:none}
+@media (max-width:759px){
+  .composer{margin:0 10px 10px}
+  .composer select.field,
+  .composer-note select.field{max-width:100%}
+}
+/* --- end chat composer --- */
+/* --- home redesign --- */
+/* Two Home layouts (dashboard_home.go homeLayout): "triage" (admins, dense
+   desk) and "ask" (chat/search members, composer first). List cards are
+   zero-padding cards of 1px-separated rows; everything reuses the tokens. */
+
+.list-card{
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:0;
+  min-width:0;
+  overflow:hidden;
+}
+.list-row{display:flex;align-items:center;gap:11px;padding:11px 14px;border-bottom:1px solid var(--border);min-width:0}
+.list-row:last-child{border-bottom:0}
+a.list-row{text-decoration:none;color:inherit}
+a.list-row:hover{background:var(--raised)}
+.list-icon{color:var(--accent-fg);flex:0 0 auto;display:inline-flex}
+.list-copy{flex:1;min-width:0}
+.list-title{display:block;font-weight:600;font-size:13.5px;overflow-wrap:anywhere}
+.list-copy .muted{display:block;font-size:12px;margin-top:2px;overflow-wrap:anywhere}
+.list-empty{gap:10px}
+.list-empty a{color:var(--accent-fg);font-size:13px;font-weight:600;text-decoration:none;white-space:nowrap}
+.list-empty a:hover{text-decoration:underline}
+
+/* Triage: the two-column desk (1 column under 960px). */
+.home-cols{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:22px;align-items:start}
+.home-cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}
+.home-col{min-width:0}
+.home-cols .section{margin-top:0}
+.home-col .section+.section{margin-top:18px}
+.head-side{display:inline-flex;align-items:center;gap:10px}
+
+/* Triage: one dense KPI card, four rule-separated cells (2x2 on phone). */
+.kpi-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));padding:0;overflow:hidden}
+.kpi-cell{padding:16px;min-width:0}
+.kpi-cell+.kpi-cell{border-left:1px solid var(--border)}
+.kpi-cell .kpi-value{font-size:21px}
+.kpi-cell .kpi-spend{font-size:17px}
+
+/* Ask layout: centred 720px column, composer first. */
+.home-ask{max-width:720px;margin:0 auto}
+.home-ask-head{text-align:center;margin:8px 0 4px}
+.home-ask-head .crumb{margin-bottom:8px}
+.home-ask-head h1{font-size:24px;letter-spacing:-.025em;margin:0}
+.home-ask-sub{color:var(--muted);font-size:13px;margin:8px auto 0;max-width:520px}
+.home-ask-empty{margin:16px 0 0;text-align:center}
+.ask-box{
+  display:block;
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:12px;
+  padding:10px 12px;
+  margin-top:16px;
+}
+.ask-box:focus-within{border-color:var(--accent)}
+.ask-box textarea{
+  display:block;
+  width:100%;
+  resize:none;
+  border:0;
+  background:transparent;
+  padding:4px 4px 0;
+  min-height:52px;
+}
+.ask-box textarea:focus-visible{outline:none} /* the box border is the focus indicator */
+.ask-foot{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px}
+.ask-targets{display:flex;gap:7px;flex-wrap:wrap;align-items:center;min-width:0}
+.ask-foot .btn{margin-left:auto}
+label.chip{cursor:pointer}
+.ask-box .chip:has(input:checked){color:var(--accent-fg);border-color:var(--accent);background:var(--accentbg)}
+.ask-box .chip:focus-within{outline:2px solid var(--accent);outline-offset:2px}
+.home-foot{margin-top:26px;text-align:center;font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+
+/* Ask: three list columns collapse on phone; triage columns collapse under
+   960px (the desk grid needs the room longer). */
+@media (max-width:959px){
+  .home-cols{grid-template-columns:1fr}
+}
+@media (max-width:759px){
+  .home-cols-3{grid-template-columns:1fr}
+  .kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .kpi-cell:nth-child(odd){border-left:0}
+  .kpi-cell:nth-child(n+3){border-top:1px solid var(--border)}
+  .kpi-cell{padding:13px}
+}
+/* --- end home redesign --- */
+/* --- redesign integration polish --- */
+/* Home: attention and running fragments read as list cards like the rest. */
+#homeAttentionList,#homeRunning{background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+#homeAttentionList>.stack,#homeRunning>.stack{gap:0}
+#homeAttentionList .attention,#homeRunning .activity-row{padding:11px 14px;border-bottom:1px solid var(--border);margin:0;align-items:center}
+#homeAttentionList .attention:last-child,#homeRunning .activity-row:last-child{border-bottom:0}
+.home-cols .section-head{min-height:24px;align-items:baseline}
+/* Ask layout: the composer column stays 720px, the lists get room; an empty
+   attention section is noise for people who cannot act on it. */
+.home-ask{max-width:1040px}
+.home-ask>*{max-width:720px;margin-left:auto;margin-right:auto}
+.home-ask>.home-cols-3{max-width:none}
+.home-ask #homeAttention:has(.list-empty){display:none}
+.home-ask #homeAttention{margin-top:16px}
+/* Pricing: capability rows read as children of their model row. */
+#models-pricing tbody[data-price-group]+tbody[data-price-group]>tr.group-row>td{border-top:1px solid var(--border)}
+#models-pricing tr.group-row:hover{background:var(--raised)}
+#models-pricing .group-toggle{cursor:pointer}
+@media (min-width:760px){
+  #models-pricing tr.sub-row>td:first-child{padding-left:42px;color:var(--muted)}
+  #models-pricing tbody.open>tr.sub-row{background:color-mix(in srgb,var(--raised) 45%,transparent)}
+}
+/* Chat: the composer box is the focus indicator, not the textarea inside. */
+.composer textarea.field:focus,.composer textarea.field:focus-visible{outline:0;border:0;box-shadow:none}
+.composer textarea.field{resize:none}
+/* Chat history: actions sit under the title instead of squeezing it. */
+.history .h-item{flex-wrap:wrap}
+.history .h-ctl{flex-basis:100%;display:flex;gap:4px;padding:0 6px 6px}
+.history .h-ctl .btn{padding:2px 7px;font-size:11px}
+/* Usage chart: keep the y-max label clear of the latest-value label. */
+.bar-ymax::before{content:"max "}
+.barchart .bar{margin-top:18px}
+/* Collapsed rail: the confidential card shows its icon only. */
+.collapsed .conf-card strong{display:none}
+/* The phone chats sheet never renders on desktop (it used to leak below the
+   thread once a conversation existed). */
+@media (min-width:760px){.mobile-chats-list{display:none}}
+/* --- end redesign integration polish --- */

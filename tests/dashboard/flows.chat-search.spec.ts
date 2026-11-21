@@ -236,7 +236,7 @@ test.describe('Chat surfaces and grants (member)', () => {
     await page.goto(`${BASE}/dashboard/chat`);
     await expect(page.locator('#assistantSelect')).toBeDisabled();
     await expect(page.locator('#assistantSelect option')).toHaveCount(0);
-    await expect(page.locator('.thread-head')).toContainText('ask an admin to grant access');
+    await expect(page.locator('.composer-note')).toContainText('ask an admin to grant access');
     await expect(page.locator('[data-action="chat:send"]')).toHaveCount(0); // composer is hidden for a grantless member
     // Grantless login replaced this context's session — restore member.
     await login(page, MEMBER_EMAIL, MEMBER_PASSWORD);
@@ -399,9 +399,10 @@ test.describe('Search (member)', () => {
 test.describe('member home and error-toast cases', () => {
   test('member home shows own sections and zero manager content', async ({ page }) => {
     await page.goto(`${BASE}/dashboard`);
-    // Members lack billing.view — #homeKPIs is admin/manager-only by design;
-    // the member-visible sections are Running now + Confidential inference.
-    await expect(page.locator('#homeRunningSection')).toBeVisible();
+    // Members get the ask-first layout: the composer leads; #homeKPIs stays
+    // admin/manager-only, and "Running now" renders only while work holds.
+    await expect(page.locator('#homeAsk')).toBeVisible();
+    await expect(page.locator('#homeKPIs')).toHaveCount(0);
     // A member never sees manager attention/admin surfaces on Home.
     await expect(page.locator('#content')).not.toContainText('Tenant budget');
   });

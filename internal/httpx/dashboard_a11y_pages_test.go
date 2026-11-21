@@ -411,9 +411,14 @@ func TestA11yWorkPages(t *testing.T) {
 		ExtractionsEmpty:   dashboardEmpty{Icon: "extract", Text: "No extractions yet."},
 		CollectionsEmpty:   dashboardEmpty{Icon: "knowledge", Text: "No collections yet."},
 	}
+	home.Layout = "triage" // adminCaps shape
 	auditRendered(t, "home page", renderPage(t, "home", home, adminCaps))
 	auditRendered(t, "home frag-running", renderFrag(t, "home", "running", home, adminCaps))
 	auditRendered(t, "home frag-attention", renderFrag(t, "home", "attention", home, adminCaps))
+	askHome := home
+	askHome.Layout = "ask" // member shape: the ask box + three list columns
+	auditRendered(t, "home page ask", renderPage(t, "home", askHome, memberCaps))
+	auditRendered(t, "home frag-attention ask", renderFrag(t, "home", "attention", askHome, memberCaps))
 
 	thread := &chatThreadData{
 		ConversationID: "c1",

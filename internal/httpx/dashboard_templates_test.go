@@ -174,29 +174,55 @@ func TestSpark(t *testing.T) {
 
 func TestBars(t *testing.T) {
 	got := string(bars([]dashboardBar{
-		{Label: "Mon", Value: 10},
-		{Label: "Tue", Value: 30},
-		{Label: "Wed", Value: 20},
+		{Label: "2026-11-01 · 10 requests", Value: 10, Date: "2026-11-01"},
+		{Label: "2026-11-02 · 30 requests", Value: 30, Date: "2026-11-02"},
+		{Label: "2026-11-03 · 0 requests", Value: 0, Date: "2026-11-03"},
+		{Label: "2026-11-20 · 20 requests", Value: 20, Date: "2026-11-20"},
 	}))
-	if !strings.Contains(got, `<svg class="bar"`) {
-		t.Fatalf("bars must render svg.bar (P7-12), got %s", got)
+	if !strings.Contains(got, `class="barchart" role="img"`) || !strings.Contains(got, `aria-label="Daily requests from 1 Nov to 20 Nov · 60 total"`) {
+		t.Fatalf("bars must summarize range and total for AT, got %s", got)
 	}
-	if n := strings.Count(got, "<rect"); n != 3 {
-		t.Fatalf("bars must render one <rect> per value, got %d in %s", n, got)
+	if n := strings.Count(got, `class="bar-col`); n != 4 {
+		t.Fatalf("bars must render one column per value, got %d in %s", n, got)
 	}
-	for _, label := range []string{"<title>Mon</title>", "<title>Tue</title>", "<title>Wed</title>"} {
-		if !strings.Contains(got, label) {
-			t.Errorf("each rect must carry its label in <title>; missing %s in %s", label, got)
+	for _, want := range []string{
+		`title="1 Nov · 10 requests"`, `title="2 Nov · 30 requests"`,
+		`title="3 Nov · 0 requests"`,
+		`class="bar-col bar-zero"`, // zero day: stub, no inline height
+		`class="bar-ymax">30<`,     // y-axis max via the count formatter
+		`<em>1 Nov</em>`, `<em>20 Nov</em>`,
+		`<b>20</b>`, // latest value above its bar
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("chart missing %s in %s", want, got)
 		}
 	}
-	// Tue is the max → scaled to full height 40.
-	if !strings.Contains(got, `height="40.00"`) {
-		t.Errorf("tallest bar must scale to the viewBox height, got %s", got)
+	if !strings.Contains(got, `style="height:100.00%"`) {
+		t.Errorf("tallest bar must scale to full height, got %s", got)
 	}
-	if strings.Contains(got, "style=") {
-		t.Errorf("bars must not inline styles — CSS owns color, got %s", got)
+	if strings.Contains(got, "background") || strings.Contains(got, "fill") || strings.Contains(got, "#") {
+		t.Errorf("bars must not inline colors — CSS owns color, got %s", got)
 	}
-	if empty := string(bars(nil)); !strings.Contains(empty, `class="bar"`) || strings.Contains(empty, "<rect") {
+	if empty := string(bars(nil)); !strings.Contains(empty, `class="bar"`) || strings.Contains(empty, "bar-col") {
 		t.Fatalf("empty histogram must render the placeholder frame, got %s", empty)
+	}
+}
+
+// TestBarsSinglePoint — one day of data stays readable: a single full-height
+// column, one date label under the baseline, the value above the bar.
+func TestBarsSinglePoint(t *testing.T) {
+	got := string(bars([]dashboardBar{{Label: "2026-11-20 · 1 request", Value: 1, Date: "2026-11-20"}}))
+	for _, want := range []string{
+		`aria-label="Daily requests on 20 Nov · 1 total"`,
+		`title="20 Nov · 1 request"`,
+		`style="height:100.00%"`,
+		`<em>20 Nov</em>`, `<b>1</b>`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("single-point chart missing %s in %s", want, got)
+		}
+	}
+	if n := strings.Count(got, "<em>"); n != 1 {
+		t.Fatalf("single point must label its day exactly once, got %d in %s", n, got)
 	}
 }
