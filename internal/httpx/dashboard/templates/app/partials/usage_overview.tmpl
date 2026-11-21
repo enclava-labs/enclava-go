@@ -9,22 +9,22 @@
     <a class="chip{{if eq .Data.Days 90}} active{{end}}" href="/dashboard/usage?range=90"{{if eq .Data.Days 90}} aria-current="page"{{end}}>90 days</a>
   </div>
   <div class="grid four">
-    <div class="kpi">
+    <div class="card kpi">
       <div class="kpi-label">Requests · {{.Data.Days}} days</div>
       <div class="kpi-value">{{count .Data.Overview.Requests}}</div>
       <div class="kpi-foot">Settled usage records</div>
     </div>
-    <div class="kpi">
+    <div class="card kpi">
       <div class="kpi-label">Tokens · {{.Data.Days}} days</div>
       <div class="kpi-value">{{count .Data.Overview.Tokens}}</div>
       <div class="kpi-foot">All unit kinds</div>
     </div>
-    <div class="kpi">
+    <div class="card kpi">
       <div class="kpi-label">Spend · {{.Data.Days}} days</div>
       <div class="kpi-value" title="{{spendMicrosTitle .Data.Overview.SpendMicros .Data.Overview.SpendCurrency}}">{{if .Data.Overview.Spend}}{{spendMoney .Data.Overview.SpendMicros .Data.Overview.SpendCurrency}}{{end}}</div>
       <div class="kpi-foot">{{range .Data.Overview.SpendExtras}}<span title="{{spendMicrosTitle .AmountMicros .Currency}}">{{spendMoney .AmountMicros .Currency}}</span> {{end}}</div>
     </div>
-    <div class="kpi">
+    <div class="card kpi">
       <div class="kpi-label">Unsettled</div>
       <div class="kpi-value">{{if .Data.Overview.Unsettled}}{{.Data.Overview.Unsettled}}{{else}}—{{end}}</div>
       <div class="kpi-foot">{{if .Data.Overview.UnsettledFoot}}{{.Data.Overview.UnsettledFoot}}{{else}}Held + unknown reservations{{end}}</div>

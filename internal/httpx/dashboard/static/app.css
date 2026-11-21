@@ -996,3 +996,136 @@ ul.dev-endpoints li{padding:3px 0;font-size:12px}
 .moneysign{align-self:center;color:var(--muted);font-size:13px;min-width:14px}
 .field-warn{color:var(--amber)}
 /* --- end 3H pricing --- */
+
+/* --- UI review polish (2026-11) --- */
+/* Layout and alignment fixes from the full-UI screenshot review. Component
+   classes only; no template contract changes. */
+
+/* Native chrome that leaked through: fieldset groove, default accent,
+   unstyled disclosure and select arrows. */
+fieldset{border:0;padding:0;margin:0;min-width:0}
+legend{padding:0}
+legend.label{margin-bottom:8px}
+input[type="checkbox"],input[type="radio"]{accent-color:var(--accent)}
+summary{cursor:pointer;color:var(--muted);font-size:13px}
+details[open]>summary{margin-bottom:8px}
+select.field{
+  appearance:none;
+  padding-right:34px;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238d99a7' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;
+  background-position:right 12px center;
+}
+
+/* Sidebar group titles were 10px. */
+.group-title{font-size:11px}
+
+/* Links: titles, table cells and whole-row links read as links by weight
+   and colour; the underline returns on hover/focus. */
+td a:not(.btn),.result-title a,.section-head a{text-decoration:none;font-weight:600}
+td a:not(.btn):hover,.result-title a:hover,.section-head a:hover{text-decoration:underline}
+a.activity-row,a.card{text-decoration:none;color:inherit}
+a.activity-row{border-radius:7px;padding-left:8px;padding-right:8px;margin:0 -8px}
+a.activity-row:hover{background:var(--panel)}
+a.card:hover{border-color:var(--accent)}
+a.card .card-title{color:var(--accent-fg)}
+.stack:has(>.activity-row){gap:0}
+.activity-copy .muted{font-size:12px}
+.muted>svg{vertical-align:-3px}
+
+/* Tables: headers never wrap, sublines stop collapsing their column to one
+   character per line, cell rows wrap instead of pushing actions off-card. */
+th{white-space:nowrap}
+td .subline{overflow-wrap:break-word}
+td .row{flex-wrap:wrap;gap:6px}
+td .avatar{display:inline-grid;vertical-align:middle;margin-right:6px}
+td .avatar+b{white-space:nowrap}
+td .chip{padding:3px 9px;font-size:12px}
+@media (min-width:760px){
+  td:first-child{min-width:150px}
+  td[data-label="Actions"],td:last-child:has(>.btn){white-space:nowrap}
+  td .btn{padding:6px 10px;font-size:13px}
+}
+
+/* A card whose only content is a table is one box, not two. */
+.card:has(>.tablewrap:only-child){padding:0;border:0;background:none}
+/* A titled card with a table: the table sits flush inside the card. */
+@media (min-width:760px){
+  .card>.section-head+.tablewrap:last-child{
+    border:0;
+    border-top:1px solid var(--border);
+    border-radius:0 0 9px 9px;
+    margin:14px -17px -17px;
+  }
+}
+
+/* Vertical rhythm inside cards and forms: labels, button rows and tables
+   no longer touch the element above them. */
+.card>.label,form>.label{margin-top:14px}
+.card>.label:first-child,form>.label:first-child{margin-top:0}
+.card>.row+.row,.card>.tablewrap+.row,.card>.empty+p,
+form>.grid+.row,form>.field+.row,form>.field-error+.row{margin-top:14px}
+.card>p{margin:8px 0 0}
+.card>.section-head+p{margin-top:0}
+#sources-credentials .stack>.label{margin-bottom:-6px}
+.admin-tag{
+  font-size:11px;
+  color:var(--muted);
+  background:var(--raised);
+  border-radius:999px;
+  padding:3px 8px;
+}
+
+/* Usage overview: KPI tiles are cards, stacked cards keep a gap, and the
+   breakdown tables get room for five columns. */
+#usage-overview>.grid.four{margin-bottom:16px}
+#usage-overview>.card+.card{margin-top:16px}
+@media (min-width:760px){
+  #usage-overview .grid.three{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+
+/* Chat fits the viewport: the composer stays on screen without page scroll. */
+@media (min-width:760px){
+  .content:has(>.thread-layout){padding-bottom:20px}
+  .thread-layout{height:calc(100vh - 156px);min-height:480px}
+}
+.composer textarea{border-radius:7px}
+.compose-foot{align-items:center;margin-top:4px}
+
+/* Connector credentials: one card per provider on a two-column grid, with
+   a ruled sub-section per credential type. */
+#sources-credentials{display:grid;gap:16px;align-items:start}
+#sources-credentials>:not([data-cred-provider]){grid-column:1/-1;margin:0}
+#sources-credentials>[data-cred-provider]{
+  margin:0;
+  min-width:0;
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:17px;
+}
+#sources-credentials .section-head{margin-bottom:4px}
+#sources-credentials [data-cred-provider]>p{margin:0 0 10px;font-size:13px}
+#sources-credentials h3{
+  font-size:13px;
+  margin:16px 0 10px;
+  padding-top:14px;
+  border-top:1px solid var(--border);
+}
+#sources-credentials .stack{gap:10px}
+#sources-credentials .stack>.help{margin:0}
+#sources-credentials code{
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:12px;
+  overflow-wrap:anywhere;
+}
+#sources-credentials .row{flex-wrap:wrap}
+@media (min-width:1100px){
+  #sources-credentials{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+
+/* Phone: the page action always sits on the right of the header row. */
+@media (max-width:759px){
+  .head>.headcopy+*{margin-left:auto}
+}
+/* --- end UI review polish --- */
