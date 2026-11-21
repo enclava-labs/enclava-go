@@ -1212,3 +1212,51 @@ form>.grid+.row,form>.field+.row,form>.field-error+.row{margin-top:14px}
   .empty .btn{flex-basis:100%;margin-left:0}
 }
 /* --- end small items --- */
+/* --- pricing grouped --- */
+/* Models pricing matrix (OA-27 review): one collapsed group per model @
+   endpoint. The toggle button is the expand control; the caret turns when
+   open; sub-rows stay hidden until then. */
+#models-pricing .group-toggle{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  width:100%;
+  padding:0;
+  background:none;
+  border:0;
+  text-align:left;
+  color:inherit;
+}
+#models-pricing .group-toggle .caret{
+  display:inline-flex;
+  flex:0 0 auto;
+  color:var(--muted);
+  transition:transform .15s;
+}
+#models-pricing .group-toggle[aria-expanded="true"] .caret svg{transform:rotate(90deg)}
+#models-pricing .group-toggle .group-name{min-width:0}
+#models-pricing .group-toggle .subline{display:block;font-weight:400}
+#models-pricing tbody[data-price-group]:not(.open)>tr.sub-row{display:none}
+
+/* Phone: one card per group — the header row reads as the card title with
+   the toggle and status pill (per-unit summaries live on the sub-rows),
+   sub-rows keep the labeled-cell stacking the global rules apply. */
+@media (max-width:759px){
+  #models-pricing tbody[data-price-group]{
+    border:1px solid var(--border);
+    background:var(--panel);
+    border-radius:9px;
+    margin-bottom:9px;
+    padding:4px 12px 8px;
+  }
+  #models-pricing tr{border:0;background:none;margin:0;padding:0;border-radius:0}
+  #models-pricing tr.sub-row{border-top:1px solid var(--border);margin-top:4px;padding-top:2px}
+  #models-pricing tr.group-row td{display:block;padding:6px 0;text-align:left}
+  #models-pricing tr.group-row td::before{content:none}
+  #models-pricing tr.group-row td[data-label="Status"]{padding-top:0}
+  #models-pricing tr.group-row td[data-label="Input"],
+  #models-pricing tr.group-row td[data-label="Cached input"],
+  #models-pricing tr.group-row td[data-label="Output"],
+  #models-pricing tr.group-row td[data-label="Actions"]{display:none}
+}
+/* --- end pricing grouped --- */

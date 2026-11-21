@@ -41,13 +41,16 @@ func modelsUnitKinds() []billing.UnitKind {
 // dashboardPageMeta so the layout serves static/pages/models.js — the old
 // page's pricing.js was never emitted, which is the bug class D-22 fixes.
 type modelsData struct {
-	Tab        string // "endpoints" | "catalog" | "pricing"
-	Endpoints  []modelsEndpointRow
-	Catalog    []modelsCatalogRow
-	HasDefault bool // a catalog model is the tenant default
-	Rows       []modelsPriceRow
-	Empty      dashboardEmpty // zero-row state for the active tab (OA-37)
-	Error      string
+	Tab              string // "endpoints" | "catalog" | "pricing"
+	Endpoints        []modelsEndpointRow
+	Catalog          []modelsCatalogRow
+	HasDefault       bool // a catalog model is the tenant default
+	Rows             []modelsPriceRow
+	Groups           []modelsPriceGroup // rows folded per model @ endpoint (pricing tab)
+	GroupsPriced     int                // fully priced groups — the Priced filter chip count
+	GroupsNeedPrices int                // unpriced + partial groups — the Needs prices chip count
+	Empty            dashboardEmpty     // zero-row state for the active tab (OA-37)
+	Error            string
 }
 
 func (m modelsData) DashboardTitle() string  { return "Models" }
@@ -97,6 +100,32 @@ type modelsPriceRow struct {
 	SubjectID       string // the Basis set's subject; every cell write lands there
 	Unpriced        bool   // a required unit is missing — reserve would refuse
 	Cells           []modelsPriceCell
+}
+
+// modelsPriceGroup is one collapsed matrix group: every capability row of
+// one model alias @ endpoint. State drives the group pill and the client
+// filter chips; Summary prices each fixed column across the group (a unit's
+// price shows only when every priced capability agrees, "varies" when they
+// differ, nothing when none prices it).
+type modelsPriceGroup struct {
+	EndpointID string
+	Model      string
+	Upstream   string
+	Rows       []modelsPriceRow
+	Priced     int
+	Unpriced   int
+	Total      int
+	State      string // priced | partial | unpriced
+	Summary    []modelsPriceSummaryCell
+	Open       bool // a sole group renders open server-side
+}
+
+// modelsPriceSummaryCell is one group-row summary cell. Text is a formatted
+// price or "varies"; Priced=false renders the muted "—" (no row prices it).
+type modelsPriceSummaryCell struct {
+	UnitLabel string
+	Text      string
+	Priced    bool
 }
 
 // modelsPriceCell is one Input/Cached/Output cell. The rate data-* pairs
@@ -510,7 +539,100 @@ func (a *App) modelsPricingData(r *http.Request) modelsData {
 			}
 		}
 	}
+	data.Groups = modelsPriceGroups(data.Rows)
+	for _, g := range data.Groups {
+		if g.State == "priced" {
+			data.GroupsPriced++
+		} else {
+			data.GroupsNeedPrices++
+		}
+	}
 	return data
+}
+
+// modelsPriceGroups folds the flat pricing rows into one group per
+// model @ endpoint binding (OA-27 pricing review), keeping first-seen order.
+// State is priced when every capability is priced, unpriced when none is,
+// partial in between — the pill and the filter chips read it. A sole group
+// renders open server-side so a single-model tenant never meets a collapsed
+// lone row.
+func modelsPriceGroups(rows []modelsPriceRow) []modelsPriceGroup {
+	var groups []modelsPriceGroup
+	at := map[string]int{}
+	for _, row := range rows {
+		key := row.EndpointID + "|" + row.Model
+		i, ok := at[key]
+		if !ok {
+			i = len(groups)
+			at[key] = i
+			groups = append(groups, modelsPriceGroup{
+				EndpointID: row.EndpointID, Model: row.Model, Upstream: row.Upstream,
+			})
+		}
+		groups[i].Rows = append(groups[i].Rows, row)
+	}
+	for gi := range groups {
+		g := &groups[gi]
+		g.Total = len(g.Rows)
+		for _, row := range g.Rows {
+			if row.Unpriced {
+				g.Unpriced++
+			} else {
+				g.Priced++
+			}
+		}
+		switch {
+		case g.Priced == 0:
+			g.State = "unpriced"
+		case g.Unpriced > 0:
+			g.State = "partial"
+		default:
+			g.State = "priced"
+		}
+		g.Summary = modelsGroupSummary(g.Rows)
+	}
+	if len(groups) == 1 {
+		groups[0].Open = true
+	}
+	return groups
+}
+
+// modelsGroupSummary prices each fixed column (Input / Cached input /
+// Output) across the group's rows: the shared value when every priced row
+// agrees on it, "varies" when they differ, unset (the muted "—") when no
+// row prices the unit. Rows share the modelsUnitKinds column order, so the
+// Cells indexes line up across rows.
+func modelsGroupSummary(rows []modelsPriceRow) []modelsPriceSummaryCell {
+	out := make([]modelsPriceSummaryCell, len(rows[0].Cells))
+	for ci := range rows[0].Cells {
+		out[ci].UnitLabel = rows[0].Cells[ci].UnitLabel
+		var ref *modelsPriceCell
+		same := true
+		for ri := range rows {
+			cell := rows[ri].Cells[ci]
+			if !cell.Priced {
+				continue
+			}
+			if ref == nil {
+				ref = &rows[ri].Cells[ci]
+				continue
+			}
+			if cell.RateMicros != ref.RateMicros || cell.UnitQuantity != ref.UnitQuantity || cell.Currency != ref.Currency {
+				same = false
+				break
+			}
+		}
+		if ref == nil {
+			continue
+		}
+		out[ci].Priced = true
+		if same {
+			out[ci].Text = tokenPrice(ref.RateMicros, ref.UnitQuantity, ref.Currency)
+		} else {
+			out[ci].Text = "varies"
+		}
+	}
+	return out
 }
 
 // modelsPriceRow prices one (model, endpoint) pair for one capability through

@@ -1,4 +1,12 @@
+import { Page } from '@playwright/test';
 import { test, expect, api, seedData } from './fixtures';
+
+// Pricing groups are collapsed by default (one tbody per model @ endpoint):
+// open a row's group before touching its sub-row buttons.
+async function expandGroup(page: Page, endpointId: string, model: string) {
+  const toggle = page.locator(`tbody[data-price-group="${endpointId}|${model}"] [data-action="models:price-group"]`);
+  if ((await toggle.getAttribute('aria-expanded')) !== 'true') await toggle.click();
+}
 
 test('one price drawer saves all three categories', async ({ page }) => {
   seedData();
@@ -9,6 +17,7 @@ test('one price drawer saves all three categories', async ({ page }) => {
   });
   await page.goto('/dashboard/models/pricing');
   const row = page.locator(`tr[data-price-row="${endpoint.ID}|${model}|chat/completions"]`);
+  await expandGroup(page, endpoint.ID, model);
   await expect(row).toContainText('Output not priced');
   await row.getByRole('button', { name: 'Set price' }).click();
   const drawer = page.locator('#drawer');

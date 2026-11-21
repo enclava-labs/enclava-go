@@ -49,6 +49,14 @@ interface PricingBody {
   currency: string;
 }
 
+// Pricing groups are collapsed by default (one tbody per model @ endpoint):
+// open a row's group before touching its sub-row buttons. A sole group
+// arrives open from the server, hence the aria-expanded guard.
+async function expandGroup(page: Page, endpointId: string, model: string) {
+  const toggle = page.locator(`tbody[data-price-group="${endpointId}|${model}"] [data-action="models:price-group"]`);
+  if ((await toggle.getAttribute('aria-expanded')) !== 'true') await toggle.click();
+}
+
 test('Set price and Change submit the admin pricing contract and the cell re-renders priced', async ({ page }) => {
   await login(page);
 
@@ -79,6 +87,7 @@ test('Set price and Change submit the admin pricing contract and the cell re-ren
 
   const row = page.locator(`tr[data-price-row="${created}|${UNPRICED}|chat/completions"]`);
   await expect(row).toHaveCount(1);
+  await expandGroup(page, created, UNPRICED);
   await row.locator('button[data-action="models:price"]').click();
   for (const unit of ['input', 'cached_input', 'output']) {
     await page.locator(`#models-price-rate-${unit}`).fill('2.5');
@@ -114,6 +123,9 @@ test('price history drawer lists the real price rows for the pair', async ({ pag
   if ((await history.count()) === 0) {
     throw new Error('no matrix rows rendered — seed an endpoint with a model binding');
   }
+  // History buttons live on sub-rows: open the first group first.
+  const firstToggle = page.locator('tbody[data-price-group] [data-action="models:price-group"]').first();
+  if ((await firstToggle.getAttribute('aria-expanded')) !== 'true') await firstToggle.click();
   await history.click();
   const drawer = page.locator('#drawer');
   await expect(drawer).toContainText('Price history');
