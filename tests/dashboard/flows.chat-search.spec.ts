@@ -236,7 +236,7 @@ test.describe('Chat surfaces and grants (member)', () => {
     await page.goto(`${BASE}/dashboard/chat`);
     await expect(page.locator('#assistantSelect')).toBeDisabled();
     await expect(page.locator('#assistantSelect option')).toHaveCount(0);
-    await expect(page.locator('.thread-head')).toContainText('ask an admin to grant access');
+    await expect(page.locator('.composer-note')).toContainText('ask an admin to grant access');
     await expect(page.locator('[data-action="chat:send"]')).toHaveCount(0); // composer is hidden for a grantless member
     // Grantless login replaced this context's session — restore member.
     await login(page, MEMBER_EMAIL, MEMBER_PASSWORD);

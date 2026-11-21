@@ -122,7 +122,7 @@ test('seed: stubs reachable, data seeded, three sessions minted', async ({ page 
   await login(page, MEMBER_EMAIL, MEMBER_PASSWORD);
   await page.goto(`${BASE}/dashboard/chat`);
   await expect(page.locator('#assistantSelect')).toBeDisabled();
-  await expect(page.locator('.thread-head')).toContainText('ask an admin to grant access');
+  await expect(page.locator('.composer-note')).toContainText('ask an admin to grant access');
   await page.goto(`${BASE}/dashboard/extract`);
   await expect(page.locator('#content')).toContainText('administrator');
   await page.context().clearCookies();

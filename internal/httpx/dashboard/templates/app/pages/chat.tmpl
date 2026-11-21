@@ -1,3 +1,8 @@
+{{define "chat-assistant-select"}}{{/* The ONE assistant picker: rendered in
+     the composer footer, and beside the note whenever the composer is
+     replaced — exactly one #assistantSelect in every state. The grant help
+     lives in the title attribute and the empty-thread welcome. */}}<select class="field" id="assistantSelect" aria-label="Assistant" title="Don't see an assistant you expected? Ask an administrator to grant your role access."{{if not .Assistants}} disabled{{end}}>{{$sel := .SelectedAssistant}}{{range .Assistants}}<option value="{{.ID}}"{{if eq .ID $sel}} selected{{end}}>{{.Name}}</option>{{end}}</select>{{end}}
+
 {{define "content"}}{{/* Chat page (OA-32): three columns ≥1280 — history,
      thread, evidence. Fragments live in partials/chat_history.tmpl,
      chat_thread.tmpl and partials/evidence.tmpl; behaviors ride
@@ -24,36 +29,30 @@
   </nav>
 
   <section class="thread" aria-label="Conversation">
-    <div class="thread-head">
-      <div class="stack">
-        <label class="label" for="assistantSelect">Assistant</label>
-        <select class="field" id="assistantSelect" aria-label="Assistant"{{if not .Data.Assistants}} disabled{{end}}>
-          {{$sel := .Data.SelectedAssistant}}{{range .Data.Assistants}}<option value="{{.ID}}"{{if eq .ID $sel}} selected{{end}}>{{.Name}}</option>{{end}}
-        </select>
-        <span class="help">Don't see an assistant you expected? Ask an administrator to grant your role access.</span>
-        {{if not .Data.Assistants}}<span class="help">{{.Data.AssistantsEmpty.Text}}</span>{{end}}
-      </div>
-      {{with .Data.Thread}}{{if .AssistantName}}<div class="threadmeta">
-        {{/* No assistant name here: the select already shows it. */}}
-        {{if .Subline}}<span class="muted" id="chatAssistantSubline">{{.Subline}}</span>{{end}}
-        {{if .ConfText}}<button type="button" class="conf-card{{if .ConfWarn}} warn{{end}}" data-action="conf-pop" aria-haspopup="dialog" aria-expanded="false" aria-controls="pop">
-          <span class="conf-title">{{icon "shield"}}<strong>{{.ConfText}}</strong></span>
-        </button>{{end}}
-      </div>{{end}}{{end}}
-    </div>
+    {{with .Data.Thread}}{{if and .AssistantName (or .Subline .ConfText)}}<div class="thread-head"><div class="threadmeta">
+      {{/* No assistant name here: the select in the composer already shows it. */}}
+      {{if .Subline}}<span class="muted" id="chatAssistantSubline">{{.Subline}}</span>{{end}}
+      {{if .ConfText}}<button type="button" class="conf-card{{if .ConfWarn}} warn{{end}}" data-action="conf-pop" aria-haspopup="dialog" aria-expanded="false" aria-controls="pop">
+        <span class="conf-title">{{icon "shield"}}<strong>{{.ConfText}}</strong></span>
+      </button>{{end}}
+    </div></div>{{end}}{{end}}
 
     {{template "frag-chat-thread" .}}
 
     {{if or .Data.NoAssistants .Data.SelectedDisabled}}
-      <div class="composer-note muted">
-        {{if .Data.NoAssistants}}{{.Data.AssistantsEmpty.Text}}{{else}}This assistant is no longer available. Pick another assistant to start a new conversation.{{end}}
-      </div>
+    <div class="composer-note">
+      {{template "chat-assistant-select" .Data}}
+      <span class="muted">{{if .Data.NoAssistants}}{{.Data.AssistantsEmpty.Text}}{{else}}This assistant is no longer available. Pick another assistant to start a new conversation.{{end}}</span>
+    </div>
     {{else}}
     <div class="composer" id="chatComposer"{{if .Data.EvidenceIDsAttr}} data-evidence="{{.Data.EvidenceIDsAttr}}"{{end}}{{if and .Data.ConversationID .Data.SelectedAssistant}} data-assistant="{{.Data.SelectedAssistant}}"{{end}}>
       <textarea class="field" id="composer" rows="2" placeholder="Ask a follow-up…" aria-label="Message"></textarea>
       <div class="compose-foot">
-        <span class="muted" id="evidenceChip"{{if not .Data.EvidenceIDsAttr}} hidden{{end}}>Answering from the saved passages you attached.</span>
-        <button type="button" class="btn primary" data-action="chat:send">{{icon "send"}} Send</button>
+        <div class="compose-left">
+          {{template "chat-assistant-select" .Data}}
+          <span class="muted" id="evidenceChip"{{if not .Data.EvidenceIDsAttr}} hidden{{end}}>Answering from the saved passages you attached.</span>
+        </div>
+        <button type="button" class="btn primary composer-send" data-action="chat:send" aria-label="Send">{{icon "send"}}<span class="visually-hidden">Send</span></button>
       </div>
     </div>
     {{end}}
