@@ -17,7 +17,7 @@ import {
 
 const PAGES: Record<string, { label: string; href: string; h1: RegExp }[]> = {
   member: [
-    { label: 'Home', href: '/dashboard', h1: /home|good (morning|afternoon|evening)/i },
+    { label: 'Home', href: '/dashboard', h1: /home|good (morning|afternoon|evening)|what do you need/i },
     { label: 'Chat', href: '/dashboard/chat', h1: /chat/i },
     { label: 'Search', href: '/dashboard/search', h1: /search/i },
     { label: 'Extract', href: '/dashboard/extract', h1: /extract/i },
@@ -25,7 +25,7 @@ const PAGES: Record<string, { label: string; href: string; h1: RegExp }[]> = {
     { label: 'API reference', href: '/dashboard/api', h1: /api reference/i },
   ],
   manager: [
-    { label: 'Home', href: '/dashboard', h1: /home|good (morning|afternoon|evening)/i },
+    { label: 'Home', href: '/dashboard', h1: /home|good (morning|afternoon|evening)|what do you need/i },
     { label: 'Chat', href: '/dashboard/chat', h1: /chat/i },
     { label: 'Search', href: '/dashboard/search', h1: /search/i },
     { label: 'Extract', href: '/dashboard/extract', h1: /extract/i },
@@ -35,7 +35,7 @@ const PAGES: Record<string, { label: string; href: string; h1: RegExp }[]> = {
     { label: 'API reference', href: '/dashboard/api', h1: /api reference/i },
   ],
   admin: [
-    { label: 'Home', href: '/dashboard', h1: /home|good (morning|afternoon|evening)/i },
+    { label: 'Home', href: '/dashboard', h1: /home|good (morning|afternoon|evening)|what do you need/i },
     { label: 'Chat', href: '/dashboard/chat', h1: /chat/i },
     { label: 'Search', href: '/dashboard/search', h1: /search/i },
     { label: 'Extract', href: '/dashboard/extract', h1: /extract/i },

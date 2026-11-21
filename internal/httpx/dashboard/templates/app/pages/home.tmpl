@@ -182,6 +182,7 @@
     <button type="submit" class="btn primary" aria-label="Send">{{icon "send" 15}}</button>
   </div>
 </form>
+{{if and .Can.Chat (not .Data.Assistants)}}<p class="muted home-ask-empty">{{.Data.AssistantsEmpty.Text}}</p>{{end}}
 {{end}}{{end}}
 
-{{define "home-foot"}}{{$conf := .Data.ConfLine .Conf}}{{if or .Can.BillingView $conf}}<footer class="home-foot muted">{{if .Can.BillingView}}{{count .Data.KPIs.Requests30d}} requests · spend · {{count .Data.KPIs.Documents}} documents in the last 30 days{{if $conf}} · {{$conf}}{{end}}{{else}}{{$conf}}{{end}}</footer>{{end}}{{end}}
+{{define "home-foot"}}{{$conf := .Data.ConfLine .Conf}}{{if $conf}}<footer class="home-foot muted">{{$conf}}</footer>{{end}}{{end}}

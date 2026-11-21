@@ -1179,16 +1179,16 @@ form>.grid+.row,form>.field+.row,form>.field-error+.row{margin-top:14px}
 .tabs{overflow-x:auto;scrollbar-width:none}
 .tabs::-webkit-scrollbar{display:none}
 .tabs.can-scroll-right{
-  -webkit-mask-image:linear-gradient(to right,transparent calc(100% - 28px),currentColor);
-  mask-image:linear-gradient(to right,transparent calc(100% - 28px),currentColor);
+  -webkit-mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent);
+  mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent);
 }
 .tabs.can-scroll-left{
-  -webkit-mask-image:linear-gradient(to left,transparent calc(100% - 28px),currentColor);
-  mask-image:linear-gradient(to left,transparent calc(100% - 28px),currentColor);
+  -webkit-mask-image:linear-gradient(to left,#000 calc(100% - 28px),transparent);
+  mask-image:linear-gradient(to left,#000 calc(100% - 28px),transparent);
 }
 .tabs.can-scroll-left.can-scroll-right{
-  -webkit-mask-image:linear-gradient(to right,transparent,currentColor 28px,currentColor calc(100% - 28px),transparent);
-  mask-image:linear-gradient(to right,transparent,currentColor 28px,currentColor calc(100% - 28px),transparent);
+  -webkit-mask-image:linear-gradient(to right,transparent,#000 28px,#000 calc(100% - 28px),transparent);
+  mask-image:linear-gradient(to right,transparent,#000 28px,#000 calc(100% - 28px),transparent);
 }
 
 /* 4. Compact empty states: one left-aligned row — icon · text · action —
@@ -1418,3 +1418,41 @@ label.chip{cursor:pointer}
   .kpi-cell{padding:13px}
 }
 /* --- end home redesign --- */
+/* --- redesign integration polish --- */
+/* Home: attention and running fragments read as list cards like the rest. */
+#homeAttentionList,#homeRunning{background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+#homeAttentionList>.stack,#homeRunning>.stack{gap:0}
+#homeAttentionList .attention,#homeRunning .activity-row{padding:11px 14px;border-bottom:1px solid var(--border);margin:0;align-items:center}
+#homeAttentionList .attention:last-child,#homeRunning .activity-row:last-child{border-bottom:0}
+.home-cols .section-head{min-height:24px;align-items:baseline}
+/* Ask layout: the composer column stays 720px, the lists get room; an empty
+   attention section is noise for people who cannot act on it. */
+.home-ask{max-width:1040px}
+.home-ask>*{max-width:720px;margin-left:auto;margin-right:auto}
+.home-ask>.home-cols-3{max-width:none}
+.home-ask #homeAttention:has(.list-empty){display:none}
+.home-ask #homeAttention{margin-top:16px}
+/* Pricing: capability rows read as children of their model row. */
+#models-pricing tbody[data-price-group]+tbody[data-price-group]>tr.group-row>td{border-top:1px solid var(--border)}
+#models-pricing tr.group-row:hover{background:var(--raised)}
+#models-pricing .group-toggle{cursor:pointer}
+@media (min-width:760px){
+  #models-pricing tr.sub-row>td:first-child{padding-left:42px;color:var(--muted)}
+  #models-pricing tbody.open>tr.sub-row{background:color-mix(in srgb,var(--raised) 45%,transparent)}
+}
+/* Chat: the composer box is the focus indicator, not the textarea inside. */
+.composer textarea.field:focus,.composer textarea.field:focus-visible{outline:0;border:0;box-shadow:none}
+.composer textarea.field{resize:none}
+/* Chat history: actions sit under the title instead of squeezing it. */
+.history .h-item{flex-wrap:wrap}
+.history .h-ctl{flex-basis:100%;display:flex;gap:4px;padding:0 6px 6px}
+.history .h-ctl .btn{padding:2px 7px;font-size:11px}
+/* Usage chart: keep the y-max label clear of the latest-value label. */
+.bar-ymax::before{content:"max "}
+.barchart .bar{margin-top:18px}
+/* Collapsed rail: the confidential card shows its icon only. */
+.collapsed .conf-card strong{display:none}
+/* The phone chats sheet never renders on desktop (it used to leak below the
+   thread once a conversation existed). */
+@media (min-width:760px){.mobile-chats-list{display:none}}
+/* --- end redesign integration polish --- */
