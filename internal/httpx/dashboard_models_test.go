@@ -233,8 +233,27 @@ func TestDashboardModelsPricingMatrix(t *testing.T) {
 		t.Fatalf("GET /dashboard/models/pricing: expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if got := strings.Count(body, "not priced — requests refused"); got != 6 {
-		t.Fatalf("unpriced cells = %d, want 6 (ep-c chat + ep-a vision required units)\n%s", got, body)
+	// Each unpriced required cell renders the refusal copy twice now — the
+	// cell's title and the visually-hidden span (the visible cell is a
+	// muted "—") — 3 unpriced units on ep-c chat + 3 on ep-a vision.
+	if got := strings.Count(body, "not priced — requests refused"); got != 12 {
+		t.Fatalf("unpriced cell copies = %d, want 12 (title + hidden span per cell)\n%s", got, body)
+	}
+	for _, want := range []string{
+		`data-price-group="ep-a|ma" data-state="partial"`,
+		`data-price-group="ep-b|mb" data-state="priced"`,
+		`data-price-group="ep-c|mc" data-state="unpriced"`,
+		`data-price-group="ep-e|me" data-state="priced"`,
+		`data-action="models:price-group" aria-expanded="false"`,
+		"Needs prices · 2",
+		"Priced · 2",
+		"Unpriced · requests refused",
+		"1 of 2 unpriced",
+		"· 2 capabilities", // group subline counts the group's rows
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("grouped pricing markup missing %q\n%s", want, body)
+		}
 	}
 	if !strings.Contains(body, `$1.00`) || !strings.Contains(body, "via endpoint") {
 		t.Fatalf("complete endpoint set must render its own rates via endpoint\n%s", body)
@@ -298,7 +317,7 @@ func TestDashboardModelsSetPriceShowsInCell(t *testing.T) {
 	save := func(endpoint, unit string, micros int64) string {
 		body := modelsGet(t, f, "/dashboard/partials/models/pricing", session, csrf).Body.String()
 		var row string
-		for _, tr := range regexp.MustCompile(`(?s)<tr data-price-row="[^"]*">.*?</tr>`).FindAllString(body, -1) {
+		for _, tr := range regexp.MustCompile(`(?s)<tr[^>]*data-price-row="[^"]*">.*?</tr>`).FindAllString(body, -1) {
 			if strings.Contains(tr, `data-price-cell="`+endpoint+`|`+unit+`"`) {
 				row = tr
 			}
@@ -507,5 +526,71 @@ func TestDashboardModelsCatalog(t *testing.T) {
 	rec = modelsGet(t, f, "/dashboard/partials/models/catalog", session, csrf)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `id="models-catalog"`) {
 		t.Fatalf("catalog fragment: %d\n%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestModelsPriceGrouping: the view-model fold behind the grouped pricing
+// matrix — one group per model @ endpoint in first-seen order, counts and
+// priced|partial|unpriced state per group, and the per-unit summary cells:
+// the shared price when every priced capability agrees, "varies" when they
+// differ, unset (the template's muted "—") when none prices the unit. A
+// sole group renders open server-side.
+func TestModelsPriceGrouping(t *testing.T) {
+	cell := func(unit string, priced bool, micros int64, currency string) modelsPriceCell {
+		return modelsPriceCell{Unit: unit, UnitLabel: unit, Required: true, Priced: priced,
+			RateMicros: micros, UnitQuantity: 1000000, Currency: currency}
+	}
+	row := func(endpoint, model string, unpriced bool, cells ...modelsPriceCell) modelsPriceRow {
+		return modelsPriceRow{EndpointID: endpoint, Model: model, Upstream: "up-" + model, Unpriced: unpriced, Cells: cells}
+	}
+	rows := []modelsPriceRow{
+		row("ep-a", "m1", false, cell("input", true, 1000000, "USD"), cell("cached_input", true, 1000000, "USD"), cell("output", true, 1000000, "USD")),
+		row("ep-a", "m1", true, cell("input", true, 2000000, "USD"), cell("cached_input", true, 1000000, "USD"), cell("output", true, 1000000, "USD")),
+		row("ep-a", "m2", true),
+		row("ep-b", "m3", false, cell("input", true, 1000000, "USD"), cell("cached_input", true, 1000000, "USD"), cell("output", true, 1000000, "USD")),
+	}
+
+	groups := modelsPriceGroups(rows)
+	if len(groups) != 3 {
+		t.Fatalf("groups = %d, want 3 (ep-a|m1, ep-a|m2, ep-b|m3)\n%+v", len(groups), groups)
+	}
+	if groups[0].EndpointID+groups[0].Model != "ep-am1" || groups[1].Model != "m2" || groups[2].Model != "m3" {
+		t.Fatalf("groups lost first-seen order: %+v", groups)
+	}
+
+	m1 := groups[0]
+	if m1.Total != 2 || m1.Priced != 1 || m1.Unpriced != 1 || m1.State != "partial" {
+		t.Fatalf("partial group counts wrong: %+v", m1)
+	}
+	if m1.Summary[0].Priced != true || m1.Summary[0].Text != "varies" {
+		t.Fatalf("input summary must read varies when priced capabilities disagree: %+v", m1.Summary[0])
+	}
+	if m1.Summary[1].Text != "$1.00" || m1.Summary[2].Text != "$1.00" {
+		t.Fatalf("agreeing units must show the shared price: %+v", m1.Summary)
+	}
+
+	m2 := groups[1]
+	if m2.Total != 1 || m2.Priced != 0 || m2.Unpriced != 1 || m2.State != "unpriced" {
+		t.Fatalf("unpriced group counts wrong: %+v", m2)
+	}
+	if m2.Upstream != "up-m2" {
+		t.Fatalf("group must carry the row's upstream: %+v", m2)
+	}
+	for i, s := range m2.Summary {
+		if s.Priced || s.Text != "" {
+			t.Fatalf("unpriced group summary cell %d must be unset (renders —): %+v", i, s)
+		}
+	}
+
+	m3 := groups[2]
+	if m3.State != "priced" || m3.Unpriced != 0 || m3.Priced != 1 {
+		t.Fatalf("priced group counts wrong: %+v", m3)
+	}
+
+	if groups := modelsPriceGroups(rows[:1]); len(groups) != 1 || !groups[0].Open {
+		t.Fatalf("a sole group must render open: %+v", groups)
+	}
+	if groups := modelsPriceGroups(rows); groups[0].Open || groups[1].Open || groups[2].Open {
+		t.Fatalf("multiple groups must render collapsed: %+v", groups)
 	}
 }

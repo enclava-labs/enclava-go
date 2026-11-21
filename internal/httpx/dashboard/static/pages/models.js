@@ -4,6 +4,8 @@
  *   models:endpoint  open the add/edit endpoint drawer (data-endpoint-id)
  *   models:price     open the Set-price form covering all three categories
  *   models:history   open the price-history drawer for the row pair
+ *   models:price-group          expand/collapse one pricing group (data-price-group tbody)
+ *   [data-price-filter]         client-side pricing group filter (all|unpriced|priced)
  *
  * Writes go through Enclava.api → /api/v1 (D-17) and fragments re-render
  * via Enclava.refresh(). The endpoint payload carries only endpointRequest
@@ -388,8 +390,14 @@
 
   document.addEventListener('click', (e) => {
     if (!(e.target instanceof Element)) return;
-    const trigger = e.target.closest('[data-action="models:endpoint"],[data-action="models:price"],[data-action="models:history"],[data-action="models:clear-default"],[data-models-discover]');
+    const trigger = e.target.closest('[data-action="models:endpoint"],[data-action="models:price"],[data-action="models:history"],[data-action="models:price-group"],[data-action="models:clear-default"],[data-models-discover],[data-price-filter]');
     if (!trigger) return;
+    // Filter chips carry no data-action: set the active filter and re-apply.
+    if (trigger.dataset.priceFilter) {
+      priceFilter = trigger.dataset.priceFilter;
+      applyPriceGroupUI();
+      return;
+    }
     switch (trigger.dataset.action) {
       case 'models:endpoint': {
         const id = trigger.dataset.endpointId || '';
@@ -399,6 +407,16 @@
       case 'models:price':
         openPricePopover(trigger);
         break;
+      case 'models:price-group': {
+        const tbody = trigger.closest('tbody[data-price-group]');
+        if (tbody) {
+          const key = tbody.dataset.priceGroup;
+          if (openPriceGroups.has(key)) openPriceGroups.delete(key);
+          else openPriceGroups.add(key);
+          applyPriceGroupUI();
+        }
+        break;
+      }
       case 'models:history':
         openHistory(trigger);
         break;
@@ -433,6 +451,41 @@
     if (e.target instanceof Element && e.target.matches('[data-models-disable]')) {
       disableEndpoint(e.target);
     }
+  });
+
+  // Pricing groups (OA-27 review): the section re-renders itself over htmx
+  // (hx-swap="outerHTML" on the refresh event), so which groups are open and
+  // the active filter live here, not in the DOM — saving a price must not
+  // collapse the group being worked on or drop the filter.
+  const openPriceGroups = new Set();
+  let priceFilter = 'all';
+
+  function applyPriceGroupUI() {
+    document.querySelectorAll('tbody[data-price-group]').forEach((tbody) => {
+      const open = openPriceGroups.has(tbody.dataset.priceGroup);
+      tbody.classList.toggle('open', open);
+      const toggle = tbody.querySelector('[data-action="models:price-group"]');
+      if (toggle) toggle.setAttribute('aria-expanded', String(open));
+      // A partial group needs prices; only "priced" groups drop out of the
+      // needs-prices view.
+      const state = tbody.dataset.state;
+      tbody.hidden = priceFilter === 'unpriced' ? state === 'priced'
+        : priceFilter === 'priced' ? state !== 'priced' : false;
+    });
+    document.querySelectorAll('#models-pricing [data-price-filter]').forEach((chip) => {
+      const on = chip.dataset.priceFilter === priceFilter;
+      chip.classList.toggle('active', on);
+      chip.setAttribute('aria-pressed', String(on));
+    });
+  }
+
+  // Seed from the server render (a sole group arrives open) so the first
+  // refresh keeps it.
+  document.querySelectorAll('tbody[data-price-group]').forEach((tbody) => {
+    if (tbody.classList.contains('open')) openPriceGroups.add(tbody.dataset.priceGroup);
+  });
+  document.body.addEventListener('htmx:afterSettle', () => {
+    if (document.querySelector('tbody[data-price-group]')) applyPriceGroupUI();
   });
 
   // Live preview of each entered category price in the shared money shape.
